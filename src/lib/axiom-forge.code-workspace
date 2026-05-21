@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"path": "../../../idea-analyzer"
+		},
+		{
+			"path": "../../../ik-adapter-base"
+		}
+	],
+	"settings": {}
+}

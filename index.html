@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Axiom Forge - Open-source local agent for the idea-to-app pipeline" />
+    <meta name="theme-color" content="#0f172a" />
+    
+    <!-- Preconnect to external domains -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    
+    <!-- Fonts -->
+    <link 
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" 
+      rel="stylesheet" 
+    />
+    
+    <!-- Favicon -->
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%236366f1'/%3E%3Cpath d='M50 25 L65 50 L50 50 L65 75 L35 75 L50 50 L35 50 Z' fill='white'/%3E%3C/svg%3E" />
+    
+    <title>Axiom Forge</title>
+    
+    <!-- Content Security Policy for Electron and Tauri -->
+    <meta 
+      http-equiv="Content-Security-Policy" 
+      content="
+        default-src 'self' tauri://localhost http://tauri.localhost;
+        script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: tauri://localhost http://tauri.localhost;
+        style-src 'self' 'unsafe-inline' https://fonts.googleapis.com tauri://localhost http://tauri.localhost;
+        font-src 'self' https://fonts.gstatic.com tauri://localhost http://tauri.localhost;
+        connect-src 'self' http://ipc.localhost ws://ipc.localhost ws://localhost:5173 http://localhost:11434 http://127.0.0.1:11434 https://api.github.com https://api.vercel.com tauri://localhost http://tauri.localhost;
+        img-src 'self' data: https: tauri://localhost http://tauri.localhost;
+        frame-src 'self' http://localhost:* http://127.0.0.1:* tauri://localhost http://tauri.localhost;
+        worker-src 'self' blob: tauri://localhost http://tauri.localhost;
+        object-src 'none';
+        base-uri 'self';
+        form-action 'self';
+      "
+    />
+    
+    <style>
+      /* Critical CSS for initial load */
+      html, body, #root {
+        height: 100%;
+        margin: 0;
+        padding: 0;
+      }
+      
+      body {
+        font-family: 'Inter', system-ui, -apple-system, sans-serif;
+        background-color: #020617;
+        color: #f8fafc;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+      }
+      
+      /* Loading spinner */
+      .loading-spinner {
+        width: 40px;
+        height: 40px;
+        border: 3px solid #1e293b;
+        border-top-color: #6366f1;
+        border-radius: 50%;
+        animation: spin 1s linear infinite;
+      }
+      
+      @keyframes spin {
+        to { transform: rotate(360deg); }
+      }
+      
+      /* Initial loading state */
+      #root:empty::before {
+        content: '';
+        display: block;
+        width: 40px;
+        height: 40px;
+        border: 3px solid #1e293b;
+        border-top-color: #6366f1;
+        border-radius: 50%;
+        animation: spin 1s linear infinite;
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
