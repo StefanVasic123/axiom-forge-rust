@@ -19,7 +19,7 @@ import { useAppStore } from './hooks/useAppStore';
 
 function AppContent() {
   const [isLoading, setIsLoading] = useState(true);
-  const { isFirstRun, checkFirstRun } = useAppStore();
+  const { isFirstRun, checkFirstRun, startGeneration } = useAppStore();
 
   useEffect(() => {
     const init = async () => {
@@ -28,6 +28,37 @@ function AppContent() {
     };
     init();
   }, []);
+
+  // Subscribe to deep link events GLOBALLY (exactly once)
+  useEffect(() => {
+    if (isLoading) return;
+
+    const unsubscribeBuild = window.electronAPI.deepLink.onBuild(async (data) => {
+      console.log('Deep link build received globally:', data);
+      if (data.manifestId) {
+        try {
+          // Trigger the generation process with the security token and originating host
+          await startGeneration(data.manifestId, data.projectId || data.manifestId, data.token, data.host);
+        } catch (error) {
+          console.error('Failed to auto-start generation globally:', error);
+        }
+      }
+    });
+
+    const unsubscribeConfig = window.electronAPI.deepLink.onConfig((data) => {
+      console.log('Deep link config received globally:', data);
+    });
+
+    const unsubscribeDeploy = window.electronAPI.deepLink.onDeploy((data) => {
+      console.log('Deep link deploy received globally:', data);
+    });
+
+    return () => {
+      unsubscribeBuild();
+      unsubscribeConfig();
+      unsubscribeDeploy();
+    };
+  }, [isLoading, startGeneration]);
 
   if (isLoading) {
     return (

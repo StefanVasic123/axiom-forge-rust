@@ -15,9 +15,12 @@ import {
   AlertCircle,
   Save,
   Trash2,
-  RefreshCw
+  RefreshCw,
+  Sliders,
+  AlertTriangle
 } from 'lucide-react';
 import { useAppStore } from '../hooks/useAppStore';
+import { verifyCompatibility } from '../lib/compatibility';
 
 // Token input component
 function TokenInput({ 
@@ -202,11 +205,64 @@ function Settings() {
   const [ollamaStatus, setOllamaStatus] = useState('unknown');
   const [isTestingOllama, setIsTestingOllama] = useState(false);
 
+  const [techOverrides, setTechOverrides] = useState({
+    nextjs: '',
+    react: '',
+    node: '',
+    tauri: '',
+    expo: '',
+    rust: ''
+  });
+  const [localTools, setLocalTools] = useState(null);
+  const [compatibilityWarnings, setCompatibilityWarnings] = useState([]);
+
   useEffect(() => {
     checkTokens();
     testOllamaConnection();
     loadHardwareProfile();
+    loadTechOverrides();
+    loadLocalTools();
   }, []);
+
+  const loadTechOverrides = async () => {
+    try {
+      const settings = await window.electronAPI.app.getSettings();
+      if (settings && settings.techOverrides) {
+        setTechOverrides(settings.techOverrides);
+      }
+    } catch (e) {
+      console.error('[Settings] Error loading tech overrides:', e);
+    }
+  };
+
+  const loadLocalTools = async () => {
+    try {
+      const tools = await window.electronAPI.hardware.getLocalToolsProfile();
+      setLocalTools(tools);
+    } catch (e) {
+      console.error('[Settings] Error loading local tools profile:', e);
+    }
+  };
+
+  const handleOverrideChange = async (key, value) => {
+    const updated = { ...techOverrides, [key]: value };
+    setTechOverrides(updated);
+    
+    try {
+      const settings = await window.electronAPI.app.getSettings() || {};
+      settings.techOverrides = updated;
+      await window.electronAPI.app.saveSettings(settings);
+    } catch (e) {
+      console.error('[Settings] Error saving tech overrides:', e);
+    }
+  };
+
+  useEffect(() => {
+    if (localTools) {
+      const warnings = verifyCompatibility(techOverrides, localTools);
+      setCompatibilityWarnings(warnings);
+    }
+  }, [techOverrides, localTools]);
 
   const loadHardwareProfile = async () => {
     const profile = await window.electronAPI.hardware.getProfile();
@@ -235,11 +291,25 @@ function Settings() {
   };
 
   const handleBuilderModelChange = async (newModel) => {
+    const model = hardwareProfile?.models.find(m => m.id === newModel);
+    if (model && !model.isCompatible && !model.isMarginal) {
+      const confirmed = window.confirm(
+        `Warning: This model requires ${model.minRamGB}GB of RAM, but your system only has ${hardwareProfile.ramGB?.toFixed(1)}GB. Running this model may cause severe system slowdowns, app crashes, or overheating. Do you want to proceed anyway?`
+      );
+      if (!confirmed) return;
+    }
     setBuilderModel(newModel);
     await window.electronAPI.hardware.setBuilderModel(newModel);
   };
 
   const handleEditorModelChange = async (newModel) => {
+    const model = hardwareProfile?.models.find(m => m.id === newModel);
+    if (model && !model.isCompatible && !model.isMarginal) {
+      const confirmed = window.confirm(
+        `Warning: This model requires ${model.minRamGB}GB of RAM, but your system only has ${hardwareProfile.ramGB?.toFixed(1)}GB. Running this model may cause severe system slowdowns, app crashes, or overheating. Do you want to proceed anyway?`
+      );
+      if (!confirmed) return;
+    }
     setEditorModel(newModel);
     await window.electronAPI.hardware.setEditorModel(newModel);
   };
@@ -326,6 +396,16 @@ function Settings() {
             description="Required for custom deployments via SSH/FTP to Hostinger"
             onSave={saveToken}
           />
+
+          <hr className="border-slate-800" />
+
+          <TokenInput
+            label="Resend API Token"
+            tokenKey="resend-token"
+            helpUrl="https://resend.com/api-keys"
+            description="Required for user authentication and sending verification emails via Resend"
+            onSave={saveToken}
+          />
         </div>
       </section>
 
@@ -381,11 +461,13 @@ function Settings() {
             )}
           </div>
 
-          {/* Hardware info bar */}
           {hardwareProfile && (
             <div className="flex flex-col gap-2 md:flex-row md:items-center justify-between px-4 py-3 bg-slate-800/60 rounded-xl border border-slate-700/50 text-xs text-slate-400">
-              <div className="flex items-center gap-4">
+              <div className="flex items-center gap-4 flex-wrap">
                 <span>🖥️ <span className="text-slate-300">{hardwareProfile.ramGB?.toFixed(1)} GB RAM</span></span>
+                {hardwareProfile.gpu && (
+                  <span>🎮 <span className="text-slate-300">{hardwareProfile.gpu.name} ({hardwareProfile.gpu.vramGB?.toFixed(1)} GB VRAM)</span></span>
+                )}
                 <span>🔧 <span className="text-slate-300">{hardwareProfile.cpus} CPUs</span></span>
               </div>
               <div className="flex items-center gap-4 flex-wrap">
@@ -572,6 +654,137 @@ function Settings() {
             )}
           </div>
         </div>
+      </section>
+
+
+      {/* Tech Stack Overrides Section */}
+      <section className="card p-6 space-y-6">
+        <div className="flex items-center gap-3 pb-4 border-b border-slate-800">
+          <div className="w-10 h-10 rounded-lg bg-indigo-500/10 flex items-center justify-center">
+            <Sliders className="w-5 h-5 text-indigo-400" />
+          </div>
+          <div>
+            <h2 className="text-lg font-semibold text-white">Tech Stack Overrides</h2>
+            <p className="text-sm text-slate-500">
+              Override default framework and program versions for new projects
+            </p>
+          </div>
+        </div>
+
+        <div className="grid gap-4 md:grid-cols-2">
+          <div>
+            <label className="label">Next.js Version</label>
+            <select
+              value={techOverrides.nextjs || ''}
+              onChange={(e) => handleOverrideChange('nextjs', e.target.value)}
+              className="input"
+            >
+              <option value="">Default (from manifest)</option>
+              <option value="15">Next.js 15</option>
+              <option value="14">Next.js 14</option>
+              <option value="13">Next.js 13</option>
+              <option value="12">Next.js 12</option>
+            </select>
+          </div>
+
+          <div>
+            <label className="label">React Version</label>
+            <select
+              value={techOverrides.react || ''}
+              onChange={(e) => handleOverrideChange('react', e.target.value)}
+              className="input"
+            >
+              <option value="">Default</option>
+              <option value="19">React 19</option>
+              <option value="18">React 18</option>
+              <option value="17">React 17</option>
+            </select>
+          </div>
+
+          <div>
+            <label className="label">Node.js Version</label>
+            <select
+              value={techOverrides.node || ''}
+              onChange={(e) => handleOverrideChange('node', e.target.value)}
+              className="input"
+            >
+              <option value="">Default</option>
+              <option value="22">Node.js 22</option>
+              <option value="20">Node.js 20</option>
+              <option value="18">Node.js 18</option>
+              <option value="16">Node.js 16</option>
+            </select>
+          </div>
+
+          <div>
+            <label className="label">Tauri Version</label>
+            <select
+              value={techOverrides.tauri || ''}
+              onChange={(e) => handleOverrideChange('tauri', e.target.value)}
+              className="input"
+            >
+              <option value="">Default</option>
+              <option value="2">Tauri 2.0</option>
+              <option value="1">Tauri 1.0</option>
+            </select>
+          </div>
+
+          <div>
+            <label className="label">Expo SDK Version</label>
+            <select
+              value={techOverrides.expo || ''}
+              onChange={(e) => handleOverrideChange('expo', e.target.value)}
+              className="input"
+            >
+              <option value="">Default</option>
+              <option value="51">Expo SDK 51</option>
+              <option value="50">Expo SDK 50</option>
+              <option value="49">Expo SDK 49</option>
+            </select>
+          </div>
+
+          <div>
+            <label className="label">Rust Version</label>
+            <select
+              value={techOverrides.rust || ''}
+              onChange={(e) => handleOverrideChange('rust', e.target.value)}
+              className="input"
+            >
+              <option value="">Default</option>
+              <option value="1.80">Rust 1.80</option>
+              <option value="1.77">Rust 1.77</option>
+              <option value="1.75">Rust 1.75</option>
+              <option value="1.70">Rust 1.70</option>
+            </select>
+          </div>
+        </div>
+
+        {/* Local Tool Versions Display */}
+        {localTools && (
+          <div className="p-4 bg-slate-800/40 rounded-xl border border-slate-800 text-xs text-slate-400 space-y-2">
+            <h3 className="font-semibold text-slate-300">Detected Local Toolchain Versions:</h3>
+            <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
+              <div>Node: <span className="text-indigo-400 font-mono">{localTools.node || 'Not Found'}</span></div>
+              <div>NPM: <span className="text-indigo-400 font-mono">{localTools.npm || 'Not Found'}</span></div>
+              <div>Rust: <span className="text-indigo-400 font-mono">{localTools.rust || 'Not Found'}</span></div>
+              <div>Cargo: <span className="text-indigo-400 font-mono">{localTools.cargo || 'Not Found'}</span></div>
+            </div>
+          </div>
+        )}
+
+        {/* Compatibility Warnings Panel */}
+        {compatibilityWarnings.length > 0 && (
+          <div className="p-4 bg-amber-500/10 border border-amber-500/20 rounded-xl space-y-1.5">
+            <h3 className="text-sm font-semibold text-amber-400 flex items-center gap-1.5">
+              <AlertCircle className="w-4 h-4" /> Compatibility Alerts
+            </h3>
+            <ul className="list-disc list-inside text-xs text-amber-300/90 space-y-1">
+              {compatibilityWarnings.map((warn, index) => (
+                <li key={index}>{warn}</li>
+              ))}
+            </ul>
+          </div>
+        )}
       </section>
 
 

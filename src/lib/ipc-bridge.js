@@ -3,6 +3,67 @@ import { listen } from '@tauri-apps/api/event';
 
 let activeProjectId = null;
 
+// Global event listeners state to prevent duplicate Tauri subscriptions
+const globalListeners = {};
+
+function registerGlobalListener(eventName, callback) {
+  if (!globalListeners[eventName]) {
+    globalListeners[eventName] = {
+      callbacks: new Set(),
+      unlistenFn: null,
+      promise: null
+    };
+  }
+  
+  const listenerInfo = globalListeners[eventName];
+  listenerInfo.callbacks.add(callback);
+  
+  // If we haven't started listening to Tauri yet, start now
+  if (!listenerInfo.promise && !listenerInfo.unlistenFn) {
+    listenerInfo.promise = listen(eventName, (event) => {
+      const payload = event.payload;
+      
+      // Centralized debug logging for specific event types to match old behavior
+      if (eventName === 'task:progress') {
+        invoke('debug_log_to_file', { message: `[IPC Bridge] task:progress event received in JS bridge: ${JSON.stringify(payload)}` });
+      } else if (eventName === 'deep-link:build') {
+        invoke('debug_log_to_file', { message: `[IPC Bridge] Live deep-link:build event received in JS listener: ${JSON.stringify(payload)}` });
+      } else if (eventName === 'deep-link:config') {
+        invoke('debug_log_to_file', { message: `[IPC Bridge] Live deep-link:config event received: ${JSON.stringify(payload)}` });
+      } else if (eventName === 'deep-link:deploy') {
+        invoke('debug_log_to_file', { message: `[IPC Bridge] Live deep-link:deploy event received: ${JSON.stringify(payload)}` });
+      }
+      
+      listenerInfo.callbacks.forEach(cb => {
+        try {
+          cb(payload);
+        } catch (err) {
+          console.error(`Error in global listener callback for ${eventName}:`, err);
+        }
+      });
+    }).then(unlisten => {
+      listenerInfo.unlistenFn = unlisten;
+      listenerInfo.promise = null;
+    }).catch(err => {
+      console.error(`Failed to subscribe to Tauri event ${eventName}:`, err);
+      listenerInfo.promise = null;
+    });
+  }
+  
+  // Return the cleanup function
+  return () => {
+    listenerInfo.callbacks.delete(callback);
+    // If there are no more callbacks, clean up the Tauri listener
+    if (listenerInfo.callbacks.size === 0) {
+      if (listenerInfo.unlistenFn) {
+        listenerInfo.unlistenFn();
+        listenerInfo.unlistenFn = null;
+      }
+      delete globalListeners[eventName];
+    }
+  };
+}
+
 function parseAxiomUrl(urlStr) {
   if (!urlStr.startsWith('axiom://')) return null;
   const rest = urlStr.substring('axiom://'.length);
@@ -85,6 +146,9 @@ window.electronAPI = {
     getProfile: async () => {
       return await invoke('get_hardware_profile');
     },
+    getLocalToolsProfile: async () => {
+      return await invoke('get_local_tools_profile');
+    },
     getSelectedModel: async () => {
       return localStorage.getItem('axiom-forge-model');
     },
@@ -126,15 +190,7 @@ window.electronAPI = {
       return await invoke('ollama_unload_model', { model });
     },
     onPullProgress: (callback) => {
-      let unlisten;
-      listen('ollama:pull-progress', (event) => {
-        callback(event.payload);
-      }).then(fn => {
-        unlisten = fn;
-      });
-      return () => {
-        if (unlisten) unlisten();
-      };
+      return registerGlobalListener('ollama:pull-progress', callback);
     }
   },
 
@@ -187,6 +243,14 @@ window.electronAPI = {
     },
     pushToGitHub: async (projectId) => {
       return await invoke('project_push_to_github', { projectId });
+    },
+    runPrismaGenerate: async (projectId) => {
+      try {
+        const res = await invoke('project_run_prisma_generate', { projectId });
+        return { success: true, output: res };
+      } catch (e) {
+        return { success: false, error: e.toString() };
+      }
     }
   },
 
@@ -232,15 +296,7 @@ window.electronAPI = {
       return () => {};
     },
     onProjectEditProgress: (callback) => {
-      let unlisten;
-      listen('editor:project-edit-progress', (event) => {
-        callback(event.payload);
-      }).then(fn => {
-        unlisten = fn;
-      });
-      return () => {
-        if (unlisten) unlisten();
-      };
+      return registerGlobalListener('editor:project-edit-progress', callback);
     }
   },
 
@@ -280,18 +336,7 @@ window.electronAPI = {
       }
     },
     onProgress: (callback) => {
-      let unlisten;
-      listen('task:progress', (event) => {
-        const payload = event.payload;
-        invoke('debug_log_to_file', { message: `[IPC Bridge] task:progress event received in JS bridge: ${JSON.stringify(payload)}` });
-        callback(payload);
-      }).then(fn => {
-        unlisten = fn;
-      });
-      
-      return () => {
-        if (unlisten) unlisten();
-      };
+      return registerGlobalListener('task:progress', callback);
     },
     stop: async (taskId) => {
       return { success: true };
@@ -316,7 +361,7 @@ window.electronAPI = {
       const pid = projectId || activeProjectId;
       if (!pid) return { success: false };
       try {
-        const success = await invoke('server_stop', { project_id: pid });
+        const success = await invoke('server_stop', { projectId: pid });
         return { success };
       } catch (error) {
         return { success: false, error: error.toString() };
@@ -324,7 +369,7 @@ window.electronAPI = {
     },
     getStatus: async (projectId) => {
       try {
-        const isRunning = await invoke('server_status', { project_id: projectId });
+        const isRunning = await invoke('server_status', { projectId: projectId });
         return { isRunning };
       } catch (error) {
         return { isRunning: false };
@@ -332,43 +377,41 @@ window.electronAPI = {
     },
     getCdpWsUrl: async () => null,
     onLog: (callback) => {
-      let unlisten;
-      listen('server:log', (event) => {
-        callback(event.payload);
-      }).then(fn => {
-        unlisten = fn;
-      });
-      return () => {
-        if (unlisten) unlisten();
-      };
+      return registerGlobalListener('server:log', callback);
     },
     onStatus: (callback) => {
-      let unlisten;
-      listen('server:status', (event) => {
-        callback(event.payload);
-      }).then(fn => {
-        unlisten = fn;
-      });
-      return () => {
-        if (unlisten) unlisten();
-      };
+      return registerGlobalListener('server:status', callback);
+    },
+    onCompileError: (callback) => {
+      return registerGlobalListener('server:compile-error', callback);
+    },
+    onHealStatus: (callback) => {
+      return registerGlobalListener('server:heal-status', callback);
+    },
+    onMissingPackage: (callback) => {
+      return registerGlobalListener('server:missing-package', callback);
+    },
+    healCompileError: async (projectId, filePath, errorMsg) => {
+      return await invoke('project_heal_compile_error', { projectId, filePath, errorMsg });
+    },
+    installPackage: async (projectId, packageName) => {
+      return await invoke('project_install_package', { projectId, packageName });
     },
   },
   shell: {
-    openExternal: (url) => {
-      console.log("Should open external:", url);
+    openExternal: async (url) => {
+      try {
+        await invoke('plugin:opener|open_url', { url: url });
+      } catch (e) {
+        console.error("Failed to open external URL:", e);
+      }
     }
   },
   
   // ==================== DEEP LINK & WINDOW STUBS ====================
   deepLink: {
     onBuild: (callback) => {
-      let unlisten;
-      listen('deep-link:build', (event) => {
-        const payload = event.payload;
-        invoke('debug_log_to_file', { message: `[IPC Bridge] Live deep-link:build event received in JS listener: ${JSON.stringify(payload)}` });
-        callback(payload);
-      }).then(fn => unlisten = fn);
+      const unsubscribe = registerGlobalListener('deep-link:build', callback);
 
       // JIT Pending Deep Link Pull for Cold Starts
       invoke('get_pending_deep_link')
@@ -398,15 +441,10 @@ window.electronAPI = {
           invoke('debug_log_to_file', { message: `[IPC Bridge] Error onBuild get_pending_deep_link: ${err.toString()}` });
         });
 
-      return () => { if (unlisten) unlisten(); };
+      return unsubscribe;
     },
     onConfig: (callback) => {
-      let unlisten;
-      listen('deep-link:config', (event) => {
-        const payload = event.payload;
-        invoke('debug_log_to_file', { message: `[IPC Bridge] Live deep-link:config event received: ${JSON.stringify(payload)}` });
-        callback(payload);
-      }).then(fn => unlisten = fn);
+      const unsubscribe = registerGlobalListener('deep-link:config', callback);
 
       invoke('get_pending_deep_link')
         .then((pendingUrl) => {
@@ -427,15 +465,10 @@ window.electronAPI = {
           }
         });
 
-      return () => { if (unlisten) unlisten(); };
+      return unsubscribe;
     },
     onDeploy: (callback) => {
-      let unlisten;
-      listen('deep-link:deploy', (event) => {
-        const payload = event.payload;
-        invoke('debug_log_to_file', { message: `[IPC Bridge] Live deep-link:deploy event received: ${JSON.stringify(payload)}` });
-        callback(payload);
-      }).then(fn => unlisten = fn);
+      const unsubscribe = registerGlobalListener('deep-link:deploy', callback);
 
       invoke('get_pending_deep_link')
         .then((pendingUrl) => {
@@ -456,18 +489,49 @@ window.electronAPI = {
           }
         });
 
-      return () => { if (unlisten) unlisten(); };
+      return unsubscribe;
     }
   },
   window: {
-    showFloating: async () => {},
-    closeFloating: async () => {},
+    showFloating: async ({ id }) => {
+      try {
+        const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+        const label = `floating-${id}`;
+        
+        const webview = new WebviewWindow(label, {
+          url: `index.html#/floating?id=${id}`,
+          title: 'Axiom Forge - Generating Codebase',
+          width: 700,
+          height: 500,
+          resizable: true,
+          alwaysOnTop: true,
+        });
+      } catch (e) {
+        console.error('Failed to show floating window:', e);
+      }
+    },
+    closeFloating: async () => {
+      try {
+        const { getCurrentWindow } = await import('@tauri-apps/api/window');
+        const win = getCurrentWindow();
+        if (win && win.label && win.label.startsWith('floating-')) {
+          await win.close();
+        }
+      } catch (e) {
+        console.error('Failed to close floating window:', e);
+      }
+    },
     hideFloating: async () => {}
   },
   app: {
     getVersion: async () => {
-      // In Tauri we can just invoke the built-in app version or return hardcoded
       return { success: true, version: '0.1.0 (Rust)' };
+    },
+    getSettings: async () => {
+      return await invoke('get_axiom_settings');
+    },
+    saveSettings: async (settings) => {
+      return await invoke('save_axiom_settings', { settings });
     }
   }
 };

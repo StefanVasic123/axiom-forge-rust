@@ -268,7 +268,9 @@ function OllamaStep({ onNext, onBack }) {
             <span className="text-sm font-medium text-slate-300 block">{message}</span>
             {hardwareProfile && (
               <span className="text-xs text-slate-500">
-                Detected: {hardwareProfile.ramGB.toFixed(1)} GB RAM • {hardwareProfile.cpus} Logical Cores
+                Detected: {hardwareProfile.ramGB.toFixed(1)} GB RAM
+                {hardwareProfile.gpu && ` • ${hardwareProfile.gpu.name} (${hardwareProfile.gpu.vramGB.toFixed(1)} GB VRAM)`}
+                {` • ${hardwareProfile.cpus} Logical Cores`}
               </span>
             )}
           </div>

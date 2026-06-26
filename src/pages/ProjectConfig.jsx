@@ -183,6 +183,28 @@ const SERVICE_PRESETS = {
         type: 'password'
       }
     ]
+  },
+  resend: {
+    name: 'Resend',
+    icon: '📧',
+    fields: [
+      {
+        name: 'RESEND_API_KEY',
+        label: 'API Key',
+        description: 'Your Resend API key for sending email verification codes',
+        helpUrl: 'https://resend.com/api-keys',
+        required: true,
+        type: 'password',
+        example: 're_xxxxxxxx'
+      },
+      {
+        name: 'EMAIL_FROM',
+        label: 'Sender Email',
+        description: 'The email address that sends the authentication link',
+        required: true,
+        example: 'onboarding@resend.dev'
+      }
+    ]
   }
 };
 

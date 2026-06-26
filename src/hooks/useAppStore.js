@@ -188,38 +188,7 @@ export function useAppStore() {
     }
   }, [actions]);
 
-  // ==================== DEEP LINK HANDLERS ====================
-  useEffect(() => {
-    // Subscribe to deep link events
-    const unsubscribeBuild = window.electronAPI.deepLink.onBuild(async (data) => {
-      console.log('Deep link build received:', data);
-      
-      if (data.manifestId) {
-        try {
-          // Trigger the generation process with the security token and originating host
-          await startGeneration(data.manifestId, data.projectId || data.manifestId, data.token, data.host);
-        } catch (error) {
-          console.error('Failed to auto-start generation:', error);
-        }
-      }
-    });
 
-    const unsubscribeConfig = window.electronAPI.deepLink.onConfig((data) => {
-      console.log('Deep link config:', data);
-      // Handle config deep link
-    });
-
-    const unsubscribeDeploy = window.electronAPI.deepLink.onDeploy((data) => {
-      console.log('Deep link deploy:', data);
-      // Handle deploy deep link
-    });
-
-    return () => {
-      unsubscribeBuild();
-      unsubscribeConfig();
-      unsubscribeDeploy();
-    };
-  }, []);
 
   // ==================== TASK PROGRESS ====================
   useEffect(() => {

@@ -21,7 +21,7 @@ import {
   ArrowLeft, Save, GitCommit, ChevronRight, ChevronDown,
   File, Folder, FolderOpen, Send, Loader2, Check, X,
   RotateCcw, Sparkles, Code2, AlertCircle, Eye, Monitor,
-  FunctionSquare, Search, Info, Terminal
+  FunctionSquare, Search, Info, Terminal, Settings
 } from 'lucide-react';
 
 // ==================== HELPERS ====================
@@ -482,6 +482,10 @@ export default function EditorPage() {
   const [project, setProject] = useState(null);
   const [files, setFiles] = useState([]);
   const [treeNodes, setTreeNodes] = useState([]);
+  const [projectDependencies, setProjectDependencies] = useState({});
+  const [integrationsExpanded, setIntegrationsExpanded] = useState(false);
+  const [isPrismaGenerating, setIsPrismaGenerating] = useState(false);
+  const [prismaResult, setPrismaResult] = useState(null);
   const [openTabs, setOpenTabs] = useState([]);     // [{path, name, content, isDirty}]
   const [activeTabPath, setActiveTabPath] = useState(null);
   const [isSaving, setIsSaving] = useState(false);
@@ -498,6 +502,12 @@ export default function EditorPage() {
   const [cdpPort, setCdpPort] = useState(null);
   const [cdpConnected, setCdpConnected] = useState(false);
   const [showTerminal, setShowTerminal] = useState(false);
+  const [compileError, setCompileError] = useState(null);
+  const [healingInProgress, setHealingInProgress] = useState(false);
+  const [healStatus, setHealStatus] = useState('');
+  const [missingPackage, setMissingPackage] = useState(null);
+  const [installingPackage, setInstallingPackage] = useState(false);
+  const [installStatus, setInstallStatus] = useState('');
   
   // Status & Inspector States
   const [statusMsg, setStatusMsg] = useState('');
@@ -547,6 +557,10 @@ export default function EditorPage() {
 
   // Server IPC listeners
   useEffect(() => {
+    setMissingPackage(null);
+    setInstallingPackage(false);
+    setInstallStatus('');
+
     if (!window.electronAPI.server) return;
 
     // Check initial status
@@ -563,11 +577,49 @@ export default function EditorPage() {
         const newLogs = [...logs, { text, type, id: Date.now() + Math.random() }];
         return newLogs.slice(-200); // Keep last 200 logs
       });
+
+      // Auto-detect preview URL from server output (e.g. Next.js or Vite logs)
+      if (text) {
+        const match = text.match(/https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|192\.\d+\.\d+\.\d+):(\d+)/i);
+        if (match) {
+          let detectedUrl = match[0];
+          // Map 0.0.0.0 to localhost so browser frame can load it correctly
+          if (detectedUrl.includes('0.0.0.0')) {
+            detectedUrl = detectedUrl.replace('0.0.0.0', 'localhost');
+          }
+          console.log('[Editor] Auto-detected local server URL from logs:', detectedUrl);
+          setPreviewUrl(detectedUrl);
+        }
+      }
     });
+
+    const unsubCompileError = window.electronAPI.server.onCompileError((errorData) => {
+      console.log('[Editor] Received compilation error:', errorData);
+      setCompileError(errorData);
+      setShowTerminal(true);
+    });
+
+    const unsubHealStatus = window.electronAPI.server.onHealStatus((statusData) => {
+      console.log('[Editor] Healing progress:', statusData);
+      setHealStatus(statusData.status);
+    });
+
+    const unsubMissingPackage = window.electronAPI.server.onMissingPackage
+      ? window.electronAPI.server.onMissingPackage((packageData) => {
+          console.log('[Editor] Received missing package event:', packageData);
+          if (packageData.projectId === projectId) {
+            setMissingPackage(packageData.packageName);
+            setShowTerminal(true);
+          }
+        })
+      : null;
 
     return () => {
       unsubStatus();
       unsubLog();
+      unsubCompileError();
+      unsubHealStatus();
+      if (unsubMissingPackage) unsubMissingPackage();
     };
   }, [projectId]);
 
@@ -586,7 +638,7 @@ export default function EditorPage() {
 
   const toggleServer = async () => {
     if (serverRunning) {
-      await window.electronAPI.server.stop();
+      await window.electronAPI.server.stop(projectId);
       setCdpPort(null);
       setCdpConnected(false);
     } else {
@@ -600,6 +652,69 @@ export default function EditorPage() {
       if (res.success && res.cdpPort) {
         setCdpPort(res.cdpPort);
       }
+    }
+  };
+
+  const handleHealError = async () => {
+    if (!compileError) return;
+    setHealingInProgress(true);
+    setHealStatus('Započinjem popravku...');
+    try {
+      const res = await window.electronAPI.server.healCompileError(
+        projectId,
+        compileError.filePath,
+        compileError.errorMessage
+      );
+      if (res) {
+        setCompileError(null);
+      }
+    } catch (err) {
+      console.error("Auto-healing error:", err);
+      setHealStatus('Greška pri popravci: ' + err.toString());
+    } finally {
+      setHealingInProgress(false);
+    }
+  };
+
+  const handleInstallPackage = async () => {
+    if (!missingPackage) return;
+    if (!window.electronAPI.server.installPackage) {
+      console.error("installPackage API is not defined.");
+      setInstallStatus('Greška: API nije učitan. Osvežite stranu (Ctrl+R/F5).');
+      return;
+    }
+    setInstallingPackage(true);
+    setInstallStatus('Instaliram paket...');
+    try {
+      const success = await window.electronAPI.server.installPackage(
+        projectId,
+        missingPackage
+      );
+      if (success) {
+        setInstallStatus('Paket uspešno instaliran! Ponovo pokrećem server...');
+        setMissingPackage(null);
+        
+        if (serverRunning) {
+          await window.electronAPI.server.stop(projectId);
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          setServerLogs([{ text: '> Starting server...', type: 'info', id: Date.now() }]);
+          const res = await window.electronAPI.server.start({ 
+            projectId, 
+            platform: project?.manifest?.platform || 'web',
+            techStack: project?.manifest?.techStack?.framework || 'nextjs'
+          });
+          if (res.success && res.cdpPort) {
+            setCdpPort(res.cdpPort);
+          }
+        }
+      } else {
+        setInstallStatus('Greška pri instalaciji: npm install nije uspeo.');
+      }
+    } catch (err) {
+      console.error("Greška pri instalaciji paketa:", err);
+      setInstallStatus('Greška pri instalaciji: ' + err.toString());
+    } finally {
+      setInstallingPackage(false);
     }
   };
 
@@ -823,6 +938,21 @@ export default function EditorPage() {
       if (fileRes.success) {
         setFiles(fileRes.files);
         setTreeNodes(buildTree(fileRes.files));
+        
+        // Try to read package.json to detect integrations
+        try {
+          const pkgRes = await window.electronAPI.project.readFile(projectId, 'package.json');
+          if (pkgRes.success && pkgRes.content) {
+            const pkg = JSON.parse(pkgRes.content);
+            const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+            setProjectDependencies(deps);
+          } else {
+            setProjectDependencies({});
+          }
+        } catch (e) {
+          console.error("Failed to read package.json", e);
+          setProjectDependencies({});
+        }
       }
     };
     load();
@@ -859,6 +989,17 @@ export default function EditorPage() {
       setOpenTabs(tabs => tabs.map(t => t.path === activeTabPath ? { ...t, isDirty: false } : t));
       setStatusMsg(`Saved: ${activeTab.name}`);
       setTimeout(() => setStatusMsg(''), 2000);
+      
+      // If package.json was saved, reload dependencies
+      if (activeTab.path === 'package.json') {
+        try {
+          const pkg = JSON.parse(activeTab.content);
+          const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+          setProjectDependencies(deps);
+        } catch (e) {
+          console.error("Failed to parse package.json dependencies on save", e);
+        }
+      }
     } else {
       setStatusMsg(`Error saving: ${result.error}`);
     }
@@ -1199,122 +1340,265 @@ export default function EditorPage() {
 
           {/* Monaco Editor Wrapper */}
           <div className="flex-1 overflow-hidden relative flex flex-col">
-            {activeTab ? (
-              <>
-                {showPreview ? (
-                  <div className="flex-1 flex flex-col bg-white">
-                    <div className="h-8 bg-slate-100 border-b border-slate-200 flex items-center px-4 gap-4 shrink-0">
-                      <div className="flex gap-1.5">
-                        <div className="w-2.5 h-2.5 rounded-full bg-red-400" />
-                        <div className="w-2.5 h-2.5 rounded-full bg-yellow-400" />
-                        <div className="w-2.5 h-2.5 rounded-full bg-green-400" />
-                      </div>
-                      <div className="flex-1 bg-white border border-slate-300 rounded px-2 py-0.5 text-[10px] text-slate-500 flex items-center gap-2">
-                        <Info className="w-3 h-3" /> {previewUrl}
-                      </div>
+            {showPreview ? (() => {
+              const integrationsList = [];
+              const usesResend = (projectDependencies['resend'] || projectDependencies['@resend/node'] || 
+                                  files.some(f => f.path.toLowerCase().includes('resend')));
+              if (usesResend) {
+                integrationsList.push({
+                  id: 'resend',
+                  name: 'Resend (Email)',
+                  desc: 'Detektovan je servis za slanje e-pošte. Potrebno je da kreirate nalog i preuzmete API ključ.',
+                  signupUrl: 'https://resend.com/signup',
+                  envVar: 'RESEND_API_KEY'
+                });
+              }
+
+              const usesStripe = (projectDependencies['stripe'] || projectDependencies['@stripe/stripe-js'] || 
+                                  files.some(f => f.path.toLowerCase().includes('stripe')));
+              if (usesStripe) {
+                integrationsList.push({
+                  id: 'stripe',
+                  name: 'Stripe (Naplata)',
+                  desc: 'Detektovana je Stripe integracija za plaćanja. Potrebno je da postavite API ključ i webhook tajnu.',
+                  signupUrl: 'https://dashboard.stripe.com/register',
+                  envVar: 'STRIPE_API_KEY, STRIPE_WEBHOOK_SECRET'
+                });
+              }
+
+              const usesSupabase = (projectDependencies['@supabase/supabase-js'] || 
+                                    files.some(f => f.path.toLowerCase().includes('supabase')));
+              if (usesSupabase) {
+                integrationsList.push({
+                  id: 'supabase',
+                  name: 'Supabase (Baza & Auth)',
+                  desc: 'Detektovana je Supabase integracija. Potrebno je da unesete URL projekta i anonimni ključ.',
+                  signupUrl: 'https://supabase.com/dashboard/sign-in',
+                  envVar: 'NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY'
+                });
+              }
+
+              const usesPrisma = (projectDependencies['@prisma/client'] || projectDependencies['prisma'] || 
+                                  files.some(f => f.path.toLowerCase().includes('prisma/schema.prisma') || f.path.toLowerCase().includes('schema.prisma')));
+              if (usesPrisma) {
+                integrationsList.push({
+                  id: 'prisma',
+                  name: 'Prisma (Baza podataka)',
+                  desc: 'Detektovano je upravljanje bazom podataka preko Prisma. Osigurajte da je baza sinhronizovana.',
+                  signupUrl: null,
+                  envVar: 'DATABASE_URL'
+                });
+              }
+
+              const handlePrismaGenerate = async () => {
+                setIsPrismaGenerating(true);
+                setPrismaResult({ type: 'info', message: 'Generisanje Prisma klijenta je u toku...' });
+                const res = await window.electronAPI.project.runPrismaGenerate(projectId);
+                setIsPrismaGenerating(false);
+                if (res.success) {
+                  setPrismaResult({ type: 'success', message: 'Prisma klijent je uspešno generisan!' });
+                } else {
+                  setPrismaResult({ type: 'error', message: `Greška pri generisanju: ${res.error}` });
+                }
+              };
+
+              return (
+                <div className="flex-1 flex flex-col bg-white">
+                  <div className="h-8 bg-slate-100 border-b border-slate-200 flex items-center px-4 gap-4 shrink-0">
+                    <div className="flex gap-1.5">
+                      <div className="w-2.5 h-2.5 rounded-full bg-red-400" />
+                      <div className="w-2.5 h-2.5 rounded-full bg-yellow-400" />
+                      <div className="w-2.5 h-2.5 rounded-full bg-green-400" />
                     </div>
-                    {project?.manifest?.platform === 'desktop' ? (
-                      <div className="flex-1 flex flex-col items-center justify-center bg-slate-900 text-center px-8 border border-slate-800 m-4 rounded-xl shadow-inner">
-                        <Monitor className="w-16 h-16 text-indigo-500/50 mb-6" />
-                        <h3 className="text-xl font-bold text-white mb-2">Desktop WYSIWYG Active</h3>
-                        <p className="text-slate-400 max-w-sm mb-6">
-                          The desktop app is running in a separate native window. Axiom Forge is attached as a debugger.
-                        </p>
-                        <div className="flex items-center gap-3 bg-slate-800 px-4 py-2 rounded-lg border border-slate-700">
-                          <div className={`w-3 h-3 rounded-full ${cdpConnected ? 'bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.5)]' : 'bg-amber-500 animate-pulse'}`} />
-                          <span className="text-sm font-medium text-slate-300">
-                            {cdpConnected ? 'CDP Debugger Connected' : 'Waiting for app to start...'}
-                          </span>
-                        </div>
-                        <p className="text-xs text-slate-500 mt-6 mt-4">
-                          Hover over elements in the app window to inspect. Click to open the file and trigger the AI prompt here.
-                        </p>
-                      </div>
-                    ) : (
-                      <iframe
-                        ref={webviewRef}
-                        src={previewUrl}
-                        className="flex-1 w-full border-none bg-white"
-                        title="Project Preview"
-                        sandbox="allow-same-origin allow-scripts allow-popups allow-forms"
-                      />
-                    )}
+                    <div className="flex-1 bg-white border border-slate-300 rounded px-2 py-0.5 text-[10px] text-slate-500 flex items-center gap-2">
+                      <Info className="w-3 h-3" /> {previewUrl}
+                    </div>
                   </div>
-                ) : (
-                  <>
-                    {/* Main Editor */}
-                    <div className={`flex-1 ${pendingContent ? 'hidden' : 'block'}`}>
-                      <Editor
-                        key={activeTabPath}
+                  
+                  {/* Premium Warning Box */}
+                  {integrationsList.length > 0 && (
+                    <div className="bg-amber-50 border-b border-amber-200 text-amber-950 px-4 py-2 shrink-0">
+                      <div className="flex items-center justify-between text-xs font-semibold">
+                        <div className="flex items-center gap-2">
+                          <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+                          <span>Detektovani servisi ({integrationsList.length}): {integrationsList.map(i => i.name).join(', ')}</span>
+                        </div>
+                        <div className="flex items-center gap-3">
+                          <button 
+                            onClick={() => setIntegrationsExpanded(!integrationsExpanded)}
+                            className="text-[10px] text-amber-700 hover:text-amber-900 underline font-bold uppercase"
+                          >
+                            {integrationsExpanded ? 'Sakrij detalje' : 'Prikaži detalje'}
+                          </button>
+                          <button 
+                            onClick={() => navigate(`/projects/${projectId}/config`)}
+                            className="flex items-center gap-1 bg-amber-600 hover:bg-amber-700 text-white px-2 py-0.5 rounded text-[10px] font-bold shadow-sm transition-colors"
+                          >
+                            <Settings className="w-3 h-3" /> Podesi ENV
+                          </button>
+                        </div>
+                      </div>
+                      
+                      {integrationsExpanded && (
+                        <div className="mt-2.5 pt-2.5 border-t border-amber-200/60 flex flex-col gap-2.5 max-h-48 overflow-y-auto pr-1">
+                          {integrationsList.map(item => (
+                            <div key={item.id} className="bg-white/70 rounded p-2 text-slate-800 flex flex-col md:flex-row md:items-center justify-between gap-3 border border-amber-200/40">
+                              <div className="flex-1">
+                                <h4 className="font-bold text-xs text-slate-900 flex items-center gap-1.5">
+                                  <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
+                                  {item.name}
+                                  {item.envVar && <code className="text-[10px] bg-slate-100 px-1 py-0.5 rounded text-indigo-700 font-mono ml-2">{item.envVar}</code>}
+                                </h4>
+                                <p className="text-[11px] text-slate-600 mt-0.5">{item.desc}</p>
+                              </div>
+                              
+                              <div className="flex items-center gap-2 shrink-0 self-end md:self-center">
+                                {item.signupUrl && (
+                                  <button
+                                    onClick={() => window.electronAPI.shell.openExternal(item.signupUrl)}
+                                    className="text-[10px] font-bold text-indigo-600 hover:text-indigo-850 bg-indigo-50 border border-indigo-200 hover:bg-indigo-100 px-2 py-1 rounded transition-colors"
+                                  >
+                                    Registracija
+                                  </button>
+                                )}
+                                
+                                {item.id === 'prisma' && (
+                                  <button
+                                    onClick={handlePrismaGenerate}
+                                    disabled={isPrismaGenerating}
+                                    className="flex items-center gap-1.5 text-[10px] font-bold text-white bg-slate-850 hover:bg-slate-950 disabled:bg-slate-400 px-2.5 py-1.5 rounded shadow-sm transition-colors"
+                                  >
+                                    {isPrismaGenerating ? (
+                                      <>
+                                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                        Generisanje...
+                                      </>
+                                    ) : (
+                                      'Generiši Prisma Client'
+                                    )}
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          ))}
+                          
+                          {prismaResult && (
+                            <div className={`text-[10px] font-semibold px-2.5 py-1.5 rounded flex items-center justify-between gap-2 border ${
+                              prismaResult.type === 'success' ? 'bg-emerald-50 text-emerald-800 border-emerald-200' :
+                              prismaResult.type === 'error' ? 'bg-rose-50 text-rose-800 border-rose-200' :
+                              'bg-blue-50 text-blue-855 border-blue-200'
+                            }`}>
+                              <span className="truncate">{prismaResult.message}</span>
+                              <button onClick={() => setPrismaResult(null)} className="hover:text-slate-950 font-bold">Zatvori</button>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  
+                  {project?.manifest?.platform === 'desktop' ? (
+                    <div className="flex-1 flex flex-col items-center justify-center bg-slate-900 text-center px-8 border border-slate-800 m-4 rounded-xl shadow-inner">
+                      <Monitor className="w-16 h-16 text-indigo-500/50 mb-6" />
+                      <h3 className="text-xl font-bold text-white mb-2">Desktop WYSIWYG Active</h3>
+                      <p className="text-slate-400 max-w-sm mb-6">
+                        The desktop app is running in a separate native window. Axiom Forge is attached as a debugger.
+                      </p>
+                      <div className="flex items-center gap-3 bg-slate-800 px-4 py-2 rounded-lg border border-slate-700">
+                        <div className={`w-3 h-3 rounded-full ${cdpConnected ? 'bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.5)]' : 'bg-amber-500 animate-pulse'}`} />
+                        <span className="text-sm font-medium text-slate-300">
+                          {cdpConnected ? 'CDP Debugger Connected' : 'Waiting for app to start...'}
+                        </span>
+                      </div>
+                      <p className="text-xs text-slate-500 mt-4">
+                        Hover over elements in the app window to inspect. Click to open the file and trigger the AI prompt here.
+                      </p>
+                    </div>
+                  ) : (
+                    <iframe
+                      ref={webviewRef}
+                      src={previewUrl}
+                      className="flex-1 w-full border-none bg-white"
+                      title="Project Preview"
+                      sandbox="allow-same-origin allow-scripts allow-popups allow-forms"
+                    />
+                  )}
+                </div>
+              );
+            })()
+            : activeTab ? (
+              <>
+                {/* Main Editor */}
+                <div className={`flex-1 ${pendingContent ? 'hidden' : 'block'}`}>
+                  <Editor
+                    key={activeTabPath}
+                    height="100%"
+                    language={getLanguage(activeTab.path)}
+                    value={activeTab.content}
+                    theme="vs-dark"
+                    onChange={handleEditorChange}
+                    onMount={(editor) => { editorRef.current = editor; }}
+                    options={{
+                      fontSize: 13,
+                      fontFamily: '"Fira Code", "Cascadia Code", Consolas, monospace',
+                      fontLigatures: true,
+                      minimap: { enabled: true, scale: 1 },
+                      lineNumbers: 'on',
+                      wordWrap: 'on',
+                      scrollBeyondLastLine: false,
+                      smoothScrolling: true,
+                      cursorBlinking: 'smooth',
+                      cursorSmoothCaretAnimation: 'on',
+                      renderLineHighlight: 'all',
+                      bracketPairColorization: { enabled: true },
+                      automaticLayout: true,
+                      padding: { top: 12 },
+                    }}
+                  />
+                </div>
+
+                {/* Diff Review View */}
+                {pendingContent && (
+                  <div className="h-full flex flex-col absolute inset-0 z-10 bg-slate-900">
+                    <div className="bg-indigo-900/40 border-b border-indigo-500/30 px-4 py-2 flex justify-between items-center shrink-0">
+                      <span className="text-sm text-indigo-300 font-semibold flex items-center gap-2">
+                        <Sparkles className="w-4 h-4" /> Reviewing AI Changes
+                      </span>
+                      <span className="text-xs text-slate-400">
+                        Original (Left) ➔ Modified (Right)
+                      </span>
+                    </div>
+                    <div className="flex-1 overflow-hidden">
+                      <SafeDiffEditor
+                        key={`diff-view-${activeTabPath}-${pendingContent ? 'active' : 'none'}`}
                         height="100%"
                         language={getLanguage(activeTab.path)}
-                        value={activeTab.content}
+                        original={activeTab.content}
+                        modified={pendingContent}
                         theme="vs-dark"
-                        onChange={handleEditorChange}
-                        onMount={(editor) => { editorRef.current = editor; }}
                         options={{
                           fontSize: 13,
                           fontFamily: '"Fira Code", "Cascadia Code", Consolas, monospace',
-                          fontLigatures: true,
-                          minimap: { enabled: true, scale: 1 },
-                          lineNumbers: 'on',
-                          wordWrap: 'on',
-                          scrollBeyondLastLine: false,
-                          smoothScrolling: true,
-                          cursorBlinking: 'smooth',
-                          cursorSmoothCaretAnimation: 'on',
-                          renderLineHighlight: 'all',
-                          bracketPairColorization: { enabled: true },
+                          minimap: { enabled: false },
+                          renderSideBySide: true,
+                          readOnly: false,
                           automaticLayout: true,
-                          padding: { top: 12 },
+                          scrollBeyondLastLine: false,
+                          originalEditable: false,
+                          diffCodeLens: false
+                        }}
+                        onChange={(newValue) => {
+                          if (pendingProjectChanges) {
+                            setPendingProjectChanges(prev => ({
+                              ...prev,
+                              [activeTabPath]: newValue
+                            }));
+                          }
+                          setPendingContent(newValue);
                         }}
                       />
                     </div>
-
-                    {/* Diff Review View */}
-                    {pendingContent && (
-                      <div className="h-full flex flex-col absolute inset-0 z-10 bg-slate-900">
-                        <div className="bg-indigo-900/40 border-b border-indigo-500/30 px-4 py-2 flex justify-between items-center shrink-0">
-                          <span className="text-sm text-indigo-300 font-semibold flex items-center gap-2">
-                            <Sparkles className="w-4 h-4" /> Reviewing AI Changes
-                          </span>
-                          <span className="text-xs text-slate-400">
-                            Original (Left) ➔ Modified (Right)
-                          </span>
-                        </div>
-                        <div className="flex-1 overflow-hidden">
-                          <SafeDiffEditor
-                            key={`diff-view-${activeTabPath}-${pendingContent ? 'active' : 'none'}`}
-                            height="100%"
-                            language={getLanguage(activeTab.path)}
-                            original={activeTab.content}
-                            modified={pendingContent}
-                            theme="vs-dark"
-                            options={{
-                              fontSize: 13,
-                              fontFamily: '"Fira Code", "Cascadia Code", Consolas, monospace',
-                              minimap: { enabled: false },
-                              renderSideBySide: true,
-                              readOnly: false,
-                              automaticLayout: true,
-                              scrollBeyondLastLine: false,
-                              originalEditable: false,
-                              diffCodeLens: false
-                            }}
-                            onChange={(newValue) => {
-                              if (pendingProjectChanges) {
-                                setPendingProjectChanges(prev => ({
-                                  ...prev,
-                                  [activeTabPath]: newValue
-                                }));
-                              }
-                              setPendingContent(newValue);
-                            }}
-                          />
-                        </div>
-                      </div>
-                    )}
-                  </>
+                  </div>
                 )}
               </>
             ) : (
@@ -1337,6 +1621,76 @@ export default function EditorPage() {
                   <X className="w-3.5 h-3.5" />
                 </button>
               </div>
+              
+              {compileError && (
+                <div className="bg-red-950/90 border-b border-red-500/50 p-2.5 text-white flex flex-col gap-1.5 shrink-0 shadow-md">
+                  <div className="flex justify-between items-center">
+                    <span className="text-xs font-bold text-red-300 flex items-center gap-2">
+                      ⚠️ Greška pri kompajliranju u: <code className="bg-red-900/60 px-1.5 py-0.5 rounded text-yellow-300 font-mono text-[10px]">{compileError.filePath}</code>
+                    </span>
+                    <div className="flex gap-2">
+                      <button 
+                        onClick={handleHealError} 
+                        disabled={healingInProgress}
+                        className="bg-emerald-600 hover:bg-emerald-500 text-white font-semibold px-3 py-1 rounded text-[10px] flex items-center gap-1.5 disabled:opacity-50 transition-colors max-w-xs truncate"
+                      >
+                        {healingInProgress ? (
+                          <>⏳ {healStatus || 'Popravljam...'}</>
+                        ) : (
+                          <>✨ Popravi sa AI</>
+                        )}
+                      </button>
+                      <button 
+                        onClick={() => setCompileError(null)} 
+                        className="text-slate-400 hover:text-white text-[10px] px-1"
+                      >
+                        Ignoriši
+                      </button>
+                    </div>
+                  </div>
+                  <pre className="text-[10px] bg-black/40 p-2 rounded font-mono overflow-auto max-h-24 whitespace-pre-wrap text-red-200 border border-red-900/30 leading-normal">
+                    {compileError.errorMessage}
+                  </pre>
+                </div>
+              )}
+
+              {missingPackage && (
+                <div className="bg-amber-950/95 border-b border-amber-500/50 p-2.5 text-white flex flex-col gap-1.5 shrink-0 shadow-md transition-all duration-300">
+                  <div className="flex justify-between items-center">
+                    <span className="text-xs font-bold text-amber-300 flex items-center gap-2">
+                      <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" /> Nedostaje paket: <code className="bg-amber-900/60 px-1.5 py-0.5 rounded text-yellow-300 font-mono text-[10px]">{missingPackage}</code>
+                    </span>
+                    <div className="flex gap-2">
+                      <button 
+                        onClick={handleInstallPackage} 
+                        disabled={installingPackage}
+                        className="bg-amber-600 hover:bg-amber-500 text-white font-semibold px-3 py-1 rounded text-[10px] flex items-center gap-1.5 disabled:opacity-50 transition-colors shadow-sm cursor-pointer"
+                      >
+                        {installingPackage ? (
+                          <>⏳ {installStatus || 'Instaliram...'}</>
+                        ) : (
+                          <>⚡ Instaliraj paket</>
+                        )}
+                      </button>
+                      <button 
+                        onClick={() => {
+                          setMissingPackage(null);
+                          setInstallStatus('');
+                        }} 
+                        className="text-slate-400 hover:text-white text-[10px] px-1 cursor-pointer"
+                      >
+                        Ignoriši
+                      </button>
+                    </div>
+                  </div>
+                  {installStatus && (
+                    <div className="text-[10px] text-amber-200/90 bg-amber-900/30 px-2 py-1 rounded border border-amber-800/30 font-mono">
+                      {installStatus}
+                    </div>
+                  )}
+                </div>
+              )}
+
               <div className="flex-1 overflow-y-auto p-2 font-mono text-[11px] text-slate-300 custom-scrollbar leading-relaxed">
                 {serverLogs.length === 0 ? (
                   <div className="text-slate-600 italic">No logs yet...</div>
