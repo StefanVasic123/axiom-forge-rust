@@ -32,6 +32,12 @@ const initialState = {
   tokensConfigured: {
     github: false,
     hosting: false
+  },
+
+  // Dual-Mode App State (Developer vs Client)
+  appMode: {
+    mode: 'developer',
+    agencyConfig: null
   }
 };
 
@@ -47,7 +53,8 @@ const ACTIONS = {
   SET_CURRENT_PROJECT: 'SET_CURRENT_PROJECT',
   SET_TASK_PROGRESS: 'SET_TASK_PROGRESS',
   UPDATE_SETTINGS: 'UPDATE_SETTINGS',
-  SET_TOKENS_CONFIGURED: 'SET_TOKENS_CONFIGURED'
+  SET_TOKENS_CONFIGURED: 'SET_TOKENS_CONFIGURED',
+  SET_APP_MODE: 'SET_APP_MODE'
 };
 
 // Reducer
@@ -108,6 +115,12 @@ function appReducer(state, action) {
         ...state,
         tokensConfigured: { ...state.tokensConfigured, ...action.payload }
       };
+
+    case ACTIONS.SET_APP_MODE:
+      return {
+        ...state,
+        appMode: { ...state.appMode, ...action.payload }
+      };
       
     default:
       return state;
@@ -166,6 +179,10 @@ export function AppProvider({ children }) {
     dispatch({ type: ACTIONS.SET_TOKENS_CONFIGURED, payload: tokens });
   }, []);
 
+  const setAppMode = useCallback((appModeState) => {
+    dispatch({ type: ACTIONS.SET_APP_MODE, payload: appModeState });
+  }, []);
+
   const actions = React.useMemo(() => ({
     setFirstRun,
     setLoading,
@@ -177,12 +194,13 @@ export function AppProvider({ children }) {
     setCurrentProject,
     setTaskProgress,
     updateSettings,
-    setTokensConfigured
+    setTokensConfigured,
+    setAppMode
   }), [
     setFirstRun, setLoading, setError, setProjects,
     addProject, updateProject, deleteProject,
     setCurrentProject, setTaskProgress, updateSettings,
-    setTokensConfigured
+    setTokensConfigured, setAppMode
   ]);
 
   const value = React.useMemo(() => ({ state, actions }), [state, actions]);

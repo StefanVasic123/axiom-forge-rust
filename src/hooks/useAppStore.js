@@ -271,6 +271,7 @@ export function useAppStore() {
     taskProgress: state.taskProgress,
     settings: state.settings,
     tokensConfigured: state.tokensConfigured,
+    appMode: state.appMode,
 
     // Actions
     checkFirstRun,
@@ -289,7 +290,8 @@ export function useAppStore() {
     importGithub,
     detectMissingEnvKeys,
     saveEnvKeys,
-    setFirstRun: actions.setFirstRun
+    setFirstRun: actions.setFirstRun,
+    setAppMode: actions.setAppMode
   };
 }
 

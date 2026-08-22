@@ -561,6 +561,64 @@ window.electronAPI = {
     saveSettings: async (settings) => {
       return await invoke('save_axiom_settings', { settings });
     }
+  },
+  agency: {
+    getAppMode: async () => {
+      try {
+        return await invoke('get_app_mode');
+      } catch (e) {
+        console.error('Failed to get app mode:', e);
+        return { mode: 'developer', agencyConfig: null };
+      }
+    },
+    setAppMode: async (mode) => {
+      try {
+        return await invoke('set_app_mode', { mode });
+      } catch (e) {
+        console.error('Failed to set app mode:', e);
+        throw e;
+      }
+    },
+    saveAgencyConfig: async (config) => {
+      try {
+        return await invoke('save_agency_config', { config });
+      } catch (e) {
+        console.error('Failed to save agency config:', e);
+        throw e;
+      }
+    },
+    createProposal: async (projectId, prompt) => {
+      try {
+        return await invoke('git_create_client_proposal', { projectId, prompt });
+      } catch (e) {
+        console.error('Failed to create proposal:', e);
+        throw e;
+      }
+    },
+    getProposals: async (projectId) => {
+      try {
+        return await invoke('git_get_client_proposals', { projectId });
+      } catch (e) {
+        console.error('Failed to get proposals:', e);
+        return [];
+      }
+    },
+    updateProposalStatus: async (projectId, proposalId, status) => {
+      try {
+        return await invoke('git_update_proposal_status', { projectId, proposalId, status });
+      } catch (e) {
+        console.error('Failed to update proposal status:', e);
+        throw e;
+      }
+    },
+    submitToRelay: async (relayUrl, payload) => {
+      try {
+        return await invoke('relay_submit_proposal', { relayUrl, payload });
+      } catch (e) {
+        console.error('Failed to submit to relay:', e);
+        throw e;
+      }
+    }
   }
 };
 

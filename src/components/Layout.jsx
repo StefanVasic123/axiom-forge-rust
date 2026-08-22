@@ -13,6 +13,7 @@ import {
   Sparkles,
   ChevronRight,
   Brain,
+  GitPullRequest,
   Loader2,
   CheckCircle2,
   AlertCircle,
@@ -36,6 +37,7 @@ function Sidebar() {
 
   const navItems = [
     { path: '/', icon: LayoutDashboard, label: 'Dashboard' },
+    { path: '/agency-dashboard', icon: GitPullRequest, label: 'Agency Review' },
     { path: '/ai-optimizer', icon: Brain, label: 'AI Optimizer' },
     { path: '/settings', icon: Settings, label: 'Settings' }
   ];
@@ -135,6 +137,7 @@ function Header() {
   const getPageTitle = () => {
     const path = location.pathname;
     if (path === '/') return 'Dashboard';
+    if (path === '/agency-dashboard') return 'Agency Review Dashboard';
     if (path === '/settings') return 'Settings';
     if (path.startsWith('/projects/')) return 'Project Details';
     return 'Axiom Forge';

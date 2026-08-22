@@ -1,3 +1,7 @@
+pub mod mode;
+pub mod git_engine;
+pub mod relay;
+
 use serde::{Deserialize, Serialize};
 use sysinfo::System;
 use std::collections::HashMap;
@@ -204,7 +208,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use serde_json::Value;
 
-fn get_base_dir() -> PathBuf {
+pub(crate) fn get_base_dir() -> PathBuf {
     // Use standard OS data directory instead of hardcoded ~/.axiom-forge
     let local_data = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
     local_data.join("axiom-forge")
@@ -237,7 +241,7 @@ fn get_projects_dir() -> PathBuf {
     get_base_dir().join("projects")
 }
 
-fn get_project_path(project_id: &str) -> PathBuf {
+pub(crate) fn get_project_path(project_id: &str) -> PathBuf {
     let file_path = get_projects_file();
     if file_path.exists() {
         if let Ok(content) = fs::read_to_string(&file_path) {
@@ -8382,6 +8386,7 @@ pub fn run() {
         })
         .manage(PendingDeepLink(Mutex::new(None)))
         .manage(ServerState(Mutex::new(HashMap::new())))
+        .manage(mode::ModeState(Mutex::new(mode::load_mode_state(&get_base_dir()))))
         .invoke_handler(tauri::generate_handler![
             greet, 
             get_hardware_profile,
@@ -8422,7 +8427,14 @@ pub fn run() {
             project_import_local_folder,
             project_import_github,
             project_detect_missing_env_keys,
-            project_save_env_keys
+            project_save_env_keys,
+            mode::get_app_mode,
+            mode::set_app_mode,
+            mode::save_agency_config,
+            git_engine::git_create_client_proposal,
+            git_engine::git_get_client_proposals,
+            git_engine::git_update_proposal_status,
+            relay::relay_submit_proposal
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

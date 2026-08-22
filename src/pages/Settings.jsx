@@ -196,7 +196,7 @@ function TokenInput({
 }
 
 function Settings() {
-  const { saveToken, checkTokens, tokensConfigured } = useAppStore();
+  const { saveToken, checkTokens, tokensConfigured, setAppMode } = useAppStore();
   const [ollamaHost, setOllamaHost] = useState('http://127.0.0.1:11434');
   const [builderModel, setBuilderModel] = useState('');
   const [editorModel, setEditorModel] = useState('');
@@ -829,6 +829,44 @@ function Settings() {
               All tokens are encrypted using AES-256-GCM with a key derived from your 
               machine-specific data. Tokens can only be decrypted on this machine.
             </p>
+          </div>
+        </div>
+      </section>
+
+      {/* Agency Collaboration & Dual-Mode Section */}
+      <section className="card p-6 space-y-6">
+        <div className="flex items-center gap-3 pb-4 border-b border-slate-800">
+          <div className="w-10 h-10 rounded-lg bg-indigo-500/10 flex items-center justify-center">
+            <Sliders className="w-5 h-5 text-indigo-400" />
+          </div>
+          <div>
+            <h2 className="text-lg font-semibold text-white">Agency & Dual-Mode</h2>
+            <p className="text-sm text-slate-500">
+              Configure agency setup and client-facing mode
+            </p>
+          </div>
+        </div>
+
+        <div className="space-y-4">
+          <div className="p-4 bg-slate-800/50 rounded-lg flex items-center justify-between">
+            <div>
+              <h3 className="font-medium text-white mb-1">Switch to Client Mode</h3>
+              <p className="text-xs text-slate-400">
+                Locks the UI into a simplified float overlay for non-technical clients.
+              </p>
+            </div>
+            <button
+              onClick={async () => {
+                if (window.electronAPI?.agency?.setAppMode) {
+                  await window.electronAPI.agency.setAppMode('client');
+                  const modeState = await window.electronAPI.agency.getAppMode();
+                  setAppMode(modeState);
+                }
+              }}
+              className="btn-secondary text-xs px-4 py-2"
+            >
+              Enter Client Mode
+            </button>
           </div>
         </div>
       </section>

@@ -15,15 +15,25 @@ import Settings from './pages/Settings';
 import ProjectConfig from './pages/ProjectConfig';
 import EditorPage from './pages/Editor';
 import AiOptimizer from './pages/AiOptimizer';
+import AgencyDashboard from './pages/AgencyDashboard';
+import ClientLayout from './components/ClientLayout';
 import { useAppStore } from './hooks/useAppStore';
 
 function AppContent() {
   const [isLoading, setIsLoading] = useState(true);
-  const { isFirstRun, checkFirstRun, startGeneration } = useAppStore();
+  const { isFirstRun, checkFirstRun, startGeneration, appMode, setAppMode } = useAppStore();
 
   useEffect(() => {
     const init = async () => {
       await checkFirstRun();
+      if (window.electronAPI?.agency?.getAppMode) {
+        try {
+          const modeState = await window.electronAPI.agency.getAppMode();
+          setAppMode(modeState);
+        } catch (e) {
+          console.warn('Failed to load app mode:', e);
+        }
+      }
       setIsLoading(false);
     };
     init();
@@ -69,6 +79,8 @@ function AppContent() {
         </div>
       </div>
     );
+  if (appMode?.mode === 'client') {
+    return <ClientLayout />;
   }
 
   return (
@@ -83,6 +95,7 @@ function AppContent() {
           {/* Standard routes (with Layout) */}
           <Route element={<Layout />}>
             <Route path="/" element={<Dashboard />} />
+            <Route path="/agency-dashboard" element={<AgencyDashboard />} />
             <Route path="/projects/:projectId" element={<ProjectDetail />} />
             <Route path="/projects/:projectId/config" element={<ProjectConfig />} />
             <Route path="/settings" element={<Settings />} />
