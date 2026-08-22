@@ -212,7 +212,13 @@ const SERVICE_PRESETS = {
 function ProjectConfig() {
   const { projectId } = useParams();
   const navigate = useNavigate();
-  const { projects, configureProject, updateProjectStatus } = useAppStore();
+  const { 
+    projects, 
+    configureProject, 
+    updateProjectStatus,
+    detectMissingEnvKeys,
+    saveEnvKeys
+  } = useAppStore();
   
   const [project, setProject] = useState(null);
   const [envVars, setEnvVars] = useState({});
@@ -221,23 +227,39 @@ function ProjectConfig() {
   const [saveError, setSaveError] = useState(null);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [activePreset, setActivePreset] = useState(null);
+  const [missingKeys, setMissingKeys] = useState([]);
+  const [isLoadingKeys, setIsLoadingKeys] = useState(false);
 
-  // Load project data
+  // Load project data and scan missing keys dynamically
   useEffect(() => {
     const foundProject = projects.find(p => p.id === projectId);
     if (foundProject) {
       setProject(foundProject);
       
-      // Initialize env vars from template if available
+      // If template is available, load from it
       if (foundProject.metadata?.envTemplate) {
         const initialVars = {};
         foundProject.metadata.envTemplate.forEach(env => {
           initialVars[env.name] = '';
         });
         setEnvVars(initialVars);
+      } else {
+        // Scan project codebase for missing keys dynamically!
+        setIsLoadingKeys(true);
+        detectMissingEnvKeys(projectId)
+          .then(keys => {
+            setMissingKeys(keys);
+            const initialVars = {};
+            keys.forEach(k => {
+              initialVars[k] = '';
+            });
+            setEnvVars(initialVars);
+          })
+          .catch(console.error)
+          .finally(() => setIsLoadingKeys(false));
       }
     }
-  }, [projectId, projects]);
+  }, [projectId, projects, detectMissingEnvKeys]);
 
   // Handle env var change
   const handleEnvChange = (name, value) => {
@@ -295,6 +317,9 @@ function ProjectConfig() {
 
       // Save to secure storage
       await configureProject(projectId, allVars);
+
+      // Save directly to the .env file in the repository (e.g. for imported projects)
+      await saveEnvKeys(projectId, allVars);
       
       // Update project status and metadata
       const updatedMetadata = {
@@ -466,6 +491,35 @@ function ProjectConfig() {
                 required={env.required}
                 example={env.example}
                 value={envVars[env.name] || ''}
+                onChange={handleEnvChange}
+              />
+            ))}
+          </div>
+        )}
+
+        {/* Dynamic Scan Keys Loader */}
+        {isLoadingKeys && (
+          <div className="flex items-center justify-center py-8 gap-3 border border-dashed border-slate-800 rounded-xl bg-slate-900/30">
+            <Loader2 className="w-5 h-5 text-indigo-500 animate-spin" />
+            <span className="text-sm text-slate-400">Scanning repository codebase for environment keys...</span>
+          </div>
+        )}
+
+        {/* Missing/Detected Keys Fields */}
+        {!isLoadingKeys && missingKeys.length > 0 && (
+          <div className="space-y-4">
+            <h3 className="text-sm font-medium text-slate-400 flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-indigo-500 animate-pulse"></span>
+              Detected Required Keys
+            </h3>
+            {missingKeys.map((key) => (
+              <EnvField
+                key={key}
+                name={key}
+                label={key}
+                description="Detected dynamically in your project source files"
+                required={true}
+                value={envVars[key] || ''}
                 onChange={handleEnvChange}
               />
             ))}

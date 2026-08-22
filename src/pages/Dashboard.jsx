@@ -19,7 +19,9 @@ import {
   Loader2,
   Trash2,
   Play,
-  Settings
+  Settings,
+  FolderOpen,
+  X
 } from 'lucide-react';
 import { useAppStore } from '../hooks/useAppStore';
 
@@ -236,6 +238,7 @@ function Dashboard() {
   const [searchQuery, setSearchQuery] = useState('');
   const [filterStatus, setFilterStatus] = useState('all');
   const [showFilterMenu, setShowFilterMenu] = useState(false);
+  const [showImportModal, setShowImportModal] = useState(false);
 
   useEffect(() => {
     loadProjects();
@@ -276,13 +279,23 @@ function Dashboard() {
           </p>
         </div>
         
-        <button
-          onClick={() => window.electronAPI.shell.openExternal('https://axiomforge.io/templates')}
-          className="btn-primary"
-        >
-          <Plus className="w-5 h-5" />
-          New Project
-        </button>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => setShowImportModal(true)}
+            className="btn-secondary"
+          >
+            <FolderOpen className="w-4 h-4 text-indigo-400" />
+            Import Project
+          </button>
+          
+          <button
+            onClick={() => window.electronAPI.shell.openExternal('https://axiomforge.io/templates')}
+            className="btn-primary"
+          >
+            <Plus className="w-5 h-5" />
+            New Project
+          </button>
+        </div>
       </div>
 
       {/* Search and Filter */}
@@ -356,6 +369,189 @@ function Dashboard() {
           <p className="text-slate-500">No projects match your search</p>
         </div>
       )}
+      <ImportModal isOpen={showImportModal} onClose={() => setShowImportModal(false)} />
+    </div>
+  );
+}
+
+function ImportModal({ isOpen, onClose }) {
+  const { importLocalFolder, importGithub } = useAppStore();
+  const navigate = useNavigate();
+  const [activeTab, setActiveTab] = useState('local'); // 'local' | 'github'
+  const [localPath, setLocalPath] = useState('');
+  const [githubUrl, setGithubUrl] = useState('');
+  const [githubToken, setGithubToken] = useState('');
+  const [isImporting, setIsImporting] = useState(false);
+  const [error, setError] = useState(null);
+
+  if (!isOpen) return null;
+
+
+
+  const handleLocalImport = async (e) => {
+    e.preventDefault();
+    if (!localPath.trim()) return;
+
+    setIsImporting(true);
+    setError(null);
+    try {
+      const project = await importLocalFolder(localPath.trim());
+      onClose();
+      navigate(`/projects/${project.id}/config`);
+    } catch (err) {
+      setError(err.message || 'Failed to import local folder.');
+    } finally {
+      setIsImporting(false);
+    }
+  };
+
+  const handleGithubImport = async (e) => {
+    e.preventDefault();
+    if (!githubUrl.trim()) return;
+
+    setIsImporting(true);
+    setError(null);
+    try {
+      const project = await importGithub(githubUrl.trim(), null, githubToken.trim() || null);
+      onClose();
+      navigate(`/projects/${project.id}/config`);
+    } catch (err) {
+      setError(err.message || 'Failed to clone & import GitHub repository.');
+    } finally {
+      setIsImporting(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg overflow-hidden shadow-2xl animate-in fade-in zoom-in-95 duration-200">
+        {/* Header */}
+        <div className="flex items-center justify-between p-5 border-b border-slate-800">
+          <div className="flex items-center gap-2">
+            <FolderOpen className="w-5 h-5 text-indigo-400" />
+            <h3 className="text-lg font-semibold text-white">Import Codebase</h3>
+          </div>
+          <button onClick={onClose} className="p-1 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white transition-colors">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        {/* Tabs */}
+        <div className="flex border-b border-slate-800 bg-slate-900/50">
+          <button
+            onClick={() => { setActiveTab('local'); setError(null); }}
+            className={`flex-1 py-3 text-sm font-medium border-b-2 transition-all ${
+              activeTab === 'local' 
+                ? 'border-indigo-500 text-indigo-400 bg-indigo-500/5' 
+                : 'border-transparent text-slate-400 hover:text-white'
+            }`}
+          >
+            Local Folder
+          </button>
+          <button
+            onClick={() => { setActiveTab('github'); setError(null); }}
+            className={`flex-1 py-3 text-sm font-medium border-b-2 transition-all ${
+              activeTab === 'github' 
+                ? 'border-indigo-500 text-indigo-400 bg-indigo-500/5' 
+                : 'border-transparent text-slate-400 hover:text-white'
+            }`}
+          >
+            GitHub Repository
+          </button>
+        </div>
+
+        {/* Content */}
+        <div className="p-6">
+          {error && (
+            <div className="p-3 mb-4 bg-rose-500/10 border border-rose-500/20 text-rose-400 text-sm rounded-lg flex items-start gap-2">
+              <span className="font-semibold">Error:</span>
+              <p>{error}</p>
+            </div>
+          )}
+
+          {activeTab === 'local' ? (
+            <form onSubmit={handleLocalImport} className="space-y-4">
+              <div className="space-y-2">
+                <label className="label text-sm text-slate-300">Local Folder Path</label>
+                <input
+                  type="text"
+                  placeholder="C:/projects/my-app"
+                  value={localPath}
+                  onChange={(e) => setLocalPath(e.target.value)}
+                  className="input"
+                  required
+                />
+                <p className="text-xs text-slate-500">
+                  Select a local folder that contains a web project (e.g. Next.js, Vite, React).
+                </p>
+              </div>
+
+              <div className="flex justify-end gap-3 pt-4 border-t border-slate-800">
+                <button type="button" onClick={onClose} className="btn-ghost" disabled={isImporting}>
+                  Cancel
+                </button>
+                <button type="submit" className="btn-primary" disabled={isImporting || !localPath.trim()}>
+                  {isImporting ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      Importing...
+                    </>
+                  ) : (
+                    'Import Folder'
+                  )}
+                </button>
+              </div>
+            </form>
+          ) : (
+            <form onSubmit={handleGithubImport} className="space-y-4">
+              <div className="space-y-2">
+                <label className="label text-sm text-slate-300">GitHub Repository URL</label>
+                <input
+                  type="url"
+                  placeholder="https://github.com/username/repo"
+                  value={githubUrl}
+                  onChange={(e) => setGithubUrl(e.target.value)}
+                  className="input"
+                  required
+                />
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="label text-sm text-slate-300">Personal Access Token (PAT)</label>
+                  <span className="text-xs text-slate-500">Optional</span>
+                </div>
+                <input
+                  type="password"
+                  placeholder="ghp_xxxxxxxxxxxx"
+                  value={githubToken}
+                  onChange={(e) => setGithubToken(e.target.value)}
+                  className="input"
+                />
+                <p className="text-xs text-slate-500">
+                  Required only for private repositories.
+                </p>
+              </div>
+
+              <div className="flex justify-end gap-3 pt-4 border-t border-slate-800">
+                <button type="button" onClick={onClose} className="btn-ghost" disabled={isImporting}>
+                  Cancel
+                </button>
+                <button type="submit" className="btn-primary" disabled={isImporting || !githubUrl.trim()}>
+                  {isImporting ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      Cloning...
+                    </>
+                  ) : (
+                    'Clone & Import'
+                  )}
+                </button>
+              </div>
+            </form>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

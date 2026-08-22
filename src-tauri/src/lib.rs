@@ -237,6 +237,25 @@ fn get_projects_dir() -> PathBuf {
     get_base_dir().join("projects")
 }
 
+fn get_project_path(project_id: &str) -> PathBuf {
+    let file_path = get_projects_file();
+    if file_path.exists() {
+        if let Ok(content) = fs::read_to_string(&file_path) {
+            if let Ok(projects) = serde_json::from_str::<Vec<Value>>(&content) {
+                if let Some(proj) = projects.iter().find(|p| p.get("id").and_then(|i| i.as_str()) == Some(project_id)) {
+                    if let Some(local_path) = proj.get("localPath").and_then(|lp| lp.as_str()) {
+                        let path = PathBuf::from(local_path);
+                        if path.exists() {
+                            return path;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    get_projects_dir().join(project_id)
+}
+
 #[tauri::command]
 fn project_get_all() -> Result<Vec<Value>, String> {
     let file_path = get_projects_file();
@@ -333,13 +352,276 @@ fn project_delete(id: String) -> Result<bool, String> {
     
     let _ = fs::write(&file_path, serde_json::to_string_pretty(&projects).unwrap());
     
-    // Also delete the folder if it exists
-    let proj_dir = get_projects_dir().join(&id);
-    if proj_dir.exists() {
+    // Also delete the folder if it exists and is internal
+    let proj_dir = get_project_path(&id);
+    let is_internal = proj_dir.starts_with(get_projects_dir());
+    if proj_dir.exists() && is_internal {
         let _ = fs::remove_dir_all(proj_dir);
     }
     
     Ok(true)
+}
+
+#[tauri::command]
+fn project_import_local_folder(path: String) -> Result<Value, String> {
+    let folder_path = PathBuf::from(&path);
+    if !folder_path.exists() || !folder_path.is_dir() {
+        return Err("Selected path does not exist or is not a directory.".to_string());
+    }
+
+    // Try to determine project name
+    let mut project_name = folder_path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "imported-project".to_string());
+
+    // If package.json exists, read the name from it
+    let pkg_json_path = folder_path.join("package.json");
+    if pkg_json_path.exists() {
+        if let Ok(content) = fs::read_to_string(&pkg_json_path) {
+            if let Ok(pkg_val) = serde_json::from_str::<Value>(&content) {
+                if let Some(name) = pkg_val.get("name").and_then(|n| n.as_str()) {
+                    project_name = name.to_string();
+                }
+            }
+        }
+    }
+
+    let project_id = format!("imported-{}", uuid::Uuid::new_v4().to_string()[..8].to_string());
+    
+    let project_data = serde_json::json!({
+        "id": project_id,
+        "name": project_name,
+        "status": "imported",
+        "localPath": path.replace('\\', "/"),
+        "createdAt": chrono::Utc::now().to_rfc3339(),
+        "updatedAt": chrono::Utc::now().to_rfc3339(),
+    });
+
+    let file_path = get_projects_file();
+    let mut projects: Vec<Value> = if file_path.exists() {
+        let content = fs::read_to_string(&file_path).unwrap_or_else(|_| "[]".to_string());
+        serde_json::from_str(&content).unwrap_or_else(|_| vec![])
+    } else {
+        vec![]
+    };
+
+    projects.push(project_data.clone());
+    let _ = fs::write(&file_path, serde_json::to_string_pretty(&projects).unwrap());
+
+    Ok(project_data)
+}
+
+#[tauri::command]
+async fn project_import_github(
+    repo_url: String,
+    local_path: Option<String>,
+    token: Option<String>,
+) -> Result<Value, String> {
+    let repo_name = repo_url.split('/')
+        .last()
+        .unwrap_or("cloned-repo")
+        .trim_end_matches(".git")
+        .to_string();
+
+    let project_id = format!("github-{}", uuid::Uuid::new_v4().to_string()[..8].to_string());
+    
+    let target_dir = if let Some(ref path) = local_path {
+        PathBuf::from(path)
+    } else {
+        get_projects_dir().join(&project_id)
+    };
+
+    let _ = fs::create_dir_all(target_dir.parent().unwrap());
+
+    // Construct clone URL with token if provided
+    let clone_url = if let Some(t) = token {
+        if !t.trim().is_empty() {
+            repo_url.replace("https://", &format!("https://{}@", t))
+        } else {
+            repo_url.clone()
+        }
+    } else {
+        repo_url.clone()
+    };
+
+    // Run git clone command
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("clone").arg(&clone_url).arg(target_dir.to_str().unwrap());
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+
+    let output = cmd.output().await.map_err(|e| format!("Failed to run git clone: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git clone failed: {}", stderr));
+    }
+
+    let project_data = serde_json::json!({
+        "id": project_id,
+        "name": repo_name,
+        "status": "imported",
+        "localPath": target_dir.to_str().unwrap().replace('\\', "/"),
+        "createdAt": chrono::Utc::now().to_rfc3339(),
+        "updatedAt": chrono::Utc::now().to_rfc3339(),
+    });
+
+    let file_path = get_projects_file();
+    let mut projects: Vec<Value> = if file_path.exists() {
+        let content = fs::read_to_string(&file_path).unwrap_or_else(|_| "[]".to_string());
+        serde_json::from_str(&content).unwrap_or_else(|_| vec![])
+    } else {
+        vec![]
+    };
+
+    projects.push(project_data.clone());
+    let _ = fs::write(&file_path, serde_json::to_string_pretty(&projects).unwrap());
+
+    Ok(project_data)
+}
+
+#[tauri::command]
+fn project_detect_missing_env_keys(project_id: String) -> Result<Vec<String>, String> {
+    use std::collections::HashSet;
+    use regex::Regex;
+
+    let proj_dir = get_project_path(&project_id);
+    if !proj_dir.exists() {
+        return Err("Project directory not found".to_string());
+    }
+
+    let mut required_keys = HashSet::new();
+
+    // 1. Try to read .env.example
+    let env_example_path = proj_dir.join(".env.example");
+    if env_example_path.exists() {
+        if let Ok(content) = fs::read_to_string(&env_example_path) {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                    if let Some(pos) = trimmed.find('=') {
+                        let key = trimmed[..pos].trim().to_string();
+                        if !key.is_empty() {
+                            required_keys.insert(key);
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        // Fallback: scan source files with regex
+        let env_regex = Regex::new(r"process\.env\.([A-Z0-9_]+)").unwrap();
+        
+        fn scan_for_env(dir: &Path, re: &Regex, keys: &mut HashSet<String>) {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    if let Ok(file_type) = entry.file_type() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        let path = entry.path();
+                        
+                        if file_type.is_dir() {
+                            if !name.starts_with('.') && name != "node_modules" && name != "dist" && name != ".next" {
+                                scan_for_env(&path, re, keys);
+                            }
+                        } else {
+                            let ext = path.extension().unwrap_or_default().to_string_lossy().to_string();
+                            if ext == "js" || ext == "ts" || ext == "jsx" || ext == "tsx" {
+                                if let Ok(content) = fs::read_to_string(&path) {
+                                    for cap in re.captures_iter(&content) {
+                                        if let Some(m) = cap.get(1) {
+                                            let key = m.as_str().to_string();
+                                            if key != "NODE_ENV" && key != "PORT" {
+                                                keys.insert(key);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        scan_for_env(&proj_dir, &env_regex, &mut required_keys);
+    }
+
+    // 2. Read existing .env (or .env.local) to see what is already configured
+    let mut configured_keys = HashSet::new();
+    let env_files = vec![".env", ".env.local", ".env.development"];
+    for file in env_files {
+        let env_path = proj_dir.join(file);
+        if env_path.exists() {
+            if let Ok(content) = fs::read_to_string(&env_path) {
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                        if let Some(pos) = trimmed.find('=') {
+                            let key = trimmed[..pos].trim().to_string();
+                            let val = trimmed[pos+1..].trim();
+                            if !key.is_empty() && !val.is_empty() {
+                                configured_keys.insert(key);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Find missing keys
+    let mut missing_keys: Vec<String> = required_keys.into_iter()
+        .filter(|k| !configured_keys.contains(k))
+        .collect();
+        
+    missing_keys.sort();
+    Ok(missing_keys)
+}
+
+#[tauri::command]
+fn project_save_env_keys(project_id: String, keys: HashMap<String, String>) -> Result<(), String> {
+    let proj_dir = get_project_path(&project_id);
+    if !proj_dir.exists() {
+        return Err("Project directory not found".to_string());
+    }
+
+    let env_path = if proj_dir.join(".env.local").exists() || !proj_dir.join(".env").exists() {
+        proj_dir.join(".env.local")
+    } else {
+        proj_dir.join(".env")
+    };
+
+    let mut env_content = if env_path.exists() {
+        fs::read_to_string(&env_path).unwrap_or_default()
+    } else {
+        "".to_string()
+    };
+
+    if !env_content.is_empty() && !env_content.ends_with('\n') {
+        env_content.push('\n');
+    }
+
+    for (k, v) in keys {
+        let mut key_replaced = false;
+        let mut new_lines = Vec::new();
+        
+        for line in env_content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with(&format!("{}=", k)) {
+                new_lines.push(format!("{}={}", k, v));
+                key_replaced = true;
+            } else {
+                new_lines.push(line.to_string());
+            }
+        }
+
+        if key_replaced {
+            env_content = new_lines.join("\n") + "\n";
+        } else {
+            env_content.push_str(&format!("{}={}\n", k, v));
+        }
+    }
+
+    fs::write(&env_path, env_content).map_err(|e| format!("Failed to write env file: {}", e))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -387,7 +669,7 @@ pub struct GetFilesResult {
 
 #[tauri::command]
 fn project_get_files(project_id: String) -> GetFilesResult {
-    let proj_dir = get_projects_dir().join(&project_id);
+    let proj_dir = get_project_path(&project_id);
     let mut files = Vec::new();
     
     fn scan_dir(dir: &Path, base_dir: &Path, files: &mut Vec<ProjectFile>) {
@@ -421,7 +703,7 @@ fn project_get_files(project_id: String) -> GetFilesResult {
 
 #[tauri::command]
 async fn project_commit(project_id: String, message: Option<String>) -> Result<Value, String> {
-    let proj_dir = get_projects_dir().join(&project_id);
+    let proj_dir = get_project_path(&project_id);
     
     let mut git_add = tokio::process::Command::new("git");
     git_add.arg("add").arg(".").current_dir(&proj_dir);
@@ -444,8 +726,91 @@ async fn project_commit(project_id: String, message: Option<String>) -> Result<V
 
 #[tauri::command]
 async fn project_push_to_github(project_id: String) -> Result<Value, String> {
-    let _ = project_id; // Silence unused warning
-    Ok(serde_json::json!({ "success": false, "error": "Not implemented in Rust yet" })) // Stub
+    let proj_dir = get_project_path(&project_id);
+    if !proj_dir.exists() {
+        return Err("Project directory not found".to_string());
+    }
+
+    // 1. Get token from security key-ring
+    let token_res = get_token("github-token".to_string());
+    let token = token_res.value;
+
+    // 2. Detect current branch
+    let mut git_branch = tokio::process::Command::new("git");
+    git_branch.arg("rev-parse").arg("--abbrev-ref").arg("HEAD").current_dir(&proj_dir);
+    #[cfg(target_os = "windows")]
+    git_branch.creation_flags(0x08000000);
+    
+    let branch_output = git_branch.output().await.map_err(|e| format!("Failed to detect git branch: {}", e))?;
+    let branch_name = String::from_utf8_lossy(&branch_output.stdout).trim().to_string();
+    if branch_name.is_empty() {
+        return Err("Failed to detect active git branch. Make sure the project is initialized with git.".to_string());
+    }
+
+    // 3. Get current origin URL
+    let mut git_url = tokio::process::Command::new("git");
+    git_url.arg("remote").arg("get-url").arg("origin").current_dir(&proj_dir);
+    #[cfg(target_os = "windows")]
+    git_url.creation_flags(0x08000000);
+    
+    let url_output = git_url.output().await;
+    let original_url = match url_output {
+        Ok(out) => {
+            if out.status.success() {
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            } else {
+                "".to_string()
+            }
+        }
+        Err(_) => "".to_string(),
+    };
+
+    if original_url.is_empty() {
+        return Err("No remote origin detected. Please configure a GitHub remote first.".to_string());
+    }
+
+    // 4. Temporarily set remote URL with token if token is available
+    let has_token = token.is_some() && !token.as_ref().unwrap().trim().is_empty();
+    if has_token {
+        let t = token.as_ref().unwrap();
+        if original_url.starts_with("https://github.com/") {
+            let auth_url = original_url.replace("https://github.com/", &format!("https://{}@github.com/", t));
+            let mut git_set_url = tokio::process::Command::new("git");
+            git_set_url.arg("remote").arg("set-url").arg("origin").arg(&auth_url).current_dir(&proj_dir);
+            #[cfg(target_os = "windows")]
+            git_set_url.creation_flags(0x08000000);
+            let _ = git_set_url.output().await;
+        }
+    }
+
+    // 5. Run git push
+    let mut git_push = tokio::process::Command::new("git");
+    git_push.arg("push").arg("origin").arg(&branch_name).current_dir(&proj_dir);
+    #[cfg(target_os = "windows")]
+    git_push.creation_flags(0x08000000);
+
+    let push_result = git_push.output().await;
+
+    // 6. Restore original URL (clean token from config)
+    if has_token && original_url.starts_with("https://github.com/") {
+        let mut git_restore_url = tokio::process::Command::new("git");
+        git_restore_url.arg("remote").arg("set-url").arg("origin").arg(&original_url).current_dir(&proj_dir);
+        #[cfg(target_os = "windows")]
+        git_restore_url.creation_flags(0x08000000);
+        let _ = git_restore_url.output().await;
+    }
+
+    match push_result {
+        Ok(out) => {
+            if out.status.success() {
+                Ok(serde_json::json!({ "success": true, "message": format!("Successfully pushed branch '{}' to GitHub", branch_name) }))
+            } else {
+                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                Err(format!("Git push failed: {}", stderr))
+            }
+        }
+        Err(e) => Err(format!("Failed to run git push: {}", e)),
+    }
 }
 
 #[derive(Serialize)]
@@ -457,7 +822,7 @@ pub struct FileReadResult {
 
 #[tauri::command]
 fn project_read_file(project_id: String, file_path: String) -> FileReadResult {
-    let proj_dir = get_projects_dir().join(&project_id);
+    let proj_dir = get_project_path(&project_id);
     let full_path = proj_dir.join(&file_path);
     
     if !full_path.starts_with(&proj_dir) {
@@ -478,7 +843,7 @@ pub struct FileWriteResult {
 
 #[tauri::command]
 fn editor_write_file(project_id: String, file_path: String, content: String) -> FileWriteResult {
-    let proj_dir = get_projects_dir().join(&project_id);
+    let proj_dir = get_project_path(&project_id);
     let full_path = proj_dir.join(&file_path);
     
     if !full_path.starts_with(&proj_dir) {
@@ -899,11 +1264,26 @@ fn post_process_generated_file(
                 .and_then(|d| d.as_object())
                 .map_or(false, |deps| deps.contains_key("next"));
 
-            if is_nextjs {
-                if let Some(deps) = pkg_obj.get_mut("dependencies").and_then(|d| d.as_object_mut()) {
+            if let Some(deps) = pkg_obj.get_mut("dependencies").and_then(|d| d.as_object_mut()) {
+                if deps.contains_key("jwt") {
+                    let version = deps.remove("jwt").unwrap_or_else(|| serde_json::json!("^9.0.2"));
+                    deps.insert("jsonwebtoken".to_string(), version);
+                }
+                deps.remove("node-base64");
+                deps.remove("base64");
+                if is_nextjs {
                     deps.remove("react-router-dom");
                     deps.remove("react-router");
                 }
+            }
+
+            if let Some(dev_deps) = pkg_obj.get_mut("devDependencies").and_then(|d| d.as_object_mut()) {
+                if dev_deps.contains_key("jwt") {
+                    let version = dev_deps.remove("jwt").unwrap_or_else(|| serde_json::json!("^9.0.2"));
+                    dev_deps.insert("jsonwebtoken".to_string(), version);
+                }
+                dev_deps.remove("node-base64");
+                dev_deps.remove("base64");
             }
 
             if let Ok(pretty) = serde_json::to_string_pretty(&pkg_val) {
@@ -937,6 +1317,28 @@ fn post_process_generated_file(
     } else {
         content.to_string()
     };
+
+    // Inject Axiom Inspect script into layout files for visual editing mode in development
+    if path_lower.ends_with("app/layout.tsx") || path_lower.ends_with("app/layout.jsx") {
+        if !processed.contains("axiom-inspect-click") {
+            let inspector_script = "      <script dangerouslySetInnerHTML={{ __html: `\n        if (!window.__axiom_inspect_injected) {\n          window.__axiom_inspect_injected = true;\n          const styleEl = document.createElement('style');\n          styleEl.textContent = \\`\n            .axiom-inspect-highlight {\n              outline: 2px solid #6366f1 !important;\n              outline-offset: -2px !important;\n              cursor: crosshair !important;\n              background-color: rgba(99, 102, 241, 0.08) !important;\n              transition: all 0.1s ease;\n            }\n          \\`;\n          document.head.appendChild(styleEl);\n          let highlightedElement = null;\n          function findAxiomTarget(el) {\n            while (el && el !== document.body) {\n              if (el.dataset && (el.dataset.axiomFile || el.dataset.axiomComponent)) {\n                return el;\n              }\n              el = el.parentElement;\n            }\n            return null;\n          }\n          document.addEventListener('mouseover', (e) => {\n            const target = findAxiomTarget(e.target);\n            if (highlightedElement && highlightedElement !== target) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n            }\n            if (target) {\n              target.classList.add('axiom-inspect-highlight');\n              highlightedElement = target;\n            }\n          }, true);\n          document.addEventListener('mouseout', (e) => {\n            if (highlightedElement) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n              highlightedElement = null;\n            }\n          }, true);\n          document.addEventListener('click', (e) => {\n            const target = findAxiomTarget(e.target);\n            if (target) {\n              e.preventDefault();\n              e.stopPropagation();\n              const payload = {\n                file: target.dataset.axiomFile || null,\n                component: target.dataset.axiomComponent || null,\n                tagName: target.tagName.toLowerCase(),\n                text: target.innerText?.substring(0, 50) || ''\n              };\n              window.parent.postMessage({ channel: 'axiom-inspect-click', payload }, '*');\n            }\n          }, true);\n        }\n      ` }} />".to_string();
+
+            if processed.contains("</body>") {
+                processed = processed.replace("</body>", &format!("{}\n      </body>", inspector_script));
+            } else if processed.contains("</html>") {
+                processed = processed.replace("</html>", &format!("{}\n</html>", inspector_script));
+            } else {
+                processed.push_str(&format!("\n// Axiom Inspect\n{}", inspector_script));
+            }
+        }
+    }
+
+    // Fix Next.js 13/14 invalid <Link> with <a> child
+    if (path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx")) && processed.contains("<Link") && (processed.contains("<a ") || processed.contains("<a>")) {
+        if !processed.contains("legacyBehavior") {
+            processed = processed.replace("<Link ", "<Link legacyBehavior ");
+        }
+    }
 
     // Apply learned global healing rules
     let rules_path = get_base_dir().join("axiom-healing-rules.json");
@@ -1282,8 +1684,10 @@ fn post_process_generated_file(
                     for possible_name in &["RootLayout", "Layout", "PageLayout", "AppLayout"] {
                         let pattern = format!("export default {}", possible_name);
                         if processed.contains(&pattern) {
-                            processed = processed.replace(&format!("const {} =", possible_name), &format!("const {}Inner =", possible_name));
-                            processed = processed.replace(&format!("let {} =", possible_name), &format!("let {}Inner =", possible_name));
+                            processed = processed.replace(&format!("const {} ", possible_name), &format!("const {}Inner ", possible_name));
+                            processed = processed.replace(&format!("let {} ", possible_name), &format!("let {}Inner ", possible_name));
+                            processed = processed.replace(&format!("const {}:", possible_name), &format!("const {}Inner:", possible_name));
+                            processed = processed.replace(&format!("let {}:", possible_name), &format!("let {}Inner:", possible_name));
                             processed = processed.replace(&format!("function {} (", possible_name), &format!("function {}Inner (", possible_name));
                             processed = processed.replace(&format!("function {}(", possible_name), &format!("function {}Inner(", possible_name));
                             processed = processed.replace(&pattern, ""); // Remove the default export statement
@@ -1313,6 +1717,10 @@ fn post_process_generated_file(
                         )
                     };
                     processed.push_str(&wrapper);
+                }
+
+                if processed.contains("SessionProvider") && !processed.contains("\"use client\"") && !processed.contains("'use client'") {
+                    processed = format!("\"use client\";\n\n{}", processed);
                 }
             }
         }
@@ -2216,6 +2624,27 @@ fn analyze_npm_install_failure(err_log: &str) -> Option<NpmFailureAction> {
         }
     }
 
+    // 5. Check for installation script failures or compile errors for specific packages in node_modules
+    for line in err_log.lines() {
+        let clean = line.replace("ERR!", "error").replace("warn", "error").replace("WARN", "error");
+        if clean.contains("npm error path") && clean.contains("node_modules") {
+            let normalized = clean.replace('\\', "/");
+            if let Some(idx) = normalized.rfind("node_modules/") {
+                let pkg_part = &normalized[idx + "node_modules/".len()..];
+                let parts: Vec<&str> = pkg_part.split('/').collect();
+                if !parts.is_empty() {
+                    let mut pkg_name = parts[0].trim().to_string();
+                    if pkg_name.starts_with('@') && parts.len() > 1 {
+                        pkg_name = format!("{}/{}", pkg_name, parts[1].trim());
+                    }
+                    if !pkg_name.is_empty() {
+                        return Some(NpmFailureAction::Remove(pkg_name));
+                    }
+                }
+            }
+        }
+    }
+
     None
 }
 
@@ -2589,9 +3018,25 @@ async fn editor_ai_edit(
     let client = reqwest::Client::new();
     let model = model_id.unwrap_or_else(|| "qwen2.5-coder:7b".to_string());
     
-    let system_prompt = "You are an expert assistant. You are helping the user edit a source code file. \
-                         Provide ONLY the modified full content of the file. Do not include any introductory or concluding text. \
-                         Do not wrap the code in markdown code blocks unless the file itself is a markdown file. Just return the raw code.";
+    let system_prompt = "You are an expert developer assistant helping the user edit a source code file. \
+        Instead of rewriting the entire file, you must identify the exact lines that need to change and provide a list of target replacements in JSON format. \
+        \n\n\
+        CRITICAL RULES:\n\
+        1. Respond ONLY with a valid JSON object matching the format described below. Do not write any explanations, introductory text, or markdown code blocks (do not wrap in ```json). Just the raw JSON.\n\
+        2. In the JSON structure, under 'edits', each 'target' block must exactly match (character-for-character, including leading whitespace and indentation) a unique substring in the original file.\n\
+        3. Do NOT include placeholders in 'replacement'. The code must be complete and ready to run.\n\
+        4. Focus only on resolving the user's request. Do not make unrelated changes.\n\
+        \n\n\
+        JSON FORMAT:\n\
+        {\n\
+          \"explanation\": \"Brief explanation of the changes made\",\n\
+          \"edits\": [\n\
+            {\n\
+              \"target\": \"exact string of lines in original file to be replaced\",\n\
+              \"replacement\": \"the new code to put in its place\"\n\
+            }\n\
+          ]\n\
+        }".to_string();
     
     let mut user_prompt = format!(
         "Original File Path: {}\n\
@@ -2626,7 +3071,7 @@ async fn editor_ai_edit(
     }
     
     // Load metadata.json to append related file context
-    let proj_dir = get_projects_dir().join(&project_id);
+    let proj_dir = get_project_path(&project_id);
     let metadata_path = proj_dir.join(".axiom").join("metadata.json");
     let rel_file_path = if let Ok(stripped) = std::path::Path::new(&file_path).strip_prefix(&proj_dir) {
         stripped.to_str().unwrap_or("").replace('\\', "/")
@@ -2664,8 +3109,6 @@ async fn editor_ai_edit(
         ));
     }
 
-    user_prompt.push_str("\nReturn only the complete updated file content.");
-
     let ollama_req = serde_json::json!({
         "model": model,
         "messages": [
@@ -2688,7 +3131,58 @@ async fn editor_ai_edit(
             if resp.status().is_success() {
                 if let Ok(data) = resp.json::<Value>().await {
                     if let Some(msg_content) = data.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
-                        let final_content = extract_code_content(msg_content);
+                        debug_log_to_file(format!("[AI Edit] Raw AI response:\n{}", msg_content));
+                        let clean_content = extract_code_content(msg_content);
+                        
+                        let mut parsed_ok = false;
+                        let mut final_content = content.clone();
+                        
+                        if let Ok(parsed_json) = serde_json::from_str::<Value>(&clean_content) {
+                            if let Some(edits) = parsed_json.get("edits").and_then(|e| e.as_array()) {
+                                if !edits.is_empty() {
+                                    let mut temp_content = content.clone();
+                                    let mut apply_failed = false;
+                                    let mut fail_reason = String::new();
+                                    
+                                    for edit in edits {
+                                        let target = edit.get("target").and_then(|t| t.as_str()).unwrap_or("");
+                                        let replacement = edit.get("replacement").and_then(|r| r.as_str()).unwrap_or("");
+                                        
+                                        if target.is_empty() {
+                                            apply_failed = true;
+                                            fail_reason = "Edit target is empty".to_string();
+                                            break;
+                                        }
+                                        
+                                        let occurrences: Vec<_> = temp_content.match_indices(target).collect();
+                                        if occurrences.is_empty() {
+                                            apply_failed = true;
+                                            fail_reason = format!("Target code block not found in file: {:?}", target);
+                                            break;
+                                        } else if occurrences.len() > 1 {
+                                            apply_failed = true;
+                                            fail_reason = format!("Target code block is duplicated ({}) in file. It must be unique.", occurrences.len());
+                                            break;
+                                        }
+                                        
+                                        temp_content = temp_content.replace(target, replacement);
+                                    }
+                                    
+                                    if !apply_failed {
+                                        final_content = temp_content;
+                                        parsed_ok = true;
+                                    } else {
+                                        debug_log_to_file(format!("[AI Edit] Targeted edit apply failed (falling back to full replacement): {}", fail_reason));
+                                    }
+                                }
+                            }
+                        }
+                        
+                        if !parsed_ok {
+                            debug_log_to_file("[AI Edit] Falling back to treating model output as full file content.".to_string());
+                            final_content = clean_content;
+                        }
+                        
                         return Ok(AIEditResult {
                             success: true,
                             new_content: Some(final_content),
@@ -2736,7 +3230,7 @@ async fn editor_ai_project_edit(
 ) -> Result<ProjectEditResult, String> {
     let client = reqwest::Client::new();
     let model = model_id.unwrap_or_else(|| "qwen2.5-coder:7b".to_string());
-    let proj_dir = get_projects_dir().join(&project_id);
+    let proj_dir = get_project_path(&project_id);
     
     if !proj_dir.exists() {
         return Ok(ProjectEditResult {
@@ -3548,8 +4042,17 @@ fn extract_file_path_from_line(line: &str) -> Option<String> {
                     !c.is_alphanumeric() && c != '/' && c != '\\' && c != '.'
                 });
                 let mut path_str = path_clean.to_string();
-                if path_str.starts_with("./") {
-                    path_str = path_str.split_off(2);
+                
+                // Handle webpack internal paths commonly found in Next.js stack traces
+                if let Some(idx) = path_str.find("webpack-internal:///") {
+                    path_str = path_str[idx + "webpack-internal:///".len()..].to_string();
+                }
+                
+                // Strip common webpack wrapper prefixes like (rsc)/, (app-pages)/, etc.
+                if let Some(idx) = path_str.find("./") {
+                    path_str = path_str[idx + 2..].to_string();
+                } else if path_str.starts_with("./") {
+                    path_str = path_str[idx + 2..].to_string();
                 }
                 // Preskoči biblioteke treće strane, bild izlaz, keš i git foldere
                 if path_str.contains("node_modules") 
@@ -3619,7 +4122,11 @@ impl CompileErrorDetector {
             }
         }
 
-        let has_error_marker = clean_line.contains('⨯') || clean_line.contains("Failed to compile") || clean_line.contains("Error:");
+        let has_error_marker = clean_line.contains('⨯') 
+            || clean_line.contains("Failed to compile") 
+            || clean_line.contains("Error:")
+            || clean_line.contains("Attempted import error:")
+            || (clean_line.contains('⚠') && (clean_line.contains(".tsx") || clean_line.contains(".ts") || clean_line.contains(".jsx") || clean_line.contains(".js")));
 
         if has_error_marker {
             if self.is_recording && self.file_path.is_some() {
@@ -3653,7 +4160,7 @@ impl CompileErrorDetector {
 
     fn emit_current(&mut self, window: &tauri::Window, project_id: &str) {
         if let Some(ref path) = self.file_path {
-            let proj_dir = get_projects_dir().join(project_id);
+            let proj_dir = get_project_path(project_id);
             let full_path = proj_dir.join(path);
             if full_path.exists() && full_path.is_file() {
                 let error_message = self.error_lines.join("\n");
@@ -3691,7 +4198,7 @@ async fn server_start(
     kill_process_on_port(3000);
     kill_process_on_port(3001);
 
-    let mut proj_dir = get_projects_dir().join(&options.project_id);
+    let mut proj_dir = get_project_path(&options.project_id);
     
     // Fallback: If there is no package.json in the root but there is one in the src directory, use the src directory as the root.
     if !proj_dir.join("package.json").exists() && proj_dir.join("src").join("package.json").exists() {
@@ -3729,42 +4236,19 @@ async fn server_start(
         run_npm_install_with_auto_healing(&proj_dir, &window, "server:log", None).await;
     }
     
-    // Auto-run prisma generate if Prisma schema exists in the project
-    let has_prisma = proj_dir.join("prisma/schema.prisma").exists() || proj_dir.join("schema.prisma").exists();
-    if has_prisma {
+    let settings = get_axiom_settings();
+    let model_id = settings.get("modelId")
+        .and_then(|m| m.as_str())
+        .unwrap_or("qwen2.5-coder:7b")
+        .to_string();
+
+    // Auto-run, validate and heal prisma generate if Prisma schema exists in the project
+    if let Err(e) = heal_prisma_schema_loop(&proj_dir, &window, &model_id, "server:log").await {
         let _ = window.emit("server:log", serde_json::json!({
-            "text": "> Prisma schema detected. Running prisma generate...\n",
-            "type": "info"
+            "text": format!("> [Prisma Critical Error] Pokretanje servera otkazano: {}\n", e),
+            "type": "error"
         }));
-        
-        #[cfg(target_os = "windows")]
-        let mut prisma_cmd = Command::new("cmd");
-        #[cfg(target_os = "windows")]
-        prisma_cmd.arg("/C").arg("npx").arg("-y").arg("prisma").arg("generate").current_dir(&proj_dir);
-        
-        #[cfg(not(target_os = "windows"))]
-        let mut prisma_cmd = Command::new("npx");
-        #[cfg(not(target_os = "windows"))]
-        prisma_cmd.arg("-y").arg("prisma").arg("generate").current_dir(&proj_dir);
-        
-        #[cfg(target_os = "windows")]
-        prisma_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        
-        match prisma_cmd.spawn() {
-            Ok(mut child) => {
-                let _ = child.wait().await;
-                let _ = window.emit("server:log", serde_json::json!({
-                    "text": "> Prisma client generation complete.\n",
-                    "type": "info"
-                }));
-            }
-            Err(e) => {
-                let _ = window.emit("server:log", serde_json::json!({
-                    "text": format!("> Failed to run prisma generate: {}\n", e),
-                    "type": "error"
-                }));
-            }
-        }
+        return Err(e);
     }
     
     // Dynamically select the npm script based on platform and package.json scripts
@@ -3917,6 +4401,169 @@ async fn server_status(project_id: String, state: State<'_, ServerState>) -> Res
     Ok(servers.contains_key(&project_id))
 }
 
+fn resolve_import_path(proj_dir: &std::path::Path, import_path: &str, current_file: &str) -> Option<String> {
+    let clean_path = import_path.trim().replace('\'', "").replace('"', "");
+    let mut resolved = None;
+    
+    if clean_path.starts_with("@/") {
+        let suffix = &clean_path[2..];
+        let test_src = proj_dir.join("src").join(suffix);
+        if test_src.exists() || proj_dir.join("src").join(format!("{}.tsx", suffix)).exists() || proj_dir.join("src").join(format!("{}.ts", suffix)).exists() {
+            resolved = Some(format!("src/{}", suffix));
+        } else {
+            resolved = Some(suffix.to_string());
+        }
+    } else if clean_path.starts_with('.') {
+        if let Some(parent) = std::path::Path::new(current_file).parent() {
+            let path = parent.join(&clean_path);
+            resolved = path.to_str().map(|s| s.replace('\\', "/"));
+        }
+    }
+    
+    if let Some(path_str) = resolved {
+        let normalized = path_str.replace('\\', "/");
+        for ext in &["tsx", "ts", "jsx", "js"] {
+            let test_file = format!("{}.{}", normalized, ext);
+            if proj_dir.join(&test_file).exists() {
+                return Some(test_file);
+            }
+            let index_file = format!("{}/index.{}", normalized, ext);
+            if proj_dir.join(&index_file).exists() {
+                return Some(index_file);
+            }
+        }
+        return Some(normalized);
+    }
+    None
+}
+
+async fn heal_prisma_schema_loop(
+    proj_dir: &std::path::Path,
+    window: &tauri::Window,
+    model_id: &str,
+    log_channel: &str,
+) -> Result<(), String> {
+    let schema_path = if proj_dir.join("prisma/schema.prisma").exists() {
+        proj_dir.join("prisma/schema.prisma")
+    } else if proj_dir.join("schema.prisma").exists() {
+        proj_dir.join("schema.prisma")
+    } else {
+        return Ok(()); // No schema, nothing to heal
+    };
+
+    for attempt in 1..=3 {
+        let _ = window.emit(log_channel, serde_json::json!({
+            "text": format!("> [Prisma Validator] Provera i generisanje Prisma klijenta (pokušaj {}/3)...\n", attempt),
+            "type": "info"
+        }));
+
+        #[cfg(target_os = "windows")]
+        let mut prisma_cmd = tokio::process::Command::new("cmd");
+        #[cfg(target_os = "windows")]
+        prisma_cmd.arg("/C").arg("npx").arg("-y").arg("prisma").arg("generate").current_dir(proj_dir);
+
+        #[cfg(not(target_os = "windows"))]
+        let mut prisma_cmd = tokio::process::Command::new("npx");
+        #[cfg(not(target_os = "windows"))]
+        prisma_cmd.arg("-y").arg("prisma").arg("generate").current_dir(proj_dir);
+
+        #[cfg(target_os = "windows")]
+        {
+            prisma_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+
+        let output_res = prisma_cmd.output().await;
+        let output = match output_res {
+            Ok(o) => o,
+            Err(e) => {
+                return Err(format!("Failed to execute prisma generate: {}", e));
+            }
+        };
+
+        if output.status.success() {
+            let _ = window.emit(log_channel, serde_json::json!({
+                "text": "> [Prisma Validator] Prisma Client uspešno generisan!\n",
+                "type": "info"
+            }));
+            return Ok(());
+        }
+
+        let stdout_str = String::from_utf8_lossy(&output.stdout);
+        let stderr_str = String::from_utf8_lossy(&output.stderr);
+        let error_log = format!("{}\n{}", stdout_str, stderr_str);
+
+        let _ = window.emit(log_channel, serde_json::json!({
+            "text": format!("> [Prisma Validator] Greška pri generisanju:\n{}\n", error_log),
+            "type": "error"
+        }));
+
+        if schema_path.exists() {
+            if let Ok(schema_content) = std::fs::read_to_string(&schema_path) {
+                let _ = window.emit(log_channel, serde_json::json!({
+                    "text": format!("> [Prisma Validator] Započinjem AI auto-healing za schema.prisma (pokušaj {}/3)...\n", attempt),
+                    "type": "info"
+                }));
+
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(60))
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new());
+
+                let system_prompt = "You are an expert database administrator and Prisma specialist. \
+                    The prisma generate command failed with syntax or validation errors. \
+                    Review the schema.prisma content and the error log. Correct the schema.prisma file to fix the validation errors. \
+                    Strictly follow Prisma Schema language rules: \
+                    1. Optional/nullable relation fields must only have ? on their type (e.g. password String? but NOT password? String?). \
+                    2. In relations, ensure fields (like userId) are explicitly declared in the model (e.g. userId String) and matches the relation fields parameter. \
+                    3. Do not use @db.Json native type annotation on String[] fields. Use standard Prisma types. \
+                    4. The @relation attribute (e.g. `@relation(fields: [userId], references: [id])`) MUST ONLY be placed on relational object fields (like `user User`), never on scalar fields (like `userId String`). Placing @relation on a scalar field will throw an 'Invalid field type, not a relation' error. \
+                    5. For NextAuth schema, the VerificationToken model does not have a direct relation back to the User model; do not define a verificationTokens relation field on the User model. \
+                    Respond ONLY with the complete corrected schema.prisma contents. Do not include any explanations, introduction, or markdown code blocks.";
+
+                let user_prompt = format!(
+                    "Prisma CLI error log:\n{}\n\nCurrent schema.prisma content:\n{}\n\nPlease provide the complete corrected schema.prisma code.",
+                    error_log, schema_content
+                );
+
+                let ollama_req = serde_json::json!({
+                    "model": model_id,
+                    "messages": [
+                        { "role": "system", "content": system_prompt },
+                        { "role": "user", "content": user_prompt }
+                    ],
+                    "stream": false,
+                    "options": {
+                        "temperature": 0.1
+                    }
+                });
+
+                if let Ok(resp) = client.post("http://127.0.0.1:11434/api/chat")
+                    .json(&ollama_req)
+                    .send()
+                    .await 
+                {
+                    if resp.status().is_success() {
+                        if let Ok(resp_json) = resp.json::<Value>().await {
+                            if let Some(content) = resp_json.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
+                                let cleaned = extract_code_content(content);
+                                if !cleaned.trim().is_empty() {
+                                    let _ = std::fs::write(&schema_path, &cleaned);
+                                    let _ = window.emit(log_channel, serde_json::json!({
+                                        "text": "> [Prisma Validator] schema.prisma uspešno ažuriran sa AI predlogom. Ponovo testiram...\n",
+                                        "type": "info"
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Err("Failed to validate and auto-heal Prisma schema after 3 attempts.".to_string())
+}
+
 #[tauri::command]
 async fn project_heal_compile_error(
     project_id: String,
@@ -3932,7 +4579,7 @@ async fn project_heal_compile_error(
         "type": "info"
     }));
 
-    let proj_dir = get_projects_dir().join(&project_id);
+    let proj_dir = get_project_path(&project_id);
     let full_path = proj_dir.join(&file_path);
     if !full_path.exists() {
         let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Greška: Fajl ne postoji" }));
@@ -3969,6 +4616,7 @@ async fn project_heal_compile_error(
         3. Do NOT include placeholders in 'replacement'. The code must be complete and ready to run.\n\
         4. Focus only on resolving the reported error. Do not make unrelated changes.\n\
         5. DATABASE RESILIENCY: If a database query (like a Prisma call `findMany`) throws a database connection error, wrap the query in try-catch and fall back to returning a mock array containing 10 realistic mockup items so the application remains previewable even if the database server is offline.\n\
+        6. NEVER declare, use, or destructure 'data-axiom-component' or 'data-axiom-file' props in React components or TypeScript interfaces/types. These are automatically injected during compilation post-processing, and manual declaration will cause syntax errors.\n\
         \n\n\
         JSON FORMAT:\n\
         {\n\
@@ -3982,11 +4630,97 @@ async fn project_heal_compile_error(
         }".to_string();
     system_prompt.push_str(&get_packages_db_summary());
 
+    let features_path = proj_dir.join("axiom-features.json");
+    let mut project_context = String::new();
+    if features_path.exists() {
+        if let Ok(features_content) = std::fs::read_to_string(&features_path) {
+            project_context.push_str(&format!(
+                "\n\n--- Project Structure & Features (axiom-features.json) ---\n{}\n-----------------------------------------------------------\n",
+                features_content
+            ));
+        }
+    }
+
+    let metadata_path = proj_dir.join(".axiom").join("metadata.json");
+    let rel_file_path = if let Ok(stripped) = std::path::Path::new(&file_path).strip_prefix(&proj_dir) {
+        stripped.to_str().unwrap_or("").replace('\\', "/")
+    } else {
+        file_path.replace('\\', "/")
+    };
+
+    if metadata_path.exists() {
+        if let Ok(meta_content) = std::fs::read_to_string(&metadata_path) {
+            if let Ok(meta_json) = serde_json::from_str::<serde_json::Value>(&meta_content) {
+                if let Some(deps) = meta_json.get("dependencies").and_then(|d| d.get(&rel_file_path)).and_then(|a| a.as_array()) {
+                    for dep_val in deps {
+                        if let Some(dep_path_str) = dep_val.as_str() {
+                            let dep_full_path = proj_dir.join(dep_path_str);
+                            if dep_full_path.exists() {
+                                if let Ok(dep_content) = std::fs::read_to_string(&dep_full_path) {
+                                    project_context.push_str(&format!(
+                                        "\n--- Related File Context: {} ---\n{}\n-----------------------------------\n",
+                                        dep_path_str, dep_content
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Proactively include layout.tsx if healing page.tsx (important for next-auth provider issues)
+    if rel_file_path.ends_with("page.tsx") || rel_file_path.ends_with("page.js") {
+        for layout_name in &["src/app/layout.tsx", "src/app/layout.jsx", "src/app/layout.js", "layout.tsx"] {
+            let layout_full_path = proj_dir.join(layout_name);
+            if layout_full_path.exists() {
+                if let Ok(layout_content) = std::fs::read_to_string(&layout_full_path) {
+                    if !project_context.contains(layout_name) {
+                        project_context.push_str(&format!(
+                            "\n--- Project Layout File: {} ---\n{}\n-------------------------------------\n",
+                            layout_name, layout_content
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Detect attempted import errors and pull in the exporting file's content
+    if error_msg.contains("Attempted import error:") {
+        if let Some(start_idx) = error_msg.find("is not exported from '") {
+            let sub = &error_msg[start_idx + "is not exported from '".len()..];
+            if let Some(end_idx) = sub.find('\'') {
+                let import_path = &sub[..end_idx];
+                if let Some(resolved_path) = resolve_import_path(&proj_dir, import_path, &rel_file_path) {
+                    let resolved_full_path = proj_dir.join(&resolved_path);
+                    if resolved_full_path.exists() {
+                        if let Ok(exporter_content) = std::fs::read_to_string(&resolved_full_path) {
+                            project_context.push_str(&format!(
+                                "\n--- Source Exporter File (Contains the actual missing export): {} ---\n{}\n----------------------------------------------------\n",
+                                resolved_path, exporter_content
+                            ));
+                            system_prompt.push_str(&format!(
+                                "\n\nCRITICAL IMPORT ERROR RULE:\n\
+                                 The error indicates that an import failed because the export is missing in '{}'.\n\
+                                 You can propose edits for '{}' (set 'path' to '{}' in edits) to add the missing export, OR modify '{}' if the import path itself is wrong.",
+                                resolved_path, resolved_path, resolved_path, rel_file_path
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let user_prompt = format!(
-        "File: {}\n\nCompilation Error Details:\n{}\n\nFile Current Content:\n{}\n\nPlease analyze the error and output the required JSON edits to fix it.",
+        "File: {}\n\nCompilation Error Details:\n{}\n\nFile Current Content:\n{}\n{}{}\n\nPlease analyze the error and output the required JSON edits to fix it.",
         file_path,
         error_msg,
-        file_content
+        file_content,
+        if project_context.is_empty() { "" } else { "\nAdditional Project Context:" },
+        project_context
     );
 
     let ollama_req = serde_json::json!({
@@ -4018,6 +4752,7 @@ async fn project_heal_compile_error(
                             "type": "info"
                         }));
 
+                        debug_log_to_file(format!("[AI Auto-Healing] Raw AI response:\n{}", ai_msg));
                         let clean_content = extract_code_content(ai_msg);
                         
                         // Parse as JSON
@@ -4028,14 +4763,20 @@ async fn project_heal_compile_error(
                                 if let Some(start_json) = clean_content.find('{') {
                                     if let Some(end_json) = clean_content.rfind('}') {
                                         let json_str = &clean_content[start_json..=end_json];
-                                        serde_json::from_str(json_str).map_err(|_| {
-                                            format!("Model did not return valid JSON. Error: {}. Response: {}", e, clean_content)
+                                        serde_json::from_str(json_str).map_err(|err| {
+                                            let err_msg = format!("Model did not return valid JSON. Error: {}. Response: {}", err, clean_content);
+                                            debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
+                                            err_msg
                                         })?
                                     } else {
-                                        return Err(format!("Model did not return valid JSON. Error: {}", e));
+                                        let err_msg = format!("Model did not return valid JSON. Error: {}", e);
+                                        debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
+                                        return Err(err_msg);
                                     }
                                 } else {
-                                    return Err(format!("Model did not return valid JSON. Error: {}", e));
+                                    let err_msg = format!("Model did not return valid JSON. Error: {}", e);
+                                    debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
+                                    return Err(err_msg);
                                 }
                             }
                         };
@@ -4049,66 +4790,172 @@ async fn project_heal_compile_error(
                             "type": "info"
                         }));
 
-                        let edits = match parsed_json.get("edits").and_then(|e| e.as_array()) {
-                            Some(arr) => arr,
-                            None => return Err("JSON does not contain an 'edits' array.".to_string()),
-                        };
+                        let mut resolved_edits = Vec::new();
 
-                        if edits.is_empty() {
-                            return Err("AI did not propose any edits to apply.".to_string());
+                        // Fallback 1: features -> files -> content
+                        if let Some(features) = parsed_json.get("features").and_then(|f| f.as_array()) {
+                            for feature in features {
+                                if let Some(files) = feature.get("files").and_then(|f| f.as_array()) {
+                                    for file in files {
+                                        if let (Some(path), Some(content)) = (file.get("path").and_then(|p| p.as_str()), file.get("content").and_then(|c| c.as_str())) {
+                                            let target_full_path = proj_dir.join(path);
+                                            if target_full_path.exists() {
+                                                if let Ok(orig) = std::fs::read_to_string(&target_full_path) {
+                                                    resolved_edits.push(serde_json::json!({
+                                                        "path": path,
+                                                        "target": orig,
+                                                        "replacement": content
+                                                    }));
+                                                }
+                                            } else {
+                                                resolved_edits.push(serde_json::json!({
+                                                    "path": path,
+                                                    "target": "",
+                                                    "replacement": content
+                                                }));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
 
-                        let mut new_file_content = file_content.clone();
+                        // Fallback 2: files -> content
+                        if resolved_edits.is_empty() {
+                            if let Some(files) = parsed_json.get("files").and_then(|f| f.as_array()) {
+                                for file in files {
+                                    if let (Some(path), Some(content)) = (file.get("path").and_then(|p| p.as_str()), file.get("content").and_then(|c| c.as_str())) {
+                                        let target_full_path = proj_dir.join(path);
+                                        if target_full_path.exists() {
+                                            if let Ok(orig) = std::fs::read_to_string(&target_full_path) {
+                                                resolved_edits.push(serde_json::json!({
+                                                    "path": path,
+                                                    "target": orig,
+                                                    "replacement": content
+                                                }));
+                                            }
+                                        } else {
+                                            resolved_edits.push(serde_json::json!({
+                                                "path": path,
+                                                "target": "",
+                                                "replacement": content
+                                            }));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Standard path: edits
+                        if resolved_edits.is_empty() {
+                            if let Some(edits) = parsed_json.get("edits").and_then(|e| e.as_array()) {
+                                resolved_edits = edits.clone();
+                            }
+                        }
+
+                        if resolved_edits.is_empty() {
+                            let err_msg = "JSON does not contain any valid 'edits', 'features' or 'files' keys to apply.".to_string();
+                            debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
+                            return Err(err_msg);
+                        }
+
+                        let edits = resolved_edits;
+
+                        use std::collections::HashMap;
+                        let mut modified_files: HashMap<String, String> = HashMap::new();
+                        
                         for edit in edits {
+                            let edit_path = match edit.get("path").and_then(|p| p.as_str()) {
+                                Some(p) => p.to_string().replace('\\', "/"),
+                                None => rel_file_path.clone(),
+                            };
+                            
                             let target = match edit.get("target").and_then(|t| t.as_str()) {
                                 Some(t) => t,
-                                None => return Err("An edit is missing its 'target' field.".to_string()),
+                                None => {
+                                    let err_msg = "An edit is missing its 'target' field.".to_string();
+                                    debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
+                                    return Err(err_msg);
+                                }
                             };
                             let replacement = match edit.get("replacement").and_then(|r| r.as_str()) {
                                 Some(r) => r,
-                                None => return Err("An edit is missing its 'replacement' field.".to_string()),
+                                None => {
+                                    let err_msg = "An edit is missing its 'replacement' field.".to_string();
+                                    debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
+                                    return Err(err_msg);
+                                }
                             };
 
+                            // Load the file content if it is not already loaded
+                            if !modified_files.contains_key(&edit_path) {
+                                let target_full_path = proj_dir.join(&edit_path);
+                                if !target_full_path.exists() {
+                                    modified_files.insert(edit_path.clone(), String::new());
+                                } else {
+                                    let content = std::fs::read_to_string(&target_full_path)
+                                        .map_err(|e| {
+                                            let err_msg = format!("Greška pri čitanju fajla {}: {}", edit_path, e);
+                                            debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
+                                            err_msg
+                                        })?;
+                                    modified_files.insert(edit_path.clone(), content);
+                                }
+                            }
+
+                            let file_content_mut = modified_files.get_mut(&edit_path).unwrap();
+
                             if target.is_empty() {
-                                return Err("Edit 'target' cannot be empty.".to_string());
-                            }
+                                *file_content_mut = replacement.to_string();
+                            } else {
+                                // Check that the target substring exists exactly once in the file content
+                                let occurrences: Vec<_> = file_content_mut.match_indices(target).collect();
+                                if occurrences.is_empty() {
+                                    let err_msg = format!(
+                                        "Greška pri primeni ispravke u fajlu {}: Target kod nije pronađen. Target: {:?}",
+                                        edit_path, target
+                                    );
+                                    debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
+                                    return Err(err_msg);
+                                } else if occurrences.len() > 1 {
+                                    let err_msg = format!(
+                                        "Greška pri primeni ispravke u fajlu {}: Target kod je dupliran ({}) u fajlu. Target mora biti jedinstven. Target: {:?}",
+                                        edit_path, occurrences.len(), target
+                                    );
+                                    debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
+                                    return Err(err_msg);
+                                }
 
-                            // Check that the target substring exists exactly once in the file content
-                            let occurrences: Vec<_> = new_file_content.match_indices(target).collect();
-                            if occurrences.is_empty() {
-                                return Err(format!(
-                                    "Greška pri primeni ispravke: Target kod nije pronađen u fajlu. Target: {:?}",
-                                    target
-                                ));
-                            } else if occurrences.len() > 1 {
-                                return Err(format!(
-                                    "Greška pri primeni ispravke: Target kod je dupliran ({}) u fajlu. Target mora biti jedinstven. Target: {:?}",
-                                    occurrences.len(), target
-                                ));
+                                *file_content_mut = file_content_mut.replace(target, replacement);
                             }
-
-                            new_file_content = new_file_content.replace(target, replacement);
                         }
 
                         let has_tailwind = proj_dir.join("tailwind.config.js").exists() || proj_dir.join("tailwind.config.ts").exists();
-                        let processed = post_process_generated_file(&file_path, &new_file_content, &serde_json::json!({}), has_tailwind);
                         
                         let _ = window.emit("server:heal-status", serde_json::json!({
                             "status": "Upisivanje ispravki na disk..."
                         }));
-                        
-                        std::fs::write(&full_path, &processed)
-                            .map_err(|e| {
-                                let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Greška pri upisu" }));
-                                format!("Greška pri upisu na disk: {}", e)
-                            })?;
+
+                        for (edit_path, processed_content) in modified_files {
+                            let processed = post_process_generated_file(&edit_path, &processed_content, &serde_json::json!({}), has_tailwind);
+                            let target_full_path = proj_dir.join(&edit_path);
+                            std::fs::write(&target_full_path, &processed)
+                                .map_err(|e| {
+                                    let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Greška pri upisu" }));
+                                    let err_msg = format!("Greška pri upisu fajla {} na disk: {}", edit_path, e);
+                                    debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
+                                    err_msg
+                                })?;
+                            
+                            let _ = window.emit("server:log", serde_json::json!({
+                                "text": format!("> [AI Auto-Healing] Uspešno popravljen fajl: {}\n", edit_path),
+                                "type": "info"
+                            }));
+                            debug_log_to_file(format!("[AI Auto-Healing] Successfully healed file: {}", edit_path));
+                        }
 
                         let _ = window.emit("server:heal-status", serde_json::json!({
                             "status": "Završeno!"
-                        }));
-                        let _ = window.emit("server:log", serde_json::json!({
-                            "text": format!("> [AI Auto-Healing] Uspešno popravljen fajl: {}. Server bi trebalo da se re-kompajlira.\n", file_path),
-                            "type": "info"
                         }));
 
                         return Ok(true);
@@ -4139,7 +4986,7 @@ async fn project_install_package(
         "type": "info"
     }));
 
-    let proj_dir = get_projects_dir().join(&project_id);
+    let proj_dir = get_project_path(&project_id);
     if !proj_dir.exists() {
         return Err("Project directory not found".to_string());
     }
@@ -4189,7 +5036,7 @@ async fn project_install_package(
 
 #[tauri::command]
 async fn project_run_prisma_generate(project_id: String) -> Result<String, String> {
-    let proj_dir = get_projects_dir().join(&project_id);
+    let proj_dir = get_project_path(&project_id);
     if !proj_dir.exists() {
         return Err("Project directory does not exist".to_string());
     }
@@ -5810,6 +6657,178 @@ fn get_project_routes_prompt(files: &[Value]) -> String {
     prompt
 }
 
+fn get_expert_system_prompt(
+    file_path: &str,
+    _project_type: &str,
+    overrides_desc: &str,
+    pkg_db_summary: &str,
+    context_ref: &str,
+    routes_ref: &str,
+    proj_dir: &std::path::Path,
+) -> String {
+    let path_lower = file_path.to_lowercase().replace('\\', "/");
+
+    let mut role_desc = "ROLE: Expert Software Engineer\n".to_string();
+    let mut specific_rules = "".to_string();
+
+    if path_lower.contains("schema.prisma") {
+        role_desc = "ROLE: Senior Database Architect\n".to_string();
+        specific_rules = "\nDATABASE DESIGN RULES:\n\
+                          - Focus on relational integrity, clean schema definitions, and proper Prisma model annotations.\n\
+                          - When writing tables, ensure IDs use `@id @default(cuid())` or similar suitable auto-generators.\n\
+                          - Make sure passwords or security token fields (e.g. `hashedPassword`) are defined as optional `String?` so that OAuth/Magic Link users can be saved without password errors.\n\
+                          - Always include necessary relation annotations cleanly and explicitly.\n\
+                          - PRISMA RELATION RULES:\n\
+                            1. In a one-to-many relation, the `@relation` attribute (specifying `fields` and `references`) MUST ONLY be defined on the model that contains the actual foreign key column (the \"many\" side). The parent model (the \"one\" side, returning an array `Model[]`) MUST NOT specify any `fields` or `references` in its `@relation` attribute.\n\
+                            2. Every relation must have an opposite relation field defined on both models. For example, if model `Message` has `sender User @relation(fields: [senderId], references: [id])`, then model `User` MUST have `messages Message[]` (no relation attributes needed on User's side).\n\
+                            3. For implicit many-to-many relations (where both sides return arrays `Model[]`), do NOT specify any `fields` or `references` arguments. Just define the array fields on both models (e.g., `users User[]` and `conversations Conversation[]`).\n\
+                            4. The `@relation` attribute (e.g. `@relation(fields: [userId], references: [id])`) MUST ONLY be placed on relational object fields (like `user User`), never on scalar fields (like `userId String`). Placing @relation on a scalar field will throw an 'Invalid field type, not a relation' error.\n\
+                            5. For NextAuth schema, the VerificationToken model does not have a direct relation back to the User model; do not define a verificationTokens relation field on the User model.".to_string();
+    } else if path_lower.contains("next.config") {
+        role_desc = "ROLE: Next.js Configuration Expert\n".to_string();
+        specific_rules = "\nNEXT.JS CONFIGURATION RULES:\n\
+                          - Write a clean next.config.js file exporting module.exports.\n\
+                          - Do NOT import, require, or use `next-i18next` or `next-i18next.config` as they might not exist or be needed in Next.js App Router projects.\n\
+                          - Standard configuration config format:\n\
+                            `/** @type {import('next').NextConfig} */\n\
+                            const nextConfig = { reactStrictMode: true };\n\
+                            module.exports = nextConfig;`".to_string();
+    } else if path_lower.contains("api/register") {
+        role_desc = "ROLE: Authentication & User Management Backend Developer\n".to_string();
+        specific_rules = "\nUSER REGISTRATION API RULES:\n\
+                          - Implement a Next.js POST handler for user registration.\n\
+                          - Parse request body and validate inputs (email, name, password).\n\
+                          - Check if a user with the given email already exists in the database. If so, return a 400 Bad Request error response.\n\
+                          - Hash the user's password asynchronously using `bcryptjs.hash(password, 10)` before storing it in the database.\n\
+                          - Create the new user record in the database using Prisma and return the created user object (excluding the password) with a 201 Created status.\n\
+                          - Wrap the database calls in a try-catch block. Inside the catch block, return a fallback success response for preview mode.".to_string();
+    } else if path_lower.contains("/api/auth/") || path_lower.contains("nextauth") {
+        role_desc = "ROLE: Security & Authentication Expert\n".to_string();
+        specific_rules = "\nAUTHENTICATION SECURITY RULES:\n\
+                          - Implement secure session management. Use `strategy: 'jwt'` sessions for NextAuth.\n\
+                          - NextAuth MUST be implemented using the Pages Router path structure: `src/pages/api/auth/[...nextauth].ts` (or `.js`) instead of App Router route handlers to avoid 'undici Proxy #state' runtime errors in Node.js.\n\
+                          - CredentialsProvider MUST be imported from 'next-auth/providers/credentials', NEVER from 'next-auth' directly.\n\
+                          - Ensure User password database checks match the exact schema property name (e.g. `user.password` instead of `user.hashedPassword`).\n\
+                          - Never hardcode environment secrets (e.g., use `process.env.NEXTAUTH_SECRET`).\n\
+                          - Use `bcryptjs` asynchronously or via standard comparison methods to compare hashed passwords securely.\n\
+                          - Fail gracefully when required environment variables for production email sending are missing during development.".to_string();
+    } else if path_lower.contains("/api/") || path_lower.contains("route.ts") || path_lower.contains("route.js") {
+        role_desc = "ROLE: Senior Backend Developer\n".to_string();
+        specific_rules = "\nBACKEND API DEVELOPMENT RULES:\n\
+                          - Implement clean Next.js Route Handlers (using GET, POST, PUT, DELETE exports).\n\
+                          - Wrap database calls in robust try-catch blocks. Implement fallback mock datasets inside catch clauses so the application remains reviewable even if the database is offline.\n\
+                          - Strictly validate requests (e.g. using standard parsing or Zod) and return clean, typed JSON responses with appropriate HTTP status codes.".to_string();
+    } else if path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx") || path_lower.contains("/components/") || path_lower.contains("/pages/") {
+        role_desc = "ROLE: Senior UI/UX Developer (Tailwind & React)\n".to_string();
+        specific_rules = "\nFRONTEND DEVELOPMENT RULES:\n\
+                          - PRISMA SERVER-ONLY RULE: You are working on the CLIENT side. Prisma Client (`@prisma/client`) MUST ONLY be imported and used inside Next.js API Route Handlers (files under `src/app/api/`). NEVER import or use Prisma in React hooks, client components, or any file with `'use client'`. Client-side hooks/components that need database data MUST use `fetch('/api/...')` to call the corresponding API route.\n\
+                          - NEVER declare, use, or destructure 'data-axiom-component' or 'data-axiom-file' props in your React components or TypeScript interface/type definitions. These attributes are injected automatically by the post-processor during build time, and manual handling in code will cause syntax or compilation errors.\n\
+                          - Generate highly complete, visually beautiful, responsive layouts using Tailwind CSS.\n\
+                          - LAYOUT, NAVBAR, FOOTER: Every generated frontend view must feature a gorgeous, cohesive visual layout. Always include a persistent Navigation Bar (Navbar) at the top containing the application logo/branding and navigation links (e.g. Dashboard, Profile), and a neat Footer at the bottom. Ensure the Navbar displays user session details (avatar, name) and a clean logout button if the user is authenticated.\n\
+                          - NEXT.JS LINK RULE: In Next.js 13+, do NOT place <a> tags inside <Link href=\"...\"> components. Place className and children directly on the <Link> component (e.g. <Link href=\"/about\" className=\"...\">About</Link>). To optimize Vercel resource usage (Edge Requests count), always append `prefetch={false}` to all <Link> tags (e.g. <Link href=\"/dashboard\" prefetch={false}>Dashboard</Link>).\n\
+                          - CAPPED CLIENT-SIDE RETRIES: All client-side fetch calls or data hooks must configure strict error retry limits (max 1 or 2 attempts) and prevent infinite query retry loops to avoid Vercel Serverless Function invocation billing spikes.\n\
+                          - Use modern components, cards, hover transitions, nice gradients, and loading states to present a premium product.\n\
+                          - NO DEAD IMPORTS: Do not import or dynamically resolve React components/files (like Overview, Analytics, or Settings) unless they are explicitly generated as separate files in this project. Otherwise, implement them inline in the same file.\n\
+                          - NO INFINITE AUTHENTICATION LOADS: If implementing a loading spinner/state dependent on NextAuth `useSession`, you MUST ensure that loading state ends for both 'authenticated' AND 'unauthenticated' session statuses (e.g. check `session.status !== 'loading'`). Never lock the interface for unauthenticated users, or the page will remain blank." .to_string();
+    }
+
+    let mut prompt = format!(
+        "You are an expert software engineer. Write only the code, no explanations. Provide only the code, wrapped in markdown code blocks.\n\n\
+         {}\n\
+         IMPORTANT DESIGN & CONTENT REQUIREMENTS:\n\
+         - Do NOT write minimal skeletons, simple placeholders, or empty cards.\n\
+         - Generate highly complete, production-ready, and visually beautiful layouts.\n\
+         - Always write rich, detailed copy and realistic mock data instead of using 'Lorem Ipsum' or empty divs.\n\
+         - Use comprehensive styles and modern layouts (e.g., responsive grids, flexboxes, borders, shadows, hover effects, nice colors) to create a premium feel.\n\
+         - For dashboards, include functional widgets, detailed summary stats, interactive tables, and charts where applicable.\n\
+         - Do NOT write mock authentication handlers or console.log-only form submissions. Use real API calls.\n\
+         - Ensure all forms have fully implemented submission handlers that communicate with real API endpoints, handle loading states, and show real success/error feedbacks.\n\
+         - DATABASE RESILIENCY & FALLBACKS: Database queries must be wrapped in `try {{ ... }} catch (error) {{ ... }}` blocks. In the `catch` block, log a warning and fall back to a rich mockup dataset (e.g. 10 realistic mockup items with full properties) so that the application can still render and run in preview mode even if the database is offline or not configured.\n\
+         - Ensure all import paths match existing files and libraries in the project.\n\
+         - STRICT IMPORT RESOLUTION: Every single external dependency, class, or utility used in your code (e.g. 'z' from 'zod', 'axios', 'bcryptjs', icons) MUST be explicitly imported at the top of the file. Do not assume any library is globally available without an import.\n\
+         - STRICT TYPE DEFINITIONS: Any TypeScript types or interfaces used in your client-side React components or pages (e.g. 'Product', 'Order') MUST be explicitly declared in the same file or imported from a shared type file. Never use undeclared types.\n\
+         - PRISMA SCHEMA STRICTNESS: When writing schema.prisma, optional/nullable fields must only have '?' on the type name (e.g. 'password String?'), NEVER on the field name (e.g. 'password? String?' is invalid). Ensure relational foreign key fields (like 'userId String') are explicitly declared inside the model. Never apply '@db.Json' native types to 'String[]' arrays.\n\
+         - NO MANUAL AXIOM ATTRS: Never declare, use, or destructure 'data-axiom-component' or 'data-axiom-file' props in your React components or TypeScript interface/type definitions. These are injected automatically.{} \n",
+         role_desc, specific_rules
+    );
+
+    if !overrides_desc.trim().is_empty() {
+        prompt.push_str(&format!(
+            "\nUse the following version/stack preferences if applicable:\n{}",
+            overrides_desc
+        ));
+    }
+
+    prompt.push_str(pkg_db_summary);
+
+    if !context_ref.is_empty() {
+        prompt.push_str(context_ref);
+    }
+
+    if !routes_ref.is_empty() {
+        prompt.push_str(routes_ref);
+    }
+
+    // Read and enforce Live Builder Guide contracts
+    let lbg_path = proj_dir.join(".axiom").join("live_builder_guide.json");
+    let mut lbg_rules = String::new();
+    let mut custom_import_rule = String::new();
+    if lbg_path.exists() {
+        if let Ok(content) = fs::read_to_string(&lbg_path) {
+            if let Ok(lbg_val) = serde_json::from_str::<Value>(&content) {
+                lbg_rules.push_str("\n\nLIVE BUILDER GUIDE ARCHITECTURE CONTRACTS:\n");
+                if let Some(spec) = lbg_val.get("projectSpecification") {
+                    lbg_rules.push_str(&format!("- Global Project Specifications: {}\n", spec));
+                    if let Some(style) = spec.get("importExportStyle").and_then(|s| s.as_str()) {
+                        custom_import_rule = format!("- STRICT IMPORT/EXPORT RULE: All hooks, components, and helper libraries in this project MUST use {} exports (and be imported as {}). Do NOT mix default and named exports.", style, style);
+                    }
+                    if let Some(category) = spec.get("category").and_then(|c| c.as_str()) {
+                        lbg_rules.push_str(&format!("- Resolved Software Category: [{}]. This software category dictates strict architectural requirements that must be followed completely.\n", category.to_uppercase()));
+                    }
+                    if let Some(reqs) = spec.get("categoryRequirements") {
+                        if let Some(features) = reqs.get("requiredFeatures").and_then(|f| f.as_array()) {
+                            lbg_rules.push_str("- Mandatory Features for this Software Category:\n");
+                            for feat in features {
+                                if let Some(feat_str) = feat.as_str() {
+                                    lbg_rules.push_str(&format!("  * {}\n", feat_str));
+                                }
+                            }
+                        }
+                        if let Some(routes) = reqs.get("requiredRoutes").and_then(|r| r.as_array()) {
+                            lbg_rules.push_str("- Mandatory File Routes & Pages to Support:\n");
+                            for route in routes {
+                                if let Some(route_str) = route.as_str() {
+                                    lbg_rules.push_str(&format!("  * {}\n", route_str));
+                                }
+                            }
+                        }
+                        if let Some(principles) = reqs.get("designPrinciples").and_then(|p| p.as_array()) {
+                            lbg_rules.push_str("- Specific Category Design Principles:\n");
+                            for prin in principles {
+                                if let Some(prin_str) = prin.as_str() {
+                                    lbg_rules.push_str(&format!("  * {}\n", prin_str));
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(contracts) = lbg_val.get("sharedContracts") {
+                    lbg_rules.push_str(&format!("- Database Models & API Specifications: {}\n", contracts));
+                }
+            }
+        }
+    }
+
+    if !custom_import_rule.is_empty() {
+        prompt.push_str(&format!("{}\n", custom_import_rule));
+    }
+    if !lbg_rules.is_empty() {
+        prompt.push_str(&lbg_rules);
+    }
+
+    prompt
+}
+
 async fn run_orchestrator(
     window: tauri::Window,
     task_id: String,
@@ -5922,25 +6941,31 @@ async fn run_orchestrator(
                     "language": "json",
                     "mergeDependencies": {
                         "dependencies": {
-                            "next": "^14.2.3",
-                            "react": "^18.3.1",
-                            "react-dom": "^18.3.1",
-                            "lucide-react": "^0.460.0",
-                            "next-auth": "^4.24.7",
-                            "@next-auth/prisma-adapter": "^1.0.7",
-                            "@prisma/client": "^5.14.0",
-                            "resend": "^3.2.0",
-                            "bcryptjs": "^2.4.3"
+                            "next": "14.2.35",
+                            "react": "^18.2.0",
+                            "react-dom": "^18.2.0",
+                            "next-auth": "^4.24.5",
+                            "@auth/prisma-adapter": "^1.0.12",
+                            "@prisma/client": "^5.7.1",
+                            "lucide-react": "^0.294.0",
+                            "clsx": "^2.1.1",
+                            "tailwind-merge": "^2.6.0",
+                            "class-variance-authority": "^0.7.1",
+                            "tailwindcss-animate": "^1.0.7",
+                            "zod": "^3.22.4",
+                            "react-hook-form": "^7.48.2",
+                            "bcryptjs": "^2.4.3",
+                            "jsonwebtoken": "^9.0.3"
                         },
                         "devDependencies": {
-                            "tailwindcss": "^3.4.14",
-                            "postcss": "^8.4.47",
-                            "autoprefixer": "^10.4.20",
-                            "typescript": "^5.0.0",
-                            "@types/react": "^18.3.1",
-                            "@types/react-dom": "^18.3.1",
-                            "@types/node": "^20.0.0",
-                            "prisma": "^5.14.0",
+                            "prisma": "^5.7.1",
+                            "tailwindcss": "^3.4.0",
+                            "postcss": "^8.4.32",
+                            "autoprefixer": "^10.4.16",
+                            "typescript": "^5.3.3",
+                            "@types/react": "^18.2.45",
+                            "@types/react-dom": "^18.2.18",
+                            "@types/node": "^20.10.5",
                             "@types/bcryptjs": "^2.4.6"
                         },
                         "scripts": {
@@ -5981,10 +7006,368 @@ async fn run_orchestrator(
                     "defaultContent": "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n\n"
                 },
                 {
-                    "path": "src/app/layout.tsx",
-                    "description": "Root layout for Next.js App Router.",
+                    "path": "src/middleware.ts",
+                    "description": "Resource-optimized middleware that bypasses static asset queries.",
                     "language": "typescript",
-                    "defaultContent": "import React from 'react';\nimport './globals.css';\n\nexport const metadata = {\n  title: 'Axiom Forge App',\n  description: 'Generated by Axiom Forge',\n};\n\nexport default function RootLayout({\n  children,\n}: {\n  children: React.ReactNode;\n}) {\n  return (\n    <html lang=\"en\">\n      <body>\n        {children}\n      </body>\n    </html>\n  );\n}"
+                    "defaultContent": r#"import { withAuth } from "next-auth/middleware";
+import { NextRequest, NextResponse } from "next/server";
+
+const authMiddleware = withAuth(
+  function middleware(req: NextRequest) {
+    return NextResponse.next();
+  },
+  {
+    callbacks: {
+      authorized: ({ token }) => !!token,
+    },
+    pages: {
+      signIn: "/login",
+    },
+  }
+);
+
+export default function middleware(req: NextRequest) {
+  const { pathname } = req.nextUrl;
+
+  // 1. Skip middleware for API, internal assets, and static files with extensions
+  if (
+    pathname.includes("/api/") ||
+    pathname.includes("/_next/") ||
+    pathname.includes("/_vercel/") ||
+    pathname.includes(".")
+  ) {
+    return NextResponse.next();
+  }
+
+  // 2. Protect dashboard, admin and profile routes
+  const isProtectedPage = 
+    pathname.startsWith("/dashboard") || 
+    pathname.startsWith("/admin") || 
+    pathname.startsWith("/profile");
+
+  if (isProtectedPage) {
+    return (authMiddleware as any)(req);
+  }
+
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: ["/((?!api|_next|_vercel|.*\\..*).*)"]
+};"#
+                },
+                {
+                    "path": "prisma/schema.prisma",
+                    "description": "Pre-configured Prisma schema for SQLite database.",
+                    "language": "prisma",
+                    "defaultContent": r#"generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+model User {
+  id             String    @id @default(cuid())
+  name           String?
+  email          String    @unique
+  emailVerified  DateTime?
+  image          String?
+  hashedPassword String?
+  role           String    @default("USER")
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  accounts       Account[]
+  sessions       Session[]
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}"#
+                },
+                {
+                    "path": "src/lib/prisma.ts",
+                    "description": "PrismaClient singleton generator.",
+                    "language": "typescript",
+                    "defaultContent": r#"import { PrismaClient } from "@prisma/client";
+
+const globalForPrisma = global as unknown as { prisma: PrismaClient };
+
+export const prisma =
+  globalForPrisma.prisma ||
+  new PrismaClient({
+    log: ["query"],
+  });
+
+if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
+
+export default prisma;"#
+                },
+                {
+                    "path": "src/pages/api/auth/[...nextauth].ts",
+                    "description": "Clean NextAuth endpoint in Pages Router to avoid App Router proxy errors.",
+                    "language": "typescript",
+                    "defaultContent": r#"import NextAuth from "next-auth";
+import CredentialsProvider from "next-auth/providers/credentials";
+import { PrismaAdapter } from "@auth/prisma-adapter";
+import bcrypt from "bcryptjs";
+import prisma from "@/lib/prisma";
+
+export const authOptions = {
+  adapter: PrismaAdapter(prisma) as any,
+  providers: [
+    CredentialsProvider({
+      name: "credentials",
+      credentials: {
+        email: { label: "Email", type: "email" },
+        password: { label: "Password", type: "password" },
+      },
+      async authorize(credentials) {
+        if (!credentials?.email || !credentials?.password) return null;
+        try {
+          const user = await prisma.user.findUnique({ where: { email: credentials.email } });
+          if (!user) return null;
+          const passwordToCompare = user.hashedPassword || (user as any).password || "";
+          const passwordMatch = await bcrypt.compare(credentials.password, passwordToCompare);
+          if (!passwordMatch) return null;
+          return { id: String(user.id), email: user.email, name: user.name, role: user.role };
+        } catch (error) {
+          console.error("Auth error in CredentialsProvider:", error);
+          return null;
+        }
+      },
+    }),
+  ],
+  session: { strategy: "jwt" as const },
+  callbacks: {
+    async jwt({ token, user }: any) {
+      if (user) {
+        token.id = user.id;
+        token.role = user.role;
+      }
+      return token;
+    },
+    async session({ session, token }: any) {
+      if (session.user && token) {
+        session.user.id = token.id;
+        session.user.role = token.role;
+      }
+      return session;
+    },
+  },
+  pages: {
+    signIn: "/login",
+  },
+  secret: process.env.NEXTAUTH_SECRET || "axiom-dev-secret-change-in-production",
+};
+
+const handler = NextAuth(authOptions);
+export default handler;"#
+                },
+                {
+                    "path": "src/pages/api/register.ts",
+                    "description": "User registration API endpoint.",
+                    "language": "typescript",
+                    "defaultContent": r#"import { NextApiRequest, NextApiResponse } from "next";
+import bcrypt from "bcryptjs";
+import prisma from "@/lib/prisma";
+import { z } from "zod";
+
+const registerSchema = z.object({
+  name: z.string().min(2).max(50),
+  email: z.string().email(),
+  password: z.string().min(8)
+});
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", ["POST"]);
+    return res.status(405).json({ message: `Method ${req.method} Not Allowed` });
+  }
+
+  try {
+    const { name, email, password } = registerSchema.parse(req.body);
+
+    const existingUser = await prisma.user.findUnique({ where: { email } });
+    if (existingUser) {
+      return res.status(400).json({ message: "Email already in use" });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const newUser = await prisma.user.create({
+      data: {
+        name,
+        email,
+        hashedPassword,
+        role: "USER"
+      }
+    });
+
+    return res.status(201).json({ message: "User registered successfully", user: { id: newUser.id, name: newUser.name, email: newUser.email } });
+  } catch (error: any) {
+    console.error("Registration error:", error);
+    return res.status(500).json({ message: error.message || "Internal server error" });
+  }
+}"#
+                },
+                {
+                    "path": "src/components/Navbar.tsx",
+                    "description": "Modern responsive Navbar using prefetch-disabled links for Vercel optimization.",
+                    "language": "typescript",
+                    "defaultContent": r#""use client";
+
+import React from "react";
+import Link from "next/link";
+import { useSession, signOut } from "next-auth/react";
+
+const Navbar: React.FC = () => {
+  const { data: session } = useSession();
+
+  return (
+    <nav className="bg-slate-900 text-white shadow-md w-full">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        <div className="flex items-center justify-between h-16">
+          <div className="flex items-center">
+            <Link href="/" prefetch={false} className="text-xl font-bold tracking-wider text-indigo-400">
+              AxiomApp
+            </Link>
+            <div className="hidden md:block">
+              <div className="ml-10 flex items-baseline space-x-4">
+                <Link href="/dashboard" prefetch={false} className="px-3 py-2 rounded-md text-sm font-medium hover:bg-slate-800 transition-colors">
+                  Dashboard
+                </Link>
+                <Link href="/profile" prefetch={false} className="px-3 py-2 rounded-md text-sm font-medium hover:bg-slate-800 transition-colors">
+                  Profile
+                </Link>
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center space-x-4">
+            {session ? (
+              <div className="flex items-center space-x-4">
+                <span className="text-sm text-slate-300">{session.user?.name || session.user?.email}</span>
+                <button
+                  onClick={() => signOut({ callbackUrl: "/" })}
+                  className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-md text-sm font-medium transition-colors"
+                >
+                  Logout
+                </button>
+              </div>
+            ) : (
+              <div className="flex space-x-2">
+                <Link href="/login" prefetch={false} className="bg-slate-800 hover:bg-slate-700 text-white px-4 py-2 rounded-md text-sm font-medium transition-colors">
+                  Sign In
+                </Link>
+                <Link href="/register" prefetch={false} className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-md text-sm font-medium transition-colors">
+                  Register
+                </Link>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </nav>
+  );
+};
+
+export default Navbar;"#
+                },
+                {
+                    "path": "src/components/Footer.tsx",
+                    "description": "Clean footer utilizing prefoot-disabled links.",
+                    "language": "typescript",
+                    "defaultContent": r#"import React from "react";
+import Link from "next/link";
+
+const Footer: React.FC = () => {
+  return (
+    <footer className="bg-slate-900 text-slate-400 border-t border-slate-800 py-8 mt-auto w-full">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        <div className="flex flex-col md:flex-row justify-between items-center space-y-4 md:space-y-0">
+          <div>
+            <p className="text-sm">&copy; {new Date().getFullYear()} AxiomApp. All rights reserved.</p>
+          </div>
+          <div className="flex space-x-6">
+            <Link href="/privacy" prefetch={false} className="text-sm hover:text-indigo-400 transition-colors">
+              Privacy Policy
+            </Link>
+            <Link href="/terms" prefetch={false} className="text-sm hover:text-indigo-400 transition-colors">
+              Terms of Service
+            </Link>
+          </div>
+        </div>
+      </div>
+    </footer>
+  );
+};
+
+export default Footer;"#
+                },
+                {
+                    "path": "src/app/layout.tsx",
+                    "description": "Root layout wrapped in SessionProvider.",
+                    "language": "typescript",
+                    "defaultContent": r#""use client";
+
+import React from "react";
+import { SessionProvider } from "next-auth/react";
+import Navbar from "@/components/Navbar";
+import Footer from "@/components/Footer";
+import "./globals.css";
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <html lang="en">
+      <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      </head>
+      <body className="flex flex-col min-h-screen bg-slate-950 text-slate-100">
+        <SessionProvider>
+          <Navbar />
+          <main className="flex-grow flex flex-col w-full">{children}</main>
+          <Footer />
+        </SessionProvider>
+      </body>
+    </html>
+  );
+}"#
                 }
             ],
             "injectTailwindDirectives": {
@@ -6176,6 +7559,7 @@ async fn run_orchestrator(
          Original files skeleton in the manifest:\n\
          {}\n\n\
          Identify all missing files, routes, state management, components, configuration files, or database schemas needed to make this project complete.\n\
+         IMPORTANT ARCHITECTURAL RULE: If the project uses next-auth (NextAuth) for authentication, you MUST always include 'src/app/api/register/route.ts' in the expanded files list to handle new user registration (creating user record using bcryptjs), since NextAuth does not natively provide a user registration route.\n\
          Output a JSON array containing the expanded, complete list of files. For each file, provide 'path', 'description', and 'language'.\n\
          Ensure all files from the original list are preserved (but you may update their descriptions to match the technology overrides).\n\
          Respond ONLY with a valid JSON array. Do not include any introductory or concluding text, or markdown code blocks.",
@@ -6450,7 +7834,47 @@ async fn run_orchestrator(
 
     // 2. Generation Loop
     let total_files = files_to_generate.len() as f64;
-    let proj_dir = get_projects_dir().join(&project_id);
+    let proj_dir = get_project_path(&project_id);
+
+    // Initialize and write the Live Builder Guide (LBG) to disk
+    let axiom_dir = proj_dir.join(".axiom");
+    let _ = fs::create_dir_all(&axiom_dir);
+    let lbg_path = axiom_dir.join("live_builder_guide.json");
+    
+    if let Some(lbg_val) = manifest.get("liveBuilderGuide") {
+        if let Ok(lbg_content) = serde_json::to_string_pretty(lbg_val) {
+            let _ = fs::write(&lbg_path, lbg_content);
+        }
+    } else if !lbg_path.exists() {
+        // Fallback: Generate a default LBG guide locally if not sent by the Web App
+        let default_lbg = serde_json::json!({
+            "projectSpecification": {
+                "stack": resolved_stack,
+                "importExportStyle": "named",
+                "importPathStyle": "absolute-alias",
+                "typescriptStrictness": "strict-false",
+                "namingConventions": {
+                    "components": "PascalCase",
+                    "hooks": "camelCase",
+                    "routes": "kebab-case",
+                    "models": "PascalCase"
+                }
+            },
+            "sharedContracts": {
+                "database": {
+                    "models": {}
+                },
+                "api": {
+                    "endpoints": {}
+                },
+                "hooks": {}
+            },
+            "generationPipeline": []
+        });
+        if let Ok(lbg_content) = serde_json::to_string_pretty(&default_lbg) {
+            let _ = fs::write(&lbg_path, lbg_content);
+        }
+    }
 
     for (i, file_spec) in files_to_generate.iter().enumerate() {
         let file_path = file_spec.get("path").and_then(|p| p.as_str()).unwrap_or("unknown.txt");
@@ -6461,43 +7885,25 @@ async fn run_orchestrator(
         let current_progress = 25.0 + ((i as f64) / total_files) * 55.0;
         emit_progress("generate-files", &msg, current_progress);
 
-        let mut system_prompt = "You are an expert software engineer. Write only the code, no explanations. Provide only the code, wrapped in markdown code blocks.\n\
-                                 IMPORTANT DESIGN & CONTENT REQUIREMENTS:\n\
-                                 - Do NOT write minimal skeletons, simple placeholders, or empty cards.\n\
-                                 - Generate highly complete, production-ready, and visually beautiful layouts.\n\
-                                 - Always write rich, detailed copy and realistic mock data (e.g. detailed statistics, complete form fields, multi-section cards, rich body text) instead of using 'Lorem Ipsum' or empty divs.\n\
-                                 - Use comprehensive styles and modern layouts (e.g., responsive grids, flexboxes, borders, shadows, hover effects, nice colors) to create a premium feel.\n\
-                                 - For dashboards, include functional widgets, detailed summary stats, interactive tables, and charts where applicable.\n\
-                                 - Do NOT write mock authentication handlers, console.log-only form submissions, or stubbed mock responses (e.g. simulating user login with hardcoded credentials or alert boxes).\n\
-                                 - Implement fully functional authentication: Login page MUST use NextAuth's `signIn` method (or the project's chosen authentication library) with proper redirection.\n\
-                                 - Registration page MUST perform a real API request (e.g. `POST` to `/api/auth/register`) to save the user, and you MUST write the corresponding API route in Next.js (under `src/app/api/auth/register/route.ts` or similar) that securely hashes the password (using bcryptjs) and writes it to the database using Prisma.\n\
-                                 - Ensure all forms have fully implemented submission handlers that communicate with real API endpoints, handle loading states, and show real success/error feedbacks.\n\
-                                 - PRISMA SERVER-ONLY RULE: Prisma Client (`@prisma/client`) MUST ONLY be imported and used inside Next.js API Route Handlers (files under `src/app/api/`). NEVER import or use Prisma in React hooks, client components, or any file with `'use client'`. Client-side hooks that need database data MUST use `fetch('/api/...')` to call the corresponding API route.\n\
-                                 - HOOK EXPORTS RULE: All custom React hooks (e.g. `useAuth`, `useProducts`, `useOrders`) MUST use `export default` (not named exports). Pages and components importing them must use default import syntax (e.g. `import useAuth from '@/hooks/useAuth'`).\n\
-                                 - NEXTAUTH ARCHITECTURE: When using next-auth with credentials (email+password), always use `CredentialsProvider` from `next-auth/providers/credentials` with bcryptjs for password comparison and `strategy: 'jwt'` sessions. DO NOT use `EmailProvider` unless the project explicitly requires magic link authentication.\n\
-                                 - DATABASE RESILIENCY & FALLBACKS: Database queries (such as Prisma Client calls like `prisma.product.findMany()`) must be wrapped in `try { ... } catch (error) { ... }` blocks. In the `catch` block, log a warning (e.g. `console.warn('Failed to fetch data, using mock data:', error)`) and fall back to a rich mockup dataset (e.g. 10 realistic mockup items with full properties) so that the application can still render and run in preview mode even if the database is offline or not configured.\n\
-                                 - Ensure all import paths match existing files and libraries in the project.".to_string();
-        if !overrides_desc.trim().is_empty() {
-            system_prompt.push_str(&format!(
-                "\nUse the following version/stack preferences if applicable:\n{}",
-                overrides_desc
-            ));
-        }
+        let overrides_desc_str = if !overrides_desc.trim().is_empty() {
+            format!("\nUse the following version/stack preferences if applicable:\n{}", overrides_desc)
+        } else {
+            "".to_string()
+        };
 
         let pkg_db_summary = get_packages_db_summary();
-        system_prompt.push_str(&pkg_db_summary);
-
-        // Include context of already generated files as reference
         let context_ref = get_context_files_for(file_path, &proj_dir);
-        if !context_ref.is_empty() {
-            system_prompt.push_str(&context_ref);
-        }
-
-        // Include routes structure for accurate link pathing
         let routes_ref = get_project_routes_prompt(&files_to_generate);
-        if !routes_ref.is_empty() {
-            system_prompt.push_str(&routes_ref);
-        }
+
+        let mut system_prompt = get_expert_system_prompt(
+            file_path,
+            &project_type,
+            &overrides_desc_str,
+            &pkg_db_summary,
+            &context_ref,
+            &routes_ref,
+            &proj_dir,
+        );
 
         if file_path == "package.json" || file_path.ends_with("/package.json") {
             let mut pkg_extra = " IMPORTANT: When generating package.json, always use modern, stable dependency versions".to_string();
@@ -6714,106 +8120,11 @@ async fn run_orchestrator(
     // Run npm install with automatic self-healing and version locking
     run_npm_install_with_auto_healing(&proj_dir, &window, "", Some(&task_id)).await;
 
-    // Auto-run prisma generate if Prisma schema exists in the project
+    // Auto-run prisma generate & db push if Prisma schema exists in the project
     let has_prisma = proj_dir.join("prisma/schema.prisma").exists() || proj_dir.join("schema.prisma").exists();
     if has_prisma {
-        let schema_path = if proj_dir.join("prisma/schema.prisma").exists() {
-            proj_dir.join("prisma/schema.prisma")
-        } else {
-            proj_dir.join("schema.prisma")
-        };
-        
-        for attempt in 1..=3 {
-            emit_progress("install-deps", &format!("Generating Prisma client (attempt {}/3)...", attempt), 78.0);
-            debug_log_to_file(format!("[Prisma Generator] Running prisma generate, attempt {}/3...", attempt));
-            
-            #[cfg(target_os = "windows")]
-            let mut prisma_cmd = std::process::Command::new("cmd");
-            #[cfg(target_os = "windows")]
-            prisma_cmd.arg("/C").arg("npx").arg("-y").arg("prisma").arg("generate").current_dir(&proj_dir);
-            
-            #[cfg(not(target_os = "windows"))]
-            let mut prisma_cmd = std::process::Command::new("npx");
-            #[cfg(not(target_os = "windows"))]
-            prisma_cmd.arg("-y").arg("prisma").arg("generate").current_dir(&proj_dir);
-            
-            #[cfg(target_os = "windows")]
-            {
-                use std::os::windows::process::CommandExt;
-                prisma_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-            }
-            
-            let output_res = prisma_cmd.output();
-            let output = match output_res {
-                Ok(o) => o,
-                Err(e) => {
-                    debug_log_to_file(format!("[Prisma Generator] Failed to execute prisma generate: {}", e));
-                    break;
-                }
-            };
-            
-            if output.status.success() {
-                debug_log_to_file("[Prisma Generator] prisma generate completed successfully!".to_string());
-                break;
-            }
-            
-            let stdout_str = String::from_utf8_lossy(&output.stdout);
-            let stderr_str = String::from_utf8_lossy(&output.stderr);
-            let error_log = format!("{}\n{}", stdout_str, stderr_str);
-            
-            debug_log_to_file(format!("[Prisma Generator] prisma generate failed. Error log:\n{}", error_log));
-            
-            if schema_path.exists() {
-                if let Ok(schema_content) = std::fs::read_to_string(&schema_path) {
-                    emit_progress("install-deps", &format!("Prisma generation failed. Self-healing schema (attempt {}/3)...", attempt), 78.2 + (attempt as f64 * 0.2));
-                    
-                    // Call local LLM to fix schema.prisma
-                    let client = reqwest::Client::builder()
-                        .timeout(std::time::Duration::from_secs(60))
-                        .build()
-                        .unwrap_or_else(|_| reqwest::Client::new());
-                    let system_prompt = "You are an expert database administrator and Prisma specialist. The prisma generate command failed with syntax or validation errors. Review the schema.prisma content and the error log. Correct the schema.prisma file to fix the validation errors. Respond ONLY with the complete corrected schema.prisma contents. Do not include any explanations, introduction, or markdown code blocks.";
-                    
-                    let user_prompt = format!(
-                        "Prisma CLI error log:\n{}\n\nCurrent schema.prisma content:\n{}\n\nPlease provide the complete corrected schema.prisma code.",
-                        error_log, schema_content
-                    );
-                    
-                    let ollama_req = serde_json::json!({
-                        "model": model_id.clone(),
-                        "messages": [
-                            { "role": "system", "content": system_prompt },
-                            { "role": "user", "content": user_prompt }
-                        ],
-                        "stream": false,
-                        "options": {
-                            "temperature": 0.2
-                        }
-                    });
-                    
-                    let req_fut = client.post("http://127.0.0.1:11434/api/chat")
-                        .json(&ollama_req)
-                        .send();
-                        
-                    if let Ok(resp) = req_fut.await {
-                        if resp.status().is_success() {
-                            if let Ok(resp_json) = resp.json::<Value>().await {
-                                if let Some(content) = resp_json.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
-                                    let cleaned = extract_code_content(content);
-                                    if !cleaned.trim().is_empty() {
-                                        let _ = std::fs::write(&schema_path, &cleaned);
-                                        debug_log_to_file("[Prisma Generator] Wrote corrected schema.prisma to disk.".to_string());
-                                        continue; // retry prisma generate
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            
-            // If we get here and didn't continue, break the loop
-            break;
+        if let Err(e) = heal_prisma_schema_loop(&proj_dir, &window, &model_id, "install-deps").await {
+            debug_log_to_file(format!("[Prisma Critical Error] Orchestrator schema healing failed: {}", e));
         }
 
         // Run prisma db push to synchronize the database schema
@@ -7107,7 +8418,11 @@ pub fn run() {
             ollama_unload_model,
             get_pending_deep_link,
             clear_pending_deep_link,
-            debug_log_to_file
+            debug_log_to_file,
+            project_import_local_folder,
+            project_import_github,
+            project_detect_missing_env_keys,
+            project_save_env_keys
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -7255,6 +8570,29 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_import_path() {
+        let temp_dir = std::env::temp_dir().join("axiom_test_import_resolve");
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let src_dir = temp_dir.join("src").join("app").join("components");
+        let _ = std::fs::create_dir_all(&src_dir);
+        
+        let card_file = src_dir.join("ProductCard.tsx");
+        let _ = std::fs::write(&card_file, "export const ProductCard = () => null;");
+        
+        // Test absolute resolve
+        let resolved = resolve_import_path(&temp_dir, "@/app/components/ProductCard", "src/app/page.tsx");
+        assert_eq!(resolved, Some("src/app/components/ProductCard.tsx".to_string()));
+        
+        // Test relative resolve
+        let resolved_rel = resolve_import_path(&temp_dir, "../components/ProductCard", "src/app/pages/page.tsx");
+        assert_eq!(resolved_rel, Some("src/app/pages/../components/ProductCard.tsx".to_string()));
+        
+        // Clean up
+        let _ = std::fs::remove_file(card_file);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
     fn test_generate_axiom_map() {
         let temp_dir = std::env::temp_dir().join(format!("axiom_test_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_dir).unwrap();
@@ -7363,6 +8701,18 @@ export const version = "1.0.0";
         let output2 = inject_axiom_attrs(input2, "src/app/register/page.tsx");
         assert!(!output2.contains("<string data-axiom-component"));
         assert!(output2.contains("<div data-axiom-component=\"Page\" data-axiom-file=\"src/app/register/page.tsx\">"));
+    }
+
+    #[test]
+    fn test_get_project_path() {
+        let temp_dir = std::env::temp_dir().join(format!("axiom_test_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        
+        // When project is not registered, it should fallback to internal projects dir
+        let fallback_path = get_project_path("non_existent_project");
+        assert!(fallback_path.ends_with("non_existent_project"));
+        
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }
 

@@ -221,6 +221,46 @@ export function useAppStore() {
     return () => unsubscribe();
   }, [actions, loadProjects]);
 
+  const importLocalFolder = useCallback(async (path) => {
+    try {
+      const project = await window.electronAPI.project.importLocalFolder(path);
+      actions.addProject(project);
+      return project;
+    } catch (error) {
+      actions.setError(error.message);
+      throw error;
+    }
+  }, [actions]);
+
+  const importGithub = useCallback(async (repoUrl, localPath, token) => {
+    try {
+      const project = await window.electronAPI.project.importGithub(repoUrl, localPath, token);
+      actions.addProject(project);
+      return project;
+    } catch (error) {
+      actions.setError(error.message);
+      throw error;
+    }
+  }, [actions]);
+
+  const detectMissingEnvKeys = useCallback(async (projectId) => {
+    try {
+      return await window.electronAPI.project.detectMissingEnvKeys(projectId);
+    } catch (error) {
+      actions.setError(error.message);
+      throw error;
+    }
+  }, [actions]);
+
+  const saveEnvKeys = useCallback(async (projectId, keys) => {
+    try {
+      return await window.electronAPI.project.saveEnvKeys(projectId, keys);
+    } catch (error) {
+      actions.setError(error.message);
+      throw error;
+    }
+  }, [actions]);
+
   return {
     // State
     isFirstRun: state.isFirstRun,
@@ -245,6 +285,10 @@ export function useAppStore() {
     configureProject,
     startDeployment,
     stopTask,
+    importLocalFolder,
+    importGithub,
+    detectMissingEnvKeys,
+    saveEnvKeys,
     setFirstRun: actions.setFirstRun
   };
 }

@@ -251,6 +251,34 @@ window.electronAPI = {
       } catch (e) {
         return { success: false, error: e.toString() };
       }
+    },
+    importLocalFolder: async (path) => {
+      try {
+        return await invoke('project_import_local_folder', { path });
+      } catch (error) {
+        throw new Error(error);
+      }
+    },
+    importGithub: async (repoUrl, localPath, token) => {
+      try {
+        return await invoke('project_import_github', { repoUrl, localPath, token });
+      } catch (error) {
+        throw new Error(error);
+      }
+    },
+    detectMissingEnvKeys: async (projectId) => {
+      try {
+        return await invoke('project_detect_missing_env_keys', { projectId });
+      } catch (error) {
+        throw new Error(error);
+      }
+    },
+    saveEnvKeys: async (projectId, keys) => {
+      try {
+        return await invoke('project_save_env_keys', { projectId, keys });
+      } catch (error) {
+        throw new Error(error);
+      }
     }
   },
 

@@ -32,3 +32,4 @@ uuid = { version = "1.8.0", features = ["v4", "fast-rng"] }
 tauri-plugin-shell = "2"
 tauri-plugin-deep-link = "2"
 tauri-plugin-single-instance = "2"
+regex = "1.10"
