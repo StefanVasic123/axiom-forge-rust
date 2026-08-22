@@ -79,6 +79,8 @@ function AppContent() {
         </div>
       </div>
     );
+  }
+
   if (appMode?.mode === 'client') {
     return <ClientLayout />;
   }
