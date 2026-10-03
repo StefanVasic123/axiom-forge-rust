@@ -419,19 +419,29 @@ function OllamaStep({ onNext, onBack }) {
         )}
       </div>
 
-      <div className="flex justify-between max-w-md mx-auto">
+      <div className="flex justify-between items-center max-w-md mx-auto">
         <button onClick={onBack} className="btn-ghost" disabled={isPulling}>
           <ChevronLeft className="w-5 h-5" />
           Back
         </button>
-        <button 
-          onClick={onNext} 
-          className="btn-primary"
-          disabled={status !== 'ready' || isPulling}
-        >
-          Continue
-          <ChevronRight className="w-5 h-5" />
-        </button>
+        <div className="flex items-center gap-3">
+          {status !== 'ready' && !isPulling && (
+            <button 
+              onClick={onNext} 
+              className="text-xs text-slate-400 hover:text-slate-200 hover:underline transition-colors px-2 py-1"
+            >
+              Skip for now
+            </button>
+          )}
+          <button 
+            onClick={onNext} 
+            className="btn-primary"
+            disabled={status !== 'ready' || isPulling}
+          >
+            Continue
+            <ChevronRight className="w-5 h-5" />
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -446,7 +456,7 @@ function GitHubStep({ onNext, onBack }) {
 
   const handleSave = async () => {
     if (!token.trim()) {
-      setError('Please enter a GitHub token');
+      setError('Please enter a GitHub token or click Skip');
       return;
     }
 
@@ -454,7 +464,7 @@ function GitHubStep({ onNext, onBack }) {
     setError(null);
 
     try {
-      await saveToken('github-token', token);
+      await saveToken('github-token', token.trim());
       onNext();
     } catch (err) {
       setError(err.message);
@@ -521,20 +531,35 @@ function GitHubStep({ onNext, onBack }) {
           Create a GitHub token
         </a>
 
-        <button
-          onClick={handleSave}
-          disabled={isSaving}
-          className="btn-primary w-full"
-        >
-          {isSaving ? 'Saving...' : 'Save & Continue'}
-          <ChevronRight className="w-5 h-5" />
-        </button>
+        <div className="space-y-2 pt-2">
+          <button
+            onClick={handleSave}
+            disabled={isSaving}
+            className="btn-primary w-full"
+          >
+            {isSaving ? 'Saving...' : 'Save & Continue'}
+            <ChevronRight className="w-5 h-5" />
+          </button>
+
+          <button
+            onClick={onNext}
+            className="w-full py-2 text-xs text-slate-400 hover:text-slate-200 transition-colors"
+          >
+            Skip for now
+          </button>
+        </div>
       </div>
 
-      <div className="flex justify-start max-w-md mx-auto">
+      <div className="flex justify-between items-center max-w-md mx-auto">
         <button onClick={onBack} className="btn-ghost">
           <ChevronLeft className="w-5 h-5" />
           Back
+        </button>
+        <button 
+          onClick={onNext} 
+          className="text-xs text-slate-400 hover:text-slate-200 hover:underline transition-colors"
+        >
+          Skip for now
         </button>
       </div>
     </div>
@@ -552,8 +577,6 @@ function HostingStep({ onNext, onBack }) {
   const { saveToken } = useAppStore();
 
   const handleSave = async () => {
-    // We allow passing without tokens, or we can enforce at least one.
-    // For now, let's just save whatever they entered.
     setIsSaving(true);
     setError(null);
 
@@ -564,7 +587,6 @@ function HostingStep({ onNext, onBack }) {
       if (hostingerToken.trim()) {
         await saveToken('hostinger-token', hostingerToken.trim());
       }
-      // If neither is provided but they click save, we can still proceed (or warn them)
       onNext();
     } catch (err) {
       setError(err.message);
@@ -660,20 +682,35 @@ function HostingStep({ onNext, onBack }) {
           </div>
         )}
 
-        <button
-          onClick={handleSave}
-          disabled={isSaving}
-          className="btn-primary w-full h-10"
-        >
-          {isSaving ? 'Saving...' : 'Save & Continue'}
-          <ChevronRight className="w-4 h-4 ml-1" />
-        </button>
+        <div className="space-y-2">
+          <button
+            onClick={handleSave}
+            disabled={isSaving}
+            className="btn-primary w-full h-10"
+          >
+            {isSaving ? 'Saving...' : 'Save & Continue'}
+            <ChevronRight className="w-4 h-4 ml-1" />
+          </button>
+
+          <button
+            onClick={onNext}
+            className="w-full py-2 text-xs text-slate-400 hover:text-slate-200 transition-colors"
+          >
+            Skip for now
+          </button>
+        </div>
       </div>
 
-      <div className="flex justify-start max-w-md mx-auto">
+      <div className="flex justify-between items-center max-w-md mx-auto">
         <button onClick={onBack} className="btn-ghost">
           <ChevronLeft className="w-5 h-5" />
           Back
+        </button>
+        <button 
+          onClick={onNext} 
+          className="text-xs text-slate-400 hover:text-slate-200 hover:underline transition-colors"
+        >
+          Skip for now
         </button>
       </div>
     </div>
