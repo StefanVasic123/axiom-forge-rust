@@ -21,7 +21,8 @@ import {
   ArrowLeft, Save, GitCommit, ChevronRight, ChevronDown,
   File, Folder, FolderOpen, Send, Loader2, Check, X,
   RotateCcw, Sparkles, Code2, AlertCircle, Eye, Monitor,
-  FunctionSquare, Search, Info, Terminal, Settings
+  FunctionSquare, Search, Info, Terminal, Settings,
+  MousePointer, Crosshair
 } from 'lucide-react';
 
 // ==================== HELPERS ====================
@@ -157,6 +158,7 @@ function AIPanel({
   pendingContent,
   setPendingContent,
   visualContext,
+  onClearVisualContext,
   
   // Project-level props
   aiScope,
@@ -444,8 +446,30 @@ function AIPanel({
 
       {/* Input */}
       <div className="px-3 py-3 border-t border-slate-700/50 shrink-0">
+        {visualContext && (
+          <div className="flex items-center justify-between bg-indigo-950/70 border border-indigo-500/40 rounded-lg px-2.5 py-1.5 mb-2 text-xs text-indigo-300">
+            <div className="flex items-center gap-1.5 min-w-0">
+              <span className="font-mono bg-indigo-600/40 text-indigo-200 px-1.5 py-0.5 rounded text-[11px] font-semibold shrink-0">
+                &lt;{visualContext.tagName || 'element'}&gt;
+              </span>
+              <span className="truncate text-slate-300 text-[11px]">
+                {visualContext.text ? `"${visualContext.text.substring(0, 32)}${visualContext.text.length > 32 ? '...' : ''}"` : (visualContext.component || visualContext.file || 'Selected')}
+              </span>
+            </div>
+            {onClearVisualContext && (
+              <button
+                onClick={onClearVisualContext}
+                className="text-slate-400 hover:text-white ml-2 text-xs font-bold shrink-0"
+                title="Ukloni vizuelni element"
+              >
+                ✕
+              </button>
+            )}
+          </div>
+        )}
         <div className="flex gap-2">
           <textarea
+            id="ai-prompt-input"
             value={input}
             onChange={e => setInput(e.target.value)}
             onKeyDown={e => {
@@ -512,6 +536,35 @@ export default function EditorPage() {
   // Status & Inspector States
   const [statusMsg, setStatusMsg] = useState('');
   const [selectedElement, setSelectedElement] = useState(null);
+  const [isInspectMode, setIsInspectMode] = useState(false);
+  const [isEditingTitle, setIsEditingTitle] = useState(false);
+  const [titleInput, setTitleInput] = useState('');
+
+  const handleTitleSubmit = async () => {
+    if (titleInput.trim() && project) {
+      const updated = { ...project, name: titleInput.trim() };
+      await window.electronAPI.project.save(updated);
+      setProject(updated);
+    }
+    setIsEditingTitle(false);
+  };
+
+  const syncInspectMode = useCallback((enabled) => {
+    if (webviewRef.current && webviewRef.current.contentWindow) {
+      try {
+        webviewRef.current.contentWindow.postMessage({
+          channel: 'axiom-toggle-inspect',
+          enabled: enabled
+        }, '*');
+      } catch (e) {
+        console.warn('Failed to postMessage to iframe:', e);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    syncInspectMode(isInspectMode);
+  }, [isInspectMode, syncInspectMode]);
 
   // Project-level AI states
   const [aiScope, setAiScope] = useState('file'); // 'file' or 'project'
@@ -904,13 +957,34 @@ export default function EditorPage() {
         if (payload.file) {
           const fileNode = { path: payload.file, name: payload.file.split('/').pop() };
           openFile(fileNode);
-          
-          // Focus prompt input
-          setTimeout(() => {
-            const promptInput = document.getElementById('ai-prompt-input');
-            if (promptInput) promptInput.focus();
-          }, 100);
+        } else if (payload.path && files.length > 0) {
+          // Fallback: If no explicit file attribute exists, resolve by current URL path
+          const cleanRoute = payload.path.replace(/^\/(en|sr|es|pt|fr|de|it)/, '').replace(/\/$/, '') || '';
+          const candidateSuffixes = [
+            cleanRoute ? `${cleanRoute}/page.tsx` : 'page.tsx',
+            cleanRoute ? `${cleanRoute}/page.jsx` : 'page.jsx',
+            cleanRoute ? `${cleanRoute}.tsx` : 'index.tsx',
+            cleanRoute ? `${cleanRoute}.jsx` : 'index.jsx',
+          ];
+          const matchedFile = files.find(f => {
+            const norm = f.path.replace(/\\/g, '/');
+            return candidateSuffixes.some(s => norm.endsWith(s));
+          });
+          if (matchedFile) {
+            openFile(matchedFile);
+          }
         }
+
+        // Focus prompt input and set visual placeholder
+        setTimeout(() => {
+          const promptInput = document.getElementById('ai-prompt-input');
+          if (promptInput) {
+            promptInput.focus();
+            if (payload.text) {
+              promptInput.placeholder = `Opiši izmenu za <${payload.tagName || 'element'}> "${payload.text.substring(0, 25)}..."`;
+            }
+          }
+        }, 100);
       }
     };
 
@@ -918,7 +992,7 @@ export default function EditorPage() {
     return () => {
       window.removeEventListener('message', handleWindowMessage);
     };
-  }, [openFile]);
+  }, [openFile, files]);
 
   console.log("[EditorPage] Render. pendingContent exists?", !!pendingContent);
   if (pendingContent) {
@@ -1173,8 +1247,33 @@ export default function EditorPage() {
         <div className="w-px h-4 bg-slate-700" />
 
         <div className="flex items-center gap-2">
-          <Code2 className="w-4 h-4 text-indigo-400" />
-          <span className="text-sm font-semibold text-white">{project?.name || projectId}</span>
+          <Code2 className="w-4 h-4 text-indigo-400 shrink-0" />
+          {isEditingTitle ? (
+            <input
+              type="text"
+              value={titleInput}
+              onChange={(e) => setTitleInput(e.target.value)}
+              onBlur={handleTitleSubmit}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') handleTitleSubmit();
+                if (e.key === 'Escape') setIsEditingTitle(false);
+              }}
+              autoFocus
+              className="text-sm font-semibold text-white bg-slate-800 border border-indigo-500 rounded px-2 py-0.5 outline-none shadow-inner"
+            />
+          ) : (
+            <span 
+              onClick={() => {
+                setTitleInput(project?.name || '');
+                setIsEditingTitle(true);
+              }}
+              className="text-sm font-semibold text-white hover:text-indigo-300 cursor-pointer flex items-center gap-1.5 group select-none transition-colors"
+              title="Klikni da preimenuješ projekat"
+            >
+              {project?.name || projectId}
+              <span className="text-[11px] text-slate-500 opacity-0 group-hover:opacity-100 transition-opacity">✏️</span>
+            </span>
+          )}
           {dirtyCount > 0 && (
             <span className="text-xs bg-amber-500/20 text-amber-400 border border-amber-500/30 px-1.5 py-0.5 rounded">
               {dirtyCount} unsaved
@@ -1413,6 +1512,30 @@ export default function EditorPage() {
                     <div className="flex-1 bg-white border border-slate-300 rounded px-2 py-0.5 text-[10px] text-slate-500 flex items-center gap-2">
                       <Info className="w-3 h-3" /> {previewUrl}
                     </div>
+                    <div className="flex items-center bg-slate-200 p-0.5 rounded gap-1 text-[10px]">
+                      <button
+                        onClick={() => setIsInspectMode(false)}
+                        className={`flex items-center gap-1 px-2 py-0.5 rounded transition-all ${
+                          !isInspectMode
+                            ? 'bg-white text-indigo-600 font-bold shadow-sm'
+                            : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                        title="Interakcija: Kliktanje na dugmad, menije, forme i linkove radi normalno u pregledaču"
+                      >
+                        <MousePointer className="w-3 h-3" /> Interakcija
+                      </button>
+                      <button
+                        onClick={() => setIsInspectMode(true)}
+                        className={`flex items-center gap-1 px-2 py-0.5 rounded transition-all ${
+                          isInspectMode
+                            ? 'bg-indigo-600 text-white font-bold shadow-sm'
+                            : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                        title="Live Edit mod: Klikni na bilo koji element u aplikaciji da ga izmeniš pomoću AI asistenta"
+                      >
+                        <Crosshair className="w-3 h-3" /> Live Edit
+                      </button>
+                    </div>
                   </div>
                   
                   {/* Premium Warning Box */}
@@ -1521,6 +1644,7 @@ export default function EditorPage() {
                       className="flex-1 w-full border-none bg-white"
                       title="Project Preview"
                       sandbox="allow-same-origin allow-scripts allow-popups allow-forms"
+                      onLoad={() => syncInspectMode(isInspectMode)}
                     />
                   )}
                 </div>
@@ -1728,6 +1852,7 @@ export default function EditorPage() {
             pendingContent={pendingContent}
             setPendingContent={setPendingContent}
             visualContext={selectedElement}
+            onClearVisualContext={() => setSelectedElement(null)}
             onApply={handleAIApply}
             
             // Project props

@@ -940,13 +940,21 @@ fn inject_axiom_attrs(content: &str, relative_path: &str) -> String {
             if next_c.is_ascii_alphabetic() || next_c == '_' {
                 let mut tag_name = String::new();
                 let mut j = i + 1;
-                while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '-' || chars[j] == '_') {
+                while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '-' || chars[j] == '_' || chars[j] == '.') {
                     tag_name.push(chars[j]);
                     j += 1;
                 }
                 
+                let is_context_provider_or_consumer = tag_name.ends_with(".Provider") || tag_name.ends_with(".Consumer");
+                
                 let is_valid_tag = if tag_name.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
-                    tag_name != "ReactNode" && tag_name != "ReactElement" && tag_name != "FC" && tag_name != "ComponentType" && tag_name != "any"
+                    !is_context_provider_or_consumer 
+                        && tag_name != "ReactNode" 
+                        && tag_name != "ReactElement" 
+                        && tag_name != "FC" 
+                        && tag_name != "ComponentType" 
+                        && tag_name != "any" 
+                        && !tag_name.ends_with('.')
                 } else {
                     let html_tags = vec![
                         "div", "section", "main", "header", "footer", "article", "aside", 
@@ -1140,6 +1148,108 @@ fn normalize_project_structure(files: &mut Vec<Value>, metamanifest: &Value, pro
     }
 }
 
+pub fn get_axiom_inspector_script() -> &'static str {
+    "      <script dangerouslySetInnerHTML={{ __html: `\n        if (!window.__axiom_inspect_injected) {\n          window.__axiom_inspect_injected = true;\n          let isInspectActive = false;\n          window.addEventListener('message', (e) => {\n            if (e.data && e.data.channel === 'axiom-toggle-inspect') {\n              isInspectActive = !!e.data.enabled;\n              if (!isInspectActive && highlightedElement) {\n                highlightedElement.classList.remove('axiom-inspect-highlight');\n                highlightedElement = null;\n              }\n            }\n          });\n          const styleEl = document.createElement('style');\n          styleEl.textContent = \\`\n            .axiom-inspect-highlight {\n              outline: 2px solid #6366f1 !important;\n              outline-offset: -2px !important;\n              cursor: crosshair !important;\n              background-color: rgba(99, 102, 241, 0.12) !important;\n              transition: all 0.1s ease;\n            }\n          \\`;\n          document.head.appendChild(styleEl);\n          let highlightedElement = null;\n          function findAxiomTarget(el) {\n            if (!el || el === document.body || el === document.documentElement) return null;\n            let cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              if (cur.dataset && (cur.dataset.axiomFile || cur.dataset.axiomComponent)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            const validTags = ['h1','h2','h3','h4','h5','h6','p','button','a','input','textarea','select','header','footer','nav','section','article','aside','li'];\n            cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              const tag = cur.tagName.toLowerCase();\n              if (validTags.includes(tag) || (cur.innerText && cur.innerText.trim().length > 0 && cur.children.length === 0)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            return el !== document.body && el !== document.documentElement ? el : null;\n          }\n          document.addEventListener('mouseover', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (highlightedElement && highlightedElement !== target) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n            }\n            if (target) {\n              target.classList.add('axiom-inspect-highlight');\n              highlightedElement = target;\n            }\n          }, true);\n          document.addEventListener('mouseout', (e) => {\n            if (highlightedElement) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n              highlightedElement = null;\n            }\n          }, true);\n          document.addEventListener('click', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (target) {\n              e.preventDefault();\n              e.stopPropagation();\n              const payload = {\n                file: target.dataset?.axiomFile || null,\n                component: target.dataset?.axiomComponent || null,\n                tagName: target.tagName.toLowerCase(),\n                text: (target.innerText || target.value || '').trim().substring(0, 80),\n                path: window.location.pathname\n              };\n              window.parent.postMessage({ channel: 'axiom-inspect-click', payload }, '*');\n            }\n          }, true);\n        }\n      ` }} />"
+}
+
+pub fn ensure_axiom_inspector_injected(proj_dir: &std::path::Path) {
+    let candidate_layouts = [
+        "src/app/[locale]/layout.tsx",
+        "src/app/[locale]/layout.jsx",
+        "src/app/layout.tsx",
+        "src/app/layout.jsx",
+        "app/layout.tsx",
+        "app/layout.jsx",
+        "src/pages/_app.tsx",
+        "src/pages/_app.jsx",
+        "pages/_app.tsx",
+        "pages/_app.jsx",
+    ];
+
+    let script = get_axiom_inspector_script();
+
+    for rel_path in &candidate_layouts {
+        let full_path = proj_dir.join(rel_path);
+        if full_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&full_path) {
+                if !content.contains("axiom-toggle-inspect") {
+                    let cleaned = if content.contains("axiom-inspect-click") {
+                        let start_marker = "<script dangerouslySetInnerHTML={{ __html: `\n        if (!window.__axiom_inspect_injected)";
+                        if let Some(s_idx) = content.find(start_marker) {
+                            if let Some(end_rel) = content[s_idx..].find("` }} />") {
+                                let mut c = content.clone();
+                                c.replace_range(s_idx..s_idx + end_rel + 7, "");
+                                c
+                            } else {
+                                content.clone()
+                            }
+                        } else {
+                            content.clone()
+                        }
+                    } else {
+                        content.clone()
+                    };
+
+                    let new_content = if cleaned.contains("</body>") {
+                        cleaned.replace("</body>", &format!("{}\n      </body>", script))
+                    } else if cleaned.contains("</html>") {
+                        cleaned.replace("</html>", &format!("{}\n</html>", script))
+                    } else {
+                        format!("{}\n// Axiom Inspect\n{}", cleaned, script)
+                    };
+                    let _ = std::fs::write(&full_path, new_content);
+                }
+            }
+            break;
+        }
+    }
+}
+
+pub fn ensure_valid_tsconfig(proj_dir: &std::path::Path) {
+    let tsconfig_path = proj_dir.join("tsconfig.json");
+    if tsconfig_path.exists() {
+        let is_valid = if let Ok(content) = std::fs::read_to_string(&tsconfig_path) {
+            if let Ok(val) = serde_json::from_str::<Value>(&content) {
+                val.get("compilerOptions").is_some()
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !is_valid {
+            let standard_tsconfig = serde_json::json!({
+                "compilerOptions": {
+                    "lib": ["dom", "dom.iterable", "esnext"],
+                    "allowJs": true,
+                    "skipLibCheck": true,
+                    "strict": false,
+                    "noEmit": true,
+                    "esModuleInterop": true,
+                    "module": "esnext",
+                    "moduleResolution": "bundler",
+                    "resolveJsonModule": true,
+                    "isolatedModules": true,
+                    "jsx": "preserve",
+                    "incremental": true,
+                    "plugins": [
+                        {
+                            "name": "next"
+                        }
+                    ],
+                    "paths": {
+                        "@/*": ["./src/*"]
+                    }
+                },
+                "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+                "exclude": ["node_modules"]
+            });
+            let _ = std::fs::write(&tsconfig_path, serde_json::to_string_pretty(&standard_tsconfig).unwrap_or_default());
+        }
+    }
+}
+
 fn post_process_generated_file(
     file_path: &str,
     content: &str,
@@ -1181,30 +1291,39 @@ fn post_process_generated_file(
     }
 
     if path_lower.ends_with("tsconfig.json") {
-        if let Ok(mut ts_val) = serde_json::from_str::<Value>(content) {
-            if let Some(ts_obj) = ts_val.as_object_mut() {
-                let compiler_options = ts_obj.entry("compilerOptions").or_insert(serde_json::json!({}));
-                if let Some(co_obj) = compiler_options.as_object_mut() {
-                    co_obj.insert("esModuleInterop".to_string(), serde_json::json!(true));
-                    co_obj.insert("resolveJsonModule".to_string(), serde_json::json!(true));
-                    co_obj.insert("skipLibCheck".to_string(), serde_json::json!(true));
-                    co_obj.insert("jsx".to_string(), serde_json::json!("preserve"));
-                    
-                    let paths = co_obj.entry("paths").or_insert(serde_json::json!({}));
-                    if let Some(paths_obj) = paths.as_object_mut() {
-                        paths_obj.insert("@/*".to_string(), serde_json::json!(["./src/*"]));
-                    }
+        let mut ts_val = match serde_json::from_str::<Value>(content) {
+            Ok(val) => val,
+            Err(_) => serde_json::json!({
+                "compilerOptions": {},
+                "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+                "exclude": ["node_modules"]
+            }),
+        };
 
-                    if let Some(types) = co_obj.get_mut("types") {
-                        if let Some(types_arr) = types.as_array_mut() {
-                            types_arr.retain(|val| val.as_str() != Some("next-env"));
-                        }
+        if let Some(ts_obj) = ts_val.as_object_mut() {
+            let compiler_options = ts_obj.entry("compilerOptions").or_insert(serde_json::json!({}));
+            if let Some(co_obj) = compiler_options.as_object_mut() {
+                co_obj.insert("esModuleInterop".to_string(), serde_json::json!(true));
+                co_obj.insert("resolveJsonModule".to_string(), serde_json::json!(true));
+                co_obj.insert("skipLibCheck".to_string(), serde_json::json!(true));
+                co_obj.insert("jsx".to_string(), serde_json::json!("preserve"));
+                co_obj.insert("moduleResolution".to_string(), serde_json::json!("bundler"));
+                co_obj.insert("module".to_string(), serde_json::json!("esnext"));
+                
+                let paths = co_obj.entry("paths").or_insert(serde_json::json!({}));
+                if let Some(paths_obj) = paths.as_object_mut() {
+                    paths_obj.insert("@/*".to_string(), serde_json::json!(["./src/*"]));
+                }
+
+                if let Some(types) = co_obj.get_mut("types") {
+                    if let Some(types_arr) = types.as_array_mut() {
+                        types_arr.retain(|val| val.as_str() != Some("next-env"));
                     }
                 }
             }
-            if let Ok(pretty) = serde_json::to_string_pretty(&ts_val) {
-                return pretty;
-            }
+        }
+        if let Ok(pretty) = serde_json::to_string_pretty(&ts_val) {
+            return pretty;
         }
     }
 
@@ -1323,9 +1442,9 @@ fn post_process_generated_file(
     };
 
     // Inject Axiom Inspect script into layout files for visual editing mode in development
-    if path_lower.ends_with("app/layout.tsx") || path_lower.ends_with("app/layout.jsx") {
+    if path_lower.ends_with("layout.tsx") || path_lower.ends_with("layout.jsx") || path_lower.ends_with("_app.tsx") || path_lower.ends_with("_app.jsx") {
         if !processed.contains("axiom-inspect-click") {
-            let inspector_script = "      <script dangerouslySetInnerHTML={{ __html: `\n        if (!window.__axiom_inspect_injected) {\n          window.__axiom_inspect_injected = true;\n          const styleEl = document.createElement('style');\n          styleEl.textContent = \\`\n            .axiom-inspect-highlight {\n              outline: 2px solid #6366f1 !important;\n              outline-offset: -2px !important;\n              cursor: crosshair !important;\n              background-color: rgba(99, 102, 241, 0.08) !important;\n              transition: all 0.1s ease;\n            }\n          \\`;\n          document.head.appendChild(styleEl);\n          let highlightedElement = null;\n          function findAxiomTarget(el) {\n            while (el && el !== document.body) {\n              if (el.dataset && (el.dataset.axiomFile || el.dataset.axiomComponent)) {\n                return el;\n              }\n              el = el.parentElement;\n            }\n            return null;\n          }\n          document.addEventListener('mouseover', (e) => {\n            const target = findAxiomTarget(e.target);\n            if (highlightedElement && highlightedElement !== target) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n            }\n            if (target) {\n              target.classList.add('axiom-inspect-highlight');\n              highlightedElement = target;\n            }\n          }, true);\n          document.addEventListener('mouseout', (e) => {\n            if (highlightedElement) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n              highlightedElement = null;\n            }\n          }, true);\n          document.addEventListener('click', (e) => {\n            const target = findAxiomTarget(e.target);\n            if (target) {\n              e.preventDefault();\n              e.stopPropagation();\n              const payload = {\n                file: target.dataset.axiomFile || null,\n                component: target.dataset.axiomComponent || null,\n                tagName: target.tagName.toLowerCase(),\n                text: target.innerText?.substring(0, 50) || ''\n              };\n              window.parent.postMessage({ channel: 'axiom-inspect-click', payload }, '*');\n            }\n          }, true);\n        }\n      ` }} />".to_string();
+            let inspector_script = get_axiom_inspector_script();
 
             if processed.contains("</body>") {
                 processed = processed.replace("</body>", &format!("{}\n      </body>", inspector_script));
@@ -1450,6 +1569,9 @@ fn post_process_generated_file(
             }
         }
         processed = lines.join("\n");
+
+        // 5. Enforce the canonical NextAuth Prisma Adapter models (Account / Session)
+        processed = apply_nextauth_prisma_template(&processed);
     }
 
     let is_js_ts_file = path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx") || path_lower.ends_with(".ts") || path_lower.ends_with(".js");
@@ -1664,68 +1786,117 @@ fn post_process_generated_file(
                     })
                 });
 
-            if processed.contains("useSession") || has_nextauth_dep {
-                let mut renamed = false;
-                let mut export_name = "RootLayout".to_string();
-                
-                for possible_name in &["RootLayout", "Layout", "PageLayout", "AppLayout"] {
-                    let pattern = format!("export default function {}", possible_name);
-                    if processed.contains(&pattern) {
-                        processed = processed.replace(&pattern, &format!("function {}Inner", possible_name));
-                        export_name = possible_name.to_string();
-                        renamed = true;
-                        break;
-                    }
+            if (processed.contains("useSession") || has_nextauth_dep) && !processed.contains("<SessionProvider") {
+                if !processed.contains("SessionProvider") {
+                    processed = format!("import {{ SessionProvider }} from 'next-auth/react';\n{}", processed);
                 }
-                
-                if !renamed && processed.contains("export default function") {
-                    processed = processed.replace("export default function", "function RootLayoutInner");
-                    export_name = "RootLayout".to_string();
-                    renamed = true;
+                if processed.contains("{children}") {
+                    processed = processed.replace("{children}", "<SessionProvider>{children}</SessionProvider>");
                 }
-                
-                if !renamed {
-                    for possible_name in &["RootLayout", "Layout", "PageLayout", "AppLayout"] {
-                        let pattern = format!("export default {}", possible_name);
-                        if processed.contains(&pattern) {
-                            processed = processed.replace(&format!("const {} ", possible_name), &format!("const {}Inner ", possible_name));
-                            processed = processed.replace(&format!("let {} ", possible_name), &format!("let {}Inner ", possible_name));
-                            processed = processed.replace(&format!("const {}:", possible_name), &format!("const {}Inner:", possible_name));
-                            processed = processed.replace(&format!("let {}:", possible_name), &format!("let {}Inner:", possible_name));
-                            processed = processed.replace(&format!("function {} (", possible_name), &format!("function {}Inner (", possible_name));
-                            processed = processed.replace(&format!("function {}(", possible_name), &format!("function {}Inner(", possible_name));
-                            processed = processed.replace(&pattern, ""); // Remove the default export statement
-                            export_name = possible_name.to_string();
-                            renamed = true;
-                            break;
-                        }
-                    }
-                }
-                
-                if renamed {
-                    // Ensure SessionProvider is imported
-                    if !processed.contains("SessionProvider") {
-                        processed = format!("import {{ SessionProvider }} from 'next-auth/react';\n{}", processed);
-                    }
-                    
-                    let is_tsx = path_lower.ends_with(".tsx");
-                    let wrapper = if is_tsx {
-                        format!(
-                            "\nexport default function {}({{ children }}: {{ children: React.ReactNode }}) {{\n  return (\n    <SessionProvider>\n      <{}Inner>{{children}}</{}Inner>\n    </SessionProvider>\n  );\n}}\n",
-                            export_name, export_name, export_name
-                        )
-                    } else {
-                        format!(
-                            "\nexport default function {}({{ children }}) {{\n  return (\n    <SessionProvider>\n      <{}Inner>{{children}}</{}Inner>\n    </SessionProvider>\n  );\n}}\n",
-                            export_name, export_name, export_name
-                        )
-                    };
-                    processed.push_str(&wrapper);
-                }
-
-                if processed.contains("SessionProvider") && !processed.contains("\"use client\"") && !processed.contains("'use client'") {
+                if !processed.trim_start().starts_with("\"use client\"") && !processed.trim_start().starts_with("'use client'") {
                     processed = format!("\"use client\";\n\n{}", processed);
                 }
+            }
+
+            // Ensure Navbar and Footer are mounted in RootLayout if Navbar component exists in templates
+            let project_has_navbar = metamanifest.get("requiredFilesTemplates")
+                .and_then(|t| t.as_array())
+                .map_or(false, |templates| {
+                    templates.iter().any(|temp| {
+                        temp.get("path").and_then(|p| p.as_str()).map_or(false, |p| p.contains("Navbar.tsx") || p.contains("Navbar.jsx"))
+                    })
+                });
+
+            if project_has_navbar && !processed.contains("<Navbar") {
+                let mut navbar_import = "";
+                let mut footer_import = "";
+                if !processed.contains("Navbar from") && !processed.contains("Navbar } from") {
+                    navbar_import = "import Navbar from '@/components/Navbar';\n";
+                }
+                if !processed.contains("Footer from") && !processed.contains("Footer } from") {
+                    footer_import = "import Footer from '@/components/Footer';\n";
+                }
+                
+                let imports_to_add = format!("{}{}", navbar_import, footer_import);
+                if !imports_to_add.is_empty() {
+                    let trimmed = processed.trim_start();
+                    if trimmed.starts_with("\"use client\"") {
+                        if let Some(idx) = processed.find("\"use client\"") {
+                            let semicolon = if processed[idx..].starts_with("\"use client\";") { 1 } else { 0 };
+                            let insert_pos = idx + "\"use client\"".len() + semicolon;
+                            processed.insert_str(insert_pos, &format!("\n{}", imports_to_add));
+                        }
+                    } else if trimmed.starts_with("'use client'") {
+                        if let Some(idx) = processed.find("'use client'") {
+                            let semicolon = if processed[idx..].starts_with("'use client';") { 1 } else { 0 };
+                            let insert_pos = idx + "'use client'".len() + semicolon;
+                            processed.insert_str(insert_pos, &format!("\n{}", imports_to_add));
+                        }
+                    } else {
+                        processed = format!("{}{}", imports_to_add, processed);
+                    }
+                }
+
+                if processed.contains("<SessionProvider>") && processed.contains("</SessionProvider>") {
+                    processed = processed.replace(
+                        "<SessionProvider>",
+                        "<SessionProvider>\n        <Navbar />\n        <main className=\"flex-grow flex flex-col w-full\">"
+                    );
+                    processed = processed.replace(
+                        "</SessionProvider>",
+                        "</main>\n        <Footer />\n      </SessionProvider>"
+                    );
+                } else if processed.contains("<body>") && processed.contains("</body>") {
+                    processed = processed.replace(
+                        "<body>",
+                        "<body>\n        <Navbar />\n        <main className=\"flex-grow flex flex-col w-full\">"
+                    );
+                    processed = processed.replace(
+                        "</body>",
+                        "</main>\n        <Footer />\n      </body>"
+                    );
+                }
+            }
+
+            // Ensure CartProvider is wrapped if cartContext exists in project
+            let project_has_cart = metamanifest.get("requiredFilesTemplates")
+                .and_then(|t| t.as_array())
+                .map_or(false, |templates| {
+                    templates.iter().any(|temp| {
+                        temp.get("path").and_then(|p| p.as_str()).map_or(false, |p| p.contains("cartContext") || p.contains("cart.tsx"))
+                    })
+                }) || processed.contains("CartProvider");
+
+            if project_has_cart && !processed.contains("<CartProvider") {
+                if !processed.contains("CartProvider") {
+                    let cart_import = "import { CartProvider } from '@/lib/cartContext';\n";
+                    let trimmed = processed.trim_start();
+                    if trimmed.starts_with("\"use client\"") {
+                        if let Some(idx) = processed.find("\"use client\"") {
+                            let semicolon = if processed[idx..].starts_with("\"use client\";") { 1 } else { 0 };
+                            let insert_pos = idx + "\"use client\"".len() + semicolon;
+                            processed.insert_str(insert_pos, &format!("\n{}", cart_import));
+                        }
+                    } else if trimmed.starts_with("'use client'") {
+                        if let Some(idx) = processed.find("'use client'") {
+                            let semicolon = if processed[idx..].starts_with("'use client';") { 1 } else { 0 };
+                            let insert_pos = idx + "'use client'".len() + semicolon;
+                            processed.insert_str(insert_pos, &format!("\n{}", cart_import));
+                        }
+                    } else {
+                        processed = format!("{}{}", cart_import, processed);
+                    }
+                }
+                if processed.contains("<SessionProvider>") {
+                    processed = processed.replace("<SessionProvider>", "<SessionProvider>\n        <CartProvider>");
+                    processed = processed.replace("</SessionProvider>", "        </CartProvider>\n      </SessionProvider>");
+                }
+            }
+
+            // Ensure "use client" is at the very top if any client provider is present
+            if (processed.contains("<SessionProvider") || processed.contains("<CartProvider") || processed.contains("useSession"))
+                && !processed.trim_start().starts_with("\"use client\"") && !processed.trim_start().starts_with("'use client'") {
+                processed = format!("\"use client\";\n\n{}", processed);
             }
         }
 
@@ -1747,7 +1918,7 @@ const authOptions = {
       async authorize(credentials) {
         if (!credentials?.email || !credentials?.password) return null;
         try {
-          const user = await prisma.user.findUnique({ where: { email: credentials.email } });
+          const user = await prisma.user.findUnique({ where: { email: credentials.email } }) as any;
           if (!user) return null;
           const passwordMatch = await bcrypt.compare(credentials.password, user.hashedPassword || user.password || "");
           if (!passwordMatch) return null;
@@ -1794,6 +1965,23 @@ export { handler as GET, handler as POST };
                                 processed.contains("useParams") || processed.contains("useSearchParams");
                 if has_hooks && !processed.trim_start().starts_with("\"use client\"") && !processed.trim_start().starts_with("'use client'") {
                     processed = format!("\"use client\";\n\n{}", processed);
+                }
+            }
+
+            // Ensure client components are never async functions (causes RSC default.then error)
+            if (processed.contains("\"use client\"") || processed.contains("'use client'")) && processed.contains("export default async function") {
+                processed = processed.replace("export default async function", "export default function");
+            }
+
+            // Ensure layout.tsx / page.tsx never omit export default
+            if path_lower.ends_with("layout.tsx") || path_lower.ends_with("layout.jsx") || path_lower.ends_with("page.tsx") || path_lower.ends_with("page.jsx") {
+                if !processed.contains("export default") {
+                    for candidate in &["RootLayout", "Layout", "Page", "Home", "Dashboard", "Profile", "LoginPage", "RegisterPage"] {
+                        if processed.contains(&format!("function {}", candidate)) || processed.contains(&format!("const {}", candidate)) {
+                            processed.push_str(&format!("\nexport default {};\n", candidate));
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -3010,6 +3198,136 @@ pub struct AIEditResult {
     pub error: Option<String>,
 }
 
+async fn resolve_valid_ollama_model(client: &reqwest::Client, requested: &str) -> String {
+    if let Ok(tags_resp) = client.get("http://127.0.0.1:11434/api/tags").send().await {
+        if let Ok(tags_json) = tags_resp.json::<Value>().await {
+            if let Some(models_arr) = tags_json.get("models").and_then(|m| m.as_array()) {
+                let installed_names: Vec<String> = models_arr
+                    .iter()
+                    .filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                    .collect();
+
+                // 1. If exact or prefix match exists, use it
+                for name in &installed_names {
+                    if name == requested || name.starts_with(requested) || requested.starts_with(name) {
+                        return name.clone();
+                    }
+                }
+
+                // 2. If requested is not found, fallback to best installed model
+                if !installed_names.is_empty() {
+                    if let Some(coder) = installed_names.iter().find(|n| n.contains("coder") || n.contains("qwen")) {
+                        return coder.clone();
+                    }
+                    return installed_names[0].clone();
+                }
+            }
+        }
+    }
+    requested.to_string()
+}
+
+fn apply_targeted_edit(content: &str, target: &str, replacement: &str) -> Result<String, String> {
+    let target_trimmed = target.trim();
+    if target_trimmed.is_empty() {
+        return Err("Target block is empty".to_string());
+    }
+
+    // 1. Try exact match
+    let exact_matches: Vec<_> = content.match_indices(target).collect();
+    if exact_matches.len() == 1 {
+        return Ok(content.replace(target, replacement));
+    } else if exact_matches.len() > 1 {
+        return Err(format!("Target block is duplicated ({}) in file. It must be unique.", exact_matches.len()));
+    }
+
+    // 2. Try trimmed match
+    let trimmed_matches: Vec<_> = content.match_indices(target_trimmed).collect();
+    if trimmed_matches.len() == 1 {
+        return Ok(content.replace(target_trimmed, replacement.trim()));
+    } else if trimmed_matches.len() > 1 {
+        return Err(format!("Trimmed target block is duplicated ({}) in file.", trimmed_matches.len()));
+    }
+
+    // 3. Whitespace-collapsed / normalized search
+    // Extract non-whitespace characters from target and match against content character positions
+    let target_chars: Vec<char> = target.chars().filter(|c| !c.is_whitespace()).collect();
+    if !target_chars.is_empty() {
+        let content_chars: Vec<(usize, char)> = content.char_indices().collect();
+        let n = content_chars.len();
+        let m = target_chars.len();
+        let mut matches_found = Vec::new();
+
+        for i in 0..n {
+            if content_chars[i].1.is_whitespace() {
+                continue;
+            }
+            let mut target_idx = 0;
+            let mut j = i;
+            while j < n && target_idx < m {
+                let ch = content_chars[j].1;
+                if ch.is_whitespace() {
+                    j += 1;
+                    continue;
+                }
+                if ch == target_chars[target_idx] {
+                    target_idx += 1;
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if target_idx == m && j > 0 {
+                let start_byte = content_chars[i].0;
+                let end_byte = content_chars[j - 1].0 + content_chars[j - 1].1.len_utf8();
+                matches_found.push((start_byte, end_byte));
+            }
+        }
+
+        if matches_found.len() == 1 {
+            let (start, end) = matches_found[0];
+            let mut result = String::with_capacity(content.len() + replacement.len());
+            result.push_str(&content[..start]);
+            result.push_str(replacement);
+            result.push_str(&content[end..]);
+            return Ok(result);
+        } else if matches_found.len() > 1 {
+            return Err(format!("Normalized target matches multiple ({}) places in file.", matches_found.len()));
+        }
+    }
+
+    // 4. Line-trimmed sliding window match
+    let target_lines: Vec<&str> = target.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+    if !target_lines.is_empty() {
+        let content_lines: Vec<&str> = content.lines().collect();
+        let mut line_matches = Vec::new();
+
+        for i in 0..=content_lines.len().saturating_sub(target_lines.len()) {
+            let mut matched = true;
+            for (k, t_line) in target_lines.iter().enumerate() {
+                if content_lines[i + k].trim() != *t_line {
+                    matched = false;
+                    break;
+                }
+            }
+            if matched {
+                line_matches.push(i);
+            }
+        }
+
+        if line_matches.len() == 1 {
+            let match_line_idx = line_matches[0];
+            let lines_before: String = content_lines[..match_line_idx].join("\n");
+            let prefix = if lines_before.is_empty() { String::new() } else { format!("{}\n", lines_before) };
+            let lines_after: String = content_lines[match_line_idx + target_lines.len()..].join("\n");
+            let suffix = if lines_after.is_empty() { String::new() } else { format!("\n{}", lines_after) };
+            return Ok(format!("{}{}{}", prefix, replacement, suffix));
+        }
+    }
+
+    Err(format!("Target code block not found in file: {:?}", target))
+}
+
 #[tauri::command]
 async fn editor_ai_edit(
     file_path: String,
@@ -3020,9 +3338,10 @@ async fn editor_ai_edit(
     visual_context: Option<Value>,
 ) -> Result<AIEditResult, String> {
     let client = reqwest::Client::new();
-    let model = model_id.unwrap_or_else(|| "qwen2.5-coder:7b".to_string());
+    let initial_model = model_id.unwrap_or_else(|| "qwen2.5-coder:7b".to_string());
+    let model = resolve_valid_ollama_model(&client, &initial_model).await;
     
-    let system_prompt = "You are an expert developer assistant helping the user edit a source code file. \
+    let mut system_prompt = "You are an expert developer assistant helping the user edit a source code file. \
         Instead of rewriting the entire file, you must identify the exact lines that need to change and provide a list of target replacements in JSON format. \
         \n\n\
         CRITICAL RULES:\n\
@@ -3041,6 +3360,11 @@ async fn editor_ai_edit(
             }\n\
           ]\n\
         }".to_string();
+
+    let rulepacks = get_stack_rulepacks(&file_path, &content, None);
+    if !rulepacks.is_empty() {
+        system_prompt.push_str(&rulepacks);
+    }
     
     let mut user_prompt = format!(
         "Original File Path: {}\n\
@@ -3140,51 +3464,56 @@ async fn editor_ai_edit(
                         
                         let mut parsed_ok = false;
                         let mut final_content = content.clone();
+                        let mut fail_reason = String::new();
                         
+                        let is_json_response = clean_content.trim().starts_with('{') 
+                            && (clean_content.contains("\"edits\"") || clean_content.contains("\"explanation\""));
+
                         if let Ok(parsed_json) = serde_json::from_str::<Value>(&clean_content) {
                             if let Some(edits) = parsed_json.get("edits").and_then(|e| e.as_array()) {
                                 if !edits.is_empty() {
                                     let mut temp_content = content.clone();
                                     let mut apply_failed = false;
-                                    let mut fail_reason = String::new();
                                     
                                     for edit in edits {
                                         let target = edit.get("target").and_then(|t| t.as_str()).unwrap_or("");
                                         let replacement = edit.get("replacement").and_then(|r| r.as_str()).unwrap_or("");
                                         
-                                        if target.is_empty() {
-                                            apply_failed = true;
-                                            fail_reason = "Edit target is empty".to_string();
-                                            break;
+                                        match apply_targeted_edit(&temp_content, target, replacement) {
+                                            Ok(modified) => {
+                                                temp_content = modified;
+                                            }
+                                            Err(err) => {
+                                                apply_failed = true;
+                                                fail_reason = err;
+                                                break;
+                                            }
                                         }
-                                        
-                                        let occurrences: Vec<_> = temp_content.match_indices(target).collect();
-                                        if occurrences.is_empty() {
-                                            apply_failed = true;
-                                            fail_reason = format!("Target code block not found in file: {:?}", target);
-                                            break;
-                                        } else if occurrences.len() > 1 {
-                                            apply_failed = true;
-                                            fail_reason = format!("Target code block is duplicated ({}) in file. It must be unique.", occurrences.len());
-                                            break;
-                                        }
-                                        
-                                        temp_content = temp_content.replace(target, replacement);
                                     }
                                     
                                     if !apply_failed {
                                         final_content = temp_content;
                                         parsed_ok = true;
                                     } else {
-                                        debug_log_to_file(format!("[AI Edit] Targeted edit apply failed (falling back to full replacement): {}", fail_reason));
+                                        debug_log_to_file(format!("[AI Edit] Targeted edit apply failed: {}", fail_reason));
                                     }
                                 }
                             }
                         }
                         
                         if !parsed_ok {
-                            debug_log_to_file("[AI Edit] Falling back to treating model output as full file content.".to_string());
-                            final_content = clean_content;
+                            if is_json_response {
+                                // CRITICAL SAFETY GUARD: Never dump raw JSON edit structures onto a source code file!
+                                debug_log_to_file(format!("[AI Edit] Model returned JSON edits but target code could not be matched: {}", fail_reason));
+                                return Ok(AIEditResult {
+                                    success: false,
+                                    new_content: None,
+                                    error: Some(format!("AI model generated targeted edit JSON, but the target code was not matched in the file: {}", fail_reason)),
+                                });
+                            } else {
+                                debug_log_to_file("[AI Edit] Falling back to treating model output as full file content.".to_string());
+                                final_content = clean_content;
+                            }
                         }
                         
                         return Ok(AIEditResult {
@@ -3200,10 +3529,17 @@ async fn editor_ai_edit(
                     error: Some("Ollama returned an empty response".to_string()),
                 })
             } else {
+                let status_code = resp.status();
+                let err_body = resp.text().await.unwrap_or_default();
+                let clean_msg = if let Ok(err_json) = serde_json::from_str::<Value>(&err_body) {
+                    err_json.get("error").and_then(|e| e.as_str()).unwrap_or(&err_body).to_string()
+                } else {
+                    err_body
+                };
                 Ok(AIEditResult {
                     success: false,
                     new_content: None,
-                    error: Some(format!("Ollama HTTP Error: {}", resp.status())),
+                    error: Some(format!("Ollama Error ({}): {}", status_code, clean_msg)),
                 })
             }
         }
@@ -3233,7 +3569,8 @@ async fn editor_ai_project_edit(
     model_id: Option<String>,
 ) -> Result<ProjectEditResult, String> {
     let client = reqwest::Client::new();
-    let model = model_id.unwrap_or_else(|| "qwen2.5-coder:7b".to_string());
+    let initial_model = model_id.unwrap_or_else(|| "qwen2.5-coder:7b".to_string());
+    let model = resolve_valid_ollama_model(&client, &initial_model).await;
     let proj_dir = get_project_path(&project_id);
     
     if !proj_dir.exists() {
@@ -4213,6 +4550,17 @@ async fn server_start(
         proj_dir = proj_dir.join("src");
     }
     
+    // Ensure Axiom Live Visual Inspector is present in layout files for visual editing mode
+    ensure_axiom_inspector_injected(&proj_dir);
+
+    // Ensure tsconfig.json is valid and not corrupted
+    ensure_valid_tsconfig(&proj_dir);
+
+    // Auto-resolve route collisions between Pages Router and App Router
+    if proj_dir.join("src/app/api").exists() && proj_dir.join("src/pages/api").exists() {
+        let _ = std::fs::remove_dir_all(proj_dir.join("src/pages/api"));
+    }
+    
     // Auto-install dependencies if node_modules is missing or incomplete
     let node_modules_dir = proj_dir.join("node_modules");
     let mut needs_install = !node_modules_dir.exists();
@@ -4441,6 +4789,176 @@ fn resolve_import_path(proj_dir: &std::path::Path, import_path: &str, current_fi
     None
 }
 
+/// Cleans CLI output for the LLM: removes real ANSI escape sequences (via the existing
+/// `strip_ansi_codes`) and also bare leftovers whose ESC byte was lost (e.g. `[0m`).
+fn clean_cli_output_for_llm(input: &str) -> String {
+    let without_esc = strip_ansi_codes(input);
+    match regex::Regex::new(r"\[[0-9;]+m") {
+        Ok(re) => re.replace_all(&without_esc, "").to_string(),
+        Err(_) => without_esc,
+    }
+}
+
+/// Extracts the exact schema lines referenced by Prisma CLI errors (`schema.prisma:31`)
+/// and returns them as `Line N: <content>` so a small model gets a focused target.
+fn extract_prisma_error_lines(error_log: &str, schema_content: &str) -> String {
+    let re = match regex::Regex::new(r"schema\.prisma:(\d+)") {
+        Ok(r) => r,
+        Err(_) => return String::new(),
+    };
+    let schema_lines: Vec<&str> = schema_content.lines().collect();
+    let mut seen: Vec<usize> = Vec::new();
+    let mut out = String::new();
+    for cap in re.captures_iter(error_log) {
+        if let Some(n) = cap.get(1).and_then(|m| m.as_str().parse::<usize>().ok()) {
+            if n == 0 || seen.contains(&n) {
+                continue;
+            }
+            seen.push(n);
+            if let Some(line) = schema_lines.get(n - 1) {
+                out.push_str(&format!("Line {}: {}\n", n, line.trim_end()));
+            }
+        }
+    }
+    out
+}
+
+/// Finds a top-level Prisma block (`model X { ... }`, `enum X { ... }`) and returns its
+/// byte range `[start, end)` including the closing brace.
+fn find_prisma_block(schema: &str, kind: &str, name: &str) -> Option<(usize, usize)> {
+    let pattern = format!(r"(?m)^[ \t]*{}[ \t]+{}[ \t]*\{{", kind, regex::escape(name));
+    let re = regex::Regex::new(&pattern).ok()?;
+    let m = re.find(schema)?;
+    let rest = &schema[m.end()..];
+
+    // Prefer a closing brace on its own line (robust against `{}` inside defaults)
+    let mut offset = 0usize;
+    for line in rest.split_inclusive('\n') {
+        if line.trim() == "}" {
+            if let Some(brace_idx) = line.find('}') {
+                return Some((m.start(), m.end() + offset + brace_idx + 1));
+            }
+        }
+        offset += line.len();
+    }
+    let close_rel = rest.find('}')?;
+    Some((m.start(), m.end() + close_rel + 1))
+}
+
+/// Replaces NextAuth `Account` / `Session` models with the canonical Prisma Adapter
+/// definitions (including `@@unique([provider, providerAccountId])`) and makes sure the
+/// `User` model has the matching back-relation fields. Only applies when the models look
+/// like NextAuth models and a `User` model exists. Provider-agnostic (no `@db.Text`),
+/// so it stays valid after the SQLite fallback.
+fn apply_nextauth_prisma_template(schema: &str) -> String {
+    let (us, ue) = match find_prisma_block(schema, "model", "User") {
+        Some(b) => b,
+        None => return schema.to_string(),
+    };
+
+    // Foreign keys must match the type of User.id (String / Int / BigInt)
+    let mut user_id_type = "String".to_string();
+    for line in schema[us..ue].lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 2 && parts[0] == "id" {
+            user_id_type = parts[1].trim_end_matches('?').to_string();
+            break;
+        }
+    }
+
+    let account_tpl = format!(
+        "model Account {{\n  id                String  @id @default(cuid())\n  userId            {t}\n  type              String\n  provider          String\n  providerAccountId String\n  refresh_token     String?\n  access_token      String?\n  expires_at        Int?\n  token_type        String?\n  scope             String?\n  id_token          String?\n  session_state     String?\n  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)\n\n  @@unique([provider, providerAccountId])\n}}",
+        t = user_id_type
+    );
+    let session_tpl = format!(
+        "model Session {{\n  id           String   @id @default(cuid())\n  sessionToken String   @unique\n  userId       {t}\n  expires      DateTime\n  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)\n}}",
+        t = user_id_type
+    );
+
+    let mut out = schema.to_string();
+    let mut needs_accounts = false;
+    let mut needs_sessions = false;
+
+    if let Some((s, e)) = find_prisma_block(&out, "model", "Account") {
+        if out[s..e].contains("providerAccountId") {
+            out.replace_range(s..e, &account_tpl);
+            needs_accounts = true;
+        }
+    }
+    if let Some((s, e)) = find_prisma_block(&out, "model", "Session") {
+        if out[s..e].contains("sessionToken") {
+            out.replace_range(s..e, &session_tpl);
+            needs_sessions = true;
+        }
+    }
+
+    if needs_accounts || needs_sessions {
+        if let Some((s, e)) = find_prisma_block(&out, "model", "User") {
+            let block = out[s..e].to_string();
+            let has_field_of_type = |ty: &str| {
+                block.lines().any(|l| {
+                    let p: Vec<&str> = l.split_whitespace().collect();
+                    p.len() >= 2 && p[1] == ty
+                })
+            };
+
+            let mut inserts = String::new();
+            if needs_accounts && !has_field_of_type("Account[]") {
+                inserts.push_str("  accounts      Account[]\n");
+            }
+            if needs_sessions && !has_field_of_type("Session[]") {
+                inserts.push_str("  sessions      Session[]\n");
+            }
+
+            if !inserts.is_empty() {
+                // Insert before the first block attribute (@@...) or before the closing brace
+                let mut insert_at: Option<usize> = None;
+                let mut offset = 0usize;
+                for line in block.split_inclusive('\n') {
+                    if line.trim_start().starts_with("@@") {
+                        insert_at = Some(offset);
+                        break;
+                    }
+                    offset += line.len();
+                }
+                let mut new_block = block.clone();
+                match insert_at {
+                    Some(pos) => new_block.insert_str(pos, &inserts),
+                    None => {
+                        if let Some(close) = new_block.rfind('}') {
+                            let prefix_ends_with_newline = new_block[..close].ends_with('\n');
+                            let to_insert = if prefix_ends_with_newline {
+                                inserts.clone()
+                            } else {
+                                format!("\n{}", inserts)
+                            };
+                            new_block.insert_str(close, &to_insert);
+                        }
+                    }
+                }
+                out.replace_range(s..e, &new_block);
+            }
+        }
+    }
+
+    out
+}
+
+/// Runs the deterministic schema.prisma sanitizer on the file on disk.
+/// Returns `true` if the file was changed.
+fn sanitize_prisma_schema_on_disk(schema_path: &std::path::Path) -> bool {
+    if let Ok(current) = std::fs::read_to_string(schema_path) {
+        if current.trim().is_empty() {
+            return false;
+        }
+        let fixed = post_process_generated_file("prisma/schema.prisma", &current, &serde_json::json!({}), false);
+        if !fixed.trim().is_empty() && fixed.replace("\r\n", "\n").trim() != current.replace("\r\n", "\n").trim() {
+            return std::fs::write(schema_path, &fixed).is_ok();
+        }
+    }
+    false
+}
+
 async fn heal_prisma_schema_loop(
     proj_dir: &std::path::Path,
     window: &tauri::Window,
@@ -4455,9 +4973,29 @@ async fn heal_prisma_schema_loop(
         return Ok(()); // No schema, nothing to heal
     };
 
-    for attempt in 1..=3 {
+    // (1) Deterministic pre-pass: fix known schema mistakes without the LLM
+    if sanitize_prisma_schema_on_disk(&schema_path) {
         let _ = window.emit(log_channel, serde_json::json!({
-            "text": format!("> [Prisma Validator] Provera i generisanje Prisma klijenta (pokušaj {}/3)...\n", attempt),
+            "text": "> [Prisma Validator] Deterministički popravljač je ispravio poznate greške u schema.prisma (pre AI-ja).\n",
+            "type": "info"
+        }));
+    }
+
+    const MAX_AI_HEALS: u32 = 3;
+    let total_checks = MAX_AI_HEALS + 1;
+    let mut previous_ai_unchanged = false;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let resolved_model = resolve_valid_ollama_model(&client, model_id).await;
+
+    // (4) attempt 0..=MAX_AI_HEALS -> the schema is re-validated after EVERY AI heal,
+    // including the last one.
+    for attempt in 0..=MAX_AI_HEALS {
+        let _ = window.emit(log_channel, serde_json::json!({
+            "text": format!("> [Prisma Validator] Provera i generisanje Prisma klijenta (provera {}/{})...\n", attempt + 1, total_checks),
             "type": "info"
         }));
 
@@ -4476,12 +5014,12 @@ async fn heal_prisma_schema_loop(
             prisma_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         }
 
-        let output_res = prisma_cmd.output().await;
-        let output = match output_res {
+        // Disable colored output at the source as well
+        prisma_cmd.env("NO_COLOR", "1").env("FORCE_COLOR", "0");
+
+        let output = match prisma_cmd.output().await {
             Ok(o) => o,
-            Err(e) => {
-                return Err(format!("Failed to execute prisma generate: {}", e));
-            }
+            Err(e) => return Err(format!("Failed to execute prisma generate: {}", e)),
         };
 
         if output.status.success() {
@@ -4492,80 +5030,128 @@ async fn heal_prisma_schema_loop(
             return Ok(());
         }
 
-        let stdout_str = String::from_utf8_lossy(&output.stdout);
-        let stderr_str = String::from_utf8_lossy(&output.stderr);
-        let error_log = format!("{}\n{}", stdout_str, stderr_str);
+        // (2) Clean ANSI escape codes before logging / sending to the model
+        let error_log = clean_cli_output_for_llm(&format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
 
         let _ = window.emit(log_channel, serde_json::json!({
             "text": format!("> [Prisma Validator] Greška pri generisanju:\n{}\n", error_log),
             "type": "error"
         }));
 
-        if schema_path.exists() {
-            if let Ok(schema_content) = std::fs::read_to_string(&schema_path) {
-                let _ = window.emit(log_channel, serde_json::json!({
-                    "text": format!("> [Prisma Validator] Započinjem AI auto-healing za schema.prisma (pokušaj {}/3)...\n", attempt),
-                    "type": "info"
-                }));
+        if attempt == MAX_AI_HEALS {
+            break;
+        }
 
-                let client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(60))
-                    .build()
-                    .unwrap_or_else(|_| reqwest::Client::new());
+        let schema_content = match std::fs::read_to_string(&schema_path) {
+            Ok(c) => c,
+            Err(_) => break,
+        };
 
-                let system_prompt = "You are an expert database administrator and Prisma specialist. \
-                    The prisma generate command failed with syntax or validation errors. \
-                    Review the schema.prisma content and the error log. Correct the schema.prisma file to fix the validation errors. \
-                    Strictly follow Prisma Schema language rules: \
-                    1. Optional/nullable relation fields must only have ? on their type (e.g. password String? but NOT password? String?). \
-                    2. In relations, ensure fields (like userId) are explicitly declared in the model (e.g. userId String) and matches the relation fields parameter. \
-                    3. Do not use @db.Json native type annotation on String[] fields. Use standard Prisma types. \
-                    4. The @relation attribute (e.g. `@relation(fields: [userId], references: [id])`) MUST ONLY be placed on relational object fields (like `user User`), never on scalar fields (like `userId String`). Placing @relation on a scalar field will throw an 'Invalid field type, not a relation' error. \
-                    5. For NextAuth schema, the VerificationToken model does not have a direct relation back to the User model; do not define a verificationTokens relation field on the User model. \
-                    Respond ONLY with the complete corrected schema.prisma contents. Do not include any explanations, introduction, or markdown code blocks.";
+        let _ = window.emit(log_channel, serde_json::json!({
+            "text": format!("> [Prisma Validator] Započinjem AI auto-healing za schema.prisma (pokušaj {}/{})...\n", attempt + 1, MAX_AI_HEALS),
+            "type": "info"
+        }));
 
-                let user_prompt = format!(
-                    "Prisma CLI error log:\n{}\n\nCurrent schema.prisma content:\n{}\n\nPlease provide the complete corrected schema.prisma code.",
-                    error_log, schema_content
-                );
+        let failing_lines = extract_prisma_error_lines(&error_log, &schema_content);
 
-                let ollama_req = serde_json::json!({
-                    "model": model_id,
-                    "messages": [
-                        { "role": "system", "content": system_prompt },
-                        { "role": "user", "content": user_prompt }
-                    ],
-                    "stream": false,
-                    "options": {
-                        "temperature": 0.1
-                    }
-                });
+        let system_prompt = "You are an expert database administrator and Prisma specialist. \
+            The prisma generate command failed with syntax or validation errors. \
+            Review the schema.prisma content and the error log. Correct the schema.prisma file to fix the validation errors. \
+            Strictly follow Prisma Schema language rules: \
+            1. Optional/nullable relation fields must only have ? on their type (e.g. password String? but NOT password? String?). \
+            2. In relations, ensure fields (like userId) are explicitly declared in the model (e.g. userId String) and matches the relation fields parameter. \
+            3. Do not use @db.Json native type annotation on String[] fields. Use standard Prisma types. \
+            4. The @relation attribute (e.g. `@relation(fields: [userId], references: [id])`) MUST ONLY be placed on relational object fields (like `user User`), never on scalar fields (like `userId String`). Placing @relation on a scalar field will throw an 'Invalid field type, not a relation' error. \
+            5. For NextAuth schema, the VerificationToken model does not have a direct relation back to the User model; do not define a verificationTokens relation field on the User model. \
+            6. Every relation needs an opposite field on the other model (e.g. `user User @relation(...)` on the child and `accounts Account[]` on User). \
+            Respond ONLY with the complete corrected schema.prisma contents. Do not include any explanations, introduction, or markdown code blocks.";
 
-                if let Ok(resp) = client.post("http://127.0.0.1:11434/api/chat")
-                    .json(&ollama_req)
-                    .send()
-                    .await 
-                {
-                    if resp.status().is_success() {
-                        if let Ok(resp_json) = resp.json::<Value>().await {
-                            if let Some(content) = resp_json.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
-                                let cleaned = extract_code_content(content);
-                                if !cleaned.trim().is_empty() {
-                                    let _ = std::fs::write(&schema_path, &cleaned);
-                                    let _ = window.emit(log_channel, serde_json::json!({
-                                        "text": "> [Prisma Validator] schema.prisma uspešno ažuriran sa AI predlogom. Ponovo testiram...\n",
-                                        "type": "info"
-                                    }));
-                                }
-                            }
+        let mut user_prompt = format!(
+            "Prisma CLI error log:\n{}\n\nCurrent schema.prisma content:\n{}\n",
+            error_log, schema_content
+        );
+        if !failing_lines.is_empty() {
+            user_prompt.push_str(&format!(
+                "\nThe errors point to these exact lines. You MUST change them:\n{}",
+                failing_lines
+            ));
+        }
+        // (3) If the previous answer did not change anything, escalate the instruction
+        if previous_ai_unchanged {
+            user_prompt.push_str(
+                "\nIMPORTANT: Your previous answer returned the schema UNCHANGED and the same errors remained. \
+                 Do not repeat it. Edit the failing lines listed above so the error disappears \
+                 (for example, remove an @relation attribute from a scalar field).\n",
+            );
+        }
+        user_prompt.push_str("\nPlease provide the complete corrected schema.prisma code.");
+
+        let ollama_req = serde_json::json!({
+            "model": resolved_model,
+            "messages": [
+                { "role": "system", "content": system_prompt },
+                { "role": "user", "content": user_prompt }
+            ],
+            "stream": false,
+            "options": {
+                "temperature": if previous_ai_unchanged { 0.4 } else { 0.1 }
+            }
+        });
+
+        let mut ai_content: Option<String> = None;
+        match client.post("http://127.0.0.1:11434/api/chat").json(&ollama_req).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(resp_json) = resp.json::<Value>().await {
+                    if let Some(content) = resp_json.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
+                        let cleaned = extract_code_content(content);
+                        if !cleaned.trim().is_empty() {
+                            ai_content = Some(cleaned);
                         }
                     }
                 }
             }
+            Ok(resp) => {
+                debug_log_to_file(format!("[Prisma Validator] Ollama returned HTTP {}", resp.status()));
+            }
+            Err(e) => {
+                debug_log_to_file(format!("[Prisma Validator] Ollama request failed: {}", e));
+            }
+        }
+
+        match ai_content {
+            Some(cleaned) => {
+                // (1) Never write raw LLM output: run it through the deterministic sanitizer first
+                let sanitized = post_process_generated_file("prisma/schema.prisma", &cleaned, &serde_json::json!({}), false);
+                let unchanged = sanitized.replace("\r\n", "\n").trim() == schema_content.replace("\r\n", "\n").trim();
+                if unchanged {
+                    previous_ai_unchanged = true;
+                    let _ = window.emit(log_channel, serde_json::json!({
+                        "text": "> [Prisma Validator] AI je vratio identičnu šemu. Sledeći pokušaj koristi ciljani prompt sa tačnim linijama greške.\n",
+                        "type": "warning"
+                    }));
+                } else {
+                    previous_ai_unchanged = false;
+                    let _ = std::fs::write(&schema_path, &sanitized);
+                    let _ = window.emit(log_channel, serde_json::json!({
+                        "text": "> [Prisma Validator] schema.prisma ažuriran (AI predlog + deterministički popravljač). Ponovo testiram...\n",
+                        "type": "info"
+                    }));
+                }
+            }
+            None => {
+                let _ = window.emit(log_channel, serde_json::json!({
+                    "text": format!("> [Prisma Validator] AI model '{}' nije vratio upotrebljiv odgovor.\n", resolved_model),
+                    "type": "warning"
+                }));
+            }
         }
     }
 
-    Err("Failed to validate and auto-heal Prisma schema after 3 attempts.".to_string())
+    Err(format!("Failed to validate and auto-heal Prisma schema after {} AI attempts.", MAX_AI_HEALS))
 }
 
 #[tauri::command]
@@ -4621,6 +5207,8 @@ async fn project_heal_compile_error(
         4. Focus only on resolving the reported error. Do not make unrelated changes.\n\
         5. DATABASE RESILIENCY: If a database query (like a Prisma call `findMany`) throws a database connection error, wrap the query in try-catch and fall back to returning a mock array containing 10 realistic mockup items so the application remains previewable even if the database server is offline.\n\
         6. NEVER declare, use, or destructure 'data-axiom-component' or 'data-axiom-file' props in React components or TypeScript interfaces/types. These are automatically injected during compilation post-processing, and manual declaration will cause syntax errors.\n\
+        7. STRICT UI & DESIGN PRESERVATION: NEVER delete or strip UI components, hero sections, product grids, forms, tables, or buttons to bypass a compilation error. Fix the underlying TypeScript, import, export, or syntax error in place. The page richness and intent MUST remain 100% intact.\n\
+        8. MANDATORY TAILWIND CSS: All JSX elements MUST continue to use comprehensive Tailwind CSS utility classes. NEVER degrade styled elements into raw, unstyled HTML.\n\
         \n\n\
         JSON FORMAT:\n\
         {\n\
@@ -4633,24 +5221,43 @@ async fn project_heal_compile_error(
           ]\n\
         }".to_string();
     system_prompt.push_str(&get_packages_db_summary());
-
-    let features_path = proj_dir.join("axiom-features.json");
-    let mut project_context = String::new();
-    if features_path.exists() {
-        if let Ok(features_content) = std::fs::read_to_string(&features_path) {
-            project_context.push_str(&format!(
-                "\n\n--- Project Structure & Features (axiom-features.json) ---\n{}\n-----------------------------------------------------------\n",
-                features_content
-            ));
-        }
+    let rulepacks = get_stack_rulepacks(&file_path, &file_content, Some(&error_msg));
+    if !rulepacks.is_empty() {
+        system_prompt.push_str(&rulepacks);
     }
 
-    let metadata_path = proj_dir.join(".axiom").join("metadata.json");
     let rel_file_path = if let Ok(stripped) = std::path::Path::new(&file_path).strip_prefix(&proj_dir) {
         stripped.to_str().unwrap_or("").replace('\\', "/")
     } else {
         file_path.replace('\\', "/")
     };
+
+    let mut project_context = String::new();
+    let features_path = proj_dir.join("axiom-features.json");
+    if features_path.exists() {
+        if let Ok(features_content) = std::fs::read_to_string(&features_path) {
+            if let Ok(features_json) = serde_json::from_str::<serde_json::Value>(&features_content) {
+                if let Some(feat_arr) = features_json.get("features").and_then(|f| f.as_array()) {
+                    for feat in feat_arr {
+                        if let Some(files) = feat.get("files").and_then(|fl| fl.as_array()) {
+                            let matches = files.iter().any(|f| f.get("path").and_then(|p| p.as_str()) == Some(&rel_file_path));
+                            if matches {
+                                let feat_name = feat.get("name").and_then(|n| n.as_str()).unwrap_or("Feature");
+                                let feat_desc = feat.get("description").and_then(|d| d.as_str()).unwrap_or("");
+                                project_context.push_str(&format!(
+                                    "\n--- Target Feature Scope: {} ---\nRole: {}\n---------------------------------\n",
+                                    feat_name, feat_desc
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let metadata_path = proj_dir.join(".axiom").join("metadata.json");
 
     if metadata_path.exists() {
         if let Ok(meta_content) = std::fs::read_to_string(&metadata_path) {
@@ -4759,47 +5366,60 @@ async fn project_heal_compile_error(
                         debug_log_to_file(format!("[AI Auto-Healing] Raw AI response:\n{}", ai_msg));
                         let clean_content = extract_code_content(ai_msg);
                         
-                        // Parse as JSON
-                        let parsed_json: serde_json::Value = match serde_json::from_str(&clean_content) {
-                            Ok(val) => val,
-                            Err(e) => {
-                                // Try to extract JSON if it was wrapped in some other text
+                        let mut resolved_edits = Vec::new();
+                        let mut explanation = "Popravka generisana od strane AI modela".to_string();
+
+                        // Try parsing as JSON first
+                        let maybe_json: Option<serde_json::Value> = serde_json::from_str(&clean_content).ok()
+                            .or_else(|| {
                                 if let Some(start_json) = clean_content.find('{') {
                                     if let Some(end_json) = clean_content.rfind('}') {
                                         let json_str = &clean_content[start_json..=end_json];
-                                        serde_json::from_str(json_str).map_err(|err| {
-                                            let err_msg = format!("Model did not return valid JSON. Error: {}. Response: {}", err, clean_content);
-                                            debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
-                                            err_msg
-                                        })?
+                                        serde_json::from_str(json_str).ok()
                                     } else {
-                                        let err_msg = format!("Model did not return valid JSON. Error: {}", e);
-                                        debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
-                                        return Err(err_msg);
+                                        None
                                     }
                                 } else {
-                                    let err_msg = format!("Model did not return valid JSON. Error: {}", e);
-                                    debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
-                                    return Err(err_msg);
+                                    None
+                                }
+                            });
+
+                        if let Some(ref parsed_json) = maybe_json {
+                            if let Some(exp) = parsed_json.get("explanation").and_then(|e| e.as_str()) {
+                                explanation = exp.to_string();
+                            }
+
+                            // Fallback 1: features -> files -> content
+                            if let Some(features) = parsed_json.get("features").and_then(|f| f.as_array()) {
+                                for feature in features {
+                                    if let Some(files) = feature.get("files").and_then(|f| f.as_array()) {
+                                        for file in files {
+                                            if let (Some(path), Some(content)) = (file.get("path").and_then(|p| p.as_str()), file.get("content").and_then(|c| c.as_str())) {
+                                                let target_full_path = proj_dir.join(path);
+                                                if target_full_path.exists() {
+                                                    if let Ok(orig) = std::fs::read_to_string(&target_full_path) {
+                                                        resolved_edits.push(serde_json::json!({
+                                                            "path": path,
+                                                            "target": orig,
+                                                            "replacement": content
+                                                        }));
+                                                    }
+                                                } else {
+                                                    resolved_edits.push(serde_json::json!({
+                                                        "path": path,
+                                                        "target": "",
+                                                        "replacement": content
+                                                    }));
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
-                        };
 
-                        let explanation = parsed_json.get("explanation")
-                            .and_then(|e| e.as_str())
-                            .unwrap_or("No explanation provided");
-                        
-                        let _ = window.emit("server:log", serde_json::json!({
-                            "text": format!("> [AI Auto-Healing] AI analiza: {}\n", explanation),
-                            "type": "info"
-                        }));
-
-                        let mut resolved_edits = Vec::new();
-
-                        // Fallback 1: features -> files -> content
-                        if let Some(features) = parsed_json.get("features").and_then(|f| f.as_array()) {
-                            for feature in features {
-                                if let Some(files) = feature.get("files").and_then(|f| f.as_array()) {
+                            // Fallback 2: files -> content
+                            if resolved_edits.is_empty() {
+                                if let Some(files) = parsed_json.get("files").and_then(|f| f.as_array()) {
                                     for file in files {
                                         if let (Some(path), Some(content)) = (file.get("path").and_then(|p| p.as_str()), file.get("content").and_then(|c| c.as_str())) {
                                             let target_full_path = proj_dir.join(path);
@@ -4822,46 +5442,52 @@ async fn project_heal_compile_error(
                                     }
                                 }
                             }
-                        }
 
-                        // Fallback 2: files -> content
-                        if resolved_edits.is_empty() {
-                            if let Some(files) = parsed_json.get("files").and_then(|f| f.as_array()) {
-                                for file in files {
-                                    if let (Some(path), Some(content)) = (file.get("path").and_then(|p| p.as_str()), file.get("content").and_then(|c| c.as_str())) {
-                                        let target_full_path = proj_dir.join(path);
-                                        if target_full_path.exists() {
-                                            if let Ok(orig) = std::fs::read_to_string(&target_full_path) {
-                                                resolved_edits.push(serde_json::json!({
-                                                    "path": path,
-                                                    "target": orig,
-                                                    "replacement": content
-                                                }));
-                                            }
-                                        } else {
-                                            resolved_edits.push(serde_json::json!({
-                                                "path": path,
-                                                "target": "",
-                                                "replacement": content
-                                            }));
-                                        }
-                                    }
+                            // Standard path: edits
+                            if resolved_edits.is_empty() {
+                                if let Some(edits) = parsed_json.get("edits").and_then(|e| e.as_array()) {
+                                    resolved_edits = edits.clone();
                                 }
                             }
                         }
 
-                        // Standard path: edits
+                        // Whole-File Code Fallback: If no valid JSON edits were resolved, but clean_content contains code
                         if resolved_edits.is_empty() {
-                            if let Some(edits) = parsed_json.get("edits").and_then(|e| e.as_array()) {
-                                resolved_edits = edits.clone();
+                            let looks_like_code = clean_content.contains("import ") 
+                                || clean_content.contains("export ") 
+                                || clean_content.contains("const ") 
+                                || clean_content.contains("function ") 
+                                || clean_content.contains("class ") 
+                                || clean_content.contains("interface ") 
+                                || clean_content.contains("type ") 
+                                || clean_content.contains("return ") 
+                                || clean_content.contains("<");
+
+                            if looks_like_code && !clean_content.trim().is_empty() {
+                                debug_log_to_file(format!("[AI Auto-Healing] Whole-file code fallback activated for: {}", rel_file_path));
+                                let _ = window.emit("server:log", serde_json::json!({
+                                    "text": format!("> [AI Auto-Healing] Prepoznat direktan kod celog fajla (Whole-File Fallback). Primenjujem na: {}\n", rel_file_path),
+                                    "type": "info"
+                                }));
+                                resolved_edits.push(serde_json::json!({
+                                    "path": rel_file_path.clone(),
+                                    "target": "",
+                                    "replacement": clean_content
+                                }));
+                                explanation = "Primenjen kompletan popravljen kod iz AI odgovora".to_string();
                             }
                         }
 
                         if resolved_edits.is_empty() {
-                            let err_msg = "JSON does not contain any valid 'edits', 'features' or 'files' keys to apply.".to_string();
+                            let err_msg = "Model response could not be parsed as targeted JSON edits or valid whole-file code replacement.".to_string();
                             debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
                             return Err(err_msg);
                         }
+
+                        let _ = window.emit("server:log", serde_json::json!({
+                            "text": format!("> [AI Auto-Healing] AI analiza: {}\n", explanation),
+                            "type": "info"
+                        }));
 
                         let edits = resolved_edits;
 
@@ -4912,25 +5538,16 @@ async fn project_heal_compile_error(
                             if target.is_empty() {
                                 *file_content_mut = replacement.to_string();
                             } else {
-                                // Check that the target substring exists exactly once in the file content
-                                let occurrences: Vec<_> = file_content_mut.match_indices(target).collect();
-                                if occurrences.is_empty() {
-                                    let err_msg = format!(
-                                        "Greška pri primeni ispravke u fajlu {}: Target kod nije pronađen. Target: {:?}",
-                                        edit_path, target
-                                    );
-                                    debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
-                                    return Err(err_msg);
-                                } else if occurrences.len() > 1 {
-                                    let err_msg = format!(
-                                        "Greška pri primeni ispravke u fajlu {}: Target kod je dupliran ({}) u fajlu. Target mora biti jedinstven. Target: {:?}",
-                                        edit_path, occurrences.len(), target
-                                    );
-                                    debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
-                                    return Err(err_msg);
+                                match apply_targeted_edit(file_content_mut, target, replacement) {
+                                    Ok(new_content) => {
+                                        *file_content_mut = new_content;
+                                    },
+                                    Err(err) => {
+                                        let err_msg = format!("Greška pri primeni ispravke u fajlu {}: {}", edit_path, err);
+                                        debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
+                                        return Err(err_msg);
+                                    }
                                 }
-
-                                *file_content_mut = file_content_mut.replace(target, replacement);
                             }
                         }
 
@@ -5800,7 +6417,7 @@ async fn generate_and_save_healing_rule(
     debug_log_to_file(format!("[Self-Healing] Analyzing changes in {} to extract global healing rules...", file_path));
 
     let client = reqwest::Client::new();
-    let system_prompt = "You are a Senior Project Architect. Analyze the original file content (with compilation errors) and the corrected content. Identify the specific lines that were changed to fix the compilation error. Respond ONLY with a valid JSON array of objects representing search-and-replace rules that can be applied globally to other files to prevent this error. Each object must have 'search' (the exact erroneous string, including leading spaces/tabs) and 'replace' (the correct replacement string). Do not include any explanations, introduction, or markdown block formatting. Respond only with clean JSON.";
+    let system_prompt = "You are a Senior Project Architect. Analyze the original file content (with compilation errors) and the corrected content. Identify ONLY atomic, reusable import, export, or TypeScript type changes that were made to fix the compilation error. DO NOT generate rules for UI components, JSX blocks, HTML tags, or component return statements. Each rule must be a precise single-line or small multi-line import/export/type fix. Respond ONLY with a valid JSON array of objects, each with 'search' and 'replace'. Do not include any explanations, introduction, or markdown block formatting. Respond only with clean JSON.";
     
     let user_prompt = format!(
         "Original Content (with errors):\n{}\n\nRepaired Content (fixed):\n{}",
@@ -5843,9 +6460,15 @@ async fn generate_and_save_healing_rule(
                             if let Some(existing_arr) = existing_rules.as_array_mut() {
                                 for new_rule in new_rules_arr {
                                     if let (Some(search_str), Some(replace_str)) = (new_rule.get("search").and_then(|s| s.as_str()), new_rule.get("replace").and_then(|r| r.as_str())) {
-                                        // Ignore rules that are too short/generic to avoid accidental corruption of valid code
-                                        if search_str.trim().len() >= 6 && search_str != replace_str {
-                                            // Check if rule already exists
+                                        // Strictly reject any UI/JSX blocks or oversized multi-line replacements
+                                        let contains_jsx = search_str.contains('<') || search_str.contains("</") || search_str.contains("return (")
+                                            || replace_str.contains('<') || replace_str.contains("</") || replace_str.contains("return (");
+                                        let s_lines = search_str.lines().count();
+                                        let r_lines = replace_str.lines().count();
+                                        let is_too_large = s_lines > 4 || r_lines > 4 || search_str.len() > 300 || replace_str.len() > 300;
+
+                                        // Only learn atomic, safe import/export/type rules
+                                        if !contains_jsx && !is_too_large && search_str.trim().len() >= 6 && search_str != replace_str {
                                             let exists = existing_arr.iter().any(|r| r.get("search").and_then(|s| s.as_str()) == Some(search_str));
                                             if !exists {
                                                 existing_arr.push(serde_json::json!({
@@ -5854,7 +6477,7 @@ async fn generate_and_save_healing_rule(
                                                     "createdAt": chrono::Utc::now().to_rfc3339()
                                                 }));
                                                 changed = true;
-                                                debug_log_to_file(format!("[Self-Healing] Learned new global rule: Replace \"{}\" with \"{}\"", search_str.trim(), replace_str.trim()));
+                                                debug_log_to_file(format!("[Self-Healing] Learned new atomic global rule: Replace \"{}\" with \"{}\"", search_str.trim(), replace_str.trim()));
                                             }
                                         }
                                     }
@@ -5953,9 +6576,53 @@ async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, file
 
         // Call local AI engine to fix the errors
         let client = reqwest::Client::new();
-        let mut system_prompt = "You are a Senior Next.js Developer. The project build failed with compilation errors. Review the build log and the contents of the files containing errors. Correct the files to fix the build errors. Respond ONLY with a valid JSON array of objects, where each object has 'path' (the relative file path, e.g. 'src/components/Layout.tsx') and 'content' (the complete corrected file contents). Do not include any explanations, introduction, or markdown block formatting. Your response must be clean JSON only.".to_string();
-        system_prompt.push_str(&get_packages_db_summary());
-        
+
+        // Extract targeted project category and stack from live_builder_guide.json if available
+        let mut category_stack_info = "Next.js App Router + Tailwind".to_string();
+        let lbg_path = proj_dir.join(".axiom").join("live_builder_guide.json");
+        let mut file_specs_map = std::collections::HashMap::new();
+        if lbg_path.exists() {
+            if let Ok(lbg_content) = std::fs::read_to_string(&lbg_path) {
+                if let Ok(lbg_json) = serde_json::from_str::<Value>(&lbg_content) {
+                    let cat = lbg_json.get("projectSpecification").and_then(|s| s.get("category")).and_then(|c| c.as_str()).unwrap_or("web-app");
+                    let stk = lbg_json.get("projectSpecification").and_then(|s| s.get("stack")).and_then(|c| c.as_str()).unwrap_or("Next.js");
+                    category_stack_info = format!("Stack: {}, Category: {}", stk, cat);
+                    
+                    if let Some(req_routes) = lbg_json.get("projectSpecification").and_then(|s| s.get("categoryRequirements")).and_then(|r| r.get("requiredRoutes")).and_then(|r| r.as_array()) {
+                        for rr in req_routes {
+                            if let Some(rr_str) = rr.as_str() {
+                                for err_file in &files_with_errors {
+                                    if let Some(err_path) = err_file.get("path").and_then(|p| p.as_str()) {
+                                        if rr_str.contains(err_path) {
+                                            file_specs_map.insert(err_path.to_string(), rr_str.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback to files_list for file descriptions if not found in LBG
+        for err_file in &files_with_errors {
+            if let Some(err_path) = err_file.get("path").and_then(|p| p.as_str()) {
+                if !file_specs_map.contains_key(err_path) {
+                    if let Some(desc) = files_list.iter()
+                        .find(|f| f.get("path").and_then(|p| p.as_str()) == Some(err_path))
+                        .and_then(|f| f.get("description").and_then(|d| d.as_str())) {
+                        file_specs_map.insert(err_path.to_string(), format!("{}: {}", err_path, desc));
+                    }
+                }
+            }
+        }
+
+        let mut targeted_specs = String::new();
+        for (_, f_desc) in &file_specs_map {
+            targeted_specs.push_str(&format!("- Target File Role: {}\n", f_desc));
+        }
+
         // Truncate build log if too long
         let truncated_log = if build_output.len() > 3000 {
             format!("...[truncated]...\n{}", &build_output[build_output.len() - 3000..])
@@ -5963,6 +6630,31 @@ async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, file
             build_output.clone()
         };
 
+        let mut system_prompt = format!(
+            "You are a Senior Next.js Developer fixing compilation errors.\n\
+             Project Architecture: {}\n{}\n\
+             CRITICAL HEALING RULES:\n\
+             1. STRICT UI & DESIGN PRESERVATION: You are fixing COMPILATION errors. NEVER delete or simplify UI components, hero sections, product grids, forms, tables, or buttons to bypass an error. The original visual richness, structure, and functional purpose of the page MUST remain 100% intact.\n\
+             2. MANDATORY TAILWIND CSS STYLING: All JSX elements MUST continue to use comprehensive Tailwind CSS utility classes. NEVER degrade styled elements into raw, unstyled HTML.\n\
+             3. SURGICAL REPAIR: Fix the underlying issue (e.g. invalid import path, missing type declaration, mismatched props, async/await syntax, or client-side hook rule) in place.\n\
+             4. CLIENT COMPONENT DIRECTIVE: If a file uses React hooks (useState, useEffect, useSession, useCart) or interactive handlers (onClick, onSubmit), the very first line MUST be \"use client\";.\n\
+             5. TYPE CASTING FALLBACK: If an external property or interface is missing, declare it locally or cast safely (e.g. `(session?.user as any)?.id`) instead of deleting the feature.\n\
+             Respond ONLY with a valid JSON array of objects, where each object has 'path' (the relative file path) and 'content' (the complete corrected file contents). Do not include explanations or markdown blocks.",
+            category_stack_info,
+            targeted_specs
+        );
+        system_prompt.push_str(&get_packages_db_summary());
+
+        for err_file in &files_with_errors {
+            if let (Some(path_str), Some(content_str)) = (err_file.get("path").and_then(|p| p.as_str()), err_file.get("content").and_then(|c| c.as_str())) {
+                let rp = get_stack_rulepacks(path_str, content_str, Some(&truncated_log));
+                if !rp.is_empty() {
+                    system_prompt.push_str(&rp);
+                    break;
+                }
+            }
+        }
+        
         let user_prompt = format!(
             "Build log with error details:\n{}\n\nFiles with errors current contents:\n{}\n\nPlease provide corrected code for these files in JSON format as specified.",
             truncated_log,
@@ -6023,6 +6715,18 @@ async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, file
                                 }
                             } else {
                                 debug_log_to_file(format!("[Self-Healing] Failed to parse AI response as JSON: {}", clean_content));
+                                // Whole-File Code Fallback for single file error
+                                if files_with_errors.len() == 1 {
+                                    if let Some(single_path) = files_with_errors[0].get("path").and_then(|p| p.as_str()) {
+                                        let has_code = clean_content.contains("import ") || clean_content.contains("export ") || clean_content.contains("function ") || clean_content.contains("const ");
+                                        if has_code {
+                                            debug_log_to_file(format!("[Self-Healing] Activating Whole-File Fallback for single errored file: {}", single_path));
+                                            let full_path = proj_dir.join(single_path);
+                                            let processed = post_process_generated_file(single_path, &clean_content, &serde_json::json!({}), has_tailwind);
+                                            let _ = std::fs::write(&full_path, &processed);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -6661,6 +7365,235 @@ fn get_project_routes_prompt(files: &[Value]) -> String {
     prompt
 }
 
+pub const NEXTJS_REACT_RULEPACK: &str = r#"REACT JSX SYNTAX, HOOKS & STYLING RULES:
+1. NEVER USE STRING STYLE ATTRIBUTES: In React/JSX, the 'style' attribute MUST NEVER be a string like style="color: yellow;". Passing a string throws a fatal runtime crash ('The `style` prop expects a mapping from style properties to values, not a string'). ALWAYS use Tailwind CSS utility classes via `className="..."` (e.g., `className="text-yellow-400 font-bold"`) or, if strictly necessary, a JS style object (e.g., `style={{ color: 'yellow' }}`).
+2. PREFER TAILWIND CSS CLASSES: When fulfilling styling requests (colors, typography, spacing, padding, margins, flex, grid, hover states), ALWAYS apply Tailwind CSS classes to `className`. Never write inline style strings.
+3. TAILWIND DYNAMIC CLASSES: NEVER construct Tailwind classes using runtime string interpolation like className={"text-" + color + "-500"}. Tailwind's compiler statically scans source files; dynamic fragments are stripped in production builds. Always use complete class names or a static mapping object.
+4. JSX ATTRIBUTE CONVENTIONS: In JSX, never use pure HTML attribute names: use `className` instead of `class`, `htmlFor` instead of `for`, and camelCase for event handlers (`onClick`, `onChange`, `onSubmit`). Void tags (<img />, <input />, <br />, <hr />, <meta />, <link />) MUST self-close with '/>'.
+5. NEVER CALL HOOKS AT MODULE SCOPE: React hooks (e.g., useTranslations, useState, useEffect, useContext, useRef, useSession, useRouter, useParams, etc.) MUST ONLY be called directly inside the body of a React Function Component or a custom hook (a function starting with 'use'). NEVER invoke any hook outside of a component body or in global/module scope.
+6. NO CONDITIONAL HOOKS: Hooks must be placed unconditionally at the top level of the component function. Never invoke hooks inside 'if' branches, loops, nested callbacks, or after early returns.
+7. 'use client' DIRECTIVE: Any component that uses React hooks, event listeners (e.g. onClick, onChange, onSubmit), or browser APIs (window, localStorage, document) MUST have 'use client' as the very first line of the file. Server Components (default, no directive) may be async and fetch data directly.
+8. SERVER-ONLY IMPORT LEAKAGE: Never import @prisma/client, fs, path, crypto, or server secrets into files containing 'use client'. Pass serialized data as props from Server Components or fetch via Route Handlers.
+9. NO FAKE CONTEXT BYPASS: Never attempt to bypass a missing React Context by defining mock objects or passing illegal second arguments to context-consuming hooks in the component file. If context is missing, the component must be wrapped by its parent Provider in a layout or parent component.
+10. HYDRATION INTEGRITY: NEVER generate different initial markup on server vs client using Date.now(), Math.random(), or unguarded browser-only state. Perform browser-dependent updates after mount inside useEffect to prevent hydration mismatch crashes.
+11. IMAGE OPTIMIZATION: Always use `import Image from 'next/image';` with required `width`, `height`, and `alt` props. Never use unoptimized `<img>` tags for static assets.
+12. DYNAMIC ROUTE PARAMS: In Next.js 14 App Router, dynamic route params are synchronous objects: type them as `{ params }: { params: { id: string } }`. Do not await params.
+13. ROUTE HANDLER SIGNATURES: In `app/api/**/route.ts`, export named async functions per HTTP method (`export async function GET(request: Request) { return NextResponse.json({...}); }`). Never use Pages Router default export `handler(req, res)`. Always validate incoming bodies with Zod before database operations.
+14. ENVIRONMENT VARIABLE EXPOSURE: Client components can only read variables prefixed with `NEXT_PUBLIC_` (e.g. `process.env.NEXT_PUBLIC_API_URL`). Server secrets (DATABASE_URL, JWT_SECRET) must remain unprefixed and server-only.
+15. SERVER ACTIONS DIRECTIVE: Mutating server actions must have `'use server'` as the first line of their file or function body. Pass actions to `<form action={myAction}>` or invoke via import.
+16. CLIENT-ONLY DYNAMIC IMPORTS: `dynamic(() => import('./Chart'), { ssr: false })` is only valid inside `'use client'` files. Never use `ssr: false` directly in Server Components.
+17. NEXT.JS APP ROUTER NAVIGATION IMPORTS: In Next.js App Router (`src/app/` or `app/`), NEVER import `useRouter`, `usePathname`, or `useSearchParams` from `'next/router'`. Importing from `'next/router'` throws a fatal runtime crash: "NextRouter was not mounted". ALWAYS import from `'next/navigation'`.
+18. NEXTAUTH CREDENTIALS PROVIDER IMPORT: In NextAuth configuration files, `CredentialsProvider` MUST be imported from `'next-auth/providers/credentials'`. NEVER import from `'next-auth'` directly (which imports the NextAuth initialization function instead of the credentials provider factory).
+19. APP ROUTER API ISOLATION: In App Router projects, all API routes MUST live under `src/app/api/**/route.ts`. NEVER create parallel duplicate endpoints in `src/pages/api/**` (e.g. `pages/api/register.ts` alongside `app/api/register/route.ts`). Having both causes a fatal Next.js build error: "Conflicting app and page files were found".
+20. REACT-ICONS PACKAGE PREFIX ACCURACY: Never mix or cross-import icon names across different families in `react-icons`. Icons with prefix `Io` or `IoMd` (e.g. `IoMdNotifications`) belong strictly in `'react-icons/io'`, `Fa` icons (e.g. `FaBars`) belong in `'react-icons/fa'`, `Md` icons in `'react-icons/md'`, `Fi` in `'react-icons/fi'`. Importing an `Io*` icon from `'react-icons/fa'` causes a fatal build compilation error.
+21. PRISMA SINGLETON PATTERN: In `src/lib/prisma.ts`, `prisma` MUST be an instantiated singleton of `PrismaClient`, NOT a function or type. Always export a ready-to-use instance: `import { PrismaClient } from '@prisma/client'; const globalForPrisma = globalThis as unknown as { prisma: PrismaClient | undefined }; export const prisma = globalForPrisma.prisma ?? new PrismaClient(); if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = prisma; export default prisma;`.
+22. MANDATORY DEFAULT EXPORT IN APP ROUTER (LAYOUTS & PAGES): Every file in `src/app/**/layout.tsx` (or `.jsx`) and `src/app/**/page.tsx` (or `.jsx`) MUST have an `export default function` (e.g. `export default function RootLayout({ children }: { children: React.ReactNode })`). NEVER omit `export default` or define only a local `const Layout = ...` without default export. If a file marked with 'use client' lacks a default export, the React Server Components runtime fails to resolve `module.default` through its client proxy and crashes fatally with: "Error: Cannot access default.then on the server. You cannot dot into a client module from a server component."
+23. ROOT LAYOUT DOM HIERARCHY & PROVIDER PLACEMENT: In `src/app/layout.tsx`, `<html lang="en">` and `<body>` MUST be the outermost tags returned by `RootLayout`. Global Context Providers (such as `<SessionProvider>`, `<ThemeProvider>`, `<QueryClientProvider>`) MUST ALWAYS be placed INSIDE the `<body>` tag wrapping `{children}`: `return (<html lang="en"><body><SessionProvider>{children}</SessionProvider></body></html>);`. NEVER wrap any Provider outside the `<html>` tag! Wrapping `<html>` inside a Provider or component produces an invalid DOM hierarchy and causes fatal Next.js hydration and server-rendering crashes.
+24. CLIENT COMPONENTS CANNOT BE ASYNC: Any component marked with 'use client' MUST NEVER be declared as an async function (e.g. `export default async function Component()`). In React 18 / Next.js 14, only Server Components can be async. Declaring an async client component causes it to return a Promise, prompting the RSC compiler to access `.then` on the client module proxy and throwing "Error: Cannot access default.then on the server". For asynchronous data fetching in client components, always use `useEffect` or standard state hooks with synchronous component signatures."#;
+
+pub const CONFIG_FILES_RULEPACK: &str = r#"CONFIGURATION & TSCONFIG RULES:
+1. TSCONFIG.JSON CONCISENESS & VALIDITY: `tsconfig.json` MUST be a valid, compact, non-redundant JSON object (maximum 30 lines). NEVER repeat compilerOptions flags or output duplicate keys (`strictNullChecks`, `noImplicitAny`). Redundant repetition loops corrupt the file and crash compilers.
+2. TSCONFIG COMPILER OPTIONS SPECIFICATION: Always include: "lib": ["dom", "dom.iterable", "esnext"], "allowJs": true, "skipLibCheck": true, "strict": false, "noEmit": true, "esModuleInterop": true, "module": "esnext", "moduleResolution": "bundler", "resolveJsonModule": true, "isolatedModules": true, "jsx": "preserve", "paths": { "@/*": ["./src/*"] }.
+3. TSCONFIG INCLUDES & EXCLUDES: Include array MUST strictly be `["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"]` and exclude MUST be `["node_modules"]`.
+4. NEXT.CONFIG.JS FORMAT: Always export `module.exports = nextConfig;` where `nextConfig` is a plain JavaScript object. Never use ES6 `export default` in `.js` config files unless `type: "module"` is set.
+5. TAILWIND.CONFIG.JS CONTENT ARRAY: The `content` array must explicitly include `./src/**/*.{js,ts,jsx,tsx,mdx}`."#;
+
+pub const NEXT_INTL_RULEPACK: &str = r#"NEXT-INTL (INTERNATIONALIZATION) RULES:
+1. useTranslations SIGNATURE ENFORCEMENT: 'useTranslations' takes only an optional namespace string, e.g. useTranslations('Header') or useTranslations(). NEVER pass an object, dictionary, or message map as a second argument (e.g., `useTranslations('Header', messages)` is STRICTLY INVALID and will crash).
+2. TRANSLATIONS STORAGE: Translation key-value pairs must be defined inside JSON files under the messages directory (e.g., src/messages/en.json). Do not declare inline translation message maps inside component code.
+3. CLIENT PROVIDER REQUIREMENT: In client components, 'useTranslations' requires NextIntlClientProvider to be mounted in the component tree."#;
+
+pub const NEXT_LINK_RULEPACK: &str = r#"NEXT.JS LINK COMPONENT RULES:
+1. NO NESTED ANCHOR TAGS: In Next.js 13+, do NOT place <a> tags inside <Link href="...">. Place className and styling directly on the <Link> component (e.g. `<Link href="/about" className="...">About</Link>`).
+2. PREFETCH OPTIMIZATION: Always add `prefetch={false}` to <Link> components (e.g. `<Link href="/dashboard" prefetch={false}>`) to prevent aggressive edge request amplification on Vercel."#;
+
+pub const MERN_STACK_RULEPACK: &str = r#"MERN STACK (EXPRESS + MONGOOSE + VITE/REACT) RULES:
+1. EXPRESS ASYNC ROUTE SAFETY: Wrap every async route handler body in try/catch. Always return explicit status codes: `res.status(200).json(data)` for success, `res.status(201).json(data)` for created, `res.status(400)` for invalid input, `res.status(404)` for missing resources, `res.status(500).json({ error: err.message })` in catch. Immediately return after sending response to prevent 'Cannot set headers after they are sent'.
+2. MIDDLEWARE ORDER: Always register `app.use(cors())` and `app.use(express.json())` immediately after `const app = express();`, BEFORE registering any API routes. Never register body parsers after route endpoints.
+3. RUNTIME SEPARATION: Never import React components into `server.js`, and never import Mongoose models, `fs`, or Node core modules into `client/src/`. Client communicates strictly via HTTP (`axios.get('/api/...')`).
+4. REACT ROUTER DOM V6 STANDARDS: Never use React Router v5 syntax (<Switch>, `<Route component={Comp}>`, `useHistory()`). Use React Router v6: `<Routes><Route path="/..." element={<Component />} /></Routes>` and `const navigate = useNavigate(); navigate('/path')`.
+5. DOTENV LOAD ORDER: `require('dotenv').config();` must be the absolute first line executed in `server.js`, before any other local module reads `process.env`.
+6. MONGOOSE CONNECTION SINGLETON: Call `mongoose.connect(process.env.MONGO_URI)` once in `server.js` at startup before `app.listen(...)`. Never connect inside individual route files or per request.
+7. PASSWORD HASHING BEFORE SAVE: Never store plaintext passwords or hash passwords inside route handlers. Always hash in a Mongoose pre-save hook: `userSchema.pre('save', async function(next) { if (!this.isModified('password')) return next(); this.password = await bcrypt.hash(this.password, 10); next(); });`.
+8. JWT AUTH MIDDLEWARE: Centralize authorization in a `protect` middleware that verifies `req.headers.authorization?.split(' ')[1]` with `jwt.verify()`. Never duplicate inline token verification in every route.
+9. CONTROLLED INPUT STATE BINDING: In React form controls, `<input value={name} />` MUST always be paired with `onChange={(e) => setName(e.target.value)}`. Never leave a value-bound input without an onChange handler.
+10. FILE UPLOAD MIDDLEWARE: For `multipart/form-data` uploads, always use `multer` middleware (e.g. `upload.single('file')`). `express.json()` cannot parse multipart form payloads.
+11. POPULATE VS MANUAL JOINS: Use Mongoose `.populate('author', 'name email')` on schema fields with `ref` types. Never perform manual joins using loops with secondary `.findById()` queries.
+12. ENVIRONMENT VARIABLE ISOLATION: Client code uses `import.meta.env.VITE_API_URL` (Vite-injected); backend uses `process.env.MONGO_URI` (Node/dotenv). Never cross the two. Handle duplicate-key MongoDB errors (code 11000) with HTTP 409 Conflict."#;
+
+pub const REACT_NATIVE_EXPO_RULEPACK: &str = r#"REACT NATIVE & EXPO MOBILE RULES:
+1. ABSOLUTE WEB DOM ELEMENT BAN: NEVER use HTML/DOM tags (<div>, <span>, <p>, <a>, <button>, <h1>-<h6>, <input>, <form>, <ul>, <li>, <img>). Use React Native primitives exclusively: <View>, <Text>, <TouchableOpacity>, <Pressable>, <TextInput>, <ScrollView>, <FlatList>, <SafeAreaView>, <Image>.
+2. MANDATORY TEXT WRAPPING: ALL textual content and string variables MUST be wrapped inside a `<Text>` component. Never place raw text strings directly inside `<View>` or other containers.
+3. BAN OF BROWSER GLOBALS & STORAGE: Never use window, document, localStorage, sessionStorage, or window.location. Use `@react-native-async-storage/async-storage` for key-value persistence. Use Expo Router or `@react-navigation` for screen navigation.
+4. STYLING ARCHITECTURE: Never pass CSS strings (style="display:flex; margin: 10px;") or use web units (px, rem, em, vh, vw). Use `StyleSheet.create({ container: { flex: 1, padding: 16 } })` with unitless numeric dimensions, or NativeWind `className` if configured.
+5. NATIVE TOUCH & INPUT EVENTS: Never use onClick, onChange, or onMouseEnter. Use `onPress` for touchables/buttons and `onChangeText` for `<TextInput>` (which receives string value directly).
+6. GESTURE HANDLER ROOT REQUIREMENT: The root of the application MUST be wrapped in `<GestureHandlerRootView style={{ flex: 1 }}>` from `react-native-gesture-handler` when using swipeable lists, bottom sheets, or Reanimated.
+7. KEYBOARD-AWARE LAYOUT: For screens with form inputs, wrap content in `<KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>` to prevent the software keyboard from covering input fields.
+8. IMAGE SOURCE SYNTAX: Use `source={require('./assets/logo.png')}` for local images and `source={{ uri: 'https://...' }}` for remote images. The web `src` prop is invalid in React Native.
+9. PLATFORM-SPECIFIC BRANCHING: Use `Platform.OS === 'ios'` or `Platform.select({...})` for OS-specific behavior. Do not assume web navigator APIs exist.
+10. ASYNC PERMISSIONS PATTERN: Hardware APIs (camera, location, media library) must always explicitly await permissions first: `const { status } = await Camera.requestCameraPermissionsAsync(); if (status !== 'granted') return;`.
+11. FONT & SPLASH SCREEN LOADING: Call `SplashScreen.preventAutoHideAsync()` at module load and gate UI rendering on font load completion: `const [loaded] = useFonts({...}); if (!loaded) return null;`.
+12. ICONS IMPORT SOURCE: Always import icons from `@expo/vector-icons` (e.g. `Ionicons`, `MaterialIcons`). Never import web icon packages (e.g. `react-icons`) which depend on the DOM.
+13. LIST VIRTUALIZATION: Never render large arrays using ScrollView + .map(). Always use `<FlatList data={items} keyExtractor={(item) => item.id} renderItem={({item}) => <Row item={item} />} />` with a stable unique keyExtractor.
+14. SAFE AREA AWARENESS: Wrap top-level screens in `<SafeAreaView style={{ flex: 1 }}>` (from `react-native-safe-area-context`) to avoid rendering behind the device notch, status bar, or home indicator."#;
+
+pub const DESKTOP_RULEPACK: &str = r#"DESKTOP (ELECTRON & TAURI) RULES:
+1. ELECTRON CONTEXT ISOLATION: Never call require('electron'), require('fs'), or use ipcRenderer directly inside renderer/React components. In `main.js`, configure `webPreferences: { contextIsolation: true, nodeIntegration: false, preload: path.join(__dirname, 'preload.js') }`.
+2. PRELOAD BRIDGE CONTRACT: In `preload.js`, expose narrow allowlisted functions via `contextBridge.exposeInMainWorld('electronAPI', { getData: () => ipcRenderer.invoke('get-data') })`. The frontend invokes via `window.electronAPI.getData()`. Never expose raw Node modules or the entire ipcRenderer object.
+3. IPC INVOCATION PAIRING: Use `ipcRenderer.invoke('channel', args)` paired with `ipcMain.handle('channel', async (event, args) => { ... })` for request/response operations. Never leave IPC listeners dangling on destroyed windows.
+4. WINDOW LIFECYCLE MANAGEMENT: Always guard window operations with `if (mainWindow && !mainWindow.isDestroyed())`. Clean up IPC event listeners when windows close. Handle `window-all-closed` and `activate` lifecycle events appropriately.
+5. FILESYSTEM PATH RESOLUTION: Always resolve OS-safe writable locations using `app.getPath('userData')`, `app.getPath('temp')`, or `app.getPath('documents')`. Never hardcode absolute paths like `C:\\...` or cwd-relative paths that fail in packaged installers.
+6. NATIVE MENU CONSTRUCTION: Build application menus in the main process using `Menu.buildFromTemplate([{ label: 'File', submenu: [{ role: 'quit' }] }])` and `Menu.setApplicationMenu(menu)`. Never build HTML `<nav>` menus expecting native OS shortcuts.
+7. TAURI COMMAND SIGNATURES: In Rust Tauri commands, never use `.unwrap()` or `panic!()`. Always annotate with `#[tauri::command]` and return `Result<T, String>` where errors are mapped with `.map_err(|e| e.to_string())`.
+8. TAURI COMMAND REGISTRATION: Every `#[tauri::command]` function MUST be registered inside `tauri::generate_handler![cmd1, cmd2, ...]` during app builder setup.
+9. TAURI STATE MANAGEMENT: Access shared state via `tauri::State<Mutex<AppState>>` registered with `.manage(Mutex::new(AppState::default()))`. Never block the UI thread with long-running synchronous operations.
+10. TAURI V2 CAPABILITIES & PERMISSIONS: In Tauri v2, declare all plugin permissions (e.g. `"fs:allow-read-file"`) in `src-tauri/capabilities/*.json`. Calls to unlisted permissions will be rejected by ACL.
+11. EVENT SYSTEM VS COMMAND INVOKE: Use `window.emit("channel", payload)` from backend and `listen("channel", callback)` from frontend for backend-pushed notifications (progress, file watchers). Use commands for frontend-initiated calls.
+12. NO CROSS-PLATFORM POLLUTION: Never reference `window.electronAPI` inside Tauri applications, and never use Tauri `invoke` inside Electron."#;
+
+pub const PRISMA_DATABASE_RULEPACK: &str = r#"PRISMA ORM & DATABASE RULES:
+1. SERVER-ONLY BOUNDARY: Prisma Client (`@prisma/client`) must NEVER be imported or instantiated in client components or files marked with `'use client'`. Database operations belong strictly in Server Components, Route Handlers (`app/api/**/route.ts`), or Server Actions (`'use server'`).
+2. CONNECTION POOLING SINGLETON: In development and serverless environments, always cache the PrismaClient instance on `globalThis` to prevent connection pool exhaustion during hot reload: `const globalForPrisma = globalThis as unknown as { prisma: PrismaClient }; export const prisma = globalForPrisma.prisma ?? new PrismaClient(); if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = prisma;`.
+3. RELATION FOREIGN-KEY PLACEMENT: In `schema.prisma`, the scalar foreign key (`authorId String`) and the `@relation(fields: [authorId], references: [id])` attribute MUST be defined on the model that stores the foreign key (the child/many side). The parent model defines only the back-relation array (`posts Post[]`).
+4. CASCADING DELETE BEHAVIOR: Always specify referential action on relations when child records should not outlive the parent: `@relation(fields: [authorId], references: [id], onDelete: Cascade)`.
+5. OFFLINE & PREVIEW DEV RESILIENCE: Wrap database calls in Route Handlers in try/catch. In catch blocks, return realistic deterministic mock data matching the TypeScript interface so the application remains fully interactive in preview mode even if the database is offline or unmigrated.
+6. SCHEMA SYNTAX VS TYPESCRIPT SYNTAX: In `schema.prisma`, optional fields use `name String?` (type first, `?` suffix). In TypeScript interfaces, optional fields use `name?: string` (`?` before colon, lowercase primitive). Never mix the two syntaxes.
+7. QUERY KEY CONSTRAINTS: Fields used in `where` clauses of `findUnique`, `update`, or `delete` MUST be marked with `@id`, `@unique`, or part of `@@unique([...])` in `schema.prisma`.
+8. ZOD VALIDATION & TYPE SYNC: Parse incoming request bodies with `schema.safeParse(body)` before invoking Prisma mutations. Keep Zod field optionality strictly synchronized with schema nullable fields.
+9. ENUM DEFINITION SYNTAX: Define enums as top-level blocks without commas or quotes: `enum Role { ADMIN USER }` and use on fields as `role Role @default(USER)`. Never write TypeScript union strings (`role: "ADMIN" | "USER"`) in `.prisma` files.
+10. SEED SCRIPT CONFIGURATION: Declare seed script in `package.json` under `"prisma": { "seed": "ts-node prisma/seed.ts" }` so `npx prisma db seed` locates it reliably.
+11. TRANSACTIONAL MULTI-WRITE OPERATIONS: When performing multiple dependent mutations, always use `prisma.$transaction([prisma.order.create({...}), prisma.inventory.update({...})])` to guarantee atomic all-or-nothing execution.
+12. INDEX DECLARATION FOR QUERY PERFORMANCE: Always add `@@index([status, createdAt])` at the model level for field combinations frequently used in `where` or `orderBy` clauses.
+13. ROUTE HANDLER HTTP METHODS: App Router route handlers in `route.ts` must export named async functions per HTTP verb (`export async function GET(request: Request) { return NextResponse.json({...}); }`). Never use default export `handler(req, res)`."#;
+
+pub fn get_stack_rulepacks(file_path: &str, file_content: &str, error_msg: Option<&str>) -> String {
+    let path_lower = file_path.to_lowercase().replace('\\', "/");
+    let err_lower = error_msg.unwrap_or("").to_lowercase();
+    let content_lower = file_content.to_lowercase();
+
+    let mut rules = Vec::new();
+
+    // 1. Mobile (React Native / Expo) - check first to avoid web DOM confusion
+    let is_react_native = path_lower.contains("react-native")
+        || path_lower.contains("expo")
+        || content_lower.contains("from 'react-native'")
+        || content_lower.contains("from \"react-native\"")
+        || content_lower.contains("from 'expo")
+        || content_lower.contains("stylesheet.create")
+        || err_lower.contains("view config not found");
+
+    if is_react_native {
+        rules.push(REACT_NATIVE_EXPO_RULEPACK);
+    } else {
+        // 2. React & Next.js Web Stack
+        let is_react_file = path_lower.ends_with(".tsx")
+            || path_lower.ends_with(".jsx")
+            || path_lower.contains("/app/")
+            || path_lower.contains("/pages/")
+            || path_lower.contains("/components/")
+            || content_lower.contains("'use client'")
+            || content_lower.contains("\"use client\"")
+            || content_lower.contains("from 'react'")
+            || content_lower.contains("from \"react\"")
+            || content_lower.contains("usestate")
+            || content_lower.contains("useeffect")
+            || content_lower.contains("usecontext")
+            || content_lower.contains("usetranslations")
+            || content_lower.contains("usesession")
+            || err_lower.contains("hook")
+            || err_lower.contains("react context")
+            || err_lower.contains("the `style` prop expects a mapping")
+            || err_lower.contains("rendered more hooks");
+
+        if is_react_file {
+            rules.push(NEXTJS_REACT_RULEPACK);
+        }
+
+        // 3. Next-Intl (Internationalization)
+        let is_next_intl = path_lower.contains("i18n")
+            || path_lower.contains("messages/")
+            || content_lower.contains("next-intl")
+            || content_lower.contains("usetranslations")
+            || err_lower.contains("nextintl")
+            || err_lower.contains("usetranslations");
+
+        if is_next_intl {
+            rules.push(NEXT_INTL_RULEPACK);
+        }
+
+        // 4. Next.js Link
+        let is_next_link = content_lower.contains("from 'next/link'")
+            || content_lower.contains("from \"next/link\"")
+            || content_lower.contains("<link")
+            || err_lower.contains("invalid <link>")
+            || err_lower.contains("legacybehavior");
+
+        if is_next_link {
+            rules.push(NEXT_LINK_RULEPACK);
+        }
+    }
+
+    // 5. MERN Stack (Express Backend + Vite / React Router)
+    let is_mern = path_lower.contains("server.js")
+        || path_lower.contains("/routes/")
+        || path_lower.contains("/models/")
+        || content_lower.contains("express()")
+        || content_lower.contains("from 'express'")
+        || content_lower.contains("require('express')")
+        || content_lower.contains("from 'react-router-dom'")
+        || content_lower.contains("from \"react-router-dom\"")
+        || err_lower.contains("cannot set headers");
+
+    if is_mern {
+        rules.push(MERN_STACK_RULEPACK);
+    }
+
+    // 6. Desktop (Electron & Tauri)
+    let is_desktop = path_lower.contains("preload.js")
+        || path_lower.contains("main.js")
+        || path_lower.contains("electron")
+        || path_lower.contains("src-tauri")
+        || content_lower.contains("contextbridge")
+        || content_lower.contains("ipcmain")
+        || content_lower.contains("ipcrenderer")
+        || content_lower.contains("#[tauri::command]")
+        || err_lower.contains("contextisolation");
+
+    if is_desktop {
+        rules.push(DESKTOP_RULEPACK);
+    }
+
+    // 7. Prisma & Database Resiliency
+    let is_prisma = path_lower.ends_with(".prisma")
+        || path_lower.contains("/api/")
+        || path_lower.contains("route.ts")
+        || path_lower.contains("route.js")
+        || content_lower.contains("@prisma/client")
+        || content_lower.contains("prisma.")
+        || err_lower.contains("prisma");
+
+    if is_prisma {
+        rules.push(PRISMA_DATABASE_RULEPACK);
+    }
+
+    // 8. Configuration & Project Config Rules
+    let is_config = path_lower.ends_with(".json")
+        || path_lower.contains("config")
+        || path_lower.ends_with("tsconfig.json")
+        || err_lower.contains("tsconfig")
+        || err_lower.contains("debug failure");
+
+    if is_config {
+        rules.push(CONFIG_FILES_RULEPACK);
+    }
+
+    if rules.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n=== STRICT STACK & LIBRARY CONSTRAINTS ===\n{}\n==========================================\n", rules.join("\n\n"))
+    }
+}
+
 fn get_expert_system_prompt(
     file_path: &str,
     _project_type: &str,
@@ -6688,6 +7621,28 @@ fn get_expert_system_prompt(
                             3. For implicit many-to-many relations (where both sides return arrays `Model[]`), do NOT specify any `fields` or `references` arguments. Just define the array fields on both models (e.g., `users User[]` and `conversations Conversation[]`).\n\
                             4. The `@relation` attribute (e.g. `@relation(fields: [userId], references: [id])`) MUST ONLY be placed on relational object fields (like `user User`), never on scalar fields (like `userId String`). Placing @relation on a scalar field will throw an 'Invalid field type, not a relation' error.\n\
                             5. For NextAuth schema, the VerificationToken model does not have a direct relation back to the User model; do not define a verificationTokens relation field on the User model.".to_string();
+    } else if path_lower.ends_with("tsconfig.json") {
+        role_desc = "ROLE: TypeScript Configuration Specialist\n".to_string();
+        specific_rules = "\nTYPESCRIPT CONFIGURATION RULES:\n\
+                          - Output a valid, concise Next.js tsconfig.json JSON object. Maximum 30 lines.\n\
+                          - NEVER repeat compilerOptions or output redundant boolean flags in a loop.\n\
+                          - Ensure all brackets and braces are properly closed.\n\
+                          - Standard compilerOptions:\n\
+                            \"lib\": [\"dom\", \"dom.iterable\", \"esnext\"],\n\
+                            \"allowJs\": true,\n\
+                            \"skipLibCheck\": true,\n\
+                            \"strict\": false,\n\
+                            \"noEmit\": true,\n\
+                            \"esModuleInterop\": true,\n\
+                            \"module\": \"esnext\",\n\
+                            \"moduleResolution\": \"bundler\",\n\
+                            \"resolveJsonModule\": true,\n\
+                            \"isolatedModules\": true,\n\
+                            \"jsx\": \"preserve\",\n\
+                            \"incremental\": true,\n\
+                            \"paths\": { \"@/*\": [\"./src/*\"] }\n\
+                          - include: [\"next-env.d.ts\", \"**/*.ts\", \"**/*.tsx\", \".next/types/**/*.ts\"]\n\
+                          - exclude: [\"node_modules\"]".to_string();
     } else if path_lower.contains("next.config") {
         role_desc = "ROLE: Next.js Configuration Expert\n".to_string();
         specific_rules = "\nNEXT.JS CONFIGURATION RULES:\n\
@@ -6700,8 +7655,8 @@ fn get_expert_system_prompt(
     } else if path_lower.contains("api/register") {
         role_desc = "ROLE: Authentication & User Management Backend Developer\n".to_string();
         specific_rules = "\nUSER REGISTRATION API RULES:\n\
-                          - Implement a Next.js POST handler for user registration.\n\
-                          - Parse request body and validate inputs (email, name, password).\n\
+                          - Implement a Next.js App Router POST handler in `src/app/api/register/route.ts`.\n\
+                          - Parse request body (`await request.json()`) and validate inputs (email, name, password).\n\
                           - Check if a user with the given email already exists in the database. If so, return a 400 Bad Request error response.\n\
                           - Hash the user's password asynchronously using `bcryptjs.hash(password, 10)` before storing it in the database.\n\
                           - Create the new user record in the database using Prisma and return the created user object (excluding the password) with a 201 Created status.\n\
@@ -6709,11 +7664,12 @@ fn get_expert_system_prompt(
     } else if path_lower.contains("/api/auth/") || path_lower.contains("nextauth") {
         role_desc = "ROLE: Security & Authentication Expert\n".to_string();
         specific_rules = "\nAUTHENTICATION SECURITY RULES:\n\
-                          - Implement secure session management. Use `strategy: 'jwt'` sessions for NextAuth.\n\
-                          - NextAuth MUST be implemented using the Pages Router path structure: `src/pages/api/auth/[...nextauth].ts` (or `.js`) instead of App Router route handlers to avoid 'undici Proxy #state' runtime errors in Node.js.\n\
+                          - Implement secure session management using App Router Route Handler in `src/app/api/auth/[...nextauth]/route.ts`.\n\
+                          - Export GET and POST handlers: `const handler = NextAuth(authOptions); export { handler as GET, handler as POST };`.\n\
+                          - Use `strategy: 'jwt'` sessions for NextAuth.\n\
                           - CredentialsProvider MUST be imported from 'next-auth/providers/credentials', NEVER from 'next-auth' directly.\n\
-                          - Ensure User password database checks match the exact schema property name (e.g. `user.password` instead of `user.hashedPassword`).\n\
-                          - Never hardcode environment secrets (e.g., use `process.env.NEXTAUTH_SECRET`).\n\
+                          - Ensure User password database checks match the exact schema property name (e.g. `user.password` or `user.hashedPassword`).\n\
+                          - Never hardcode environment secrets (use `process.env.NEXTAUTH_SECRET || 'dev-secret'`).\n\
                           - Use `bcryptjs` asynchronously or via standard comparison methods to compare hashed passwords securely.\n\
                           - Fail gracefully when required environment variables for production email sending are missing during development.".to_string();
     } else if path_lower.contains("/api/") || path_lower.contains("route.ts") || path_lower.contains("route.js") {
@@ -6722,6 +7678,24 @@ fn get_expert_system_prompt(
                           - Implement clean Next.js Route Handlers (using GET, POST, PUT, DELETE exports).\n\
                           - Wrap database calls in robust try-catch blocks. Implement fallback mock datasets inside catch clauses so the application remains reviewable even if the database is offline.\n\
                           - Strictly validate requests (e.g. using standard parsing or Zod) and return clean, typed JSON responses with appropriate HTTP status codes.".to_string();
+    } else if path_lower.ends_with("layout.tsx") || path_lower.ends_with("layout.jsx") {
+        role_desc = "ROLE: Next.js Root Layout Architect\n".to_string();
+        specific_rules = "\nROOT LAYOUT ARCHITECTURE RULES:\n\
+                          - The RootLayout component in Next.js App Router defines the global application shell.\n\
+                          - DOM HIERARCHY: Outermost elements returned MUST be `<html lang=\"en\"><body className=\"min-h-screen flex flex-col bg-gray-50 text-gray-900\">...</body></html>`.\n\
+                          - GLOBAL PROVIDERS: Wrap all global providers inside `<body>` around `{children}`. If NextAuth is configured, wrap with `<SessionProvider>`. If an e-commerce or cart context exists (e.g. `CartProvider` from `@/lib/cartContext`), wrap `{children}` with `<CartProvider>` inside `SessionProvider`.\n\
+                          - PERSISTENT NAVIGATION & FOOTER: You MUST always import and mount `<Navbar />` (from `@/components/Navbar`) above the main content, wrap `{children}` in `<main className=\"flex-grow flex flex-col w-full\">{children}</main>`, and mount `<Footer />` (from `@/components/Footer`) at the bottom of the page.\n\
+                          - MANDATORY DEFAULT EXPORT: RootLayout MUST have `export default function RootLayout({ children }: { children: React.ReactNode })`.\n\
+                          - CLIENT DIRECTIVE: Mark the layout file with \"use client\"; at line 1 so that client-side providers and components function smoothly.".to_string();
+    } else if path_lower == "src/app/page.tsx" || path_lower == "src/app/page.jsx" || path_lower == "app/page.tsx" || path_lower == "app/page.jsx" {
+        role_desc = "ROLE: Principal Frontend Architect & UI/UX Designer\n".to_string();
+        specific_rules = "\nROOT LANDING PAGE DESIGN RULES:\n\
+                          - This is the HOME/LANDING PAGE (`/`) of the entire application. It must NEVER be a blank screen or a simple utility page (e.g. NEVER just a bare shopping cart or login form).\n\
+                          - HERO SECTION: Include a high-impact Hero banner with a compelling headline, engaging description, and clear CTA buttons linking to primary destinations (e.g. `/products` or `/dashboard`).\n\
+                          - CORE FEATURE SHOWCASE: Show the primary content of the app. For e-commerce apps: a rich Featured Products Grid displaying product cards with images, categories, prices, and an \"Add to Cart\" button. For dashboards: key metric widgets or activity feeds.\n\
+                          - VALUE PROPOSITIONS: Display a responsive grid of key benefits/badges (e.g. fast shipping, 24/7 support, secure checkout, guarantee).\n\
+                          - DATA RESILIENCY: Fetch real data from `/api/...` with an immediate fallback to a rich realistic local mockup array so the storefront renders beautifully in preview mode even if the database has not been seeded yet.\n\
+                          - MANDATORY TAILWIND CSS: Every element must use modern Tailwind CSS classes (`space-y-12`, `rounded-2xl`, `shadow-sm`, `hover:shadow-md`, `transition-all`, etc.).".to_string();
     } else if path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx") || path_lower.contains("/components/") || path_lower.contains("/pages/") {
         role_desc = "ROLE: Senior UI/UX Developer (Tailwind & React)\n".to_string();
         specific_rules = "\nFRONTEND DEVELOPMENT RULES:\n\
@@ -6755,6 +7729,11 @@ fn get_expert_system_prompt(
          - NO MANUAL AXIOM ATTRS: Never declare, use, or destructure 'data-axiom-component' or 'data-axiom-file' props in your React components or TypeScript interface/type definitions. These are injected automatically.{} \n",
          role_desc, specific_rules
     );
+
+    let rulepacks = get_stack_rulepacks(file_path, context_ref, None);
+    if !rulepacks.is_empty() {
+        prompt.push_str(&rulepacks);
+    }
 
     if !overrides_desc.trim().is_empty() {
         prompt.push_str(&format!(
@@ -6928,7 +7907,12 @@ async fn run_orchestrator(
         manifest = json.get("data").cloned().ok_or("No data in manifest response")?;
     }
     let files = manifest.get("files").and_then(|f| f.as_array()).ok_or("No files in manifest")?;
-    let name = manifest.get("name").and_then(|n| n.as_str()).unwrap_or("Unknown Project");
+    let name_val = manifest.get("name")
+        .or_else(|| manifest.get("projectName"))
+        .or_else(|| manifest.get("title"))
+        .or_else(|| manifest.get("metadata").and_then(|m| m.get("name")))
+        .or_else(|| manifest.get("metadata").and_then(|m| m.get("title")));
+    let name = name_val.and_then(|n| n.as_str()).unwrap_or("Unknown Project");
     let project_type = detect_project_type(&manifest);
     let mut metamanifest = manifest.get("metamanifest").cloned().unwrap_or(serde_json::json!({}));
     
@@ -7127,10 +8111,10 @@ model VerificationToken {
                     "language": "typescript",
                     "defaultContent": r#"import { PrismaClient } from "@prisma/client";
 
-const globalForPrisma = global as unknown as { prisma: PrismaClient };
+const globalForPrisma = globalThis as unknown as { prisma: PrismaClient | undefined };
 
 export const prisma =
-  globalForPrisma.prisma ||
+  globalForPrisma.prisma ??
   new PrismaClient({
     log: ["query"],
   });
@@ -7140,8 +8124,8 @@ if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
 export default prisma;"#
                 },
                 {
-                    "path": "src/pages/api/auth/[...nextauth].ts",
-                    "description": "Clean NextAuth endpoint in Pages Router to avoid App Router proxy errors.",
+                    "path": "src/app/api/auth/[...nextauth]/route.ts",
+                    "description": "NextAuth App Router route handler.",
                     "language": "typescript",
                     "defaultContent": r#"import NextAuth from "next-auth";
 import CredentialsProvider from "next-auth/providers/credentials";
@@ -7198,13 +8182,13 @@ export const authOptions = {
 };
 
 const handler = NextAuth(authOptions);
-export default handler;"#
+export { handler as GET, handler as POST };"#
                 },
                 {
-                    "path": "src/pages/api/register.ts",
-                    "description": "User registration API endpoint.",
+                    "path": "src/app/api/register/route.ts",
+                    "description": "User registration App Router API endpoint.",
                     "language": "typescript",
-                    "defaultContent": r#"import { NextApiRequest, NextApiResponse } from "next";
+                    "defaultContent": r#"import { NextResponse } from "next/server";
 import bcrypt from "bcryptjs";
 import prisma from "@/lib/prisma";
 import { z } from "zod";
@@ -7215,18 +8199,14 @@ const registerSchema = z.object({
   password: z.string().min(8)
 });
 
-export default async function handler(req: NextApiRequest, res: NextApiResponse) {
-  if (req.method !== "POST") {
-    res.setHeader("Allow", ["POST"]);
-    return res.status(405).json({ message: `Method ${req.method} Not Allowed` });
-  }
-
+export async function POST(request: Request) {
   try {
-    const { name, email, password } = registerSchema.parse(req.body);
+    const body = await request.json();
+    const { name, email, password } = registerSchema.parse(body);
 
     const existingUser = await prisma.user.findUnique({ where: { email } });
     if (existingUser) {
-      return res.status(400).json({ message: "Email already in use" });
+      return NextResponse.json({ message: "Email already in use" }, { status: 400 });
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
@@ -7240,10 +8220,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       }
     });
 
-    return res.status(201).json({ message: "User registered successfully", user: { id: newUser.id, name: newUser.name, email: newUser.email } });
+    return NextResponse.json(
+      { message: "User registered successfully", user: { id: newUser.id, name: newUser.name, email: newUser.email } },
+      { status: 201 }
+    );
   } catch (error: any) {
     console.error("Registration error:", error);
-    return res.status(500).json({ message: error.message || "Internal server error" });
+    return NextResponse.json({ message: error.message || "Internal server error" }, { status: 500 });
   }
 }"#
                 },
@@ -8286,12 +9269,13 @@ fn handle_axiom_url<R: tauri::Runtime>(app: &tauri::AppHandle<R>, url_str: &str)
             "build" | "generate" => {
                 let manifest_id = params.get("id").copied().unwrap_or("");
                 let project_id = params.get("projectId").copied().unwrap_or(manifest_id);
+                let custom_name = params.get("name").or_else(|| params.get("projectName")).copied().unwrap_or("");
                 let token = params.get("token").copied().unwrap_or("");
                 let host = params.get("host").copied().unwrap_or("");
                 
                 debug_log_to_file(format!(
-                    "Emitting deep-link:build event with manifestId={} token={} host={}",
-                    manifest_id, token, host
+                    "Emitting deep-link:build event with manifestId={} token={} host={} name={}",
+                    manifest_id, token, host, custom_name
                 ));
                 
                 if !manifest_id.is_empty() {
@@ -8299,7 +9283,8 @@ fn handle_axiom_url<R: tauri::Runtime>(app: &tauri::AppHandle<R>, url_str: &str)
                         "manifestId": manifest_id,
                         "projectId": project_id,
                         "token": token,
-                        "host": host
+                        "host": host,
+                        "name": custom_name
                     }));
                 }
             },
@@ -8520,9 +9505,9 @@ mod tests {
         let content = "import { useSession } from 'next-auth/react';\nexport default function RootLayout({ children }) { const { data } = useSession(); return <html><body>{children}</body></html>; }";
         let metamanifest = serde_json::json!({});
         let processed = post_process_generated_file("src/app/layout.tsx", content, &metamanifest, false);
-        assert!(processed.contains("function RootLayoutInner"));
         assert!(processed.contains("export default function RootLayout"));
-        assert!(processed.contains("<SessionProvider>"));
+        assert!(processed.contains("<SessionProvider>{children}</SessionProvider>"));
+        assert!(processed.starts_with("\"use client\";"));
     }
 
     #[test]
@@ -8564,6 +9549,59 @@ mod tests {
         let metamanifest = serde_json::json!({});
         let processed = post_process_generated_file("src/lib/prisma.ts", content, &metamanifest, false);
         assert!(processed.contains("export default prisma;"));
+    }
+
+    #[test]
+    fn test_prisma_sanitizer_fixes_relation_on_scalar_and_nextauth() {
+        // Exact schema that broke the "Health App" project
+        let content = "generator client {\n  provider = \"prisma-client-js\"\n}\n\ndatasource db {\n  provider = \"postgresql\"\n  url      = env(\"DATABASE_URL\")\n}\n\nmodel User {\n  id            String     @id @default(cuid())\n  createdAt     DateTime   @default(now())\n  email         String     @unique\n  name          String?\n  accounts      Account[]\n  sessions      Session[]\n}\n\nmodel Account {\n  id                String     @id @default(cuid())\n  type              String\n  provider          String\n  providerAccountId String\n  refresh_token     String?\n  access_token      String?\n  expires_at        Int?\n  token_type        String?\n  scope             String?\n  id_token          String?\n  session_state     String?\n  userId            String     @relation(fields: [userId], references: [id], onDelete: Cascade)\n  user              User       @relation(fields: [userId], references: [id], onDelete: Cascade)\n}\n\nmodel Session {\n  id           String   @id @default(cuid())\n  sessionToken String   @unique\n  expires      DateTime\n  userId       String   \n  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)\n}";
+        let processed = post_process_generated_file("prisma/schema.prisma", content, &serde_json::json!({}), false);
+
+        // No @relation on a scalar field anymore
+        for line in processed.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 && parts[0] == "userId" {
+                assert!(!line.contains("@relation"), "scalar userId still has @relation: {}", line);
+            }
+        }
+        // Canonical NextAuth constraint added
+        assert!(processed.contains("@@unique([provider, providerAccountId])"));
+        // Back-relations are not duplicated
+        assert_eq!(processed.matches("Account[]").count(), 1);
+        assert_eq!(processed.matches("Session[]").count(), 1);
+    }
+
+    #[test]
+    fn test_nextauth_template_matches_int_user_id_and_adds_back_relations() {
+        let content = "model User {\n  id    Int    @id @default(autoincrement())\n  email String @unique\n\n  @@index([email])\n}\n\nmodel Account {\n  id                String @id\n  userId            Int\n  provider          String\n  providerAccountId String\n}\n\nmodel Session {\n  id           String @id\n  sessionToken String @unique\n  userId       Int\n  expires      DateTime\n}";
+        let processed = apply_nextauth_prisma_template(content);
+        assert!(processed.contains("  userId            Int\n"));
+        assert!(processed.contains("  userId       Int\n"));
+        assert!(processed.contains("accounts      Account[]"));
+        assert!(processed.contains("sessions      Session[]"));
+        // Back-relations are inserted before the @@index block attribute
+        let acc_idx = processed.find("accounts      Account[]").unwrap();
+        let idx_idx = processed.find("@@index([email])").unwrap();
+        assert!(acc_idx < idx_idx);
+    }
+
+    #[test]
+    fn test_nextauth_template_skips_non_nextauth_models() {
+        let content = "model User {\n  id String @id\n}\n\nmodel Session {\n  id      String @id\n  workout String\n}";
+        assert_eq!(apply_nextauth_prisma_template(content), content);
+    }
+
+    #[test]
+    fn test_clean_cli_output_and_extract_failing_lines() {
+        let raw = "\u{1b}[1;91merror\u{1b}[0m: Invalid field type\n  -->  [4mprisma\\schema.prisma:2[0m\n  -->  prisma\\schema.prisma:2";
+        let clean = clean_cli_output_for_llm(raw);
+        assert!(!clean.contains("[1;91m"));
+        assert!(!clean.contains("[0m"));
+        assert!(!clean.contains('\u{1b}'));
+        let schema = "model A {\n  userId String @relation(fields: [userId], references: [id])\n}";
+        let lines = extract_prisma_error_lines(&clean, schema);
+        assert_eq!(lines.matches("Line 2:").count(), 1);
+        assert!(lines.contains("userId String @relation"));
     }
 
     #[test]
@@ -8716,6 +9754,22 @@ export const version = "1.0.0";
     }
 
     #[test]
+    fn test_inject_axiom_attrs_context_provider_and_member_expr() {
+        // 1. Context Provider should NOT have attributes injected into it
+        let input = "return (<CartContext.Provider value={{ cart }}><div>Content</div></CartContext.Provider>);";
+        let output = inject_axiom_attrs(input, "src/lib/cartContext.tsx");
+        assert!(!output.contains("<CartContext data-axiom-component"));
+        assert!(!output.contains("<CartContext.Provider data-axiom-component"));
+        assert!(output.contains("<div data-axiom-component=\"CartContext\" data-axiom-file=\"src/lib/cartContext.tsx\">Content</div>"));
+
+        // 2. Member expression components (like Menu.Item) should have attribute placed cleanly on full tag name
+        let input2 = "return (<Menu.Item className=\"p-2\"><span>Text</span></Menu.Item>);";
+        let output2 = inject_axiom_attrs(input2, "src/components/Menu.tsx");
+        assert!(output2.contains("<Menu.Item data-axiom-component=\"Menu\" data-axiom-file=\"src/components/Menu.tsx\" className=\"p-2\">"));
+        assert!(!output2.contains("<Menu data-axiom-component"));
+    }
+
+    #[test]
     fn test_get_project_path() {
         let temp_dir = std::env::temp_dir().join(format!("axiom_test_{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&temp_dir);
@@ -8725,6 +9779,86 @@ export const version = "1.0.0";
         assert!(fallback_path.ends_with("non_existent_project"));
         
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_get_stack_rulepacks() {
+        // Test 1: React + NextIntl file and error detection
+        let file_path = "src/components/header.tsx";
+        let content = "import { useTranslations } from 'next-intl'; export function Header() { const t = useTranslations('Header'); }";
+        let err = "Error: Failed to call `useTranslations` because the context from `NextIntlClientProvider` was not found.";
+
+        let rules = get_stack_rulepacks(file_path, content, Some(err));
+        assert!(rules.contains("REACT JSX SYNTAX, HOOKS & STYLING RULES"));
+        assert!(rules.contains("NEVER USE STRING STYLE ATTRIBUTES"));
+        assert!(rules.contains("NEVER CALL HOOKS AT MODULE SCOPE"));
+        assert!(rules.contains("NEXT-INTL (INTERNATIONALIZATION) RULES"));
+        assert!(rules.contains("useTranslations SIGNATURE ENFORCEMENT"));
+        assert!(rules.contains("NEXT.JS LINK COMPONENT RULES") == false);
+
+        // Test 2: Next.js Link component
+        let link_content = "import Link from 'next/link'; export default function Nav() { return <Link href='/'>Home</Link>; }";
+        let link_rules = get_stack_rulepacks("src/components/Nav.tsx", link_content, None);
+        assert!(link_rules.contains("NEXT.JS LINK COMPONENT RULES"));
+        assert!(link_rules.contains("PREFETCH OPTIMIZATION"));
+
+        // Test 3: Prisma schema
+        let prisma_rules = get_stack_rulepacks("prisma/schema.prisma", "datasource db { provider = \"sqlite\" }", None);
+        assert!(prisma_rules.contains("PRISMA ORM & DATABASE RULES"));
+        assert!(prisma_rules.contains("SERVER-ONLY BOUNDARY"));
+
+        // Test 4: MERN server.js
+        let mern_rules = get_stack_rulepacks("server.js", "const express = require('express'); const app = express();", None);
+        assert!(mern_rules.contains("MERN STACK (EXPRESS + MONGOOSE + VITE/REACT) RULES"));
+        assert!(mern_rules.contains("EXPRESS ASYNC ROUTE SAFETY"));
+
+        // Test 5: React Native / Expo screen
+        let rn_rules = get_stack_rulepacks("src/screens/HomeScreen.tsx", "import { View, Text } from 'react-native';", None);
+        assert!(rn_rules.contains("REACT NATIVE & EXPO MOBILE RULES"));
+        assert!(rn_rules.contains("ABSOLUTE WEB DOM ELEMENT BAN"));
+        // React Native should NOT have web React rules injected
+        assert!(!rn_rules.contains("REACT JSX SYNTAX, HOOKS & STYLING RULES"));
+
+        // Test 6: Desktop Electron preload
+        let desktop_rules = get_stack_rulepacks("preload.js", "const { contextBridge, ipcRenderer } = require('electron');", None);
+        assert!(desktop_rules.contains("DESKTOP (ELECTRON & TAURI) RULES"));
+        assert!(desktop_rules.contains("ELECTRON CONTEXT ISOLATION"));
+
+        // Test 7: Unrelated plain file
+        let plain_rules = get_stack_rulepacks("README.md", "# My Project", None);
+        assert!(plain_rules.is_empty());
+
+        // Test 8: Configuration files (tsconfig.json)
+        let config_rules = get_stack_rulepacks("tsconfig.json", "{}", None);
+        assert!(config_rules.contains("CONFIGURATION & TSCONFIG RULES"));
+        assert!(config_rules.contains("TSCONFIG.JSON CONCISENESS & VALIDITY"));
+    }
+
+    #[test]
+    fn test_apply_targeted_edit() {
+        let original = "
+        <Toolbar>
+          <IconButton edge=\"start\">
+            <FaBars />
+          </IconButton>
+          <Typography variant=\"h6\" component=\"div\" sx={{ flexGrow: 1, ml: 1 }}>
+            Axiom Dev
+          </Typography>
+          <IconButton>
+            <IoMdNotifications />
+          </IconButton>
+        </Toolbar>
+";
+
+        // LLM generates target compressed onto one line
+        let target = "<Typography variant=\"h6\" component=\"div\" sx={{ flexGrow: 1, ml: 1 }}>Axiom Dev</Typography>";
+        let replacement = "<Typography variant=\"h6\" component=\"div\" sx={{ flexGrow: 1, ml: 1 }}>Construction Smart System</Typography>";
+
+        let result = apply_targeted_edit(original, target, replacement);
+        assert!(result.is_ok(), "Targeted edit should succeed: {:?}", result.err());
+        let modified = result.unwrap();
+        assert!(modified.contains("Construction Smart System"));
+        assert!(!modified.contains("Axiom Dev"));
     }
 }
 
