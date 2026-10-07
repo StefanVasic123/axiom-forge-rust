@@ -37,3 +37,24 @@ pub async fn relay_submit_proposal(
         Err(format!("Relay HTTP error status: {}", res.status()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_relay_payload_serialization() {
+        let payload = RelayProposalPayload {
+            setup_key: "MOJ-RESTORAN-2026".to_string(),
+            project_id: "camper-connect".to_string(),
+            prompt: "Update logo".to_string(),
+            branch_name: "client-proposal/20260823".to_string(),
+            files: vec![serde_json::json!({ "filePath": "src/App.jsx" })],
+        };
+
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("setupKey"));
+        assert!(json.contains("MOJ-RESTORAN-2026"));
+        assert!(json.contains("camper-connect"));
+    }
+}

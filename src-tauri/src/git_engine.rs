@@ -182,3 +182,33 @@ pub async fn git_update_proposal_status(
 
     Ok(proposal)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_client_proposal_serialization() {
+        let prop = ClientProposal {
+            id: "prop-100".to_string(),
+            project_id: "my-test-proj".to_string(),
+            branch_name: "client-proposal/20260823-100000".to_string(),
+            prompt: "Change header color".to_string(),
+            created_at: "2026-08-23T14:50:00Z".to_string(),
+            status: "pending_review".to_string(),
+            files: vec![ProposalFileDiff {
+                file_path: "src/App.jsx".to_string(),
+                diff: "+ const color = 'blue';".to_string(),
+                is_new: false,
+            }],
+        };
+
+        let json = serde_json::to_string(&prop).unwrap();
+        let parsed: ClientProposal = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.id, "prop-100");
+        assert_eq!(parsed.status, "pending_review");
+        assert_eq!(parsed.files.len(), 1);
+        assert_eq!(parsed.files[0].file_path, "src/App.jsx");
+    }
+}
