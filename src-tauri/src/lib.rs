@@ -1259,7 +1259,23 @@ fn post_process_generated_file(
     let normalized_path = file_path.replace('\\', "/");
     let path_lower = normalized_path.to_lowercase();
 
-    if content.trim().is_empty() || content.trim() == "{}" {
+    let mut raw_content = content.to_string();
+
+    // If a non-JSON code file received a raw JSON envelope by mistake, extract the code payload
+    if !path_lower.ends_with(".json") && raw_content.trim().starts_with('{') && (raw_content.contains("\"fixes\"") || raw_content.contains("\"edits\"") || raw_content.contains("\"code\"") || raw_content.contains("\"explanation\"")) {
+        if let Ok(parsed_json) = serde_json::from_str::<Value>(&raw_content) {
+            let extracted = extract_edits_from_json(&parsed_json, &normalized_path);
+            if let Some(first_edit) = extracted.first() {
+                if let Some(repl) = first_edit.get("replacement").and_then(|r| r.as_str()) {
+                    if !repl.trim().is_empty() {
+                        raw_content = repl.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    if raw_content.trim().is_empty() || raw_content.trim() == "{}" {
         if let Some(templates) = metamanifest.get("requiredFilesTemplates").and_then(|t| t.as_array()) {
             for template in templates {
                 if let Some(t_path) = template.get("path").and_then(|p| p.as_str()) {
@@ -1272,6 +1288,8 @@ fn post_process_generated_file(
             }
         }
     }
+
+    let content = raw_content.as_str();
 
     if path_lower.ends_with("tailwind.config.js") {
         if !content.contains("./src/") && !content.contains("src/") {
@@ -1450,8 +1468,6 @@ fn post_process_generated_file(
                 processed = processed.replace("</body>", &format!("{}\n      </body>", inspector_script));
             } else if processed.contains("</html>") {
                 processed = processed.replace("</html>", &format!("{}\n</html>", inspector_script));
-            } else {
-                processed.push_str(&format!("\n// Axiom Inspect\n{}", inspector_script));
             }
         }
     }
@@ -1758,7 +1774,7 @@ fn post_process_generated_file(
                 }
             }
 
-            if processed.contains("({ children })") {
+            if processed.contains("({ children })") && !processed.contains("React.FC<") && !processed.contains("FC<") {
                 processed = processed.replace("({ children })", "({ children }: { children: React.ReactNode })");
             }
             
@@ -4371,6 +4387,29 @@ fn strip_ansi_codes(input: &str) -> String {
 }
 
 fn extract_file_path_from_line(line: &str) -> Option<String> {
+    // Next.js route-based runtime errors, e.g. 'Error: The default export is not a React Component in page: "/"'
+    let route_extracted = if let Some(start) = line.find("in page: \"") {
+        let sub = &line[start + "in page: \"".len()..];
+        sub.find('\"').map(|end| sub[..end].to_string())
+    } else if let Some(start) = line.find("in page: '") {
+        let sub = &line[start + "in page: '".len()..];
+        sub.find('\'').map(|end| sub[..end].to_string())
+    } else {
+        None
+    };
+
+    if let Some(route) = route_extracted {
+        let clean_route = route.trim_matches('/');
+        if clean_route.is_empty() {
+            return Some("src/app/page.tsx".to_string());
+        } else if clean_route.starts_with("api/") || clean_route == "api" {
+            // In Next.js App Router, API routes are located in route.ts/route.js, NOT page.tsx
+            return Some(format!("src/app/{}/route.ts", clean_route));
+        } else {
+            return Some(format!("src/app/{}/page.tsx", clean_route));
+        }
+    }
+
     let cleaned = line.replace("⨯", " ");
     for word in cleaned.split_whitespace() {
         let word_clean = word.trim_matches(|c| c == '[' || c == ']' || c == ',' || c == '`' || c == '(' || c == ')');
@@ -4430,6 +4469,91 @@ fn extract_package_name_from_error(line: &str) -> Option<String> {
         }
         return Some(trimmed.to_string());
     }
+    None
+}
+
+fn resolve_project_file_candidate(proj_dir: &Path, rel_path: &str) -> Option<String> {
+    if proj_dir.join(rel_path).is_file() {
+        return Some(rel_path.to_string());
+    }
+
+    // Try without src/ if path starts with src/
+    if let Some(stripped) = rel_path.strip_prefix("src/") {
+        if proj_dir.join(stripped).is_file() {
+            return Some(stripped.to_string());
+        }
+    }
+
+    // Try with src/ if path doesn't start with src/
+    let with_src = format!("src/{}", rel_path);
+    if proj_dir.join(&with_src).is_file() {
+        return Some(with_src);
+    }
+
+    // Try alternative file extensions (.tsx, .jsx, .ts, .js)
+    for ext in &[".tsx", ".jsx", ".ts", ".js"] {
+        if let Some(dot_idx) = rel_path.rfind('.') {
+            let base = &rel_path[..dot_idx];
+            let candidate = format!("{}{}", base, ext);
+            if proj_dir.join(&candidate).is_file() {
+                return Some(candidate);
+            }
+            if let Some(stripped) = candidate.strip_prefix("src/") {
+                if proj_dir.join(stripped).is_file() {
+                    return Some(stripped.to_string());
+                }
+            }
+            let with_src = format!("src/{}", candidate);
+            if proj_dir.join(&with_src).is_file() {
+                return Some(with_src);
+            }
+        }
+    }
+
+    // If it's src/app/api/.../route.ts, also check Pages router candidates: src/pages/api/....ts
+    if rel_path.contains("app/api/") && rel_path.ends_with("/route.ts") {
+        let api_name = rel_path
+            .trim_start_matches("src/")
+            .trim_start_matches("app/api/")
+            .trim_end_matches("/route.ts");
+        for ext in &[".ts", ".js", ".tsx", ".jsx"] {
+            let pages_candidate = format!("src/pages/api/{}{}", api_name, ext);
+            if proj_dir.join(&pages_candidate).is_file() {
+                return Some(pages_candidate);
+            }
+            let pages_no_src = format!("pages/api/{}{}", api_name, ext);
+            if proj_dir.join(&pages_no_src).is_file() {
+                return Some(pages_no_src);
+            }
+        }
+    }
+
+    // If it's src/app/.../page.tsx, also check Pages router candidates: src/pages/....tsx
+    if rel_path.contains("app/") && rel_path.ends_with("/page.tsx") {
+        let page_name = rel_path
+            .trim_start_matches("src/")
+            .trim_start_matches("app/")
+            .trim_end_matches("/page.tsx");
+        for ext in &[".tsx", ".jsx", ".js", ".ts"] {
+            let pages_candidate = if page_name.is_empty() {
+                format!("src/pages/index{}", ext)
+            } else {
+                format!("src/pages/{}{}", page_name, ext)
+            };
+            if proj_dir.join(&pages_candidate).is_file() {
+                return Some(pages_candidate);
+            }
+            let pages_no_src = if page_name.is_empty() {
+                format!("pages/index{}", ext)
+            } else {
+                format!("pages/{}{}", page_name, ext)
+            };
+            if proj_dir.join(&pages_no_src).is_file() {
+                return Some(pages_no_src);
+            }
+        }
+    }
+
     None
 }
 
@@ -4500,14 +4624,16 @@ impl CompileErrorDetector {
     }
 
     fn emit_current(&mut self, window: &tauri::Window, project_id: &str) {
-        if let Some(ref path) = self.file_path {
+        if let Some(ref raw_path) = self.file_path {
             let proj_dir = get_project_path(project_id);
-            let full_path = proj_dir.join(path);
+            let resolved_path = resolve_project_file_candidate(&proj_dir, raw_path)
+                .unwrap_or_else(|| raw_path.clone());
+            let full_path = proj_dir.join(&resolved_path);
             if full_path.exists() && full_path.is_file() {
                 let error_message = self.error_lines.join("\n");
                 let _ = window.emit("server:compile-error", serde_json::json!({
                     "projectId": project_id,
-                    "filePath": path,
+                    "filePath": resolved_path,
                     "errorMessage": error_message
                 }));
             }
@@ -4787,6 +4913,118 @@ fn resolve_import_path(proj_dir: &std::path::Path, import_path: &str, current_fi
         return Some(normalized);
     }
     None
+}
+
+fn extract_related_project_files_for_error(
+    proj_dir: &std::path::Path,
+    file_content: &str,
+    current_file: &str,
+    error_msg: &str,
+) -> Vec<(String, String)> {
+    use std::collections::HashSet;
+    let mut resolved_paths = HashSet::new();
+    let mut results = Vec::new();
+
+    // 1. Scan for all quoted tokens in error_msg ('...', "...", `...`)
+    let mut quoted_tokens = Vec::new();
+    let chars: Vec<char> = error_msg.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' || c == '"' || c == '`' {
+            let quote = c;
+            let start = i + 1;
+            let mut end = start;
+            while end < chars.len() && chars[end] != quote {
+                end += 1;
+            }
+            if end < chars.len() {
+                let token: String = chars[start..end].iter().collect();
+                let trimmed = token.trim();
+                if !trimmed.is_empty() {
+                    quoted_tokens.push(trimmed.to_string());
+                }
+                i = end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    // Check each quoted token as a direct or relative import path
+    for token in &quoted_tokens {
+        if token.starts_with("@/") || token.starts_with("./") || token.starts_with("../") || token.contains('/') {
+            if let Some(resolved) = resolve_import_path(proj_dir, token, current_file) {
+                if resolved != current_file && proj_dir.join(&resolved).is_file() {
+                    resolved_paths.insert(resolved);
+                }
+            }
+        }
+    }
+
+    // 2. Parse all imports declared in the failing file
+    // Matches: import ... from '...'; import '...'; const ... = require('...');
+    if let Ok(re) = regex::Regex::new(r#"(?m)(?:import\s+(?:(?:(\{[^}]+\})|([a-zA-Z0-9_$]+)|(?:\*\s+as\s+[a-zA-Z0-9_$]+))\s+from\s+)?['"]([^'"]+)['"]"#) {
+        for cap in re.captures_iter(file_content) {
+            let import_specifier = cap.get(3).map(|m| m.as_str()).unwrap_or("");
+            if import_specifier.is_empty() {
+                continue;
+            }
+
+            // Extract imported symbols (e.g. named imports { A, B } or default import Navbar)
+            let mut imported_symbols = Vec::new();
+            if let Some(named) = cap.get(1) {
+                for sym in named.as_str().trim_matches(|c| c == '{' || c == '}').split(',') {
+                    let sym_clean = sym.trim().split_whitespace().last().unwrap_or("").trim();
+                    if !sym_clean.is_empty() {
+                        imported_symbols.push(sym_clean.to_string());
+                    }
+                }
+            }
+            if let Some(default_sym) = cap.get(2) {
+                let sym_clean = default_sym.as_str().trim();
+                if !sym_clean.is_empty() {
+                    imported_symbols.push(sym_clean.to_string());
+                }
+            }
+
+            // Check if error_msg mentions the import specifier OR any of its imported symbols
+            let mentions_specifier = !import_specifier.is_empty() && error_msg.contains(import_specifier);
+            let mentions_symbol = imported_symbols.iter().any(|sym| error_msg.contains(sym));
+
+            if mentions_specifier || mentions_symbol {
+                if let Some(resolved) = resolve_import_path(proj_dir, import_specifier, current_file) {
+                    if resolved != current_file && proj_dir.join(&resolved).is_file() {
+                        resolved_paths.insert(resolved);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. For any identifier in quoted_tokens, check if a file named <token>.tsx, <token>.ts, etc. exists in the project
+    for token in &quoted_tokens {
+        if !token.contains('/') && !token.contains(' ') && token.len() >= 3 {
+            for sub in &["src/components", "components", "src/hooks", "hooks", "src/lib", "lib", "src/utils", "utils"] {
+                for ext in &["tsx", "ts", "jsx", "js"] {
+                    let candidate = format!("{}/{}.{}", sub, token, ext);
+                    if proj_dir.join(&candidate).is_file() && candidate != current_file {
+                        resolved_paths.insert(candidate);
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Read contents of all resolved related files
+    for path_str in resolved_paths {
+        let full_path = proj_dir.join(&path_str);
+        if let Ok(content) = std::fs::read_to_string(&full_path) {
+            results.push((path_str, content));
+        }
+    }
+
+    results
 }
 
 /// Cleans CLI output for the LLM: removes real ANSI escape sequences (via the existing
@@ -5154,6 +5392,199 @@ async fn heal_prisma_schema_loop(
     Err(format!("Failed to validate and auto-heal Prisma schema after {} AI attempts.", MAX_AI_HEALS))
 }
 
+fn looks_like_code_payload(s: &str) -> bool {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // Cannot be a raw JSON object or array
+    if (trimmed.starts_with('{') && trimmed.ends_with('}')) || (trimmed.starts_with('[') && trimmed.ends_with(']')) {
+        return false;
+    }
+    trimmed.contains('\n')
+        || trimmed.contains("import ")
+        || trimmed.contains("export ")
+        || trimmed.contains("const ")
+        || trimmed.contains("function ")
+        || trimmed.contains("class ")
+        || trimmed.contains("interface ")
+        || trimmed.contains("type ")
+        || trimmed.contains("return ")
+        || trimmed.contains("from '")
+        || trimmed.contains("from \"")
+        || trimmed.contains("<")
+        || trimmed.contains("=>")
+        || trimmed.contains("model ")
+        || trimmed.contains("datasource ")
+}
+
+fn is_valid_file_path(s: &str) -> bool {
+    let trimmed = s.trim();
+    if trimmed.is_empty() || trimmed.len() > 260 {
+        return false;
+    }
+    // File paths cannot contain newlines, spaces, or code syntax characters
+    if trimmed.contains('\n')
+        || trimmed.contains(' ')
+        || trimmed.contains(';')
+        || trimmed.contains('{')
+        || trimmed.contains('}')
+        || trimmed.contains('(')
+        || trimmed.contains(')')
+        || trimmed.contains('<')
+        || trimmed.contains('>')
+        || trimmed.contains('=')
+        || trimmed.contains('\'')
+        || trimmed.contains('"')
+    {
+        return false;
+    }
+    let lower = trimmed.to_lowercase().replace('\\', "/");
+    lower.ends_with(".tsx")
+        || lower.ends_with(".ts")
+        || lower.ends_with(".jsx")
+        || lower.ends_with(".js")
+        || lower.ends_with(".prisma")
+        || lower.ends_with(".css")
+        || lower.ends_with(".scss")
+        || lower.ends_with(".json")
+        || lower.ends_with(".html")
+        || lower.ends_with(".md")
+        || lower.ends_with(".svg")
+        || (lower.contains('/') && !lower.contains("import") && !lower.contains("export"))
+}
+
+fn recursively_find_edits(value: &Value, current_path: &str, edits: &mut Vec<Value>) {
+    match value {
+        Value::Object(map) => {
+            let mut detected_code = None;
+            let mut detected_path = None;
+            let mut detected_target = None;
+            let mut context_path = current_path.to_string();
+
+            // First pass: check if there is an explicit valid file path in this object (e.g. "file": "src/components/Navbar.tsx")
+            for (k, v) in map {
+                let k_lower = k.to_lowercase();
+                if let Some(s) = v.as_str() {
+                    if is_valid_file_path(s) {
+                        if k_lower.contains("file") || k_lower.contains("path") || k_lower.contains("filename") {
+                            context_path = s.to_string();
+                            detected_path = Some(s.to_string());
+                        }
+                    }
+                }
+            }
+
+            // Second pass: extract code and target/search strings
+            for (k, v) in map {
+                let k_lower = k.to_lowercase();
+                if let Some(s) = v.as_str() {
+                    if is_valid_file_path(s) && detected_path.is_none() {
+                        detected_path = Some(s.to_string());
+                    } else if k_lower.contains("target") || k_lower.contains("search") || k_lower.contains("old") || k_lower.contains("original") || k_lower.contains("before") || k_lower.contains("find") {
+                        if !s.is_empty() {
+                            detected_target = Some(s.to_string());
+                        }
+                    } else if (k_lower == "path" || k_lower == "file") && !is_valid_file_path(s) && !s.is_empty() {
+                        // The model put the search/target string in the "path" field!
+                        detected_target = Some(s.to_string());
+                    } else if k_lower.contains("replacement") || k_lower.contains("replace") || k_lower.contains("code") || k_lower.contains("content") || k_lower.contains("solution") || k_lower.contains("fixed") || k_lower.contains("new") || k_lower == "with" || k_lower == "to" || k_lower == "insert" || k_lower == "val" || k_lower == "value" {
+                        if !s.trim().is_empty() {
+                            detected_code = Some(s.to_string());
+                        }
+                    } else if looks_like_code_payload(s) && detected_code.is_none() && detected_target.as_deref() != Some(s) {
+                        detected_code = Some(s.to_string());
+                    }
+                }
+            }
+
+            if let Some(code) = detected_code {
+                let final_path = detected_path.unwrap_or_else(|| context_path.clone());
+                let final_target = detected_target.unwrap_or_default();
+                edits.push(serde_json::json!({
+                    "path": final_path,
+                    "target": final_target,
+                    "replacement": code
+                }));
+                return;
+            }
+
+            for (_, v) in map {
+                recursively_find_edits(v, &context_path, edits);
+            }
+        },
+        Value::Array(arr) => {
+            for item in arr {
+                recursively_find_edits(item, current_path, edits);
+            }
+        },
+        Value::String(s) => {
+            if looks_like_code_payload(s) && edits.is_empty() {
+                edits.push(serde_json::json!({
+                    "path": current_path,
+                    "target": "",
+                    "replacement": s
+                }));
+            }
+        },
+        _ => {}
+    }
+}
+
+fn extract_code_from_malformed_json_response(raw: &str, default_path: &str) -> Option<Vec<Value>> {
+    let trimmed = raw.trim();
+    
+    // Check if raw text has an embedded code block inside "content": `...` or "content": "..."
+    // or "replacement": `...` or "replacement": "..."
+    let markers = ["\"content\":", "\"replacement\":", "\"code\":"];
+    for marker in &markers {
+        if let Some(pos) = trimmed.find(marker) {
+            let before = &trimmed[..pos];
+            let mut detected_path = default_path.to_string();
+            // Dynamically search for any file path referenced in the envelope before the marker
+            for token in before.split('"') {
+                if is_valid_file_path(token) {
+                    detected_path = token.replace('\\', "/");
+                }
+            }
+
+            let after = trimmed[pos + marker.len()..].trim();
+            if after.starts_with('`') {
+                if let Some(end_bt) = after[1..].rfind('`') {
+                    let code = after[1..=end_bt].trim();
+                    if !code.is_empty() {
+                        let unescaped = code.replace("\\\"", "\"").replace("\\n", "\n").replace("\\\\", "\\");
+                        return Some(vec![serde_json::json!({
+                            "path": detected_path,
+                            "target": "",
+                            "replacement": unescaped
+                        })]);
+                    }
+                }
+            } else if after.starts_with('"') {
+                if let Some(end_quote) = after[1..].rfind('"') {
+                    let code = after[1..=end_quote].trim();
+                    if !code.is_empty() {
+                        let unescaped = code.replace("\\\"", "\"").replace("\\n", "\n").replace("\\\\", "\\");
+                        return Some(vec![serde_json::json!({
+                            "path": detected_path,
+                            "target": "",
+                            "replacement": unescaped
+                        })]);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_edits_from_json(parsed_json: &Value, default_path: &str) -> Vec<Value> {
+    let mut edits = Vec::new();
+    recursively_find_edits(parsed_json, default_path, &mut edits);
+    edits
+}
+
 #[tauri::command]
 async fn project_heal_compile_error(
     project_id: String,
@@ -5298,30 +5729,20 @@ async fn project_heal_compile_error(
         }
     }
 
-    // Detect attempted import errors and pull in the exporting file's content
-    if error_msg.contains("Attempted import error:") {
-        if let Some(start_idx) = error_msg.find("is not exported from '") {
-            let sub = &error_msg[start_idx + "is not exported from '".len()..];
-            if let Some(end_idx) = sub.find('\'') {
-                let import_path = &sub[..end_idx];
-                if let Some(resolved_path) = resolve_import_path(&proj_dir, import_path, &rel_file_path) {
-                    let resolved_full_path = proj_dir.join(&resolved_path);
-                    if resolved_full_path.exists() {
-                        if let Ok(exporter_content) = std::fs::read_to_string(&resolved_full_path) {
-                            project_context.push_str(&format!(
-                                "\n--- Source Exporter File (Contains the actual missing export): {} ---\n{}\n----------------------------------------------------\n",
-                                resolved_path, exporter_content
-                            ));
-                            system_prompt.push_str(&format!(
-                                "\n\nCRITICAL IMPORT ERROR RULE:\n\
-                                 The error indicates that an import failed because the export is missing in '{}'.\n\
-                                 You can propose edits for '{}' (set 'path' to '{}' in edits) to add the missing export, OR modify '{}' if the import path itself is wrong.",
-                                resolved_path, resolved_path, resolved_path, rel_file_path
-                            ));
-                        }
-                    }
-                }
-            }
+    // Abstractly extract and inject all related exporter/dependency files based on error message, tokens, and imports
+    let related_files = extract_related_project_files_for_error(&proj_dir, &file_content, &rel_file_path, &error_msg);
+    for (rel_dep_path, dep_content) in related_files {
+        if !project_context.contains(&rel_dep_path) {
+            project_context.push_str(&format!(
+                "\n--- Related Dependency / Exporter File: {} ---\n{}\n----------------------------------------------------\n",
+                rel_dep_path, dep_content
+            ));
+            system_prompt.push_str(&format!(
+                "\n\nCRITICAL MULTI-FILE EDIT RULE:\n\
+                 The error in '{}' may be caused by missing or incorrect exports/definitions in '{}'.\n\
+                 You are allowed to propose edits for '{}' (set 'path' to '{}' in edits) to fix/add exports or declarations, OR modify '{}'.",
+                rel_file_path, rel_dep_path, rel_dep_path, rel_dep_path, rel_file_path
+            ));
         }
     }
 
@@ -5336,6 +5757,7 @@ async fn project_heal_compile_error(
 
     let ollama_req = serde_json::json!({
         "model": model,
+        "format": "json",
         "messages": [
             { "role": "system", "content": system_prompt },
             { "role": "user", "content": user_prompt }
@@ -5379,102 +5801,74 @@ async fn project_heal_compile_error(
                                     } else {
                                         None
                                     }
+                                } else if let Some(start_arr) = clean_content.find('[') {
+                                    if let Some(end_arr) = clean_content.rfind(']') {
+                                        let json_str = &clean_content[start_arr..=end_arr];
+                                        serde_json::from_str(json_str).ok()
+                                    } else {
+                                        None
+                                    }
                                 } else {
                                     None
                                 }
                             });
 
                         if let Some(ref parsed_json) = maybe_json {
-                            if let Some(exp) = parsed_json.get("explanation").and_then(|e| e.as_str()) {
+                            if let Some(exp) = parsed_json.get("explanation").or_else(|| parsed_json.get("reason")).and_then(|e| e.as_str()) {
                                 explanation = exp.to_string();
                             }
 
-                            // Fallback 1: features -> files -> content
-                            if let Some(features) = parsed_json.get("features").and_then(|f| f.as_array()) {
-                                for feature in features {
-                                    if let Some(files) = feature.get("files").and_then(|f| f.as_array()) {
-                                        for file in files {
-                                            if let (Some(path), Some(content)) = (file.get("path").and_then(|p| p.as_str()), file.get("content").and_then(|c| c.as_str())) {
-                                                let target_full_path = proj_dir.join(path);
-                                                if target_full_path.exists() {
-                                                    if let Ok(orig) = std::fs::read_to_string(&target_full_path) {
-                                                        resolved_edits.push(serde_json::json!({
-                                                            "path": path,
-                                                            "target": orig,
-                                                            "replacement": content
-                                                        }));
-                                                    }
-                                                } else {
-                                                    resolved_edits.push(serde_json::json!({
-                                                        "path": path,
-                                                        "target": "",
-                                                        "replacement": content
-                                                    }));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            resolved_edits = extract_edits_from_json(parsed_json, &rel_file_path);
+                        }
 
-                            // Fallback 2: files -> content
-                            if resolved_edits.is_empty() {
-                                if let Some(files) = parsed_json.get("files").and_then(|f| f.as_array()) {
-                                    for file in files {
-                                        if let (Some(path), Some(content)) = (file.get("path").and_then(|p| p.as_str()), file.get("content").and_then(|c| c.as_str())) {
-                                            let target_full_path = proj_dir.join(path);
-                                            if target_full_path.exists() {
-                                                if let Ok(orig) = std::fs::read_to_string(&target_full_path) {
-                                                    resolved_edits.push(serde_json::json!({
-                                                        "path": path,
-                                                        "target": orig,
-                                                        "replacement": content
-                                                    }));
-                                                }
-                                            } else {
-                                                resolved_edits.push(serde_json::json!({
-                                                    "path": path,
-                                                    "target": "",
-                                                    "replacement": content
-                                                }));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Standard path: edits
-                            if resolved_edits.is_empty() {
-                                if let Some(edits) = parsed_json.get("edits").and_then(|e| e.as_array()) {
-                                    resolved_edits = edits.clone();
-                                }
+                        // Try extracting code payload if the model returned malformed/partially-formatted JSON with backticks
+                        if resolved_edits.is_empty() {
+                            if let Some(malformed_edits) = extract_code_from_malformed_json_response(&clean_content, &rel_file_path) {
+                                debug_log_to_file(format!("[AI Auto-Healing] Extracted embedded code from malformed JSON for: {}", rel_file_path));
+                                let _ = window.emit("server:log", serde_json::json!({
+                                    "text": format!("> [AI Auto-Healing] Prepoznat kod unutar odgovora modela. Primenjujem na: {}\n", rel_file_path),
+                                    "type": "info"
+                                }));
+                                resolved_edits = malformed_edits;
+                                explanation = "Izvučen popravljen kod iz AI odgovora".to_string();
                             }
                         }
 
-                        // Whole-File Code Fallback: If no valid JSON edits were resolved, but clean_content contains code
+                        // Whole-File Code Fallback: If no valid JSON edits were resolved, but clean_content is strictly raw code (NOT a JSON dictionary)
                         if resolved_edits.is_empty() {
-                            let looks_like_code = clean_content.contains("import ") 
-                                || clean_content.contains("export ") 
-                                || clean_content.contains("const ") 
-                                || clean_content.contains("function ") 
-                                || clean_content.contains("class ") 
-                                || clean_content.contains("interface ") 
-                                || clean_content.contains("type ") 
-                                || clean_content.contains("return ") 
-                                || clean_content.contains("<");
+                            let trimmed = clean_content.trim();
+                            let is_raw_json = (trimmed.starts_with('{') && trimmed.ends_with('}'))
+                                || (trimmed.starts_with('[') && trimmed.ends_with(']'));
+                            let is_json_envelope = trimmed.contains("\"files\":") 
+                                || trimmed.contains("\"content\":") 
+                                || trimmed.contains("\"edits\":") 
+                                || trimmed.contains("\"target\":") 
+                                || trimmed.contains("\"replacement\":");
 
-                            if looks_like_code && !clean_content.trim().is_empty() {
-                                debug_log_to_file(format!("[AI Auto-Healing] Whole-file code fallback activated for: {}", rel_file_path));
-                                let _ = window.emit("server:log", serde_json::json!({
-                                    "text": format!("> [AI Auto-Healing] Prepoznat direktan kod celog fajla (Whole-File Fallback). Primenjujem na: {}\n", rel_file_path),
-                                    "type": "info"
-                                }));
-                                resolved_edits.push(serde_json::json!({
-                                    "path": rel_file_path.clone(),
-                                    "target": "",
-                                    "replacement": clean_content
-                                }));
-                                explanation = "Primenjen kompletan popravljen kod iz AI odgovora".to_string();
+                            if !is_raw_json && !is_json_envelope {
+                                let looks_like_code = clean_content.contains("import ") 
+                                    || clean_content.contains("export ") 
+                                    || clean_content.contains("const ") 
+                                    || clean_content.contains("function ") 
+                                    || clean_content.contains("class ") 
+                                    || clean_content.contains("interface ") 
+                                    || clean_content.contains("type ") 
+                                    || clean_content.contains("return ") 
+                                    || clean_content.contains("<");
+
+                                if looks_like_code && !trimmed.is_empty() {
+                                    debug_log_to_file(format!("[AI Auto-Healing] Whole-file code fallback activated for: {}", rel_file_path));
+                                    let _ = window.emit("server:log", serde_json::json!({
+                                        "text": format!("> [AI Auto-Healing] Prepoznat direktan kod celog fajla (Whole-File Fallback). Primenjujem na: {}\n", rel_file_path),
+                                        "type": "info"
+                                    }));
+                                    resolved_edits.push(serde_json::json!({
+                                        "path": rel_file_path.clone(),
+                                        "target": "",
+                                        "replacement": clean_content
+                                    }));
+                                    explanation = "Primenjen kompletan popravljen kod iz AI odgovora".to_string();
+                                }
                             }
                         }
 
@@ -5536,7 +5930,21 @@ async fn project_heal_compile_error(
                             let file_content_mut = modified_files.get_mut(&edit_path).unwrap();
 
                             if target.is_empty() {
-                                *file_content_mut = replacement.to_string();
+                                let repl_trimmed = replacement.trim();
+                                let is_just_import = (repl_trimmed.starts_with("import ") || repl_trimmed.starts_with("import{") || repl_trimmed.starts_with("import type"))
+                                    && !repl_trimmed.contains("export ")
+                                    && !repl_trimmed.contains("function ")
+                                    && !repl_trimmed.contains("const ")
+                                    && !repl_trimmed.contains("default ")
+                                    && !repl_trimmed.contains("class ");
+                                
+                                if is_just_import && !file_content_mut.is_empty() {
+                                    if !file_content_mut.contains(repl_trimmed) {
+                                        *file_content_mut = format!("{}\n{}", repl_trimmed, file_content_mut);
+                                    }
+                                } else {
+                                    *file_content_mut = replacement.to_string();
+                                }
                             } else {
                                 match apply_targeted_edit(file_content_mut, target, replacement) {
                                     Ok(new_content) => {
@@ -7389,7 +7797,8 @@ pub const NEXTJS_REACT_RULEPACK: &str = r#"REACT JSX SYNTAX, HOOKS & STYLING RUL
 21. PRISMA SINGLETON PATTERN: In `src/lib/prisma.ts`, `prisma` MUST be an instantiated singleton of `PrismaClient`, NOT a function or type. Always export a ready-to-use instance: `import { PrismaClient } from '@prisma/client'; const globalForPrisma = globalThis as unknown as { prisma: PrismaClient | undefined }; export const prisma = globalForPrisma.prisma ?? new PrismaClient(); if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = prisma; export default prisma;`.
 22. MANDATORY DEFAULT EXPORT IN APP ROUTER (LAYOUTS & PAGES): Every file in `src/app/**/layout.tsx` (or `.jsx`) and `src/app/**/page.tsx` (or `.jsx`) MUST have an `export default function` (e.g. `export default function RootLayout({ children }: { children: React.ReactNode })`). NEVER omit `export default` or define only a local `const Layout = ...` without default export. If a file marked with 'use client' lacks a default export, the React Server Components runtime fails to resolve `module.default` through its client proxy and crashes fatally with: "Error: Cannot access default.then on the server. You cannot dot into a client module from a server component."
 23. ROOT LAYOUT DOM HIERARCHY & PROVIDER PLACEMENT: In `src/app/layout.tsx`, `<html lang="en">` and `<body>` MUST be the outermost tags returned by `RootLayout`. Global Context Providers (such as `<SessionProvider>`, `<ThemeProvider>`, `<QueryClientProvider>`) MUST ALWAYS be placed INSIDE the `<body>` tag wrapping `{children}`: `return (<html lang="en"><body><SessionProvider>{children}</SessionProvider></body></html>);`. NEVER wrap any Provider outside the `<html>` tag! Wrapping `<html>` inside a Provider or component produces an invalid DOM hierarchy and causes fatal Next.js hydration and server-rendering crashes.
-24. CLIENT COMPONENTS CANNOT BE ASYNC: Any component marked with 'use client' MUST NEVER be declared as an async function (e.g. `export default async function Component()`). In React 18 / Next.js 14, only Server Components can be async. Declaring an async client component causes it to return a Promise, prompting the RSC compiler to access `.then` on the client module proxy and throwing "Error: Cannot access default.then on the server". For asynchronous data fetching in client components, always use `useEffect` or standard state hooks with synchronous component signatures."#;
+24. CLIENT COMPONENTS CANNOT BE ASYNC: Any component marked with 'use client' MUST NEVER be declared as an async function (e.g. `export default async function Component()`). In React 18 / Next.js 14, only Server Components can be async. Declaring an async client component causes it to return a Promise, prompting the RSC compiler to access `.then` on the client module proxy and throwing "Error: Cannot access default.then on the server". For asynchronous data fetching in client components, always use `useEffect` or standard state hooks with synchronous component signatures.
+25. NEXT.JS MIDDLEWARE MATCHER SYNTAX: In `src/middleware.ts` or `src/middleware.js`, route matchers use `path-to-regexp` syntax. Wildcards MUST use named parameters (e.g., `'/dashboard/:path*'`, `'/profile/:path*'`, `'/admin/:path*'`) or regex filters (e.g. `'/((?!api|_next|_vercel|.*\\..*).*)'`). NEVER use glob wildcards like `'/dashboard/*'` or `'/profile/*'`. Glob syntax (`/*`) throws a fatal route parsing crash: "Error parsing `/.../*` Reason: Unexpected MODIFIER, expected END"."#;
 
 pub const CONFIG_FILES_RULEPACK: &str = r#"CONFIGURATION & TSCONFIG RULES:
 1. TSCONFIG.JSON CONCISENESS & VALIDITY: `tsconfig.json` MUST be a valid, compact, non-redundant JSON object (maximum 30 lines). NEVER repeat compilerOptions flags or output duplicate keys (`strictNullChecks`, `noImplicitAny`). Redundant repetition loops corrupt the file and crash compilers.
@@ -7406,6 +7815,13 @@ pub const NEXT_INTL_RULEPACK: &str = r#"NEXT-INTL (INTERNATIONALIZATION) RULES:
 pub const NEXT_LINK_RULEPACK: &str = r#"NEXT.JS LINK COMPONENT RULES:
 1. NO NESTED ANCHOR TAGS: In Next.js 13+, do NOT place <a> tags inside <Link href="...">. Place className and styling directly on the <Link> component (e.g. `<Link href="/about" className="...">About</Link>`).
 2. PREFETCH OPTIMIZATION: Always add `prefetch={false}` to <Link> components (e.g. `<Link href="/dashboard" prefetch={false}>`) to prevent aggressive edge request amplification on Vercel."#;
+
+pub const NEXTJS_MIDDLEWARE_RULEPACK: &str = r#"NEXT.JS MIDDLEWARE & EDGE ROUTING RULES:
+1. PATH-TO-REGEXP MATCHERS: In `src/middleware.ts` or root `middleware.ts`, `config.matcher` strictly parses paths using `path-to-regexp`. Wildcards for subpaths MUST use named parameters (e.g. `'/dashboard/:path*'`, `'/profile/:path*'`, `'/admin/:path*'`) or regex filters (e.g. `'/((?!api|_next|_vercel|.*\\..*).*)'`). NEVER write glob wildcards like `'/dashboard/*'` or `'/profile/*'`. Unnamed wildcards (`/*` or `/**`) throw fatal syntax crashes: "Error parsing /.../* Reason: Unexpected MODIFIER, expected END: Invalid middlewares found".
+2. SINGLE ROOT/SRC MIDDLEWARE FILE: Next.js allows only ONE middleware file per project located strictly at `src/middleware.ts` (or `middleware.ts` at the root). Never create nested middleware files inside app subfolders.
+3. EDGE RUNTIME BOUNDARY: Next.js middleware executes exclusively in the Edge Runtime. NEVER import Node.js native packages (`fs`, `path`, `child_process`, `crypto`) or database drivers/Prisma Client in middleware files. Database operations belong in Server Components, Route Handlers, or Server Actions.
+4. WITHAUTH & NEXTAUTH SESSIONS: For NextAuth route protection in middleware, either wrap the handler with `withAuth` from `'next-auth/middleware'` or inspect the JWT via `await getToken({ req: request, secret: process.env.NEXTAUTH_SECRET })`. For unauthenticated access to protected routes, redirect using `NextResponse.redirect(new URL('/login', request.url))`.
+5. ASSET BYPASS OPTIMIZATION: Always filter out or bypass static resources (`/_next/static`, `/_next/image`, `/favicon.ico`, and files with extensions like `.png`, `.svg`, `.css`) in the matcher configuration to avoid redundant middleware execution on static assets."#;
 
 pub const MERN_STACK_RULEPACK: &str = r#"MERN STACK (EXPRESS + MONGOOSE + VITE/REACT) RULES:
 1. EXPRESS ASYNC ROUTE SAFETY: Wrap every async route handler body in try/catch. Always return explicit status codes: `res.status(200).json(data)` for success, `res.status(201).json(data)` for created, `res.status(400)` for invalid input, `res.status(404)` for missing resources, `res.status(500).json({ error: err.message })` in catch. Immediately return after sending response to prevent 'Cannot set headers after they are sent'.
@@ -7585,6 +8001,21 @@ pub fn get_stack_rulepacks(file_path: &str, file_content: &str, error_msg: Optio
 
     if is_config {
         rules.push(CONFIG_FILES_RULEPACK);
+    }
+
+    // 9. Next.js Middleware & Edge Routing Rules
+    let is_middleware = path_lower.contains("middleware.ts")
+        || path_lower.contains("middleware.js")
+        || content_lower.contains("nextrequest")
+        || content_lower.contains("nextresponse")
+        || content_lower.contains("withauth")
+        || err_lower.contains("invalid middlewares found")
+        || err_lower.contains("invalid-route-source")
+        || err_lower.contains("unexpected modifier")
+        || err_lower.contains("middleware");
+
+    if is_middleware {
+        rules.push(NEXTJS_MIDDLEWARE_RULEPACK);
     }
 
     if rules.is_empty() {
@@ -9511,6 +9942,62 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_edits_from_json_fixes_and_code() {
+        // Test JSON with "fixes" array containing "code" (exact response from qwen on layout.tsx)
+        let json_fixes = serde_json::json!({
+            "fixes": [
+                {
+                    "file": "src/app/layout.tsx",
+                    "line": 12,
+                    "description": "Unexpected token html",
+                    "code": "export default function RootLayout({ children }: { children: React.ReactNode }) { return (<html><body>{children}</body></html>); }"
+                }
+            ]
+        });
+        let edits = extract_edits_from_json(&json_fixes, "src/app/layout.tsx");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0]["path"], "src/app/layout.tsx");
+        assert!(edits[0]["replacement"].as_str().unwrap().contains("export default function RootLayout"));
+
+        // Test JSON with arbitrary nested structure and custom key names
+        let json_nested = serde_json::json!({
+            "response": {
+                "solution": {
+                    "target_file": "src/app/layout.tsx",
+                    "updated_code": "export default function Layout() { return <div>Hello</div>; }"
+                }
+            }
+        });
+        let edits_nested = extract_edits_from_json(&json_nested, "src/app/layout.tsx");
+        assert_eq!(edits_nested.len(), 1);
+        assert_eq!(edits_nested[0]["path"], "src/app/layout.tsx");
+        assert!(edits_nested[0]["replacement"].as_str().unwrap().contains("export default function Layout"));
+
+        // Test JSON with outer file and inner "path" containing target code snippet (Navbar.tsx case)
+        let json_router_fix = serde_json::json!({
+            "file": "src/components/Navbar.tsx",
+            "changes": [
+                {
+                    "type": "replace",
+                    "path": "import { useRouter } from 'next/router';",
+                    "replacement": "import { useRouter } from 'next/navigation';"
+                }
+            ]
+        });
+        let edits_router = extract_edits_from_json(&json_router_fix, "src/components/Navbar.tsx");
+        assert_eq!(edits_router.len(), 1);
+        assert_eq!(edits_router[0]["path"], "src/components/Navbar.tsx");
+        assert_eq!(edits_router[0]["target"], "import { useRouter } from 'next/router';");
+        assert_eq!(edits_router[0]["replacement"], "import { useRouter } from 'next/navigation';");
+
+        // Test post_process_generated_file safely unwraps raw JSON envelope into code
+        let raw_json_file = "{\n  \"fixes\": [\n    {\n      \"file\": \"src/app/layout.tsx\",\n      \"code\": \"export default function Clean() { return <div>Clean</div>; }\"\n    }\n  ]\n}";
+        let processed = post_process_generated_file("src/app/layout.tsx", raw_json_file, &serde_json::json!({}), false);
+        assert!(!processed.contains("\"fixes\":"));
+        assert!(processed.contains("export default function Clean"));
+    }
+
+    #[test]
     fn test_analyze_npm_install_failure() {
         // Test ETARGET (version mismatch)
         let etarget_log = "npm error code ETARGET\nnpm error notarget No matching version found for tw-elements-react@^4.0.0.\nnpm error notarget In most cases you or one of your dependencies...";
@@ -9589,6 +10076,24 @@ mod tests {
     fn test_nextauth_template_skips_non_nextauth_models() {
         let content = "model User {\n  id String @id\n}\n\nmodel Session {\n  id      String @id\n  workout String\n}";
         assert_eq!(apply_nextauth_prisma_template(content), content);
+    }
+
+    #[test]
+    fn test_nextjs_middleware_rulepack() {
+        let content = r#"import { NextRequest, NextResponse } from 'next/server';
+
+export function middleware(request: NextRequest) {
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: ['/dashboard/:path*'],
+};"#;
+        let rules = get_stack_rulepacks("src/middleware.ts", content, None);
+        assert!(rules.contains("NEXT.JS MIDDLEWARE & EDGE ROUTING RULES"));
+        assert!(rules.contains("PATH-TO-REGEXP MATCHERS"));
+        assert!(rules.contains("EDGE RUNTIME BOUNDARY"));
+        assert!(rules.contains("SINGLE ROOT/SRC MIDDLEWARE FILE"));
     }
 
     #[test]
@@ -9717,6 +10222,15 @@ export const version = "1.0.0";
 
         let input6 = "  at eval (./.next/server/app/products/page.js:151:1)";
         assert_eq!(extract_file_path_from_line(input6), None);
+
+        let input7 = "Unhandled Runtime Error: Error: The default export is not a React Component in page: \"/\"";
+        assert_eq!(extract_file_path_from_line(input7), Some("src/app/page.tsx".to_string()));
+
+        let input8 = "Error: The default export is not a React Component in page: \"/dashboard\"";
+        assert_eq!(extract_file_path_from_line(input8), Some("src/app/dashboard/page.tsx".to_string()));
+
+        let input9 = "Error: Handler is not defined in page: \"/api/auth/[...nextauth]\"";
+        assert_eq!(extract_file_path_from_line(input9), Some("src/app/api/auth/[...nextauth]/route.ts".to_string()));
     }
 
     #[test]
@@ -9832,6 +10346,11 @@ export const version = "1.0.0";
         let config_rules = get_stack_rulepacks("tsconfig.json", "{}", None);
         assert!(config_rules.contains("CONFIGURATION & TSCONFIG RULES"));
         assert!(config_rules.contains("TSCONFIG.JSON CONCISENESS & VALIDITY"));
+
+        // Test 9: Middleware on error
+        let mw_err_rules = get_stack_rulepacks("src/middleware.ts", "", Some("Error parsing `/dashboard/*`: Invalid middlewares found"));
+        assert!(mw_err_rules.contains("NEXT.JS MIDDLEWARE & EDGE ROUTING RULES"));
+        assert!(mw_err_rules.contains("PATH-TO-REGEXP MATCHERS"));
     }
 
     #[test]
@@ -9859,6 +10378,26 @@ export const version = "1.0.0";
         let modified = result.unwrap();
         assert!(modified.contains("Construction Smart System"));
         assert!(!modified.contains("Axiom Dev"));
+    }
+
+    #[test]
+    fn test_extract_related_project_files_for_error() {
+        let temp_dir = std::env::temp_dir().join(format!("axiom_rel_test_{}", uuid::Uuid::new_v4()));
+        let comp_dir = temp_dir.join("src/components");
+        let _ = std::fs::create_dir_all(&comp_dir);
+
+        let navbar_file = comp_dir.join("Navbar.tsx");
+        std::fs::write(&navbar_file, "export default function Navbar() { return <nav>Nav</nav>; }").unwrap();
+
+        let layout_content = "import React from 'react';\nimport Navbar from '@/components/Navbar';\nexport default function RootLayout() { return <Navbar />; }";
+        let err_msg = "Attempted import error: '@/components/Navbar' does not contain a default export (imported as 'Navbar').";
+
+        let related = extract_related_project_files_for_error(&temp_dir, layout_content, "src/app/layout.tsx", err_msg);
+        assert!(!related.is_empty());
+        assert_eq!(related[0].0, "src/components/Navbar.tsx");
+        assert!(related[0].1.contains("Navbar"));
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }
 
