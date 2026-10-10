@@ -17,7 +17,10 @@ import {
   Trash2,
   RefreshCw,
   Sliders,
-  AlertTriangle
+  AlertTriangle,
+  Download,
+  Check,
+  Loader2
 } from 'lucide-react';
 import { useAppStore } from '../hooks/useAppStore';
 import { verifyCompatibility } from '../lib/compatibility';
@@ -204,6 +207,11 @@ function Settings() {
   const [hardwareProfile, setHardwareProfile] = useState(null);
   const [ollamaStatus, setOllamaStatus] = useState('unknown');
   const [isTestingOllama, setIsTestingOllama] = useState(false);
+  const [installedOllamaModels, setInstalledOllamaModels] = useState([]);
+  const [pullingModelId, setPullingModelId] = useState(null);
+  const [pullProgress, setPullProgress] = useState(0);
+  const [pullStatus, setPullStatus] = useState('');
+  const [pullError, setPullError] = useState(null);
 
   const [techOverrides, setTechOverrides] = useState({
     nextjs: '',
@@ -317,13 +325,71 @@ function Settings() {
   const testOllamaConnection = async () => {
     setIsTestingOllama(true);
     try {
-      // In a real implementation, this would check via the main process
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      setOllamaStatus('connected');
+      const health = await window.electronAPI.ollama.checkHealth(ollamaHost);
+      if (health && health.available) {
+        setOllamaStatus('connected');
+        setInstalledOllamaModels(health.models || []);
+      } else {
+        setOllamaStatus('error');
+      }
     } catch (error) {
       setOllamaStatus('error');
     } finally {
       setIsTestingOllama(false);
+    }
+  };
+
+  useEffect(() => {
+    const unsubscribe = window.electronAPI.ollama.onPullProgress((data) => {
+      if (typeof data?.percent === 'number') {
+        setPullProgress(data.percent);
+      }
+      if (data?.status) {
+        setPullStatus(data.status);
+      }
+    });
+    return () => {
+      if (typeof unsubscribe === 'function') unsubscribe();
+    };
+  }, []);
+
+  const isModelInstalled = (modelId) => {
+    if (!modelId || !installedOllamaModels || installedOllamaModels.length === 0) return false;
+    const [targetRepo, targetTag = 'latest'] = modelId.toLowerCase().split(':');
+    return installedOllamaModels.some(installed => {
+      const [installedRepo, installedTag = 'latest'] = installed.toLowerCase().split(':');
+      if (installedRepo !== targetRepo) return false;
+      if (installedTag === targetTag) return true;
+      if (installedTag.startsWith(targetTag + '-') || installedTag.startsWith(targetTag + '_')) return true;
+      if (targetTag === 'latest' && installedTag) return true;
+      return false;
+    });
+  };
+
+  const handlePullModel = async (modelId) => {
+    if (pullingModelId) return;
+    setPullingModelId(modelId);
+    setPullProgress(0);
+    setPullStatus('Connecting to Ollama...');
+    setPullError(null);
+
+    try {
+      await window.electronAPI.ollama.pullModel(modelId);
+      // Refresh installed models list after download completes
+      await testOllamaConnection();
+      setPullStatus('Downloaded successfully!');
+      setTimeout(() => {
+        setPullingModelId(null);
+        setPullProgress(0);
+        setPullStatus('');
+      }, 3000);
+    } catch (err) {
+      console.error('[Settings] Pull model error:', err);
+      setPullError(typeof err === 'string' ? err : err?.message || 'Download failed');
+      setTimeout(() => {
+        setPullingModelId(null);
+        setPullError(null);
+      }, 5000);
     }
   };
 
@@ -471,8 +537,22 @@ function Settings() {
                 <span>🔧 <span className="text-slate-300">{hardwareProfile.cpus} CPUs</span></span>
               </div>
               <div className="flex items-center gap-4 flex-wrap">
-                <span>🛠️ Builder: <span className="text-indigo-400 font-mono font-semibold">{builderModel}</span></span>
-                <span>✏️ Editor: <span className="text-violet-400 font-mono font-semibold">{editorModel}</span></span>
+                <span className="flex items-center gap-1.5">
+                  🛠️ Builder: <span className="text-indigo-400 font-mono font-semibold">{builderModel}</span>
+                  {isModelInstalled(builderModel) ? (
+                    <span className="inline-flex items-center text-[10px] text-emerald-400 bg-emerald-500/10 px-1.5 py-0.5 rounded border border-emerald-500/20 font-medium">✓ Ready</span>
+                  ) : (
+                    <span className="inline-flex items-center text-[10px] text-amber-400 bg-amber-500/10 px-1.5 py-0.5 rounded border border-amber-500/20 font-medium">⚠️ Not Installed</span>
+                  )}
+                </span>
+                <span className="flex items-center gap-1.5">
+                  ✏️ Editor: <span className="text-violet-400 font-mono font-semibold">{editorModel}</span>
+                  {isModelInstalled(editorModel) ? (
+                    <span className="inline-flex items-center text-[10px] text-emerald-400 bg-emerald-500/10 px-1.5 py-0.5 rounded border border-emerald-500/20 font-medium">✓ Ready</span>
+                  ) : (
+                    <span className="inline-flex items-center text-[10px] text-amber-400 bg-amber-500/10 px-1.5 py-0.5 rounded border border-amber-500/20 font-medium">⚠️ Not Installed</span>
+                  )}
+                </span>
               </div>
             </div>
           )}
@@ -537,15 +617,16 @@ function Settings() {
                           const isSelected = currentRoleModel === model.id;
                           const isIncompatible = !model.isCompatible && !model.isMarginal;
                           const isMarginal = model.isMarginal;
+                          const isInstalled = isModelInstalled(model.id);
+                          const isCurrentlyPulling = pullingModelId === model.id;
 
                           // SSA recommendation badge logic for builder role
-                          const isSsaModel = model.tags.contains ? model.tags.contains('ssa') : model.tags.includes('ssa');
+                          const isSsaModel = model.tags?.contains ? model.tags.contains('ssa') : model.tags?.includes('ssa');
                           const isSsaRecommended = activeRole === 'builder' && isSsaModel;
 
                           return (
-                            <button
+                            <div
                               key={model.id}
-                              type="button"
                               onClick={() => {
                                 if (activeRole === 'builder') {
                                   handleBuilderModelChange(model.id);
@@ -553,7 +634,7 @@ function Settings() {
                                   handleEditorModelChange(model.id);
                                 }
                               }}
-                              className={`w-full text-left p-3 rounded-xl border transition-all ${
+                              className={`w-full text-left p-3.5 rounded-xl border transition-all cursor-pointer ${
                                 isSelected
                                   ? activeRole === 'builder'
                                     ? 'bg-indigo-600/20 border-indigo-500/60 shadow-sm shadow-indigo-500/10'
@@ -601,17 +682,85 @@ function Settings() {
                                       ⚠️ You selected this model at your own risk. Your system has {hardwareProfile.ramGB?.toFixed(1)}GB RAM but this model requires {model.minRamGB}GB.
                                     </p>
                                   )}
+
+                                  {/* Warning & Download button when model is selected but not installed */}
+                                  {isSelected && !isInstalled && !isCurrentlyPulling && (
+                                    <div className="mt-2.5 flex items-center justify-between gap-2 p-2 rounded-lg bg-amber-500/10 border border-amber-500/20 text-xs text-amber-300">
+                                      <div className="flex items-center gap-1.5 min-w-0">
+                                        <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 text-amber-400" />
+                                        <span className="truncate">Model not installed locally! Click download to install.</span>
+                                      </div>
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          handlePullModel(model.id);
+                                        }}
+                                        disabled={!!pullingModelId}
+                                        className="btn-primary text-xs py-1 px-2.5 flex-shrink-0 flex items-center gap-1"
+                                      >
+                                        <Download className="w-3 h-3" /> Download Now
+                                      </button>
+                                    </div>
+                                  )}
+
+                                  {/* Live progress bar when pulling this model */}
+                                  {isCurrentlyPulling && (
+                                    <div className="mt-2.5 space-y-1.5" onClick={(e) => e.stopPropagation()}>
+                                      <div className="flex items-center justify-between text-xs text-slate-400">
+                                        <span className="truncate text-indigo-300 font-mono text-[11px]">{pullStatus || 'Downloading model layers...'}</span>
+                                        <span className="font-mono font-semibold text-white ml-2">{pullProgress}%</span>
+                                      </div>
+                                      <div className="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                                        <div 
+                                          className="bg-indigo-500 h-1.5 rounded-full transition-all duration-200" 
+                                          style={{ width: `${Math.max(pullProgress, 3)}%` }} 
+                                        />
+                                      </div>
+                                    </div>
+                                  )}
                                 </div>
-                                <div className="text-right flex-shrink-0">
-                                  <span className="text-xs text-slate-500 font-mono">{model.sizeGB}GB</span>
-                                  {isSelected && (
-                                    <div className={`w-2 h-2 rounded-full ml-auto mt-1 ${
-                                      activeRole === 'builder' ? 'bg-indigo-500' : 'bg-violet-500'
-                                    }`} />
+                                <div className="flex flex-col items-end gap-2 flex-shrink-0">
+                                  <div className="flex items-center gap-1.5">
+                                    <span className="text-xs text-slate-500 font-mono">{model.sizeGB}GB</span>
+                                    {isSelected && (
+                                      <div className={`w-2.5 h-2.5 rounded-full ${
+                                        activeRole === 'builder' ? 'bg-indigo-500 ring-2 ring-indigo-500/30' : 'bg-violet-500 ring-2 ring-violet-500/30'
+                                      }`} />
+                                    )}
+                                  </div>
+
+                                  {/* Download button or Installed badge */}
+                                  {isInstalled ? (
+                                    <span className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-md border border-emerald-500/20">
+                                      <Check className="w-3 h-3" /> Installed
+                                    </span>
+                                  ) : isCurrentlyPulling ? (
+                                    <span className="inline-flex items-center gap-1 text-xs text-indigo-400 bg-indigo-500/10 px-2 py-0.5 rounded-md border border-indigo-500/30 font-medium">
+                                      <Loader2 className="w-3 h-3 animate-spin" /> {pullProgress}%
+                                    </span>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handlePullModel(model.id);
+                                      }}
+                                      disabled={!!pullingModelId}
+                                      className={`inline-flex items-center gap-1 text-xs px-2.5 py-1 rounded-lg font-medium transition-all ${
+                                        pullingModelId 
+                                          ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                                          : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-sm hover:shadow-indigo-500/25 active:scale-95'
+                                      }`}
+                                      title={`Download ${model.name} via Ollama`}
+                                    >
+                                      <Download className="w-3 h-3" />
+                                      <span>Download</span>
+                                    </button>
                                   )}
                                 </div>
                               </div>
-                            </button>
+                            </div>
                           );
                         })}
                       </div>
@@ -623,7 +772,21 @@ function Settings() {
               /* Fallback for old profile structure */
               <div className="space-y-4">
                 <div>
-                  <label className="label text-slate-400 text-xs">🛠️ Builder Model</label>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="label text-slate-400 text-xs mb-0">🛠️ Builder Model</label>
+                    {isModelInstalled(builderModel) ? (
+                      <span className="text-[11px] text-emerald-400 flex items-center gap-1"><Check className="w-3 h-3" /> Installed</span>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => handlePullModel(builderModel)}
+                        disabled={!!pullingModelId}
+                        className="text-xs text-indigo-400 hover:text-indigo-300 flex items-center gap-1"
+                      >
+                        <Download className="w-3 h-3" /> Download Model
+                      </button>
+                    )}
+                  </div>
                   <select
                     value={builderModel}
                     onChange={(e) => handleBuilderModelChange(e.target.value)}
@@ -631,13 +794,27 @@ function Settings() {
                   >
                     {hardwareProfile?.models.map(model => (
                       <option key={model.id} value={model.id}>
-                        {model.name} {model.isRecommended ? '(Recommended)' : ''} {!model.isCompatible ? `(Requires ${model.minRamGB}GB RAM)` : ''}
+                        {model.name} {model.isRecommended ? '(Recommended)' : ''} {!model.isCompatible ? `(Requires ${model.minRamGB}GB RAM)` : ''} {isModelInstalled(model.id) ? '✓' : ''}
                       </option>
                     ))}
                   </select>
                 </div>
                 <div>
-                  <label className="label text-slate-400 text-xs">✏️ Editor Model</label>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="label text-slate-400 text-xs mb-0">✏️ Editor Model</label>
+                    {isModelInstalled(editorModel) ? (
+                      <span className="text-[11px] text-emerald-400 flex items-center gap-1"><Check className="w-3 h-3" /> Installed</span>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => handlePullModel(editorModel)}
+                        disabled={!!pullingModelId}
+                        className="text-xs text-indigo-400 hover:text-indigo-300 flex items-center gap-1"
+                      >
+                        <Download className="w-3 h-3" /> Download Model
+                      </button>
+                    )}
+                  </div>
                   <select
                     value={editorModel}
                     onChange={(e) => handleEditorModelChange(e.target.value)}
@@ -645,7 +822,7 @@ function Settings() {
                   >
                     {hardwareProfile?.models.map(model => (
                       <option key={model.id} value={model.id}>
-                        {model.name} {model.isRecommended ? '(Recommended)' : ''} {!model.isCompatible ? `(Requires ${model.minRamGB}GB RAM)` : ''}
+                        {model.name} {model.isRecommended ? '(Recommended)' : ''} {!model.isCompatible ? `(Requires ${model.minRamGB}GB RAM)` : ''} {isModelInstalled(model.id) ? '✓' : ''}
                       </option>
                     ))}
                   </select>

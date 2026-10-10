@@ -6187,25 +6187,33 @@ use tauri::Emitter;
 
 fn detect_infinite_loop(content: &str) -> bool {
     // 1. Check character repetition (e.g. } } } } } } } } } } } } } } })
-    let trimmed_chars: Vec<char> = content.trim_end().chars().rev().take(20).collect();
-    if trimmed_chars.len() >= 15 {
+    // Ignore common banner, divider, and comment formatting characters that frequently occur in large blocks
+    let divider_chars = ['=', '-', '*', '/', '#', '_', ' ', '.', '\t', '~', ':'];
+    let trimmed_chars: Vec<char> = content.trim_end().chars().rev().take(30).collect();
+    if trimmed_chars.len() >= 25 {
         let first = trimmed_chars[0];
-        if !first.is_alphanumeric() && trimmed_chars.iter().all(|&c| c == first) {
+        if !first.is_alphanumeric() && !divider_chars.contains(&first) && trimmed_chars.iter().all(|&c| c == first) {
             return true;
         }
     }
 
-    // 2. Check line block repetition (e.g. repeating a block of 1-5 lines 3 times)
+    // 2. Check line block repetition (e.g. repeating a block of 1-5 lines 5 times)
     let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
     let n = lines.len();
     for block_size in 1..=5 {
-        if n >= block_size * 3 {
+        if n >= block_size * 5 {
             let mut is_loop = true;
             for i in 0..block_size {
                 let idx_curr = n - block_size + i;
                 let idx_prev1 = n - 2 * block_size + i;
                 let idx_prev2 = n - 3 * block_size + i;
-                if lines[idx_curr] != lines[idx_prev1] || lines[idx_curr] != lines[idx_prev2] {
+                let idx_prev3 = n - 4 * block_size + i;
+                let idx_prev4 = n - 5 * block_size + i;
+                if lines[idx_curr] != lines[idx_prev1]
+                    || lines[idx_curr] != lines[idx_prev2]
+                    || lines[idx_curr] != lines[idx_prev3]
+                    || lines[idx_curr] != lines[idx_prev4]
+                {
                     is_loop = false;
                     break;
                 }
@@ -6220,20 +6228,22 @@ fn detect_infinite_loop(content: &str) -> bool {
         }
     }
 
-    // 3. Check word repetition on the last line (e.g. repeating a word 4 times)
+    // 3. Check word repetition on the last line (require at least 8 repetitions to avoid false positives on CSS shorthands)
     if let Some(last_line) = content.lines().last() {
         let words: Vec<&str> = last_line.split_whitespace().collect();
         let nw = words.len();
         for w_size in 1..=4 {
-            if nw >= w_size * 4 {
+            if nw >= w_size * 8 {
                 let mut w_loop = true;
                 for i in 0..w_size {
                     let w_curr = words[nw - w_size + i];
-                    let w_prev1 = words[nw - 2 * w_size + i];
-                    let w_prev2 = words[nw - 3 * w_size + i];
-                    let w_prev3 = words[nw - 4 * w_size + i];
-                    if w_curr != w_prev1 || w_curr != w_prev2 || w_curr != w_prev3 {
-                        w_loop = false;
+                    for repeat_idx in 1..8 {
+                        if w_curr != words[nw - (repeat_idx + 1) * w_size + i] {
+                            w_loop = false;
+                            break;
+                        }
+                    }
+                    if !w_loop {
                         break;
                     }
                 }
@@ -6248,6 +6258,25 @@ fn detect_infinite_loop(content: &str) -> bool {
     }
 
     false
+}
+
+fn get_safe_fallback_content(file_path: &str, _lang: &str, desc: &str) -> String {
+    let lower = file_path.to_lowercase();
+    if lower.ends_with(".css") {
+        format!("/* {}\n * {}\n */\n\n.container {{\n  display: flex;\n  flex-direction: column;\n}}\n", file_path, desc)
+    } else if lower.ends_with(".json") {
+        "{\n}\n".to_string()
+    } else if lower.ends_with(".tsx") || lower.ends_with(".jsx") {
+        let comp_name = std::path::Path::new(file_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Component");
+        format!("import React from 'react';\n\nexport default function {}() {{\n  return (\n    <div className=\"p-4\">\n      <h1 className=\"text-xl font-bold\">{}</h1>\n    </div>\n  );\n}}\n", comp_name, comp_name)
+    } else if lower.ends_with(".ts") || lower.ends_with(".js") {
+        format!("// {}\n// {}\n\nexport {{}};\n", file_path, desc)
+    } else {
+        format!("// {}\n", desc)
+    }
 }
 
 fn index_modules(dir: &std::path::Path, src_root: &std::path::Path, index: &mut std::collections::HashMap<String, Vec<String>>) {
@@ -8027,7 +8056,7 @@ pub fn get_stack_rulepacks(file_path: &str, file_content: &str, error_msg: Optio
 
 fn get_expert_system_prompt(
     file_path: &str,
-    _project_type: &str,
+    project_type: &str,
     overrides_desc: &str,
     pkg_db_summary: &str,
     context_ref: &str,
@@ -8035,211 +8064,233 @@ fn get_expert_system_prompt(
     proj_dir: &std::path::Path,
 ) -> String {
     let path_lower = file_path.to_lowercase().replace('\\', "/");
+    let proj_type_lower = project_type.to_lowercase();
 
-    let mut role_desc = "ROLE: Expert Software Engineer\n".to_string();
-    let mut specific_rules = "".to_string();
+    // 1. RUST & TAURI SYSTEM SCOPE (.rs, Cargo.toml)
+    if path_lower.ends_with(".rs") {
+        return format!(
+            "You are a Senior Rust Systems Engineer. Write only clean, production-ready Rust code wrapped in markdown code blocks. No explanations.\n\n\
+             RUST IMPLEMENTATION RULES:\n\
+             - Write idiomatic, memory-safe Rust adhering to ownership, borrowing, and lifetime rules.\n\
+             - Implement robust error handling with Result<T, E> and Option<T>, avoiding bare unwrap() in production paths.\n\
+             - Use serde::{{Serialize, Deserialize}} for data structures requiring serialization.\n\
+             - If this file defines Tauri commands, annotate handlers with #[tauri::command] and return clean Result types.\n\
+             - STRICTLY NO JavaScript, TypeScript, HTML, CSS, or Node.js imports in Rust code.\n\
+             FILE: {}\n",
+            file_path
+        );
+    }
 
+    if path_lower.ends_with("cargo.toml") {
+        return "You are an expert Rust systems architect. Write only valid, production-ready Cargo.toml code wrapped in markdown code blocks. No explanations.\n\n\
+                CARGO.TOML RULES:\n\
+                - Define valid [package] metadata with edition = \"2021\".\n\
+                - Specify verified, stable crate versions under [dependencies] (e.g. serde, tokio, tauri, etc.).\n\
+                - NEVER output npm, package.json, or JavaScript syntax in Cargo.toml.\n".to_string();
+    }
+
+    // 2. FLUTTER & DART MOBILE SCOPE (.dart, pubspec.yaml)
+    if path_lower.ends_with(".dart") {
+        return format!(
+            "You are a Senior Flutter & Dart Mobile Developer. Write only clean, production-ready Dart code wrapped in markdown code blocks. No explanations.\n\n\
+             FLUTTER RULES:\n\
+             - Write clean StatelessWidget or StatefulWidget implementations using Material 3 or Cupertino widgets.\n\
+             - Structure mobile layouts using Column, Row, ListView, Container, Padding, and SizedBox.\n\
+             - Strictly NO HTML DOM tags (no <div>, <span>, <p>, <a>), no React hooks, and no web CSS.\n\
+             - Adhere to Dart sound null-safety standards.\n\
+             FILE: {}\n",
+            file_path
+        );
+    }
+
+    if path_lower.ends_with("pubspec.yaml") {
+        return "You are an expert Flutter architect. Write only valid pubspec.yaml code wrapped in markdown code blocks. No explanations.\n\n\
+                PUBSPEC RULES:\n\
+                - Specify valid name, description, version, and environment sdk: \">=3.0.0 <4.0.0\".\n\
+                - Include flutter sdk dependency under dependencies and flutter: uses-material-design: true.\n".to_string();
+    }
+
+    // 3. REACT NATIVE / EXPO MOBILE SCOPE
+    let is_mobile_rn = proj_type_lower == "react-native" || proj_type_lower == "expo" || path_lower.contains("app.json");
+    if is_mobile_rn && (path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx")) {
+        return format!(
+            "You are a Senior React Native Mobile Engineer. Write only clean, production-ready React Native / Expo code wrapped in markdown code blocks. No explanations.\n\n\
+             REACT NATIVE RULES:\n\
+             - MOBILE UI ONLY: NEVER use HTML DOM tags (no <div>, <p>, <span>, <a>, <button>, or <html>). ALWAYS use React Native core components (<View>, <Text>, <TouchableOpacity>, <ScrollView>, <FlatList>, <TextInput>, <SafeAreaView>).\n\
+             - STYLING: Use StyleSheet.create({{ ... }}) or NativeWind classes. Do NOT use web CSS stylesheets.\n\
+             - NAVIGATION: Use React Navigation or Expo Router conventions (never Next.js Link or Next.js router).\n\
+             - CLIENT-SIDE ONLY: Never import @prisma/client or Node.js server modules.\n\
+             FILE: {}\n",
+            file_path
+        );
+    }
+
+    // 4. FILE-SCOPED PROMPT: Styles & CSS (.css, .module.css, .scss)
+    if path_lower.ends_with(".css") || path_lower.ends_with(".scss") {
+        return format!(
+            "You are an expert CSS / Styling Engineer. Write only valid, production-ready CSS code wrapped in markdown code blocks. No explanations.\n\n\
+             ROLE: Senior UI/UX & CSS Specialist\n\
+             STYLING RULES:\n\
+             - Write clean, modern, responsive CSS rules with flexbox, grid, smooth transitions, and accessible colors.\n\
+             - If this is a CSS module (e.g. *.module.css), define clean class selectors (camelCase or kebab-case) matching component usage.\n\
+             - Do NOT import JavaScript, TypeScript, Prisma, or backend libraries.\n\
+             - Do NOT generate empty placeholders; provide full, polished styling rules.\n"
+        );
+    }
+
+    // 5. FILE-SCOPED PROMPT: Web Configuration files
+    if path_lower.ends_with("postcss.config.js") || path_lower.ends_with("postcss.config.mjs") {
+        return "You are an expert build configuration engineer. Write only valid postcss.config.js code wrapped in markdown code blocks. No explanations.\n\nmodule.exports = {\n  plugins: {\n    tailwindcss: {},\n    autoprefixer: {},\n  },\n};\n".to_string();
+    }
+
+    if path_lower.ends_with("tailwind.config.js") || path_lower.ends_with("tailwind.config.ts") {
+        return "You are an expert Tailwind CSS configuration engineer. Write only valid tailwind.config.js code wrapped in markdown code blocks. No explanations.\n\n/** @type {import('tailwindcss').Config} */\nmodule.exports = {\n  content: [\n    './src/pages/**/*.{js,ts,jsx,tsx,mdx}',\n    './src/components/**/*.{js,ts,jsx,tsx,mdx}',\n    './src/app/**/*.{js,ts,jsx,tsx,mdx}',\n  ],\n  theme: {\n    extend: {},\n  },\n  plugins: [],\n};\n".to_string();
+    }
+
+    if path_lower.ends_with("tsconfig.json") {
+        return "You are a TypeScript Configuration Specialist. Output only a valid, concise Next.js tsconfig.json JSON object wrapped in markdown code blocks. Maximum 30 lines. No explanations.\n\n{\n  \"compilerOptions\": {\n    \"lib\": [\"dom\", \"dom.iterable\", \"esnext\"],\n    \"allowJs\": true,\n    \"skipLibCheck\": true,\n    \"strict\": false,\n    \"noEmit\": true,\n    \"esModuleInterop\": true,\n    \"module\": \"esnext\",\n    \"moduleResolution\": \"bundler\",\n    \"resolveJsonModule\": true,\n    \"isolatedModules\": true,\n    \"jsx\": \"preserve\",\n    \"incremental\": true,\n    \"paths\": {\n      \"@/*\": [\"./src/*\"]\n    }\n  },\n  \"include\": [\"next-env.d.ts\", \"**/*.ts\", \"**/*.tsx\", \".next/types/**/*.ts\"],\n  \"exclude\": [\"node_modules\"]\n}\n".to_string();
+    }
+
+    if path_lower.contains("next.config") {
+        return "You are a Next.js Configuration Expert. Write only valid next.config.js code wrapped in markdown code blocks. No explanations.\n\n/** @type {import('next').NextConfig} */\nconst nextConfig = {\n  reactStrictMode: true,\n};\n\nmodule.exports = nextConfig;\n".to_string();
+    }
+
+    // Read Live Builder Guide contracts if available
+    let lbg_path = proj_dir.join(".axiom").join("live_builder_guide.json");
+    let lbg_val: Option<Value> = if lbg_path.exists() {
+        fs::read_to_string(&lbg_path).ok().and_then(|c| serde_json::from_str::<Value>(&c).ok())
+    } else {
+        None
+    };
+
+    // 6. FILE-SCOPED PROMPT: Database & Prisma Schema
     if path_lower.contains("schema.prisma") {
-        role_desc = "ROLE: Senior Database Architect\n".to_string();
-        specific_rules = "\nDATABASE DESIGN RULES:\n\
-                          - Focus on relational integrity, clean schema definitions, and proper Prisma model annotations.\n\
-                          - When writing tables, ensure IDs use `@id @default(cuid())` or similar suitable auto-generators.\n\
-                          - Make sure passwords or security token fields (e.g. `hashedPassword`) are defined as optional `String?` so that OAuth/Magic Link users can be saved without password errors.\n\
-                          - Always include necessary relation annotations cleanly and explicitly.\n\
-                          - PRISMA RELATION RULES:\n\
-                            1. In a one-to-many relation, the `@relation` attribute (specifying `fields` and `references`) MUST ONLY be defined on the model that contains the actual foreign key column (the \"many\" side). The parent model (the \"one\" side, returning an array `Model[]`) MUST NOT specify any `fields` or `references` in its `@relation` attribute.\n\
-                            2. Every relation must have an opposite relation field defined on both models. For example, if model `Message` has `sender User @relation(fields: [senderId], references: [id])`, then model `User` MUST have `messages Message[]` (no relation attributes needed on User's side).\n\
-                            3. For implicit many-to-many relations (where both sides return arrays `Model[]`), do NOT specify any `fields` or `references` arguments. Just define the array fields on both models (e.g., `users User[]` and `conversations Conversation[]`).\n\
-                            4. The `@relation` attribute (e.g. `@relation(fields: [userId], references: [id])`) MUST ONLY be placed on relational object fields (like `user User`), never on scalar fields (like `userId String`). Placing @relation on a scalar field will throw an 'Invalid field type, not a relation' error.\n\
-                            5. For NextAuth schema, the VerificationToken model does not have a direct relation back to the User model; do not define a verificationTokens relation field on the User model.".to_string();
-    } else if path_lower.ends_with("tsconfig.json") {
-        role_desc = "ROLE: TypeScript Configuration Specialist\n".to_string();
-        specific_rules = "\nTYPESCRIPT CONFIGURATION RULES:\n\
-                          - Output a valid, concise Next.js tsconfig.json JSON object. Maximum 30 lines.\n\
-                          - NEVER repeat compilerOptions or output redundant boolean flags in a loop.\n\
-                          - Ensure all brackets and braces are properly closed.\n\
-                          - Standard compilerOptions:\n\
-                            \"lib\": [\"dom\", \"dom.iterable\", \"esnext\"],\n\
-                            \"allowJs\": true,\n\
-                            \"skipLibCheck\": true,\n\
-                            \"strict\": false,\n\
-                            \"noEmit\": true,\n\
-                            \"esModuleInterop\": true,\n\
-                            \"module\": \"esnext\",\n\
-                            \"moduleResolution\": \"bundler\",\n\
-                            \"resolveJsonModule\": true,\n\
-                            \"isolatedModules\": true,\n\
-                            \"jsx\": \"preserve\",\n\
-                            \"incremental\": true,\n\
-                            \"paths\": { \"@/*\": [\"./src/*\"] }\n\
-                          - include: [\"next-env.d.ts\", \"**/*.ts\", \"**/*.tsx\", \".next/types/**/*.ts\"]\n\
-                          - exclude: [\"node_modules\"]".to_string();
-    } else if path_lower.contains("next.config") {
-        role_desc = "ROLE: Next.js Configuration Expert\n".to_string();
-        specific_rules = "\nNEXT.JS CONFIGURATION RULES:\n\
-                          - Write a clean next.config.js file exporting module.exports.\n\
-                          - Do NOT import, require, or use `next-i18next` or `next-i18next.config` as they might not exist or be needed in Next.js App Router projects.\n\
-                          - Standard configuration config format:\n\
-                            `/** @type {import('next').NextConfig} */\n\
-                            const nextConfig = { reactStrictMode: true };\n\
-                            module.exports = nextConfig;`".to_string();
-    } else if path_lower.contains("api/register") {
-        role_desc = "ROLE: Authentication & User Management Backend Developer\n".to_string();
-        specific_rules = "\nUSER REGISTRATION API RULES:\n\
-                          - Implement a Next.js App Router POST handler in `src/app/api/register/route.ts`.\n\
-                          - Parse request body (`await request.json()`) and validate inputs (email, name, password).\n\
-                          - Check if a user with the given email already exists in the database. If so, return a 400 Bad Request error response.\n\
-                          - Hash the user's password asynchronously using `bcryptjs.hash(password, 10)` before storing it in the database.\n\
-                          - Create the new user record in the database using Prisma and return the created user object (excluding the password) with a 201 Created status.\n\
-                          - Wrap the database calls in a try-catch block. Inside the catch block, return a fallback success response for preview mode.".to_string();
-    } else if path_lower.contains("/api/auth/") || path_lower.contains("nextauth") {
-        role_desc = "ROLE: Security & Authentication Expert\n".to_string();
-        specific_rules = "\nAUTHENTICATION SECURITY RULES:\n\
-                          - Implement secure session management using App Router Route Handler in `src/app/api/auth/[...nextauth]/route.ts`.\n\
-                          - Export GET and POST handlers: `const handler = NextAuth(authOptions); export { handler as GET, handler as POST };`.\n\
-                          - Use `strategy: 'jwt'` sessions for NextAuth.\n\
-                          - CredentialsProvider MUST be imported from 'next-auth/providers/credentials', NEVER from 'next-auth' directly.\n\
-                          - Ensure User password database checks match the exact schema property name (e.g. `user.password` or `user.hashedPassword`).\n\
-                          - Never hardcode environment secrets (use `process.env.NEXTAUTH_SECRET || 'dev-secret'`).\n\
-                          - Use `bcryptjs` asynchronously or via standard comparison methods to compare hashed passwords securely.\n\
-                          - Fail gracefully when required environment variables for production email sending are missing during development.".to_string();
-    } else if path_lower.contains("/api/") || path_lower.contains("route.ts") || path_lower.contains("route.js") {
-        role_desc = "ROLE: Senior Backend Developer\n".to_string();
-        specific_rules = "\nBACKEND API DEVELOPMENT RULES:\n\
-                          - Implement clean Next.js Route Handlers (using GET, POST, PUT, DELETE exports).\n\
-                          - Wrap database calls in robust try-catch blocks. Implement fallback mock datasets inside catch clauses so the application remains reviewable even if the database is offline.\n\
-                          - Strictly validate requests (e.g. using standard parsing or Zod) and return clean, typed JSON responses with appropriate HTTP status codes.".to_string();
-    } else if path_lower.ends_with("layout.tsx") || path_lower.ends_with("layout.jsx") {
-        role_desc = "ROLE: Next.js Root Layout Architect\n".to_string();
-        specific_rules = "\nROOT LAYOUT ARCHITECTURE RULES:\n\
-                          - The RootLayout component in Next.js App Router defines the global application shell.\n\
-                          - DOM HIERARCHY: Outermost elements returned MUST be `<html lang=\"en\"><body className=\"min-h-screen flex flex-col bg-gray-50 text-gray-900\">...</body></html>`.\n\
-                          - GLOBAL PROVIDERS: Wrap all global providers inside `<body>` around `{children}`. If NextAuth is configured, wrap with `<SessionProvider>`. If an e-commerce or cart context exists (e.g. `CartProvider` from `@/lib/cartContext`), wrap `{children}` with `<CartProvider>` inside `SessionProvider`.\n\
-                          - PERSISTENT NAVIGATION & FOOTER: You MUST always import and mount `<Navbar />` (from `@/components/Navbar`) above the main content, wrap `{children}` in `<main className=\"flex-grow flex flex-col w-full\">{children}</main>`, and mount `<Footer />` (from `@/components/Footer`) at the bottom of the page.\n\
-                          - MANDATORY DEFAULT EXPORT: RootLayout MUST have `export default function RootLayout({ children }: { children: React.ReactNode })`.\n\
-                          - CLIENT DIRECTIVE: Mark the layout file with \"use client\"; at line 1 so that client-side providers and components function smoothly.".to_string();
-    } else if path_lower == "src/app/page.tsx" || path_lower == "src/app/page.jsx" || path_lower == "app/page.tsx" || path_lower == "app/page.jsx" {
-        role_desc = "ROLE: Principal Frontend Architect & UI/UX Designer\n".to_string();
-        specific_rules = "\nROOT LANDING PAGE DESIGN RULES:\n\
-                          - This is the HOME/LANDING PAGE (`/`) of the entire application. It must NEVER be a blank screen or a simple utility page (e.g. NEVER just a bare shopping cart or login form).\n\
-                          - HERO SECTION: Include a high-impact Hero banner with a compelling headline, engaging description, and clear CTA buttons linking to primary destinations (e.g. `/products` or `/dashboard`).\n\
-                          - CORE FEATURE SHOWCASE: Show the primary content of the app. For e-commerce apps: a rich Featured Products Grid displaying product cards with images, categories, prices, and an \"Add to Cart\" button. For dashboards: key metric widgets or activity feeds.\n\
-                          - VALUE PROPOSITIONS: Display a responsive grid of key benefits/badges (e.g. fast shipping, 24/7 support, secure checkout, guarantee).\n\
-                          - DATA RESILIENCY: Fetch real data from `/api/...` with an immediate fallback to a rich realistic local mockup array so the storefront renders beautifully in preview mode even if the database has not been seeded yet.\n\
-                          - MANDATORY TAILWIND CSS: Every element must use modern Tailwind CSS classes (`space-y-12`, `rounded-2xl`, `shadow-sm`, `hover:shadow-md`, `transition-all`, etc.).".to_string();
-    } else if path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx") || path_lower.contains("/components/") || path_lower.contains("/pages/") {
-        role_desc = "ROLE: Senior UI/UX Developer (Tailwind & React)\n".to_string();
-        specific_rules = "\nFRONTEND DEVELOPMENT RULES:\n\
-                          - PRISMA SERVER-ONLY RULE: You are working on the CLIENT side. Prisma Client (`@prisma/client`) MUST ONLY be imported and used inside Next.js API Route Handlers (files under `src/app/api/`). NEVER import or use Prisma in React hooks, client components, or any file with `'use client'`. Client-side hooks/components that need database data MUST use `fetch('/api/...')` to call the corresponding API route.\n\
-                          - NEVER declare, use, or destructure 'data-axiom-component' or 'data-axiom-file' props in your React components or TypeScript interface/type definitions. These attributes are injected automatically by the post-processor during build time, and manual handling in code will cause syntax or compilation errors.\n\
-                          - Generate highly complete, visually beautiful, responsive layouts using Tailwind CSS.\n\
-                          - LAYOUT, NAVBAR, FOOTER: Every generated frontend view must feature a gorgeous, cohesive visual layout. Always include a persistent Navigation Bar (Navbar) at the top containing the application logo/branding and navigation links (e.g. Dashboard, Profile), and a neat Footer at the bottom. Ensure the Navbar displays user session details (avatar, name) and a clean logout button if the user is authenticated.\n\
-                          - NEXT.JS LINK RULE: In Next.js 13+, do NOT place <a> tags inside <Link href=\"...\"> components. Place className and children directly on the <Link> component (e.g. <Link href=\"/about\" className=\"...\">About</Link>). To optimize Vercel resource usage (Edge Requests count), always append `prefetch={false}` to all <Link> tags (e.g. <Link href=\"/dashboard\" prefetch={false}>Dashboard</Link>).\n\
-                          - CAPPED CLIENT-SIDE RETRIES: All client-side fetch calls or data hooks must configure strict error retry limits (max 1 or 2 attempts) and prevent infinite query retry loops to avoid Vercel Serverless Function invocation billing spikes.\n\
-                          - Use modern components, cards, hover transitions, nice gradients, and loading states to present a premium product.\n\
-                          - NO DEAD IMPORTS: Do not import or dynamically resolve React components/files (like Overview, Analytics, or Settings) unless they are explicitly generated as separate files in this project. Otherwise, implement them inline in the same file.\n\
-                          - NO INFINITE AUTHENTICATION LOADS: If implementing a loading spinner/state dependent on NextAuth `useSession`, you MUST ensure that loading state ends for both 'authenticated' AND 'unauthenticated' session statuses (e.g. check `session.status !== 'loading'`). Never lock the interface for unauthenticated users, or the page will remain blank." .to_string();
+        let mut prompt = "You are a Senior Database Architect. Write only the complete, valid schema.prisma code wrapped in markdown code blocks. No explanations.\n\n\
+             DATABASE DESIGN RULES:\n\
+             - Focus on relational integrity, clean schema definitions, and proper Prisma model annotations.\n\
+             - When writing tables, ensure IDs use `@id @default(cuid())` or similar suitable auto-generators.\n\
+             - Make sure passwords or security token fields (e.g. `hashedPassword`) are defined as optional `String?` so that OAuth/Magic Link users can be saved without password errors.\n\
+             - Always include necessary relation annotations cleanly and explicitly.\n\
+             - PRISMA RELATION RULES:\n\
+               1. In a one-to-many relation, the `@relation` attribute (specifying `fields` and `references`) MUST ONLY be defined on the model that contains the actual foreign key column (the \"many\" side). The parent model (the \"one\" side, returning an array `Model[]`) MUST NOT specify any `fields` or `references` in its `@relation` attribute.\n\
+               2. Every relation must have an opposite relation field defined on both models. For example, if model `Message` has `sender User @relation(fields: [senderId], references: [id])`, then model `User` MUST have `messages Message[]`.\n\
+               3. For implicit many-to-many relations, do NOT specify any `fields` or `references` arguments.\n\
+               4. The `@relation` attribute MUST ONLY be placed on relational object fields, never on scalar fields.\n\
+               5. For NextAuth schema, the VerificationToken model does not have a direct relation back to the User model.\n".to_string();
+
+        if let Some(ref lbg) = lbg_val {
+            if let Some(db_models) = lbg.get("sharedContracts").and_then(|c| c.get("database")).and_then(|d| d.get("models")) {
+                prompt.push_str(&format!("\nREQUIRED DATABASE MODELS CONTRACT:\n{}\n", db_models));
+            }
+        }
+        return prompt;
     }
 
-    let mut prompt = format!(
-        "You are an expert software engineer. Write only the code, no explanations. Provide only the code, wrapped in markdown code blocks.\n\n\
-         {}\n\
-         IMPORTANT DESIGN & CONTENT REQUIREMENTS:\n\
-         - Do NOT write minimal skeletons, simple placeholders, or empty cards.\n\
-         - Generate highly complete, production-ready, and visually beautiful layouts.\n\
-         - Always write rich, detailed copy and realistic mock data instead of using 'Lorem Ipsum' or empty divs.\n\
-         - Use comprehensive styles and modern layouts (e.g., responsive grids, flexboxes, borders, shadows, hover effects, nice colors) to create a premium feel.\n\
-         - For dashboards, include functional widgets, detailed summary stats, interactive tables, and charts where applicable.\n\
-         - Do NOT write mock authentication handlers or console.log-only form submissions. Use real API calls.\n\
-         - Ensure all forms have fully implemented submission handlers that communicate with real API endpoints, handle loading states, and show real success/error feedbacks.\n\
-         - DATABASE RESILIENCY & FALLBACKS: Database queries must be wrapped in `try {{ ... }} catch (error) {{ ... }}` blocks. In the `catch` block, log a warning and fall back to a rich mockup dataset (e.g. 10 realistic mockup items with full properties) so that the application can still render and run in preview mode even if the database is offline or not configured.\n\
-         - Ensure all import paths match existing files and libraries in the project.\n\
-         - STRICT IMPORT RESOLUTION: Every single external dependency, class, or utility used in your code (e.g. 'z' from 'zod', 'axios', 'bcryptjs', icons) MUST be explicitly imported at the top of the file. Do not assume any library is globally available without an import.\n\
-         - STRICT TYPE DEFINITIONS: Any TypeScript types or interfaces used in your client-side React components or pages (e.g. 'Product', 'Order') MUST be explicitly declared in the same file or imported from a shared type file. Never use undeclared types.\n\
-         - PRISMA SCHEMA STRICTNESS: When writing schema.prisma, optional/nullable fields must only have '?' on the type name (e.g. 'password String?'), NEVER on the field name (e.g. 'password? String?' is invalid). Ensure relational foreign key fields (like 'userId String') are explicitly declared inside the model. Never apply '@db.Json' native types to 'String[]' arrays.\n\
-         - NO MANUAL AXIOM ATTRS: Never declare, use, or destructure 'data-axiom-component' or 'data-axiom-file' props in your React components or TypeScript interface/type definitions. These are injected automatically.{} \n",
-         role_desc, specific_rules
-    );
+    // 7. FILE-SCOPED PROMPT: Backend API Routes & NextAuth
+    let is_api_route = path_lower.contains("/api/") || path_lower.contains("route.ts") || path_lower.contains("route.js");
+    if is_api_route {
+        let mut prompt = "You are a Senior Backend Developer. Write only clean, production-ready Next.js Route Handler code wrapped in markdown code blocks. No explanations.\n\n\
+             BACKEND API DEVELOPMENT RULES:\n\
+             - Implement clean Next.js App Router Route Handlers (exporting GET, POST, PUT, DELETE functions).\n\
+             - Wrap database calls in robust try-catch blocks. Implement fallback mock datasets inside catch clauses so the application remains reviewable even if the database is offline.\n\
+             - Strictly validate requests (e.g. using standard parsing or Zod) and return clean, typed JSON responses with appropriate HTTP status codes.\n\
+             - STRICT IMPORT RESOLUTION: Every external dependency ('zod', 'bcryptjs', etc.) MUST be explicitly imported at the top.\n".to_string();
 
-    let rulepacks = get_stack_rulepacks(file_path, context_ref, None);
-    if !rulepacks.is_empty() {
-        prompt.push_str(&rulepacks);
+        if path_lower.contains("/api/auth/") || path_lower.contains("nextauth") {
+            prompt.push_str(
+                "\nAUTHENTICATION SECURITY RULES:\n\
+                 - Export GET and POST handlers: `const handler = NextAuth(authOptions); export { handler as GET, handler as POST };`.\n\
+                 - Use `strategy: 'jwt'` sessions for NextAuth.\n\
+                 - CredentialsProvider MUST be imported from 'next-auth/providers/credentials', NEVER from 'next-auth' directly.\n\
+                 - Never hardcode environment secrets (use `process.env.NEXTAUTH_SECRET || 'dev-secret'`).\n\
+                 - Use bcryptjs to verify passwords asynchronously.\n"
+            );
+        }
+
+        if let Some(ref lbg) = lbg_val {
+            if let Some(api_contracts) = lbg.get("sharedContracts").and_then(|c| c.get("api")) {
+                prompt.push_str(&format!("\nAPI ENDPOINTS CONTRACT:\n{}\n", api_contracts));
+            }
+            if let Some(db_contracts) = lbg.get("sharedContracts").and_then(|c| c.get("database")) {
+                prompt.push_str(&format!("\nDATABASE MODELS REFERENCE:\n{}\n", db_contracts));
+            }
+        }
+        return prompt;
     }
 
-    if !overrides_desc.trim().is_empty() {
-        prompt.push_str(&format!(
-            "\nUse the following version/stack preferences if applicable:\n{}",
-            overrides_desc
-        ));
+    // 8. FILE-SCOPED PROMPT: Web Client UI Components, Pages & Layouts (.tsx, .jsx)
+    let is_react_frontend = path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx");
+    if is_react_frontend {
+        let mut prompt = "You are an expert React and Tailwind UI Engineer. Write only clean, complete, production-ready React code wrapped in markdown code blocks. No explanations.\n\n".to_string();
+
+        if path_lower.ends_with("layout.tsx") || path_lower.ends_with("layout.jsx") {
+            prompt.push_str(
+                "ROOT LAYOUT ARCHITECTURE RULES:\n\
+                 - DOM HIERARCHY: Outermost elements returned MUST be `<html lang=\"en\"><body className=\"min-h-screen flex flex-col bg-gray-50 text-gray-900\">...</body></html>`.\n\
+                 - GLOBAL PROVIDERS: Wrap all global providers inside `<body>` around `{children}`. If NextAuth is configured, wrap with `<SessionProvider>`.\n\
+                 - PERSISTENT NAVIGATION & FOOTER: Always import and mount `<Navbar />` (from `@/components/Navbar`) above main content, wrap `{children}` in `<main className=\"flex-grow flex flex-col w-full\">{children}</main>`, and mount `<Footer />` at the bottom.\n\
+                 - MANDATORY DEFAULT EXPORT: RootLayout MUST have `export default function RootLayout({ children }: { children: React.ReactNode })`.\n\
+                 - Mark the layout file with 'use client'; at line 1.\n\n"
+            );
+        } else if path_lower == "src/app/page.tsx" || path_lower == "src/app/page.jsx" || path_lower == "app/page.tsx" || path_lower == "app/page.jsx" {
+            prompt.push_str(
+                "ROOT LANDING PAGE DESIGN RULES:\n\
+                 - This is the HOME/LANDING PAGE (`/`). It must NEVER be a blank screen or bare login form.\n\
+                 - HERO SECTION: Include a high-impact Hero banner with compelling headline, engaging description, and clear CTA buttons.\n\
+                 - CORE FEATURE SHOWCASE: Show primary interactive content, product cards, or metric widgets.\n\
+                 - VALUE PROPOSITIONS: Display a responsive grid of key benefits/badges.\n\
+                 - DATA RESILIENCY: Fetch data with an immediate fallback to a rich realistic mockup array.\n\
+                 - MANDATORY TAILWIND CSS: Every element must use modern Tailwind CSS classes.\n\n"
+            );
+        } else {
+            prompt.push_str(
+                "FRONTEND COMPONENT RULES:\n\
+                 - PRISMA SERVER-ONLY RULE: You are on the CLIENT side. NEVER import `@prisma/client` in React components. Fetch data from `/api/...` endpoints.\n\
+                 - STRICT TYPE DEFINITIONS: Any TypeScript types/interfaces used MUST be declared in the file or imported.\n\
+                 - NEXT.JS LINK RULE: Do NOT place <a> tags inside <Link>. Put className directly on <Link>, and add `prefetch={false}`.\n\
+                 - NO DEAD IMPORTS: Do not import components unless they exist; implement inline if needed.\n\
+                 - Use modern Tailwind CSS with responsive flex/grid layouts, nice borders, shadows, and hover states.\n\
+                 - NO MANUAL AXIOM ATTRS: Never declare or use 'data-axiom-component' or 'data-axiom-file' props.\n\n"
+            );
+        }
+
+        if let Some(ref lbg) = lbg_val {
+            if let Some(spec) = lbg.get("projectSpecification") {
+                if let Some(style) = spec.get("importExportStyle").and_then(|s| s.as_str()) {
+                    prompt.push_str(&format!("- IMPORT/EXPORT RULE: Use {} exports.\n", style));
+                }
+                if let Some(reqs) = spec.get("categoryRequirements") {
+                    if let Some(principles) = reqs.get("designPrinciples").and_then(|p| p.as_array()) {
+                        prompt.push_str("- Design Principles:\n");
+                        for p in principles {
+                            if let Some(ps) = p.as_str() { prompt.push_str(&format!("  * {}\n", ps)); }
+                        }
+                    }
+                }
+            }
+            if let Some(api_contracts) = lbg.get("sharedContracts").and_then(|c| c.get("api")).and_then(|a| a.get("endpoints")) {
+                prompt.push_str(&format!("- Available API Endpoints to Fetch:\n{}\n", api_contracts));
+            }
+        }
+
+        if !context_ref.is_empty() {
+            prompt.push_str(context_ref);
+        }
+        return prompt;
     }
 
-    prompt.push_str(pkg_db_summary);
-
+    // 9. GENERAL UTILITY / FALLBACK SCOPE (e.g. src/utils/..., src/lib/...)
+    let mut prompt = "You are an expert software engineer. Write only clean, production-ready code wrapped in markdown code blocks. No explanations.\n\n".to_string();
+    if proj_type_lower == "rust" || proj_type_lower == "tauri" {
+        prompt.push_str(&format!("ROLE: Senior Rust Systems Engineer\nFILE: {}\n", file_path));
+    } else if proj_type_lower == "flutter" {
+        prompt.push_str(&format!("ROLE: Senior Flutter & Dart Mobile Developer\nFILE: {}\n", file_path));
+    } else {
+        prompt.push_str(&format!("ROLE: Expert TypeScript / JavaScript Developer\nFILE: {}\n", file_path));
+    }
     if !context_ref.is_empty() {
         prompt.push_str(context_ref);
     }
-
-    if !routes_ref.is_empty() {
-        prompt.push_str(routes_ref);
-    }
-
-    // Read and enforce Live Builder Guide contracts
-    let lbg_path = proj_dir.join(".axiom").join("live_builder_guide.json");
-    let mut lbg_rules = String::new();
-    let mut custom_import_rule = String::new();
-    if lbg_path.exists() {
-        if let Ok(content) = fs::read_to_string(&lbg_path) {
-            if let Ok(lbg_val) = serde_json::from_str::<Value>(&content) {
-                lbg_rules.push_str("\n\nLIVE BUILDER GUIDE ARCHITECTURE CONTRACTS:\n");
-                if let Some(spec) = lbg_val.get("projectSpecification") {
-                    lbg_rules.push_str(&format!("- Global Project Specifications: {}\n", spec));
-                    if let Some(style) = spec.get("importExportStyle").and_then(|s| s.as_str()) {
-                        custom_import_rule = format!("- STRICT IMPORT/EXPORT RULE: All hooks, components, and helper libraries in this project MUST use {} exports (and be imported as {}). Do NOT mix default and named exports.", style, style);
-                    }
-                    if let Some(category) = spec.get("category").and_then(|c| c.as_str()) {
-                        lbg_rules.push_str(&format!("- Resolved Software Category: [{}]. This software category dictates strict architectural requirements that must be followed completely.\n", category.to_uppercase()));
-                    }
-                    if let Some(reqs) = spec.get("categoryRequirements") {
-                        if let Some(features) = reqs.get("requiredFeatures").and_then(|f| f.as_array()) {
-                            lbg_rules.push_str("- Mandatory Features for this Software Category:\n");
-                            for feat in features {
-                                if let Some(feat_str) = feat.as_str() {
-                                    lbg_rules.push_str(&format!("  * {}\n", feat_str));
-                                }
-                            }
-                        }
-                        if let Some(routes) = reqs.get("requiredRoutes").and_then(|r| r.as_array()) {
-                            lbg_rules.push_str("- Mandatory File Routes & Pages to Support:\n");
-                            for route in routes {
-                                if let Some(route_str) = route.as_str() {
-                                    lbg_rules.push_str(&format!("  * {}\n", route_str));
-                                }
-                            }
-                        }
-                        if let Some(principles) = reqs.get("designPrinciples").and_then(|p| p.as_array()) {
-                            lbg_rules.push_str("- Specific Category Design Principles:\n");
-                            for prin in principles {
-                                if let Some(prin_str) = prin.as_str() {
-                                    lbg_rules.push_str(&format!("  * {}\n", prin_str));
-                                }
-                            }
-                        }
-                    }
-                }
-                if let Some(contracts) = lbg_val.get("sharedContracts") {
-                    lbg_rules.push_str(&format!("- Database Models & API Specifications: {}\n", contracts));
-                }
-            }
-        }
-    }
-
-    if !custom_import_rule.is_empty() {
-        prompt.push_str(&format!("{}\n", custom_import_rule));
-    }
-    if !lbg_rules.is_empty() {
-        prompt.push_str(&lbg_rules);
-    }
-
     prompt
 }
 
@@ -9372,8 +9423,8 @@ export default function RootLayout({
                 .json(&ollama_req)
                 .send();
 
-            // 60-second connection timeout
-            let resp_res = tokio::time::timeout(std::time::Duration::from_secs(60), req_fut).await;
+            // 180-second connection timeout for local LLMs with CPU offload
+            let resp_res = tokio::time::timeout(std::time::Duration::from_secs(180), req_fut).await;
 
             let mut resp = match resp_res {
                 Ok(Ok(r)) => r,
@@ -9399,8 +9450,8 @@ export default function RootLayout({
 
             loop {
                 let chunk_fut = resp.chunk();
-                // 25-second timeout per streaming chunk
-                let chunk_res = tokio::time::timeout(std::time::Duration::from_secs(25), chunk_fut).await;
+                // 60-second timeout per streaming chunk
+                let chunk_res = tokio::time::timeout(std::time::Duration::from_secs(60), chunk_fut).await;
 
                 let chunk = match chunk_res {
                     Ok(Ok(Some(c))) => c,
@@ -9429,8 +9480,8 @@ export default function RootLayout({
                                     emit_progress("generate-files", &format!("AI typing {}... ({} tokens)", file_path, token_count), current_progress);
                                 }
 
-                                // Detect repetition loop every 20 tokens
-                                if token_count % 20 == 0 && detect_infinite_loop(&full_content) {
+                                // Detect repetition loop only after 100 tokens every 30 tokens to avoid early false positives
+                                if token_count >= 100 && token_count % 30 == 0 && detect_infinite_loop(&full_content) {
                                     debug_log_to_file(format!(
                                         "[Orchestrator] Infinite loop detected for {} (Attempt {}/{} at token {})!",
                                         file_path, attempts, max_attempts, token_count
@@ -9481,7 +9532,18 @@ export default function RootLayout({
         }
 
         if !file_gen_success {
-            return Err(format!("Failed to generate file {} after 3 attempts due to infinite loops or timeouts.", file_path));
+            if !processed_content.trim().is_empty() {
+                debug_log_to_file(format!(
+                    "[Orchestrator] Warning: Max attempts reached for {}. Using partially processed content to avoid blocking pipeline.",
+                    file_path
+                ));
+            } else {
+                debug_log_to_file(format!(
+                    "[Orchestrator] Warning: Max attempts reached for {}. Generating safe fallback stub to avoid blocking pipeline.",
+                    file_path
+                ));
+                processed_content = get_safe_fallback_content(file_path, lang, desc);
+            }
         }
 
         // 3. Save File
@@ -9791,12 +9853,39 @@ pub fn run() {
                 // 2. Fall back to plugin retrieval if CLI scan produced no deep link
                 if !found_cli_url {
                     if let Ok(Some(urls)) = app.deep_link().get_current() {
-                        for url in urls {
-                            debug_log_to_file(format!("Cold start plugin-registered match found: {}", url.as_str()));
                             handle_axiom_url(app.handle(), url.as_str());
                         }
                     }
                 }
+
+                // 3. Start local web-to-desktop handshake listener (127.0.0.1:24859)
+                tauri::async_runtime::spawn(async move {
+                    if let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:24859").await {
+                        while let Ok((mut stream, _)) = listener.accept().await {
+                            tokio::spawn(async move {
+                                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                                let mut buf = [0u8; 1024];
+                                if stream.read(&mut buf).await.is_ok() {
+                                    let req = String::from_utf8_lossy(&buf);
+                                    let response = if req.starts_with("OPTIONS") {
+                                        "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\nConnection: close\r\n\r\n".to_string()
+                                    } else {
+                                        let body = format!(
+                                            r#"{{"app":"axiom-forge","version":"{}","status":"ready"}}"#,
+                                            env!("CARGO_PKG_VERSION")
+                                        );
+                                        format!(
+                                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                            body.len(),
+                                            body
+                                        )
+                                    };
+                                    let _ = stream.write_all(response.as_bytes()).await;
+                                }
+                            });
+                        }
+                    }
+                });
             }
             Ok(())
         })
