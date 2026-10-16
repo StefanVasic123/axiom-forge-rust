@@ -1972,7 +1972,63 @@ export { handler as GET, handler as POST };
 "#.to_string();
         }
 
-        if normalized_path.contains("src/app/") {
+        // Ensure client components are never async functions (causes RSC 'Cannot access default.then on the server' error)
+        let is_client_file = processed.contains("\"use client\"") || processed.contains("'use client'");
+        if is_client_file {
+            if processed.contains("export default async function") {
+                processed = processed.replace("export default async function", "export default function");
+            }
+            // Strip server-only imports (Prisma, bcrypt, fs) from client components to prevent webpack & RSC crashes
+            if !path_lower.ends_with("route.ts") && !path_lower.ends_with("route.js") {
+                let filtered_lines: Vec<&str> = processed
+                    .lines()
+                    .filter(|line| {
+                        let t = line.trim();
+                        if t.starts_with("import ") {
+                            let is_server_import = t.contains("'@prisma/client'")
+                                || t.contains("\"@prisma/client\"")
+                                || t.contains("'@/lib/prisma'")
+                                || t.contains("\"@/lib/prisma\"")
+                                || t.contains("'bcrypt'")
+                                || t.contains("\"bcrypt\"")
+                                || t.contains("'bcryptjs'")
+                                || t.contains("\"bcryptjs\"");
+                            return !is_server_import;
+                        }
+                        true
+                    })
+                    .collect();
+                processed = filtered_lines.join("\n");
+            }
+        }
+
+        // Dual-export synchronization (both named and default export) for hooks and components
+        // Prevents: Attempted import error: 'useAuth' is not exported from '@/hooks/useAuth'
+        if !path_lower.contains("/api/") && !path_lower.ends_with("route.ts") && !path_lower.ends_with("route.js") && !path_lower.ends_with("middleware.ts") {
+            if let Some(stem) = std::path::Path::new(&normalized_path).file_stem().and_then(|s| s.to_str()) {
+                let valid_ident = stem.chars().all(|c| c.is_alphanumeric() || c == '_')
+                    && stem.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_');
+                if valid_ident && stem != "page" && stem != "layout" && stem != "index" && stem != "loading" && stem != "error" {
+                    let has_ident_decl = processed.contains(&format!("function {}", stem))
+                        || processed.contains(&format!("const {} =", stem))
+                        || processed.contains(&format!("const {}:", stem));
+                    if has_ident_decl {
+                        let has_default_export = processed.contains("export default");
+                        let has_named_export = processed.contains(&format!("export function {}", stem))
+                            || processed.contains(&format!("export const {}", stem))
+                            || processed.contains(&format!("export {{ {}", stem))
+                            || processed.contains(&format!("export {{{}", stem));
+                        if has_default_export && !has_named_export {
+                            processed.push_str(&format!("\nexport {{ {} }};\n", stem));
+                        } else if has_named_export && !has_default_export {
+                            processed.push_str(&format!("\nexport default {};\n", stem));
+                        }
+                    }
+                }
+            }
+        }
+
+        if normalized_path.contains("src/app/") || normalized_path.starts_with("app/") {
             if !path_lower.ends_with("route.ts") && !path_lower.ends_with("route.js") {
                 let has_hooks = processed.contains("useState") || processed.contains("useEffect") || 
                                 processed.contains("useContext") || processed.contains("useRef") || 
@@ -1984,19 +2040,42 @@ export { handler as GET, handler as POST };
                 }
             }
 
-            // Ensure client components are never async functions (causes RSC default.then error)
+            // Re-check async client component after potential "use client" injection above
             if (processed.contains("\"use client\"") || processed.contains("'use client'")) && processed.contains("export default async function") {
                 processed = processed.replace("export default async function", "export default function");
             }
 
-            // Ensure layout.tsx / page.tsx never omit export default
+            // Ensure layout.tsx / page.tsx never omit export default (prevents RSC default.then crash)
             if path_lower.ends_with("layout.tsx") || path_lower.ends_with("layout.jsx") || path_lower.ends_with("page.tsx") || path_lower.ends_with("page.jsx") {
                 if !processed.contains("export default") {
-                    for candidate in &["RootLayout", "Layout", "Page", "Home", "Dashboard", "Profile", "LoginPage", "RegisterPage"] {
+                    let mut found_comp: Option<String> = None;
+                    for candidate in &["RootLayout", "Layout", "HomePage", "Page", "Home", "DashboardPage", "Dashboard", "ProfilePage", "Profile", "LoginPage", "RegisterPage"] {
                         if processed.contains(&format!("function {}", candidate)) || processed.contains(&format!("const {}", candidate)) {
-                            processed.push_str(&format!("\nexport default {};\n", candidate));
+                            found_comp = Some(candidate.to_string());
                             break;
                         }
+                    }
+                    if found_comp.is_none() {
+                        // Dynamically scan for any PascalCase function or const declaration
+                        for line in processed.lines() {
+                            let t = line.trim().trim_start_matches("export ").trim();
+                            if let Some(rest) = t.strip_prefix("function ") {
+                                let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                                if name.chars().next().map_or(false, |c| c.is_uppercase()) {
+                                    found_comp = Some(name);
+                                    break;
+                                }
+                            } else if let Some(rest) = t.strip_prefix("const ") {
+                                let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                                if name.chars().next().map_or(false, |c| c.is_uppercase()) && (t.contains("=>") || t.contains("React.FC") || t.contains("FC")) {
+                                    found_comp = Some(name);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(comp) = found_comp {
+                        processed.push_str(&format!("\nexport default {};\n", comp));
                     }
                 }
             }
@@ -6087,10 +6166,22 @@ async fn project_heal_compile_error(
                                     && !repl_trimmed.contains("const ")
                                     && !repl_trimmed.contains("default ")
                                     && !repl_trimmed.contains("class ");
-                                
+
+                                let is_partial_helper_snippet = !file_content_mut.is_empty()
+                                    && file_content_mut.contains("export default")
+                                    && !repl_trimmed.contains("export default")
+                                    && repl_trimmed.lines().count() <= 10;
+
                                 if is_just_import && !file_content_mut.is_empty() {
                                     if !file_content_mut.contains(repl_trimmed) {
                                         *file_content_mut = format!("{}\n{}", repl_trimmed, file_content_mut);
+                                    }
+                                } else if is_partial_helper_snippet {
+                                    // Do not wipe out a full React page with a 1-10 line helper declaration
+                                    if !file_content_mut.contains(repl_trimmed) {
+                                        if let Some(idx) = file_content_mut.find("export default") {
+                                            file_content_mut.insert_str(idx, &format!("{}\n\n", repl_trimmed));
+                                        }
                                     }
                                 } else {
                                     *file_content_mut = replacement.to_string();
@@ -6170,20 +6261,41 @@ async fn project_install_package(
         return Err("Project directory not found".to_string());
     }
 
+    let enriched_path = ensure_node_toolchain_ready(Some(&window), "server:log").await;
+
     let _ = window.emit("server:log", serde_json::json!({
         "text": "> [AI Auto-Healing] Pokrećem npm install za paket...\n".to_string(),
         "type": "info"
     }));
 
+    let mut pkgs_to_install = vec![package_name.clone()];
+    if package_name == "@emotion/styled" || package_name == "@mui/material" {
+        pkgs_to_install.push("@emotion/react".to_string());
+    } else if package_name == "@emotion/react" {
+        pkgs_to_install.push("@emotion/styled".to_string());
+    }
+
     #[cfg(target_os = "windows")]
     let mut cmd = tokio::process::Command::new("cmd");
     #[cfg(target_os = "windows")]
-    cmd.arg("/C").arg("npm").arg("install").arg(&package_name).current_dir(&proj_dir);
+    {
+        cmd.arg("/C").arg("npm").arg("install").arg("--legacy-peer-deps");
+        for p in &pkgs_to_install {
+            cmd.arg(p);
+        }
+        cmd.current_dir(&proj_dir).env("PATH", &enriched_path);
+    }
 
     #[cfg(not(target_os = "windows"))]
     let mut cmd = tokio::process::Command::new("npm");
     #[cfg(not(target_os = "windows"))]
-    cmd.arg("install").arg(&package_name).current_dir(&proj_dir);
+    {
+        cmd.arg("install").arg("--legacy-peer-deps");
+        for p in &pkgs_to_install {
+            cmd.arg(p);
+        }
+        cmd.current_dir(&proj_dir).env("PATH", &enriched_path);
+    }
 
     #[cfg(target_os = "windows")]
     {
@@ -8348,12 +8460,20 @@ fn get_expert_system_prompt(
 
         if path_lower.contains("/api/auth/") || path_lower.contains("nextauth") {
             prompt.push_str(
-                "\nAUTHENTICATION SECURITY RULES:\n\
+                "\nAUTHENTICATION SECURITY & HYBRID PROVIDER RULES (SCOPED TO AUTH ROUTE):\n\
                  - Export GET and POST handlers: `const handler = NextAuth(authOptions); export { handler as GET, handler as POST };`.\n\
                  - Use `strategy: 'jwt'` sessions for NextAuth.\n\
+                 - HYBRID DEV/PROD PROVIDERS: Dynamically use `CredentialsProvider` (email+password verified with `bcryptjs`) during development (`process.env.NODE_ENV !== 'production'`), and support `EmailProvider` (Resend SMTP) in production (`process.env.NODE_ENV === 'production'`) ONLY when `process.env.EMAIL_SERVER_HOST` or `process.env.RESEND_API_KEY` is configured, falling back to `CredentialsProvider` if SMTP keys are missing.\n\
                  - CredentialsProvider MUST be imported from 'next-auth/providers/credentials', NEVER from 'next-auth' directly.\n\
-                 - Never hardcode environment secrets (use `process.env.NEXTAUTH_SECRET || 'dev-secret'`).\n\
-                 - Use bcryptjs to verify passwords asynchronously.\n"
+                 - Never hardcode environment secrets (use `process.env.NEXTAUTH_SECRET || 'dev-secret'`).\n"
+            );
+        }
+
+        if path_lower.contains("stripe") || path_lower.contains("webhook") || path_lower.contains("checkout") {
+            prompt.push_str(
+                "\nPAYMENTS & STRIPE DOMAIN RULES (SCOPED TO BILLING API):\n\
+                 - Guard Stripe initialization if `process.env.STRIPE_SECRET_KEY` is missing in local preview, returning a graceful mock/preview JSON response instead of crashing.\n\
+                 - Verify webhook signatures cleanly when `STRIPE_WEBHOOK_SECRET` is present.\n"
             );
         }
 
@@ -8386,8 +8506,8 @@ fn get_expert_system_prompt(
             prompt.push_str(
                 "ROOT LANDING PAGE DESIGN RULES:\n\
                  - This is the HOME/LANDING PAGE (`/`). It must NEVER be a blank screen or bare login form.\n\
-                 - HERO SECTION: Include a high-impact Hero banner with compelling headline, engaging description, and clear CTA buttons.\n\
-                 - CORE FEATURE SHOWCASE: Show primary interactive content, product cards, or metric widgets.\n\
+                 - HERO SECTION: Include a high-impact Hero banner with compelling headline, engaging description, and clear CTA buttons tailored specifically to the project's business idea.\n\
+                 - CORE FEATURE SHOWCASE: Show primary interactive domain workflows, product cards, or metric widgets.\n\
                  - VALUE PROPOSITIONS: Display a responsive grid of key benefits/badges.\n\
                  - DATA RESILIENCY: Fetch data with an immediate fallback to a rich realistic mockup array.\n\
                  - MANDATORY TAILWIND CSS: Every element must use modern Tailwind CSS classes.\n\n"
@@ -8401,6 +8521,31 @@ fn get_expert_system_prompt(
                  - NO DEAD IMPORTS: Do not import components unless they exist; implement inline if needed.\n\
                  - Use modern Tailwind CSS with responsive flex/grid layouts, nice borders, shadows, and hover states.\n\
                  - NO MANUAL AXIOM ATTRS: Never declare or use 'data-axiom-component' or 'data-axiom-file' props.\n\n"
+            );
+        }
+
+        // Scoped Domain Contexts for Frontend Pages & Components
+        if path_lower.contains("/login") || path_lower.contains("/register") || path_lower.contains("/signup") || path_lower.contains("auth") {
+            prompt.push_str(
+                "SCOPED AUTH UI RULES (ACTIVE ONLY FOR AUTH FILES):\n\
+                 - Ensure the Login/Register UI works out-of-the-box locally without any SMTP server configuration.\n\
+                 - Render the email + password form locally (calling `signIn('credentials', { email, password, redirect: false })`) and support passwordless magic-link email form in production.\n\
+                 - If defining an auth hook or provider (e.g. `useAuth`), export BOTH named (`export { useAuth }`) and default (`export default useAuth`) exports.\n\n"
+            );
+        }
+
+        if path_lower.contains("dashboard") || path_lower.contains("analytics") || path_lower.contains("metrics") {
+            prompt.push_str(
+                "SCOPED ANALYTICS & DASHBOARD RULES (ACTIVE ONLY FOR DASHBOARD/ANALYTICS FILES):\n\
+                 - Build domain-specific KPI summary cards, interactive tabs/filters, and data visualizations directly matching the project's business domain.\n\
+                 - Pre-populate state with realistic domain mockup data so charts, tables, and workflows are immediately interactive even before API records are created.\n\n"
+            );
+        }
+
+        if path_lower.contains("pricing") || path_lower.contains("checkout") || path_lower.contains("billing") {
+            prompt.push_str(
+                "SCOPED BILLING & PRICING UI RULES (ACTIVE ONLY FOR PRICING/CHECKOUT FILES):\n\
+                 - Display clear tier comparisons, billing cycle toggles (monthly/annual), and interactive checkout triggers with graceful local preview feedback.\n\n"
             );
         }
 
@@ -8545,6 +8690,13 @@ async fn run_orchestrator(
         .or_else(|| manifest.get("metadata").and_then(|m| m.get("name")))
         .or_else(|| manifest.get("metadata").and_then(|m| m.get("title")));
     let name = name_val.and_then(|n| n.as_str()).unwrap_or("Unknown Project");
+    let desc_val = manifest.get("description")
+        .or_else(|| manifest.get("projectDescription"))
+        .or_else(|| manifest.get("idea"))
+        .or_else(|| manifest.get("content"))
+        .or_else(|| manifest.get("metadata").and_then(|m| m.get("description")))
+        .or_else(|| manifest.get("metadata").and_then(|m| m.get("idea")));
+    let project_description = desc_val.and_then(|d| d.as_str()).unwrap_or("");
     let project_type = detect_project_type(&manifest);
     let mut metamanifest = manifest.get("metamanifest").cloned().unwrap_or(serde_json::json!({}));
     
@@ -9172,17 +9324,19 @@ export default function RootLayout({
     
     let expansion_prompt = format!(
         "You are a Senior Project Architect. We are generating a complete {} application named '{}' using {}.\n\
-         The user requested a fully complete, production-ready implementation.\n\
+         Project Idea & Core Domain Description: \"{}\"\n\
+         The user requested a fully complete, production-ready implementation tailored specifically to this business domain.\n\
          Version Overrides requested by user:\n\
          {}\n\n\
          Original files skeleton in the manifest:\n\
          {}\n\n\
          Identify all missing files, routes, state management, components, configuration files, or database schemas needed to make this project complete.\n\
+         CRITICAL DOMAIN RULE: Ensure the pages, dashboard, API routes, and Prisma schema models directly implement the core business features described in the Project Idea (not just generic user authentication).\n\
          IMPORTANT ARCHITECTURAL RULE: If the project uses next-auth (NextAuth) for authentication, you MUST always include 'src/app/api/register/route.ts' in the expanded files list to handle new user registration (creating user record using bcryptjs), since NextAuth does not natively provide a user registration route.\n\
          Output a JSON array containing the expanded, complete list of files. For each file, provide 'path', 'description', and 'language'.\n\
-         Ensure all files from the original list are preserved (but you may update their descriptions to match the technology overrides).\n\
+         Ensure all files from the original list are preserved (but you may update their descriptions to match the technology overrides and core domain features).\n\
          Respond ONLY with a valid JSON array. Do not include any introductory or concluding text, or markdown code blocks.",
-         platform, name, resolved_stack, overrides_desc, original_files_json
+         platform, name, resolved_stack, project_description, overrides_desc, original_files_json
     );
 
     let mut files_to_generate = files.clone();
@@ -9534,7 +9688,14 @@ export default function RootLayout({
             pkg_extra.push_str(". Do NOT use outdated versions.");
             system_prompt.push_str(&pkg_extra);
         }
-        let user_prompt = format!("Generate {} code for file: {}\n\nDescription: {}", lang, file_path, desc);
+        let user_prompt = if project_description.is_empty() {
+            format!("Project: {}\nGenerate {} code for file: {}\n\nDescription: {}", name, lang, file_path, desc)
+        } else {
+            format!(
+                "Project: {} ({})\nGenerate {} code for file: {}\n\nFile Specification: {}\n\nIMPORTANT: Ensure all UI text, domain entities, metrics, and business logic reflect the Project description above rather than generic placeholders.",
+                name, project_description, lang, file_path, desc
+            )
+        };
 
         let mut processed_content = String::new();
         let mut file_gen_success = false;
