@@ -2957,7 +2957,7 @@ async fn ensure_node_toolchain_ready(window: Option<&tauri::Window>, log_event: 
         if let Some(local_data) = dirs::data_local_dir() {
             candidates.push(local_data.join("Programs").join("nodejs"));
         }
-        if let Some(roaming) = dirs::data_roaming_dir() {
+        if let Some(roaming) = dirs::data_dir() {
             candidates.push(roaming.join("nvm"));
         }
 
@@ -8207,10 +8207,10 @@ pub fn get_stack_rulepacks(file_path: &str, file_content: &str, error_msg: Optio
 fn get_expert_system_prompt(
     file_path: &str,
     project_type: &str,
-    overrides_desc: &str,
-    pkg_db_summary: &str,
+    _overrides_desc: &str,
+    _pkg_db_summary: &str,
     context_ref: &str,
-    routes_ref: &str,
+    _routes_ref: &str,
     proj_dir: &std::path::Path,
 ) -> String {
     let path_lower = file_path.to_lowercase().replace('\\', "/");
