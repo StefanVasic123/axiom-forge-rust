@@ -2931,6 +2931,141 @@ fn lock_installed_dependencies(pkg_path: &std::path::Path) {
     }
 }
 
+async fn ensure_node_toolchain_ready(window: Option<&tauri::Window>, log_event: &str) -> String {
+    let emit_msg = |msg: &str, is_err: bool| {
+        if let Some(w) = window {
+            if !log_event.is_empty() {
+                let _ = w.emit(log_event, serde_json::json!({
+                    "text": msg.to_string(),
+                    "type": if is_err { "error" } else { "info" }
+                }));
+            }
+        }
+        debug_log_to_file(format!("[NodeToolchain] {}", msg.trim()));
+    };
+
+    let current_path = std::env::var("PATH").unwrap_or_default();
+
+    #[cfg(target_os = "windows")]
+    {
+        let toolchain_node_dir = get_base_dir().join("toolchain").join("node").join("node-v20.18.1-win-x64");
+        let mut candidates = vec![
+            toolchain_node_dir.clone(),
+            std::path::PathBuf::from(r"C:\Program Files\nodejs"),
+            std::path::PathBuf::from(r"C:\Program Files (x86)\nodejs"),
+        ];
+        if let Some(local_data) = dirs::data_local_dir() {
+            candidates.push(local_data.join("Programs").join("nodejs"));
+        }
+        if let Some(roaming) = dirs::data_roaming_dir() {
+            candidates.push(roaming.join("nvm"));
+        }
+
+        // 1. Check known candidate directories first
+        for cand in &candidates {
+            if cand.join("node.exe").exists() && cand.join("npm.cmd").exists() {
+                let cand_str = cand.to_string_lossy().to_string();
+                let new_path = if current_path.to_lowercase().contains(&cand_str.to_lowercase()) {
+                    current_path.clone()
+                } else {
+                    format!("{};{}", cand_str, current_path)
+                };
+                std::env::set_var("PATH", &new_path);
+                return new_path;
+            }
+        }
+
+        // 2. Check if `where.exe node` succeeds in current PATH
+        let mut check_cmd = tokio::process::Command::new("where.exe");
+        check_cmd.arg("node").creation_flags(0x08000000);
+        if let Ok(out) = check_cmd.output().await {
+            if out.status.success() {
+                return current_path;
+            }
+        }
+
+        // 3. Node.js is missing! Automatically download & extract Portable Node.js v20.18.1 LTS
+        emit_msg("> [Auto-Setup] Node.js nije pronađen na sistemu. Automatski preuzimam i instaliram Node.js v20.18.1 LTS...\n", false);
+
+        let base_toolchain = get_base_dir().join("toolchain").join("node");
+        let _ = std::fs::create_dir_all(&base_toolchain);
+        let zip_path = base_toolchain.join("node.zip");
+        let node_url = "https://nodejs.org/dist/v20.18.1/node-v20.18.1-win-x64.zip";
+
+        let mut download_ok = false;
+        if let Ok(client) = reqwest::Client::builder().timeout(std::time::Duration::from_secs(180)).build() {
+            if let Ok(resp) = client.get(node_url).send().await {
+                if resp.status().is_success() {
+                    if let Ok(bytes) = resp.bytes().await {
+                        if std::fs::write(&zip_path, &bytes).is_ok() {
+                            download_ok = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !download_ok {
+            // Fallback to curl.exe
+            let mut curl_cmd = tokio::process::Command::new("curl.exe");
+            curl_cmd
+                .arg("-L")
+                .arg("-s")
+                .arg("-o")
+                .arg(&zip_path)
+                .arg(node_url)
+                .creation_flags(0x08000000);
+            if let Ok(st) = curl_cmd.status().await {
+                download_ok = st.success() && zip_path.exists();
+            }
+        }
+
+        if download_ok {
+            emit_msg("> [Auto-Setup] Raspakujem Node.js v20.18.1 LTS okruženje...\n", false);
+            let mut tar_cmd = tokio::process::Command::new("tar.exe");
+            tar_cmd
+                .arg("-xf")
+                .arg(&zip_path)
+                .arg("-C")
+                .arg(&base_toolchain)
+                .creation_flags(0x08000000);
+            let _ = tar_cmd.status().await;
+            let _ = std::fs::remove_file(&zip_path);
+        }
+
+        if toolchain_node_dir.join("node.exe").exists() {
+            let node_bin_str = toolchain_node_dir.to_string_lossy().to_string();
+            // Create shims in %LOCALAPPDATA%\Microsoft\WindowsApps so all child shells find node/npm/npx
+            if let Some(local_data) = dirs::data_local_dir() {
+                let win_apps = local_data.join("Microsoft").join("WindowsApps");
+                if win_apps.exists() {
+                    let _ = std::fs::write(
+                        win_apps.join("node.cmd"),
+                        format!("@echo off\r\n\"{}\\node.exe\" %*\r\n", node_bin_str),
+                    );
+                    let _ = std::fs::write(
+                        win_apps.join("npm.cmd"),
+                        format!("@echo off\r\nSET \"PATH={};%PATH%\"\r\n\"{}\\npm.cmd\" %*\r\n", node_bin_str, node_bin_str),
+                    );
+                    let _ = std::fs::write(
+                        win_apps.join("npx.cmd"),
+                        format!("@echo off\r\nSET \"PATH={};%PATH%\"\r\n\"{}\\npx.cmd\" %*\r\n", node_bin_str, node_bin_str),
+                    );
+                }
+            }
+
+            let new_path = format!("{};{}", node_bin_str, current_path);
+            std::env::set_var("PATH", &new_path);
+            emit_msg("> [Auto-Setup] Node.js v20.18.1 LTS (node, npm, npx) je uspešno instaliran i spreman!\n", false);
+            return new_path;
+        } else {
+            emit_msg("> [Auto-Setup Error] Automatsko preuzimanje Node.js-a nije uspelo. Proverite internet konekciju.\n", true);
+        }
+    }
+
+    current_path
+}
+
 async fn run_npm_install_with_auto_healing(
     proj_dir: &std::path::Path,
     window: &tauri::Window,
@@ -2941,6 +3076,8 @@ async fn run_npm_install_with_auto_healing(
     if !pkg_path.exists() {
         return false;
     }
+
+    let enriched_path = ensure_node_toolchain_ready(Some(window), log_event).await;
 
     use tauri::Manager;
     let mut project_id = proj_dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
@@ -3019,6 +3156,7 @@ async fn run_npm_install_with_auto_healing(
         #[cfg(target_os = "windows")]
         install_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
 
+        install_cmd.env("PATH", &enriched_path);
         install_cmd.stdout(std::process::Stdio::piped());
         install_cmd.stderr(std::process::Stdio::piped());
 
@@ -4710,6 +4848,8 @@ async fn server_start(
         }
     }
     
+    let enriched_path = ensure_node_toolchain_ready(Some(&window), "server:log").await;
+
     if needs_install {
         run_npm_install_with_auto_healing(&proj_dir, &window, "server:log", None).await;
     }
@@ -4767,6 +4907,7 @@ async fn server_start(
             cmd.arg(arg);
         }
         cmd.current_dir(&proj_dir)
+            .env("PATH", &enriched_path)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
     }
@@ -4779,6 +4920,7 @@ async fn server_start(
             cmd.arg(arg);
         }
         cmd.current_dir(&proj_dir)
+            .env("PATH", &enriched_path)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
     }
@@ -5211,6 +5353,8 @@ async fn heal_prisma_schema_loop(
         return Ok(()); // No schema, nothing to heal
     };
 
+    let enriched_path = ensure_node_toolchain_ready(Some(window), log_channel).await;
+
     // (1) Deterministic pre-pass: fix known schema mistakes without the LLM
     if sanitize_prisma_schema_on_disk(&schema_path) {
         let _ = window.emit(log_channel, serde_json::json!({
@@ -5252,8 +5396,8 @@ async fn heal_prisma_schema_loop(
             prisma_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         }
 
-        // Disable colored output at the source as well
-        prisma_cmd.env("NO_COLOR", "1").env("FORCE_COLOR", "0");
+        // Disable colored output at the source as well and inject enriched PATH
+        prisma_cmd.env("PATH", &enriched_path).env("NO_COLOR", "1").env("FORCE_COLOR", "0");
 
         let output = match prisma_cmd.output().await {
             Ok(o) => o,
@@ -5279,6 +5423,12 @@ async fn heal_prisma_schema_loop(
             "text": format!("> [Prisma Validator] Greška pri generisanju:\n{}\n", error_log),
             "type": "error"
         }));
+
+        if error_log.contains("is not recognized as an internal or external command")
+            || error_log.contains("command not found")
+        {
+            return Err("Node.js (npx) nije pronađen u sistemu. Proverite internet konekciju za automatsko preuzimanje Node.js-a.".to_string());
+        }
 
         if attempt == MAX_AI_HEALS {
             break;
@@ -9853,12 +10003,19 @@ pub fn run() {
                 // 2. Fall back to plugin retrieval if CLI scan produced no deep link
                 if !found_cli_url {
                     if let Ok(Some(urls)) = app.deep_link().get_current() {
+                        for url in urls {
+                            debug_log_to_file(format!("Cold start plugin-registered match found: {}", url.as_str()));
                             handle_axiom_url(app.handle(), url.as_str());
                         }
                     }
                 }
 
-                // 3. Start local web-to-desktop handshake listener (127.0.0.1:24859)
+                // 3. Auto-verify and bootstrap Node.js v20 LTS toolchain in the background on startup
+                tauri::async_runtime::spawn(async move {
+                    let _ = ensure_node_toolchain_ready(None, "").await;
+                });
+
+                // 4. Start local web-to-desktop handshake listener (127.0.0.1:24859)
                 tauri::async_runtime::spawn(async move {
                     if let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:24859").await {
                         while let Ok((mut stream, _)) = listener.accept().await {
