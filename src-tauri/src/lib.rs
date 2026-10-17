@@ -148,14 +148,114 @@ async fn ollama_check_health(host: Option<String>, target_model: Option<String>)
     }
 }
 
-#[tauri::command]
-async fn ollama_check_installed() -> Result<bool, String> {
-    Ok(true) // Stub: real implementation runs `ollama --version` in terminal
+#[derive(Serialize)]
+pub struct OllamaInstalledResult {
+    pub installed: bool,
+    pub version: Option<String>,
+    pub path: Option<String>,
+}
+
+fn find_ollama_executable() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(local_data) = dirs::data_local_dir() {
+            let win_default = local_data.join("Programs").join("Ollama").join("ollama.exe");
+            if win_default.exists() {
+                return win_default;
+            }
+        }
+    }
+    PathBuf::from("ollama")
 }
 
 #[tauri::command]
-async fn ollama_start_server() -> Result<bool, String> {
-    Ok(true) // Stub: runs `ollama serve` process
+async fn ollama_check_installed() -> Result<OllamaInstalledResult, String> {
+    let exe = find_ollama_executable();
+    let mut cmd = tokio::process::Command::new(&exe);
+    cmd.arg("--version");
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+
+    match cmd.output().await {
+        Ok(output) if output.status.success() => {
+            let ver = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            Ok(OllamaInstalledResult {
+                installed: true,
+                version: Some(ver),
+                path: Some(exe.to_string_lossy().to_string()),
+            })
+        }
+        _ => {
+            // Also check if Ollama HTTP API is already responding on 11434
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap_or_default();
+            if let Ok(resp) = client.get("http://127.0.0.1:11434/api/tags").send().await {
+                if resp.status().is_success() {
+                    return Ok(OllamaInstalledResult {
+                        installed: true,
+                        version: Some("running".to_string()),
+                        path: None,
+                    });
+                }
+            }
+            Ok(OllamaInstalledResult {
+                installed: false,
+                version: None,
+                path: None,
+            })
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct OllamaStartResult {
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+#[tauri::command]
+async fn ollama_start_server() -> Result<OllamaStartResult, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap_or_default();
+
+    // Check if already running
+    if let Ok(resp) = client.get("http://127.0.0.1:11434/api/tags").send().await {
+        if resp.status().is_success() {
+            return Ok(OllamaStartResult { success: true, error: None });
+        }
+    }
+
+    let exe = find_ollama_executable();
+    let mut cmd = tokio::process::Command::new(&exe);
+    cmd.arg("serve");
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+
+    if let Err(e) = cmd.spawn() {
+        return Ok(OllamaStartResult {
+            success: false,
+            error: Some(format!("Failed to spawn ollama serve: {}", e)),
+        });
+    }
+
+    // Wait up to 8 seconds for server to become responsive
+    for _ in 0..16 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Ok(resp) = client.get("http://127.0.0.1:11434/api/tags").send().await {
+            if resp.status().is_success() {
+                return Ok(OllamaStartResult { success: true, error: None });
+            }
+        }
+    }
+
+    Ok(OllamaStartResult {
+        success: false,
+        error: Some("Timed out waiting for Ollama server to start on port 11434".to_string()),
+    })
 }
 
 #[tauri::command]
@@ -231,7 +331,9 @@ fn get_axiom_settings() -> Value {
 
 #[tauri::command]
 fn save_axiom_settings(settings: Value) -> Result<(), String> {
-    let file_path = get_base_dir().join("axiom-settings.json");
+    let base_dir = get_base_dir();
+    let _ = fs::create_dir_all(&base_dir);
+    let file_path = base_dir.join("axiom-settings.json");
     let content = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
     fs::write(&file_path, content).map_err(|e| e.to_string())?;
     Ok(())

@@ -150,24 +150,70 @@ window.electronAPI = {
       return await invoke('get_local_tools_profile');
     },
     getSelectedModel: async () => {
-      return localStorage.getItem('axiom-forge-model');
+      const local = localStorage.getItem('axiom-forge-model');
+      if (local) return local;
+      try {
+        const settings = await invoke('get_axiom_settings');
+        if (settings && settings.selectedModel) {
+          localStorage.setItem('axiom-forge-model', settings.selectedModel);
+          return settings.selectedModel;
+        }
+      } catch (e) {
+        console.warn('[IPC Bridge] Could not read selectedModel from axiom-settings.json:', e);
+      }
+      return null;
     },
     setSelectedModel: async (modelId) => {
       localStorage.setItem('axiom-forge-model', modelId);
+      try {
+        const settings = (await invoke('get_axiom_settings')) || {};
+        settings.selectedModel = modelId;
+        await invoke('save_axiom_settings', { settings });
+      } catch (e) {
+        console.warn('[IPC Bridge] Could not persist selectedModel to axiom-settings.json:', e);
+      }
       console.log("Model selected:", modelId);
     },
     getBuilderModel: async () => {
-      return localStorage.getItem('axiom-forge-builder-model');
+      const local = localStorage.getItem('axiom-forge-builder-model');
+      if (local) return local;
+      try {
+        const settings = await invoke('get_axiom_settings');
+        if (settings && settings.builderModel) {
+          localStorage.setItem('axiom-forge-builder-model', settings.builderModel);
+          return settings.builderModel;
+        }
+      } catch (e) {}
+      return null;
     },
     setBuilderModel: async (modelId) => {
       localStorage.setItem('axiom-forge-builder-model', modelId);
+      try {
+        const settings = (await invoke('get_axiom_settings')) || {};
+        settings.builderModel = modelId;
+        await invoke('save_axiom_settings', { settings });
+      } catch (e) {}
       console.log("Builder model selected:", modelId);
     },
     getEditorModel: async () => {
-      return localStorage.getItem('axiom-forge-editor-model');
+      const local = localStorage.getItem('axiom-forge-editor-model');
+      if (local) return local;
+      try {
+        const settings = await invoke('get_axiom_settings');
+        if (settings && settings.editorModel) {
+          localStorage.setItem('axiom-forge-editor-model', settings.editorModel);
+          return settings.editorModel;
+        }
+      } catch (e) {}
+      return null;
     },
     setEditorModel: async (modelId) => {
       localStorage.setItem('axiom-forge-editor-model', modelId);
+      try {
+        const settings = (await invoke('get_axiom_settings')) || {};
+        settings.editorModel = modelId;
+        await invoke('save_axiom_settings', { settings });
+      } catch (e) {}
       console.log("Editor model selected:", modelId);
     }
   },
@@ -178,13 +224,22 @@ window.electronAPI = {
       return await invoke('ollama_check_health', { host, targetModel });
     },
     checkInstalled: async () => {
-      return await invoke('ollama_check_installed');
+      const res = await invoke('ollama_check_installed');
+      if (typeof res === 'boolean') return { installed: res };
+      return res || { installed: false };
     },
     startServer: async () => {
-      return await invoke('ollama_start_server');
+      const res = await invoke('ollama_start_server');
+      if (typeof res === 'boolean') return { success: res };
+      return res || { success: false };
     },
     pullModel: async (model) => {
-      return await invoke('ollama_pull_model', { model });
+      try {
+        await invoke('ollama_pull_model', { model });
+        return { success: true };
+      } catch (e) {
+        return { success: false, error: e.toString() };
+      }
     },
     unloadModel: async (model) => {
       return await invoke('ollama_unload_model', { model });

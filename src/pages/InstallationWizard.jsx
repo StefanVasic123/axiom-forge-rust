@@ -156,13 +156,23 @@ function OllamaStep({ onNext, onBack }) {
     
     try {
       const installedStatus = await window.electronAPI.ollama.checkInstalled();
-      setIsInstalled(installedStatus.installed);
+      const isOllamaInstalled = !!(installedStatus && installedStatus.installed);
+      setIsInstalled(isOllamaInstalled);
 
-      const health = await window.electronAPI.ollama.checkHealth();
+      let health = await window.electronAPI.ollama.checkHealth(undefined, modelToCheck);
       
+      // If Ollama is installed on disk but service isn't running yet, auto-start it
+      if (!health.available && isOllamaInstalled) {
+        setMessage('Starting local Ollama service...');
+        const startRes = await window.electronAPI.ollama.startServer();
+        if (startRes && startRes.success) {
+          health = await window.electronAPI.ollama.checkHealth(undefined, modelToCheck);
+        }
+      }
+
       if (!health.available) {
         setStatus('engine_missing');
-        setMessage(installedStatus.installed ? 'Ollama Engine is installed but stopped' : 'Local AI Engine not found');
+        setMessage(isOllamaInstalled ? 'Ollama Engine is installed but stopped' : 'Local AI Engine not found');
         return;
       }
 

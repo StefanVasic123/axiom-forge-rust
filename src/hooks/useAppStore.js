@@ -13,17 +13,37 @@ export function useAppStore() {
   const checkFirstRun = useCallback(async () => {
     console.log('[Setup] Starting first run check...');
     try {
-      // 1. Check if user has explicitly selected a model via the new Setup Wizard
-      const selectedModel = await window.electronAPI.hardware.getSelectedModel();
+      // 1. Check if Ollama is available and running (auto-start if installed but stopped after reboot)
+      let ollamaHealth = await window.electronAPI.ollama.checkHealth();
+      if (!ollamaHealth.available) {
+        const installedStatus = await window.electronAPI.ollama.checkInstalled();
+        if (installedStatus && installedStatus.installed) {
+          console.log('[Setup] Ollama is installed but not running. Attempting auto-start...');
+          const startRes = await window.electronAPI.ollama.startServer();
+          if (startRes && startRes.success) {
+            ollamaHealth = await window.electronAPI.ollama.checkHealth();
+          }
+        }
+      }
+      console.log('[Setup] Ollama check:', ollamaHealth);
+
+      // 2. Check if user has explicitly selected a model, or recover from installed models
+      let selectedModel = await window.electronAPI.hardware.getSelectedModel();
+      if (!selectedModel && ollamaHealth.available && Array.isArray(ollamaHealth.models) && ollamaHealth.models.length > 0) {
+        // Recover model selection from already installed Ollama models (e.g. after power loss / WebView cache reset)
+        const profile = await window.electronAPI.hardware.getProfile().catch(() => null);
+        const recModel = profile?.recommendedModelId;
+        const matchedRec = recModel && ollamaHealth.models.find(m => m === recModel || m.startsWith(recModel));
+        selectedModel = matchedRec || ollamaHealth.models[0];
+        console.log(`[Setup] Auto-recovered installed model: ${selectedModel}`);
+        await window.electronAPI.hardware.setSelectedModel(selectedModel);
+      }
+
       if (!selectedModel) {
         console.log('[Setup] Forcing Wizard: No model selected in hardware config.');
         actions.setFirstRun(true);
         return;
       }
-
-      // 2. Check if Ollama is available and running
-      const ollamaHealth = await window.electronAPI.ollama.checkHealth();
-      console.log('[Setup] Ollama check:', ollamaHealth);
 
       // Check if the explicitly selected model is actually installed
       const hasRequiredModel = (ollamaHealth.models || []).some(m => m === selectedModel || m.startsWith(selectedModel));
