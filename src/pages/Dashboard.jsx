@@ -31,6 +31,8 @@ function StatusBadge({ status }) {
     'generating': { icon: Loader2, className: 'badge-amber', text: 'Generating', animate: true },
     'awaiting-keys': { icon: AlertCircle, className: 'badge-amber', text: 'Awaiting Keys' },
     'ready': { icon: CheckCircle2, className: 'badge-indigo', text: 'Ready' },
+    'generated': { icon: CheckCircle2, className: 'badge-indigo', text: 'Ready' },
+    'imported': { icon: CheckCircle2, className: 'badge-indigo', text: 'Imported' },
     'deploying': { icon: Loader2, className: 'badge-amber', text: 'Deploying', animate: true },
     'live': { icon: Globe, className: 'badge-emerald', text: 'Live' },
     'error': { icon: AlertCircle, className: 'badge-rose', text: 'Error' },

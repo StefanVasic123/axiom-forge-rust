@@ -198,6 +198,13 @@ export function useAppStore() {
         
         // JIT Memory Swapping: Unload builder model after completion to free VRAM/RAM
         const phase = data.phase || (data.status ? data.status.toLowerCase() : '');
+        if (phase === 'manifest-expansion' || phase === 'save-project') {
+          try {
+            await loadProjects();
+          } catch (e) {
+            console.warn("[Task Progress] Failed to reload projects:", e);
+          }
+        }
         if (phase === 'success' || phase === 'error' || phase === 'stopped' || phase === 'complete') {
           // Auto-reload projects so dashboard instantly reflects newly created codebases!
           try {

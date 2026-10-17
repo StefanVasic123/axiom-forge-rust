@@ -231,12 +231,17 @@ function Layout() {
                 </div>
               </div>
               
-              <button 
-                onClick={handleDismiss}
-                className="p-1 rounded-lg hover:bg-slate-800 text-slate-500 hover:text-slate-300 transition-colors"
-              >
-                <X className="w-4 h-4" />
-              </button>
+              <div className="relative group/dismiss">
+                <button 
+                  onClick={handleDismiss}
+                  className="p-1 rounded-lg hover:bg-slate-800 text-slate-500 hover:text-slate-300 transition-colors"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+                <div className="pointer-events-none absolute right-full mr-2 top-1/2 -translate-y-1/2 z-50 w-52 opacity-0 scale-95 group-hover/dismiss:opacity-100 group-hover/dismiss:scale-100 transition-all duration-75 bg-slate-950/95 border border-slate-700 text-slate-200 text-[10px] leading-snug px-2.5 py-1.5 rounded-lg shadow-xl">
+                  Sakrij karticu statusa (proces u pozadini nastavlja sa radom)
+                </div>
+              </div>
             </div>
             
             <div className="mt-3">

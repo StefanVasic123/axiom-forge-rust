@@ -553,7 +553,13 @@ window.electronAPI = {
   },
   app: {
     getVersion: async () => {
-      return { success: true, version: '0.1.0 (Rust)' };
+      try {
+        const { getVersion } = await import('@tauri-apps/api/app');
+        const ver = await getVersion();
+        return { success: true, version: `${ver} (Rust)` };
+      } catch {
+        return { success: true, version: '0.1.8 (Rust)' };
+      }
     },
     getSettings: async () => {
       return await invoke('get_axiom_settings');

@@ -8609,6 +8609,7 @@ async fn run_orchestrator(
         ));
         let _ = window.emit("task:progress", serde_json::json!({
             "taskId": task_id,
+            "projectId": project_id,
             "phase": phase,
             "message": msg,
             "progress": progress
@@ -8698,6 +8699,19 @@ async fn run_orchestrator(
         .or_else(|| manifest.get("metadata").and_then(|m| m.get("idea")));
     let project_description = desc_val.and_then(|d| d.as_str()).unwrap_or("");
     let project_type = detect_project_type(&manifest);
+
+    // Immediately register/update the project in projects.json with "generating" status
+    // so it appears on the Dashboard right away with its real name and description.
+    let initial_proj = serde_json::json!({
+        "id": project_id,
+        "name": name,
+        "description": project_description,
+        "status": "generating",
+        "createdAt": chrono::Utc::now().to_rfc3339(),
+        "updatedAt": chrono::Utc::now().to_rfc3339(),
+    });
+    let _ = project_save(initial_proj);
+
     let mut metamanifest = manifest.get("metamanifest").cloned().unwrap_or(serde_json::json!({}));
     
     // Load default metamanifest definitions based on project type
@@ -9959,7 +9973,8 @@ export default function RootLayout({
     let new_proj = serde_json::json!({
         "id": project_id,
         "name": name,
-        "status": "generated",
+        "description": project_description,
+        "status": "ready",
         "createdAt": chrono::Utc::now().to_rfc3339(),
         "updatedAt": chrono::Utc::now().to_rfc3339(),
     });
@@ -9993,10 +10008,12 @@ async fn task_start_generation(
     let host_clone = host.clone();
     tokio::spawn(async move {
         debug_log_to_file(format!("[IPC Rust Command] Spawned tokio worker task for task_id: {}", t_id));
+        let err_proj_id = p_id_clone.clone();
         if let Err(e) = run_orchestrator(window.clone(), t_id.clone(), manifest_id, p_id_clone, token, model, host_clone).await {
             debug_log_to_file(format!("[IPC Rust Command] run_orchestrator failed for task_id {}: {}", t_id, e));
             let _ = window.emit("task:progress", serde_json::json!({
                 "taskId": t_id,
+                "projectId": err_proj_id,
                 "phase": "error",
                 "message": e,
                 "progress": 0.0
