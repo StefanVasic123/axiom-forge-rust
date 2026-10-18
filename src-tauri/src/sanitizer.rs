@@ -1108,6 +1108,28 @@ export { handler as GET, handler as POST };
 "#.to_string();
         }
 
+        // Next.js Edge Middleware safeguard: prevent Express middleware leakage or missing middleware export
+        if path_lower.ends_with("middleware.ts") || path_lower.ends_with("middleware.js") {
+            let has_express = processed.contains("'express'") || processed.contains("\"express\"") || processed.contains("NextFunction");
+            let has_valid_export = processed.contains("export function middleware")
+                || processed.contains("export async function middleware")
+                || processed.contains("export default")
+                || processed.contains("withAuth");
+            if has_express || !has_valid_export {
+                processed = r#"import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
+
+export function middleware(request: NextRequest) {
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: ['/((?!api|_next/static|_next/image|favicon.ico).*)'],
+};
+"#.to_string();
+            }
+        }
+
         // Ensure client components are never async functions (causes RSC 'Cannot access default.then on the server' error)
         let is_client_file = processed.contains("\"use client\"") || processed.contains("'use client'");
         if is_client_file {

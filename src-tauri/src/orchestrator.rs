@@ -132,7 +132,11 @@ pub async fn validate_file_with_abstract_rules(
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
         
-    let system_prompt = "You are a strict code quality validator. Analyze the provided file path and code content for logical errors, missing imports, syntax errors, or architectural violations. If it is a Next.js App Router layout, check that globals.css is imported. If NextAuth is used, ensure there are no incorrect imports for Prisma or NextAuth. Respond ONLY with a JSON object in this format: { \"valid\": true } or { \"valid\": false, \"reason\": \"Detailed description of the issue\" }.";
+    let system_prompt = "You are a strict code quality validator. Analyze the provided file path and code content for critical syntax errors, truncated code, or severe architectural violations. Rules:\n\
+1. ONLY root layout files (`layout.tsx` / `layout.jsx`) import `globals.css`. Regular pages (`page.tsx`) and components do NOT need to import `globals.css`.\n\
+2. In Next.js projects, `src/middleware.ts` or `middleware.ts` MUST use `NextRequest` and `NextResponse` from `'next/server'` and export `function middleware(request: NextRequest)`. It must NEVER use Express (`from 'express'`, `NextFunction`, or `(req, res, next)`).\n\
+3. If NextAuth is used, ensure there are no invalid imports for Prisma or NextAuth.\n\
+Respond ONLY with a JSON object in this format: { \"valid\": true } or { \"valid\": false, \"reason\": \"Detailed description of the issue\" }.";
     
     let user_prompt = format!("File Path: {}\n\nCode Content:\n```\n{}\n```", file_path, content);
     
@@ -809,6 +813,16 @@ pub fn get_expert_system_prompt(
         return prompt;
     }
 
+    // 7b. FILE-SCOPED PROMPT: Next.js Edge Middleware (middleware.ts / middleware.js)
+    if path_lower.ends_with("middleware.ts") || path_lower.ends_with("middleware.js") {
+        return format!(
+            "You are a Senior Next.js Edge Architecture Engineer. Write only clean, production-ready Next.js Middleware code wrapped in markdown code blocks. No explanations.\n\n{}\n\
+             - NEVER import from 'express' (no Request, Response, NextFunction from 'express'). Always import `{{ NextResponse }}` and `type {{ NextRequest }}` from `'next/server'`.\n\
+             - Always export `function middleware(request: NextRequest)` and `export const config = {{ matcher: [...] }}`.\n",
+            NEXTJS_MIDDLEWARE_RULEPACK
+        );
+    }
+
     // 8. FILE-SCOPED PROMPT: Web Client UI Components, Pages & Layouts (.tsx, .jsx)
     let is_react_frontend = path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx");
     if is_react_frontend {
@@ -1051,21 +1065,21 @@ pub async fn run_orchestrator(
                             "next": "14.2.35",
                             "react": "^18.2.0",
                             "react-dom": "^18.2.0",
-                            "next-auth": "^4.24.5",
+                            "next-auth": "^4.24.7",
                             "@auth/prisma-adapter": "^1.0.12",
-                            "@prisma/client": "^5.7.1",
-                            "lucide-react": "^0.294.0",
+                            "@prisma/client": "5.22.0",
+                            "lucide-react": "^0.460.0",
                             "clsx": "^2.1.1",
-                            "tailwind-merge": "^2.6.0",
-                            "class-variance-authority": "^0.7.1",
+                            "tailwind-merge": "^2.3.0",
+                            "class-variance-authority": "^0.7.0",
                             "tailwindcss-animate": "^1.0.7",
-                            "zod": "^3.22.4",
-                            "react-hook-form": "^7.48.2",
+                            "zod": "^3.23.8",
+                            "react-hook-form": "^7.51.5",
                             "bcryptjs": "^2.4.3",
-                            "jsonwebtoken": "^9.0.3"
+                            "jsonwebtoken": "^9.0.2"
                         },
                         "devDependencies": {
-                            "prisma": "^5.7.1",
+                            "prisma": "5.22.0",
                             "tailwindcss": "^3.4.0",
                             "postcss": "^8.4.32",
                             "autoprefixer": "^10.4.16",
@@ -1073,7 +1087,8 @@ pub async fn run_orchestrator(
                             "@types/react": "^18.2.45",
                             "@types/react-dom": "^18.2.18",
                             "@types/node": "^20.10.5",
-                            "@types/bcryptjs": "^2.4.6"
+                            "@types/bcryptjs": "^2.4.6",
+                            "@types/jsonwebtoken": "^9.0.6"
                         },
                         "scripts": {
                             "dev": "next dev",
@@ -2170,8 +2185,8 @@ export default function RootLayout({
                     ));
                     if attempts < max_attempts {
                         current_user_prompt = format!(
-                            "Generate {} code for file: {}\n\nDescription: {}\n\nIMPORTANT: The previous attempt failed validation with the following error:\n{}\nPlease correct this error in your new implementation.",
-                            lang, file_path, desc, validation_error
+                            "{}\n\nIMPORTANT: The previous attempt failed validation with the following error:\n{}\nPlease correct this error in your new implementation.",
+                            user_prompt, validation_error
                         );
                         file_gen_success = false;
                     } else {
@@ -2261,15 +2276,23 @@ export default function RootLayout({
 
         // Run prisma db push to synchronize the database schema
         emit_progress("install-deps", "Syncing database schema...", 79.0);
-        #[cfg(target_os = "windows")]
-        let mut push_cmd = std::process::Command::new("cmd");
-        #[cfg(target_os = "windows")]
-        push_cmd.arg("/C").arg("npx").arg("-y").arg("prisma@5.14.0").arg("db").arg("push").arg("--accept-data-loss").current_dir(&proj_dir);
-        
-        #[cfg(not(target_os = "windows"))]
-        let mut push_cmd = std::process::Command::new("npx");
-        #[cfg(not(target_os = "windows"))]
-        push_cmd.arg("-y").arg("prisma@5.14.0").arg("db").arg("push").arg("--accept-data-loss").current_dir(&proj_dir);
+        let local_prisma_js = proj_dir.join("node_modules").join("prisma").join("build").join("index.js");
+        let mut push_cmd = if local_prisma_js.exists() {
+            let mut c = std::process::Command::new("node");
+            c.arg(&local_prisma_js).arg("db").arg("push").arg("--accept-data-loss").current_dir(&proj_dir);
+            c
+        } else {
+            #[cfg(target_os = "windows")]
+            let mut c = std::process::Command::new("cmd");
+            #[cfg(target_os = "windows")]
+            c.arg("/C").arg("npx").arg("-y").arg("prisma@5.22.0").arg("db").arg("push").arg("--accept-data-loss").current_dir(&proj_dir);
+            
+            #[cfg(not(target_os = "windows"))]
+            let mut c = std::process::Command::new("npx");
+            #[cfg(not(target_os = "windows"))]
+            c.arg("-y").arg("prisma@5.22.0").arg("db").arg("push").arg("--accept-data-loss").current_dir(&proj_dir);
+            c
+        };
         
         #[cfg(target_os = "windows")]
         {

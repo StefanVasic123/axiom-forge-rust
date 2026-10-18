@@ -361,15 +361,23 @@ pub async fn heal_prisma_schema_loop(
             "type": "info"
         }));
 
-        #[cfg(target_os = "windows")]
-        let mut prisma_cmd = tokio::process::Command::new("cmd");
-        #[cfg(target_os = "windows")]
-        prisma_cmd.arg("/C").arg("npx").arg("-y").arg("prisma@5.14.0").arg("generate").current_dir(proj_dir);
+        let local_prisma_js = proj_dir.join("node_modules").join("prisma").join("build").join("index.js");
+        let mut prisma_cmd = if local_prisma_js.exists() {
+            let mut cmd = tokio::process::Command::new("node");
+            cmd.arg(&local_prisma_js).arg("generate").current_dir(proj_dir);
+            cmd
+        } else {
+            #[cfg(target_os = "windows")]
+            let mut cmd = tokio::process::Command::new("cmd");
+            #[cfg(target_os = "windows")]
+            cmd.arg("/C").arg("npx").arg("-y").arg("prisma@5.22.0").arg("generate").current_dir(proj_dir);
 
-        #[cfg(not(target_os = "windows"))]
-        let mut prisma_cmd = tokio::process::Command::new("npx");
-        #[cfg(not(target_os = "windows"))]
-        prisma_cmd.arg("-y").arg("prisma@5.14.0").arg("generate").current_dir(proj_dir);
+            #[cfg(not(target_os = "windows"))]
+            let mut cmd = tokio::process::Command::new("npx");
+            #[cfg(not(target_os = "windows"))]
+            cmd.arg("-y").arg("prisma@5.22.0").arg("generate").current_dir(proj_dir);
+            cmd
+        };
 
         #[cfg(target_os = "windows")]
         {
@@ -410,8 +418,11 @@ pub async fn heal_prisma_schema_loop(
             return Err("Node.js (npx) nije pronađen u sistemu. Proverite internet konekciju za automatsko preuzimanje Node.js-a.".to_string());
         }
 
-        if error_log.contains("CLI.UNKNOWN_COMMAND") || error_log.contains("No command registered for") {
-            return Err("Neodgovarajuća verzija Prisma CLI paketa u kešu. Pokušajte ponovo (sistem je automatski zaključao verziju na prisma@5.14.0).".to_string());
+        if error_log.contains("CLI.UNKNOWN_COMMAND")
+            || error_log.contains("No command registered for")
+            || error_log.contains("The \"path\" argument must be of type string")
+        {
+            return Err("Neodgovarajuća verzija Prisma CLI paketa u kešu u odnosu na @prisma/client.".to_string());
         }
 
         if attempt == MAX_AI_HEALS {
@@ -1242,15 +1253,23 @@ pub async fn project_run_prisma_generate(project_id: String) -> Result<String, S
         return Err("No Prisma schema found in this project".to_string());
     }
     
-    #[cfg(target_os = "windows")]
-    let mut cmd = Command::new("cmd");
-    #[cfg(target_os = "windows")]
-    cmd.arg("/C").arg("npx").arg("-y").arg("prisma@5.14.0").arg("generate").current_dir(&proj_dir);
-    
-    #[cfg(not(target_os = "windows"))]
-    let mut cmd = Command::new("npx");
-    #[cfg(not(target_os = "windows"))]
-    cmd.arg("-y").arg("prisma@5.14.0").arg("generate").current_dir(&proj_dir);
+    let local_prisma_js = proj_dir.join("node_modules").join("prisma").join("build").join("index.js");
+    let mut cmd = if local_prisma_js.exists() {
+        let mut c = Command::new("node");
+        c.arg(&local_prisma_js).arg("generate").current_dir(&proj_dir);
+        c
+    } else {
+        #[cfg(target_os = "windows")]
+        let mut c = Command::new("cmd");
+        #[cfg(target_os = "windows")]
+        c.arg("/C").arg("npx").arg("-y").arg("prisma@5.22.0").arg("generate").current_dir(&proj_dir);
+        
+        #[cfg(not(target_os = "windows"))]
+        let mut c = Command::new("npx");
+        #[cfg(not(target_os = "windows"))]
+        c.arg("-y").arg("prisma@5.22.0").arg("generate").current_dir(&proj_dir);
+        c
+    };
     
     #[cfg(target_os = "windows")]
     cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW

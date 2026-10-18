@@ -20,7 +20,7 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
     let mut needs_write = !db_path.exists();
     if db_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&db_path) {
-            if !content.contains("@mui/material") {
+            if !content.contains("\"dbVersion\": 2") {
                 needs_write = true;
             }
         }
@@ -28,6 +28,7 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
     
     if needs_write {
         let default_db = serde_json::json!({
+            "dbVersion": 2,
             "packages": [
                 {
                     "name": "resend",
@@ -56,13 +57,24 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
                     "bestPractices": "Use NextAuth(authOptions) in API routes. Use useSession() hook on the client side with SessionProvider."
                 },
                 {
+                    "name": "@auth/prisma-adapter",
+                    "version": "^1.0.12",
+                    "aliases": [],
+                    "importExamples": ["import { PrismaAdapter } from '@auth/prisma-adapter';"],
+                    "compatibility": {
+                        "next-auth": "^4.24.7",
+                        "@prisma/client": "5.22.0"
+                    },
+                    "bestPractices": "Pass the PrismaClient instance to PrismaAdapter(prisma) as any in NextAuth v4 configuration."
+                },
+                {
                     "name": "@next-auth/prisma-adapter",
                     "version": "^1.0.7",
                     "aliases": [],
                     "importExamples": ["import { PrismaAdapter } from '@next-auth/prisma-adapter';"],
                     "compatibility": {
-                        "next-auth": ">=4.0.0",
-                        "prisma": ">=4.0.0"
+                        "next-auth": "^4.24.7",
+                        "@prisma/client": "5.22.0"
                     },
                     "bestPractices": "Pass the PrismaClient instance to PrismaAdapter(prisma) in NextAuth configuration."
                 },
@@ -88,7 +100,8 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
                     "aliases": [],
                     "importExamples": ["import { zodResolver } from '@hookform/resolvers/zod';"],
                     "compatibility": {
-                        "react-hook-form": ">=7.0.0"
+                        "react-hook-form": "^7.51.5",
+                        "zod": "^3.23.8"
                     },
                     "bestPractices": "Combine with zod to validate react-hook-form: useForm({ resolver: zodResolver(schema) })."
                 },
@@ -109,6 +122,14 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
                     "bestPractices": "Import only necessary icons to enable tree shaking and reduce bundle sizes."
                 },
                 {
+                    "name": "@heroicons/react",
+                    "version": "^2.1.5",
+                    "aliases": ["heroicons"],
+                    "importExamples": ["import { UserIcon } from '@heroicons/react/24/outline';", "import { CheckIcon } from '@heroicons/react/24/solid';"],
+                    "compatibility": {},
+                    "bestPractices": "Import icons from @heroicons/react/24/outline or @heroicons/react/24/solid."
+                },
+                {
                     "name": "framer-motion",
                     "version": "^11.2.10",
                     "aliases": [],
@@ -123,6 +144,44 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
                     "importExamples": ["import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip } from 'recharts';"],
                     "compatibility": {},
                     "bestPractices": "Wrap Recharts charts in ResponsiveContainer to ensure responsiveness."
+                },
+                {
+                    "name": "react-chartjs-2",
+                    "version": "^5.2.0",
+                    "aliases": [],
+                    "importExamples": ["import { Line, Bar, Doughnut } from 'react-chartjs-2';"],
+                    "compatibility": {
+                        "chart.js": "^4.4.4"
+                    },
+                    "bestPractices": "Always pair react-chartjs-2 with chart.js."
+                },
+                {
+                    "name": "chart.js",
+                    "version": "^4.4.4",
+                    "aliases": ["chartjs"],
+                    "importExamples": ["import { Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement } from 'chart.js';"],
+                    "compatibility": {},
+                    "bestPractices": "Register scales and elements via ChartJS.register(...)."
+                },
+                {
+                    "name": "@reduxjs/toolkit",
+                    "version": "^2.2.7",
+                    "aliases": ["redux-toolkit"],
+                    "importExamples": ["import { configureStore, createSlice } from '@reduxjs/toolkit';"],
+                    "compatibility": {
+                        "react-redux": "^9.1.2"
+                    },
+                    "bestPractices": "Use configureStore and createSlice alongside react-redux Provider."
+                },
+                {
+                    "name": "react-redux",
+                    "version": "^9.1.2",
+                    "aliases": [],
+                    "importExamples": ["import { Provider, useSelector, useDispatch } from 'react-redux';"],
+                    "compatibility": {
+                        "@reduxjs/toolkit": "^2.2.7"
+                    },
+                    "bestPractices": "Wrap root state consumers with <Provider store={store}>."
                 },
                 {
                     "name": "react-icons",
@@ -165,10 +224,10 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
                     "bestPractices": "Generate random UUID v4."
                 },
                 {
-                    "name": "bcrypt",
-                    "version": "^5.1.1",
-                    "aliases": ["bcryptjs-alias"],
-                    "importExamples": ["import bcrypt from 'bcrypt';"],
+                    "name": "bcryptjs",
+                    "version": "^2.4.3",
+                    "aliases": ["bcrypt", "bcryptjs-alias"],
+                    "importExamples": ["import bcrypt from 'bcryptjs';"],
                     "compatibility": {},
                     "bestPractices": "Hash passwords asynchronously using bcrypt.hash(pwd, 10)."
                 },
@@ -189,9 +248,9 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
                         "import { styled } from '@mui/material/styles';"
                     ],
                     "compatibility": {
-                        "react": ">=17.0.0",
-                        "@emotion/react": "^11.0.0",
-                        "@emotion/styled": "^11.0.0"
+                        "react": "^18.2.0",
+                        "@emotion/react": "^11.11.4",
+                        "@emotion/styled": "^11.11.5"
                     },
                     "bestPractices": "Import components from @mui/material. Use custom styles with styled utility."
                 },
@@ -201,27 +260,31 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
                     "aliases": ["@material-ui/icons"],
                     "importExamples": ["import { Mail, Settings, Notifications } from '@mui/icons-material';"],
                     "compatibility": {
-                        "@mui/material": ">=5.0.0"
+                        "@mui/material": "^5.15.0",
+                        "@emotion/react": "^11.11.4",
+                        "@emotion/styled": "^11.11.5"
                     },
                     "bestPractices": "Import icons individually or destructured. Make sure @mui/material is installed."
                 },
                 {
                     "name": "@prisma/client",
-                    "version": "^5.14.0",
+                    "version": "5.22.0",
                     "aliases": [],
                     "importExamples": ["import { PrismaClient } from '@prisma/client';"],
                     "compatibility": {
-                        "prisma": ">=5.0.0"
+                        "prisma": "5.22.0"
                     },
                     "bestPractices": "Instantiate PrismaClient globally to avoid multiple connection pools in hot reload environments. Prisma client MUST only be imported and used inside server-side code (Next.js API route handlers), never in React hooks or client components ('use client')."
                 },
                 {
                     "name": "prisma",
-                    "version": "^5.14.0",
+                    "version": "5.22.0",
                     "aliases": [],
                     "importExamples": [],
-                    "compatibility": {},
-                    "bestPractices": "Use prisma developer CLI commands via npx prisma."
+                    "compatibility": {
+                        "@prisma/client": "5.22.0"
+                    },
+                    "bestPractices": "Use local prisma CLI from node_modules/prisma/build/index.js."
                 }
             ]
         });
@@ -561,6 +624,7 @@ pub fn repair_package_json_dependencies(proj_dir: &std::path::Path) {
                     }
 
                     if let Some(deps_obj) = pkg_obj.get_mut("dependencies").and_then(|d| d.as_object_mut()) {
+                        // Force-standardize core Next.js 14 stack versions (overwriting outdated/mismatched LLM versions)
                         for (k, v) in [
                             ("next", "14.2.35"),
                             ("react", "^18.2.0"),
@@ -569,13 +633,18 @@ pub fn repair_package_json_dependencies(proj_dir: &std::path::Path) {
                             ("clsx", "^2.1.1"),
                             ("tailwind-merge", "^2.3.0"),
                         ] {
-                            if !deps_obj.contains_key(k) {
-                                deps_obj.insert(k.to_string(), serde_json::json!(v));
+                            let target_val = serde_json::json!(v);
+                            if deps_obj.get(k) != Some(&target_val) {
+                                deps_obj.insert(k.to_string(), target_val);
                                 changed = true;
                             }
                         }
-                        if deps_obj.contains_key("next-auth") && !deps_obj.contains_key("@auth/prisma-adapter") && has_prisma_schema {
-                            deps_obj.insert("@auth/prisma-adapter".to_string(), serde_json::json!("^1.0.12"));
+
+                        // Remove unused Express or misplaced devDependencies from Next.js dependencies
+                        if !imports_found.contains("express") && deps_obj.remove("express").is_some() {
+                            changed = true;
+                        }
+                        if deps_obj.remove("tailwindcss").is_some() {
                             changed = true;
                         }
                     }
@@ -590,31 +659,31 @@ pub fn repair_package_json_dependencies(proj_dir: &std::path::Path) {
                             ("@types/react-dom", "^18.2.18"),
                             ("@types/node", "^20.10.5"),
                         ] {
-                            if !dev_deps_obj.contains_key(k) {
-                                dev_deps_obj.insert(k.to_string(), serde_json::json!(v));
+                            let target_val = serde_json::json!(v);
+                            if dev_deps_obj.get(k) != Some(&target_val) {
+                                dev_deps_obj.insert(k.to_string(), target_val);
+                                changed = true;
+                            }
+                        }
+                        // Synchronize eslint-config-next & eslint with Next.js 14.2.35 if present
+                        if dev_deps_obj.contains_key("eslint-config-next") {
+                            let target = serde_json::json!("14.2.35");
+                            if dev_deps_obj.get("eslint-config-next") != Some(&target) {
+                                dev_deps_obj.insert("eslint-config-next".to_string(), target);
+                                changed = true;
+                            }
+                        }
+                        if dev_deps_obj.contains_key("eslint") {
+                            let target = serde_json::json!("^8.57.0");
+                            if dev_deps_obj.get("eslint") != Some(&target) {
+                                dev_deps_obj.insert("eslint".to_string(), target);
                                 changed = true;
                             }
                         }
                     }
                 }
 
-                let uses_prisma = has_prisma_schema
-                    || pkg_obj.get("dependencies").and_then(|d| d.as_object()).map_or(false, |d| d.contains_key("@prisma/client"));
-                if uses_prisma {
-                    if let Some(deps_obj) = pkg_obj.get_mut("dependencies").and_then(|d| d.as_object_mut()) {
-                        if !deps_obj.contains_key("@prisma/client") {
-                            deps_obj.insert("@prisma/client".to_string(), serde_json::json!("^5.14.0"));
-                            changed = true;
-                        }
-                    }
-                    if let Some(dev_deps_obj) = pkg_obj.get_mut("devDependencies").and_then(|d| d.as_object_mut()) {
-                        if !dev_deps_obj.contains_key("prisma") {
-                            dev_deps_obj.insert("prisma".to_string(), serde_json::json!("^5.14.0"));
-                            changed = true;
-                        }
-                    }
-                }
-                
+                // Rewrite deprecated/native-C++ packages in dependencies
                 if let Some(deps_obj) = pkg_obj.get_mut("dependencies").and_then(|d| d.as_object_mut()) {
                     if deps_obj.remove("bcrypt").is_some() {
                         deps_obj.insert("bcryptjs".to_string(), serde_json::json!("^2.4.3"));
@@ -645,74 +714,127 @@ pub fn repair_package_json_dependencies(proj_dir: &std::path::Path) {
                         }
                     }
                 }
-                for imp in imports_found {
-                    // Try to find the version in the database
+
+                // Ensure all imported packages exist in dependencies
+                for imp in &imports_found {
+                    if imp == "prisma" {
+                        if let Some(deps_obj) = pkg_obj.get_mut("dependencies").and_then(|d| d.as_object_mut()) {
+                            if !deps_obj.contains_key("@prisma/client") {
+                                deps_obj.insert("@prisma/client".to_string(), serde_json::json!("5.22.0"));
+                                changed = true;
+                            }
+                        }
+                        continue;
+                    }
                     let mut version = None;
                     for pkg in &packages_db {
-                        if pkg.name == imp {
+                        if &pkg.name == imp {
                             version = Some(pkg.version.clone());
                             break;
                         }
                     }
-                    
-                    if let Some(v) = version {
-                        if let Some(deps_obj) = pkg_obj.get_mut("dependencies").and_then(|d| d.as_object_mut()) {
-                            if !deps_obj.contains_key(&imp) {
-                                deps_obj.insert(imp.clone(), serde_json::json!(v));
-                                changed = true;
-                            }
+                    if let Some(deps_obj) = pkg_obj.get_mut("dependencies").and_then(|d| d.as_object_mut()) {
+                        if !deps_obj.contains_key(imp) {
+                            let v = version.unwrap_or_else(|| "*".to_string());
+                            deps_obj.insert(imp.clone(), serde_json::json!(v));
+                            changed = true;
                         }
-                    } else if imp == "prisma" {
-                        if let Some(deps_obj) = pkg_obj.get_mut("dependencies").and_then(|d| d.as_object_mut()) {
-                            if !deps_obj.contains_key("@prisma/client") {
-                                deps_obj.insert("@prisma/client".to_string(), serde_json::json!("^5.14.0"));
-                                changed = true;
-                            }
+                    }
+                }
+
+                // Standardize versions for all known packages already in dependencies
+                if let Some(deps_obj) = pkg_obj.get_mut("dependencies").and_then(|d| d.as_object_mut()) {
+                    for pkg in &packages_db {
+                        if pkg.name == "prisma" {
+                            continue;
                         }
-                    } else if imp == "@mui/material" {
-                        if let Some(deps_obj) = pkg_obj.get_mut("dependencies").and_then(|d| d.as_object_mut()) {
-                            if !deps_obj.contains_key("@mui/material") {
-                                deps_obj.insert("@mui/material".to_string(), serde_json::json!("^5.15.0"));
-                                changed = true;
-                            }
-                            if !deps_obj.contains_key("@emotion/react") {
-                                deps_obj.insert("@emotion/react".to_string(), serde_json::json!("^11.11.0"));
-                                changed = true;
-                            }
-                            if !deps_obj.contains_key("@emotion/styled") {
-                                deps_obj.insert("@emotion/styled".to_string(), serde_json::json!("^11.11.0"));
-                                changed = true;
-                            }
-                        }
-                    } else if imp == "@mui/icons-material" {
-                        if let Some(deps_obj) = pkg_obj.get_mut("dependencies").and_then(|d| d.as_object_mut()) {
-                            if !deps_obj.contains_key("@mui/icons-material") {
-                                deps_obj.insert("@mui/icons-material".to_string(), serde_json::json!("^5.15.0"));
-                                changed = true;
-                            }
-                        }
-                    } else {
-                        if let Some(deps_obj) = pkg_obj.get_mut("dependencies").and_then(|d| d.as_object_mut()) {
-                            if !deps_obj.contains_key(&imp) {
-                                deps_obj.insert(imp.clone(), serde_json::json!("*"));
+                        if deps_obj.contains_key(&pkg.name) {
+                            let target_val = serde_json::json!(pkg.version);
+                            if deps_obj.get(&pkg.name) != Some(&target_val) {
+                                deps_obj.insert(pkg.name.clone(), target_val);
                                 changed = true;
                             }
                         }
                     }
-                    
-                    if has_tsconfig {
-                        let type_pkg = match imp.as_str() {
-                            "bcrypt" => Some(("@types/bcrypt", "^5.0.2")),
-                            "bcryptjs" => Some(("@types/bcryptjs", "^2.4.6")),
-                            "jsonwebtoken" => Some(("@types/jsonwebtoken", "^9.0.6")),
-                            "uuid" => Some(("@types/uuid", "^9.0.8")),
-                            "canvas-confetti" => Some(("@types/canvas-confetti", "^1.6.4")),
-                            _ => None
-                        };
-                        if let Some((tp_name, tp_ver)) = type_pkg {
-                            if let Some(dev_deps_obj) = pkg_obj.get_mut("devDependencies").and_then(|d| d.as_object_mut()) {
-                                if !dev_deps_obj.contains_key(tp_name) {
-                                    dev_deps_obj.insert(tp_name.to_string(), serde_json::json!(tp_ver));
+
+                    // Cross-package peer dependency & companion matching
+                    for pkg in &packages_db {
+                        if deps_obj.contains_key(&pkg.name) {
+                            for (peer_name, peer_ver) in &pkg.compatibility {
+                                if peer_name == "node" || peer_name == "next" || peer_name == "react" || peer_name == "prisma" {
+                                    continue;
+                                }
+                                if let Some(peer_ver_str) = peer_ver.as_str() {
+                                    if !peer_ver_str.starts_with(">=") {
+                                        let target_peer = serde_json::json!(peer_ver_str);
+                                        if deps_obj.get(peer_name) != Some(&target_peer) {
+                                            deps_obj.insert(peer_name.clone(), target_peer);
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // If next-auth is used with Prisma, ensure @auth/prisma-adapter is present and locked to v1.x (NextAuth v4 compatible)
+                    let has_prisma = has_prisma_schema || deps_obj.contains_key("@prisma/client");
+                    if deps_obj.contains_key("next-auth") && has_prisma && !deps_obj.contains_key("@auth/prisma-adapter") && !deps_obj.contains_key("@next-auth/prisma-adapter") {
+                        deps_obj.insert("@auth/prisma-adapter".to_string(), serde_json::json!("^1.0.12"));
+                        changed = true;
+                    }
+                }
+
+                // Enforce strict Prisma Lockstep ("5.22.0") across dependencies (@prisma/client) and devDependencies (prisma)
+                let uses_prisma = has_prisma_schema
+                    || imports_found.contains("@prisma/client")
+                    || imports_found.contains("prisma")
+                    || pkg_obj.get("dependencies").and_then(|d| d.as_object()).map_or(false, |d| d.contains_key("@prisma/client") || d.contains_key("prisma"))
+                    || pkg_obj.get("devDependencies").and_then(|d| d.as_object()).map_or(false, |d| d.contains_key("prisma"));
+                if uses_prisma {
+                    let locked_prisma = serde_json::json!("5.22.0");
+                    if let Some(deps_obj) = pkg_obj.get_mut("dependencies").and_then(|d| d.as_object_mut()) {
+                        if deps_obj.remove("prisma").is_some() {
+                            changed = true;
+                        }
+                        if deps_obj.get("@prisma/client") != Some(&locked_prisma) {
+                            deps_obj.insert("@prisma/client".to_string(), locked_prisma.clone());
+                            changed = true;
+                        }
+                    }
+                    if let Some(dev_deps_obj) = pkg_obj.get_mut("devDependencies").and_then(|d| d.as_object_mut()) {
+                        if dev_deps_obj.get("prisma") != Some(&locked_prisma) {
+                            dev_deps_obj.insert("prisma".to_string(), locked_prisma);
+                            changed = true;
+                        }
+                    }
+                }
+
+                // Auto-inject matching TypeScript @types/* packages for all dependencies when tsconfig.json exists
+                if has_tsconfig {
+                    let dep_keys: Vec<String> = pkg_obj
+                        .get("dependencies")
+                        .and_then(|d| d.as_object())
+                        .map(|d| d.keys().cloned().collect())
+                        .unwrap_or_default();
+
+                    if let Some(dev_deps_obj) = pkg_obj.get_mut("devDependencies").and_then(|d| d.as_object_mut()) {
+                        for dep in dep_keys {
+                            let type_pkg = match dep.as_str() {
+                                "bcrypt" => Some(("@types/bcrypt", "^5.0.2")),
+                                "bcryptjs" => Some(("@types/bcryptjs", "^2.4.6")),
+                                "jsonwebtoken" => Some(("@types/jsonwebtoken", "^9.0.6")),
+                                "uuid" => Some(("@types/uuid", "^9.0.8")),
+                                "nodemailer" => Some(("@types/nodemailer", "^6.4.14")),
+                                "cors" => Some(("@types/cors", "^2.8.17")),
+                                "cookie" => Some(("@types/cookie", "^0.6.0")),
+                                "canvas-confetti" => Some(("@types/canvas-confetti", "^1.6.4")),
+                                _ => None,
+                            };
+                            if let Some((tp_name, tp_ver)) = type_pkg {
+                                let target_val = serde_json::json!(tp_ver);
+                                if dev_deps_obj.get(tp_name) != Some(&target_val) {
+                                    dev_deps_obj.insert(tp_name.to_string(), target_val);
                                     changed = true;
                                 }
                             }
