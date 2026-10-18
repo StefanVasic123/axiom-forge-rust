@@ -480,9 +480,7 @@ pub async fn heal_prisma_schema_loop(
                 { "role": "user", "content": user_prompt }
             ],
             "stream": false,
-            "options": {
-                "temperature": if previous_ai_unchanged { 0.4 } else { 0.1 }
-            }
+            "options": build_ollama_options(&resolved_model, if previous_ai_unchanged { 0.4 } else { 0.1 }, Some(4096))
         });
 
         let mut ai_content: Option<String> = None;
@@ -908,9 +906,7 @@ pub async fn project_heal_compile_error(
             { "role": "user", "content": user_prompt }
         ],
         "stream": false,
-        "options": {
-            "temperature": 0.1
-        }
+        "options": build_ollama_options(&model, 0.1, Some(4096))
     });
 
     match client.post("http://127.0.0.1:11434/api/chat")
@@ -1195,7 +1191,7 @@ pub async fn project_install_package(
     let mut cmd = tokio::process::Command::new("cmd");
     #[cfg(target_os = "windows")]
     {
-        cmd.arg("/C").arg("npm").arg("install").arg("--legacy-peer-deps");
+        cmd.arg("/C").arg("npm").arg("install").arg("--legacy-peer-deps").arg("--prefer-offline");
         for p in &pkgs_to_install {
             cmd.arg(p);
         }
@@ -1206,7 +1202,7 @@ pub async fn project_install_package(
     let mut cmd = tokio::process::Command::new("npm");
     #[cfg(not(target_os = "windows"))]
     {
-        cmd.arg("install").arg("--legacy-peer-deps");
+        cmd.arg("install").arg("--legacy-peer-deps").arg("--prefer-offline");
         for p in &pkgs_to_install {
             cmd.arg(p);
         }

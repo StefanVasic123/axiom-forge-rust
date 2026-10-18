@@ -1280,12 +1280,12 @@ pub async fn run_npm_install_with_auto_healing(
         #[cfg(target_os = "windows")]
         let mut install_cmd = tokio::process::Command::new("cmd");
         #[cfg(target_os = "windows")]
-        install_cmd.arg("/C").arg("npm").arg("install").arg("--legacy-peer-deps").current_dir(proj_dir);
+        install_cmd.arg("/C").arg("npm").arg("install").arg("--legacy-peer-deps").arg("--prefer-offline").current_dir(proj_dir);
 
         #[cfg(not(target_os = "windows"))]
         let mut install_cmd = tokio::process::Command::new("npm");
         #[cfg(not(target_os = "windows"))]
-        install_cmd.arg("install").arg("--legacy-peer-deps").current_dir(proj_dir);
+        install_cmd.arg("install").arg("--legacy-peer-deps").arg("--prefer-offline").current_dir(proj_dir);
 
         #[cfg(target_os = "windows")]
         install_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW

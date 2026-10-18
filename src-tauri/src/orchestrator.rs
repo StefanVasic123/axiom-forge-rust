@@ -147,9 +147,7 @@ Respond ONLY with a JSON object in this format: { \"valid\": true } or { \"valid
             { "role": "user", "content": &user_prompt }
         ],
         "stream": false,
-        "options": {
-            "temperature": 0.1
-        }
+        "options": build_ollama_options(model_id, 0.1, Some(512))
     });
     
     let res = client.post("http://127.0.0.1:11434/api/chat")
@@ -1694,6 +1692,7 @@ export default function RootLayout({
 
     let mut files_to_generate = files.clone();
     
+    let manifest_runtime_cfg = get_ollama_runtime_config(&model_id);
     let ollama_req = serde_json::json!({
         "model": &model_id,
         "messages": [
@@ -1701,10 +1700,7 @@ export default function RootLayout({
             { "role": "user", "content": expansion_prompt }
         ],
         "stream": true,
-        "options": {
-            "temperature": 0.2,
-            "num_predict": 8192
-        }
+        "options": build_ollama_options(&model_id, 0.2, Some(manifest_runtime_cfg.manifest_num_predict))
     });
 
     let mut expansion_success = false;
@@ -2078,10 +2074,7 @@ export default function RootLayout({
                     { "role": "user", "content": &current_user_prompt }
                 ],
                 "stream": true,
-                "options": {
-                    "temperature": 0.3,
-                    "num_predict": 4096
-                }
+                "options": build_ollama_options(&model_id, 0.3, Some(4096))
             });
 
             let req_fut = client.post("http://127.0.0.1:11434/api/chat")

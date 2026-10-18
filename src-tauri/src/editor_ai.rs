@@ -346,9 +346,7 @@ pub async fn editor_ai_edit(
             { "role": "user", "content": user_prompt }
         ],
         "stream": false,
-        "options": {
-            "temperature": 0.2
-        }
+        "options": build_ollama_options(&model, 0.2, Some(4096))
     });
 
     let res = client.post("http://127.0.0.1:11434/api/chat")
@@ -533,7 +531,7 @@ pub async fn editor_ai_project_edit(
             { "role": "user", "content": routing_user_prompt }
         ],
         "stream": false,
-        "options": { "temperature": 0.1 }
+        "options": build_ollama_options(&model, 0.1, Some(1024))
     });
 
     let res = client.post("http://127.0.0.1:11434/api/chat")
@@ -619,7 +617,7 @@ pub async fn editor_ai_project_edit(
                 { "role": "user", "content": planning_user_prompt }
             ],
             "stream": false,
-            "options": { "temperature": 0.2 }
+            "options": build_ollama_options(&model, 0.2, Some(1024))
         });
 
         let plan_res = client.post("http://127.0.0.1:11434/api/chat")
@@ -668,7 +666,7 @@ pub async fn editor_ai_project_edit(
                 { "role": "user", "content": coder_user_prompt }
             ],
             "stream": false,
-            "options": { "temperature": 0.2 }
+            "options": build_ollama_options(&model, 0.2, Some(4096))
         });
 
         let coder_res = client.post("http://127.0.0.1:11434/api/chat")

@@ -387,9 +387,7 @@ pub async fn repair_broken_imports(proj_dir: &std::path::Path, model: &str) {
                     { "role": "user", "content": user_prompt }
                 ],
                 "stream": false,
-                "options": {
-                    "temperature": 0.1
-                }
+                "options": build_ollama_options(model, 0.1, Some(4096))
             });
             
             if let Ok(resp) = client.post("http://127.0.0.1:11434/api/chat")
@@ -688,9 +686,7 @@ pub async fn generate_and_save_healing_rule(
             { "role": "user", "content": user_prompt }
         ],
         "stream": false,
-        "options": {
-            "temperature": 0.1
-        }
+        "options": build_ollama_options(model, 0.1, Some(1024))
     });
 
     if let Ok(resp) = client.post("http://127.0.0.1:11434/api/chat")
@@ -924,9 +920,7 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                 { "role": "user", "content": user_prompt }
             ],
             "stream": false,
-            "options": {
-                "temperature": 0.2
-            }
+            "options": build_ollama_options(model, 0.2, Some(4096))
         });
 
         match client.post("http://127.0.0.1:11434/api/chat")

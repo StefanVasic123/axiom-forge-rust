@@ -37,13 +37,14 @@ pub struct GpuInfo {
 pub fn detect_gpu() -> Option<GpuInfo> {
     #[cfg(target_os = "windows")]
     {
-        let output = std::process::Command::new("powershell")
-            .arg("-NoProfile")
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.arg("-NoProfile")
             .arg("-Command")
-            .arg("Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM | ConvertTo-Json -Compress")
-            .output();
+            .arg("$regMax = (Get-ItemProperty -Path 'HKLM:\\SYSTEM\\ControlSet001\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}\\0*' -ErrorAction SilentlyContinue | ForEach-Object { $_.'HardwareInformation.qwMemorySize' } | Measure-Object -Maximum).Maximum; Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM, @{N='QwMem';E={$regMax}} | ConvertTo-Json -Compress")
+            .creation_flags(0x08000000); // CREATE_NO_WINDOW
 
-        if let Ok(out) = output {
+        if let Ok(out) = cmd.output() {
             if out.status.success() {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let trimmed = stdout.trim();
@@ -51,18 +52,20 @@ pub fn detect_gpu() -> Option<GpuInfo> {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
                     let parse_single_gpu = |obj: &serde_json::Value| -> Option<GpuInfo> {
                         let name = obj.get("Name")?.as_str()?.to_string();
-                        let ram_bytes = if let Some(n) = obj.get("AdapterRAM").and_then(|v| v.as_u64()) {
-                            n as f64
-                        } else if let Some(s) = obj.get("AdapterRAM").and_then(|v| v.as_str()) {
-                            s.parse::<f64>().unwrap_or(0.0)
-                        } else if let Some(n) = obj.get("AdapterRAM").and_then(|v| v.as_i64()) {
-                            n as f64
-                        } else {
-                            0.0
+                        let parse_bytes = |field: &str| -> f64 {
+                            if let Some(n) = obj.get(field).and_then(|v| v.as_u64()) {
+                                n as f64
+                            } else if let Some(s) = obj.get(field).and_then(|v| v.as_str()) {
+                                s.parse::<f64>().unwrap_or(0.0)
+                            } else if let Some(n) = obj.get(field).and_then(|v| v.as_i64()) {
+                                n as f64
+                            } else {
+                                0.0
+                            }
                         };
 
-                        let vram_gb = ram_bytes / (1024.0 * 1024.0 * 1024.0);
-                        
+                        let adapter_bytes = parse_bytes("AdapterRAM");
+                        let qw_bytes = parse_bytes("QwMem");
                         let name_lower = name.to_lowercase();
                         let brand = if name_lower.contains("nvidia") || name_lower.contains("geforce") || name_lower.contains("rtx") || name_lower.contains("gtx") {
                             "Nvidia".to_string()
@@ -73,6 +76,15 @@ pub fn detect_gpu() -> Option<GpuInfo> {
                         } else {
                             "Unknown".to_string()
                         };
+
+                        // Prefer 64-bit QwMem for dedicated GPUs to avoid the 32-bit 4GB AdapterRAM cap on Windows
+                        let ram_bytes = if (brand == "Nvidia" || brand == "AMD") && qw_bytes > adapter_bytes {
+                            qw_bytes
+                        } else {
+                            adapter_bytes
+                        };
+
+                        let vram_gb = (ram_bytes / (1024.0 * 1024.0 * 1024.0) * 100.0).round() / 100.0;
 
                         Some(GpuInfo {
                             name,
@@ -179,6 +191,147 @@ pub fn detect_gpu() -> Option<GpuInfo> {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct CachedHardwareSpecs {
+    pub cpu_model: String,
+    pub logical_cpus: usize,
+    pub physical_cores: usize,
+    pub ram_gb: f64,
+    pub gpu: Option<GpuInfo>,
+}
+
+static HARDWARE_SPECS_CACHE: std::sync::OnceLock<CachedHardwareSpecs> = std::sync::OnceLock::new();
+
+pub fn get_cached_hardware_specs() -> &'static CachedHardwareSpecs {
+    HARDWARE_SPECS_CACHE.get_or_init(|| {
+        let mut sys = System::new_all();
+        sys.refresh_all();
+        let total_ram_bytes = sys.total_memory();
+        let ram_gb = total_ram_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        let logical_cpus = sys.cpus().len().max(1);
+        let physical_cores = sys.physical_core_count().unwrap_or_else(|| (logical_cpus / 2).max(1));
+        let cpu_model = sys.cpus().first().map(|c| c.brand().to_string()).unwrap_or_else(|| "Unknown CPU".to_string());
+        let gpu = detect_gpu();
+        CachedHardwareSpecs {
+            cpu_model,
+            logical_cpus,
+            physical_cores,
+            ram_gb,
+            gpu,
+        }
+    })
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct OllamaRuntimeConfig {
+    pub profile_tier: String,
+    #[serde(rename = "numCtx")]
+    pub num_ctx: u32,
+    #[serde(rename = "defaultNumPredict")]
+    pub default_num_predict: u32,
+    #[serde(rename = "manifestNumPredict")]
+    pub manifest_num_predict: u32,
+    #[serde(rename = "numBatch")]
+    pub num_batch: u32,
+    #[serde(rename = "numThread")]
+    pub num_thread: Option<usize>,
+}
+
+pub fn estimate_model_size_gb(model_id: &str) -> f64 {
+    let lower = model_id.to_lowercase();
+    for m in get_all_models() {
+        if m.id.to_lowercase() == lower {
+            return m.size_gb;
+        }
+    }
+    if lower.contains("32b") || lower.contains("31b") || lower.contains("34b") {
+        19.0
+    } else if lower.contains("26b") || lower.contains("27b") {
+        16.0
+    } else if lower.contains("14b") || lower.contains("13b") {
+        9.0
+    } else if lower.contains("12b") {
+        7.2
+    } else if lower.contains("7b") || lower.contains("8b") || lower.contains("6.7b") {
+        4.7
+    } else if lower.contains("4b") {
+        2.8
+    } else if lower.contains("3b") {
+        2.0
+    } else if lower.contains("1.5b") || lower.contains("2b") || lower.contains("1b") {
+        1.2
+    } else {
+        4.7
+    }
+}
+
+pub fn get_ollama_runtime_config(model_id: &str) -> OllamaRuntimeConfig {
+    let specs = get_cached_hardware_specs();
+    let model_size_gb = estimate_model_size_gb(model_id);
+
+    let (has_dedicated_gpu, vram_gb) = match &specs.gpu {
+        Some(gpu) if gpu.brand == "Nvidia" || gpu.brand == "AMD" || gpu.brand == "Apple" => (true, gpu.vram_gb),
+        _ => (false, 0.0),
+    };
+
+    let vram_headroom = vram_gb - model_size_gb;
+
+    if has_dedicated_gpu && vram_headroom >= 3.0 {
+        // Tier 1: High-End GPU (Full model + large KV cache fit comfortably in VRAM)
+        OllamaRuntimeConfig {
+            profile_tier: "high-end-gpu".to_string(),
+            num_ctx: 12288,
+            default_num_predict: 4096,
+            manifest_num_predict: 8192,
+            num_batch: 512,
+            num_thread: None,
+        }
+    } else if has_dedicated_gpu && vram_headroom >= -1.0 {
+        // Tier 2: Hybrid GPU+CPU (e.g., 6GB VRAM with 7B model: compact 6144 context keeps layers in VRAM + protects CPU)
+        let safe_threads = if specs.physical_cores > 2 {
+            specs.physical_cores - 1
+        } else {
+            specs.physical_cores.max(1)
+        };
+        OllamaRuntimeConfig {
+            profile_tier: "hybrid-gpu-cpu".to_string(),
+            num_ctx: 6144,
+            default_num_predict: 4096,
+            manifest_num_predict: 6144,
+            num_batch: 256,
+            num_thread: Some(safe_threads),
+        }
+    } else {
+        // Tier 3: Low-Spec / CPU-Heavy (Integrated GPU or model significantly larger than VRAM)
+        let safe_threads = ((specs.physical_cores * 3) / 4).max(1);
+        OllamaRuntimeConfig {
+            profile_tier: "low-spec-cpu".to_string(),
+            num_ctx: 6144,
+            default_num_predict: 4096,
+            manifest_num_predict: 6144,
+            num_batch: 128,
+            num_thread: Some(safe_threads),
+        }
+    }
+}
+
+pub fn build_ollama_options(model_id: &str, temperature: f64, num_predict_override: Option<u32>) -> serde_json::Value {
+    let cfg = get_ollama_runtime_config(model_id);
+    let num_predict = num_predict_override.unwrap_or(cfg.default_num_predict);
+    let mut opts = serde_json::json!({
+        "temperature": temperature,
+        "num_ctx": cfg.num_ctx,
+        "num_predict": num_predict,
+        "num_batch": cfg.num_batch,
+    });
+    if let Some(threads) = cfg.num_thread {
+        if let Some(obj) = opts.as_object_mut() {
+            obj.insert("num_thread".to_string(), serde_json::json!(threads));
+        }
+    }
+    opts
+}
+
 #[derive(Serialize)]
 pub struct HardwareProfile {
     pub platform: String,
@@ -193,6 +346,8 @@ pub struct HardwareProfile {
     #[serde(rename = "recommendedModelId")]
     pub recommended_model_id: String,
     pub gpu: Option<GpuInfo>,
+    #[serde(rename = "runtimeOptimization")]
+    pub runtime_optimization: OllamaRuntimeConfig,
 }
 
 pub fn get_all_models() -> Vec<Model> {
@@ -334,16 +489,13 @@ pub fn get_all_models() -> Vec<Model> {
 
 #[tauri::command]
 pub fn get_hardware_profile() -> HardwareProfile {
-    let mut sys = System::new_all();
-    sys.refresh_all();
-    
-    let total_ram_bytes = sys.total_memory();
-    let ram_gb = total_ram_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-    let cpus = sys.cpus().len();
-    let cpu_model = sys.cpus().first().map(|c| c.brand().to_string()).unwrap_or_else(|| "Unknown CPU".to_string());
+    let specs = get_cached_hardware_specs();
+    let ram_gb = specs.ram_gb;
+    let cpus = specs.logical_cpus;
+    let cpu_model = specs.cpu_model.clone();
+    let gpu_info = specs.gpu.clone();
     
     let raw_models = get_all_models();
-    let gpu_info = detect_gpu();
     
     // Determine recommended model based on GPU first, fall back to RAM
     let mut best_model_id = "qwen2.5-coder:7b".to_string(); // default fallback
@@ -355,7 +507,6 @@ pub fn get_hardware_profile() -> HardwareProfile {
                 best_model_id = "qwen2.5-coder:14b".to_string();
                 recommendation_set = true;
             } else if gpu.vram_gb >= 3.0 {
-                // Matches GTX 1060 (reported as 4GB) or other 4GB-8GB GPUs
                 best_model_id = "qwen2.5-coder:7b".to_string();
                 recommendation_set = true;
             }
@@ -385,6 +536,8 @@ pub fn get_hardware_profile() -> HardwareProfile {
         }
     }
     
+    let runtime_optimization = get_ollama_runtime_config(&best_model_id);
+    
     let mut models = Vec::new();
     let mut by_tier: HashMap<String, Vec<Model>> = HashMap::new();
     let tolerance = 0.5;
@@ -408,6 +561,7 @@ pub fn get_hardware_profile() -> HardwareProfile {
         by_tier,
         recommended_model_id: best_model_id,
         gpu: gpu_info,
+        runtime_optimization,
     }
 }
 
