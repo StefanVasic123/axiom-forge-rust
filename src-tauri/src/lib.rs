@@ -2772,17 +2772,121 @@ pub fn repair_package_json_dependencies(proj_dir: &std::path::Path) {
     };
     
     let has_tsconfig = proj_dir.join("tsconfig.json").exists();
+    let is_nextjs_proj = proj_dir.join("next.config.js").exists()
+        || proj_dir.join("next.config.mjs").exists()
+        || proj_dir.join("src/app").exists()
+        || proj_dir.join("app").exists();
+    let has_prisma_schema = proj_dir.join("prisma/schema.prisma").exists()
+        || proj_dir.join("schema.prisma").exists();
+
+    // Repair broken fallback stubs in tailwind.config.js and postcss.config.js if present
+    let tw_path = proj_dir.join("tailwind.config.js");
+    if tw_path.exists() {
+        if let Ok(tw_content) = std::fs::read_to_string(&tw_path) {
+            if tw_content.contains("export {};") || !tw_content.contains("content:") {
+                let valid_tw = "/** @type {import('tailwindcss').Config} */\nmodule.exports = {\n  content: [\n    \"./src/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./app/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./components/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./pages/**/*.{js,ts,jsx,tsx,mdx}\"\n  ],\n  theme: {\n    extend: {},\n  },\n  plugins: [],\n};\n";
+                let _ = std::fs::write(&tw_path, valid_tw);
+            }
+        }
+    }
+    let postcss_path = proj_dir.join("postcss.config.js");
+    if postcss_path.exists() {
+        if let Ok(pc_content) = std::fs::read_to_string(&postcss_path) {
+            if pc_content.contains("export {};") || !pc_content.contains("tailwindcss") {
+                let valid_pc = "module.exports = {\n  plugins: {\n    tailwindcss: {},\n    autoprefixer: {},\n  },\n};\n";
+                let _ = std::fs::write(&postcss_path, valid_pc);
+            }
+        }
+    }
+
     scan_dir(proj_dir);
     
     if let Ok(pkg_content) = std::fs::read_to_string(&pkg_path) {
         if let Ok(mut pkg_json) = serde_json::from_str::<Value>(&pkg_content) {
             if let Some(pkg_obj) = pkg_json.as_object_mut() {
-                pkg_obj.entry("dependencies").or_insert(serde_json::json!({}));
-                if has_tsconfig {
-                    pkg_obj.entry("devDependencies").or_insert(serde_json::json!({}));
-                }
-                
                 let mut changed = false;
+
+                if !pkg_obj.contains_key("name") {
+                    pkg_obj.insert("name".to_string(), serde_json::json!("axiom-app"));
+                    changed = true;
+                }
+                if !pkg_obj.contains_key("version") {
+                    pkg_obj.insert("version".to_string(), serde_json::json!("0.1.0"));
+                    changed = true;
+                }
+                if !pkg_obj.contains_key("private") {
+                    pkg_obj.insert("private".to_string(), serde_json::json!(true));
+                    changed = true;
+                }
+
+                pkg_obj.entry("dependencies").or_insert(serde_json::json!({}));
+                pkg_obj.entry("devDependencies").or_insert(serde_json::json!({}));
+
+                if is_nextjs_proj {
+                    let scripts = pkg_obj.entry("scripts").or_insert(serde_json::json!({}));
+                    if let Some(scripts_obj) = scripts.as_object_mut() {
+                        for (k, v) in [("dev", "next dev"), ("build", "next build"), ("start", "next start")] {
+                            if !scripts_obj.contains_key(k) {
+                                scripts_obj.insert(k.to_string(), serde_json::json!(v));
+                                changed = true;
+                            }
+                        }
+                    }
+
+                    if let Some(deps_obj) = pkg_obj.get_mut("dependencies").and_then(|d| d.as_object_mut()) {
+                        for (k, v) in [
+                            ("next", "14.2.35"),
+                            ("react", "^18.2.0"),
+                            ("react-dom", "^18.2.0"),
+                            ("lucide-react", "^0.460.0"),
+                            ("clsx", "^2.1.1"),
+                            ("tailwind-merge", "^2.3.0"),
+                        ] {
+                            if !deps_obj.contains_key(k) {
+                                deps_obj.insert(k.to_string(), serde_json::json!(v));
+                                changed = true;
+                            }
+                        }
+                        if deps_obj.contains_key("next-auth") && !deps_obj.contains_key("@auth/prisma-adapter") && has_prisma_schema {
+                            deps_obj.insert("@auth/prisma-adapter".to_string(), serde_json::json!("^1.0.12"));
+                            changed = true;
+                        }
+                    }
+
+                    if let Some(dev_deps_obj) = pkg_obj.get_mut("devDependencies").and_then(|d| d.as_object_mut()) {
+                        for (k, v) in [
+                            ("tailwindcss", "^3.4.0"),
+                            ("postcss", "^8.4.32"),
+                            ("autoprefixer", "^10.4.16"),
+                            ("typescript", "^5.3.3"),
+                            ("@types/react", "^18.2.45"),
+                            ("@types/react-dom", "^18.2.18"),
+                            ("@types/node", "^20.10.5"),
+                        ] {
+                            if !dev_deps_obj.contains_key(k) {
+                                dev_deps_obj.insert(k.to_string(), serde_json::json!(v));
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+
+                let uses_prisma = has_prisma_schema
+                    || pkg_obj.get("dependencies").and_then(|d| d.as_object()).map_or(false, |d| d.contains_key("@prisma/client"));
+                if uses_prisma {
+                    if let Some(deps_obj) = pkg_obj.get_mut("dependencies").and_then(|d| d.as_object_mut()) {
+                        if !deps_obj.contains_key("@prisma/client") {
+                            deps_obj.insert("@prisma/client".to_string(), serde_json::json!("^5.14.0"));
+                            changed = true;
+                        }
+                    }
+                    if let Some(dev_deps_obj) = pkg_obj.get_mut("devDependencies").and_then(|d| d.as_object_mut()) {
+                        if !dev_deps_obj.contains_key("prisma") {
+                            dev_deps_obj.insert("prisma".to_string(), serde_json::json!("^5.14.0"));
+                            changed = true;
+                        }
+                    }
+                }
                 
                 if let Some(deps_obj) = pkg_obj.get_mut("dependencies").and_then(|d| d.as_object_mut()) {
                     if deps_obj.remove("bcrypt").is_some() {
@@ -5001,6 +5105,9 @@ async fn server_start(
     // Ensure tsconfig.json is valid and not corrupted
     ensure_valid_tsconfig(&proj_dir);
 
+    // Ensure package.json has all required Next.js, Prisma, and Tailwind dependencies and scripts
+    repair_package_json_dependencies(&proj_dir);
+
     // Auto-resolve route collisions between Pages Router and App Router
     if proj_dir.join("src/app/api").exists() && proj_dir.join("src/pages/api").exists() {
         let _ = std::fs::remove_dir_all(proj_dir.join("src/pages/api"));
@@ -5013,16 +5120,21 @@ async fn server_start(
     if !needs_install {
         if let Ok(pkg_content) = std::fs::read_to_string(proj_dir.join("package.json")) {
             if let Ok(pkg_json) = serde_json::from_str::<Value>(&pkg_content) {
-                if let Some(deps) = pkg_json.get("dependencies").and_then(|d| d.as_object()) {
-                    for dep_name in deps.keys() {
-                        if !node_modules_dir.join(dep_name).exists() {
-                            needs_install = true;
-                            let _ = window.emit("server:log", serde_json::json!({
-                                "text": format!("> Detected missing package in node_modules: {}. Running npm install...\n", dep_name),
-                                "type": "info"
-                            }));
-                            break;
+                for section in ["dependencies", "devDependencies"] {
+                    if let Some(deps) = pkg_json.get(section).and_then(|d| d.as_object()) {
+                        for dep_name in deps.keys() {
+                            if !node_modules_dir.join(dep_name).exists() {
+                                needs_install = true;
+                                let _ = window.emit("server:log", serde_json::json!({
+                                    "text": format!("> Detected missing package in node_modules: {}. Running npm install...\n", dep_name),
+                                    "type": "info"
+                                }));
+                                break;
+                            }
                         }
+                    }
+                    if needs_install {
+                        break;
                     }
                 }
             }
@@ -5552,6 +5664,7 @@ async fn heal_prisma_schema_loop(
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
+    let _ = ollama_start_server().await;
     let resolved_model = resolve_valid_ollama_model(&client, model_id).await;
 
     // (4) attempt 0..=MAX_AI_HEALS -> the schema is re-validated after EVERY AI heal,
@@ -5565,12 +5678,12 @@ async fn heal_prisma_schema_loop(
         #[cfg(target_os = "windows")]
         let mut prisma_cmd = tokio::process::Command::new("cmd");
         #[cfg(target_os = "windows")]
-        prisma_cmd.arg("/C").arg("npx").arg("-y").arg("prisma").arg("generate").current_dir(proj_dir);
+        prisma_cmd.arg("/C").arg("npx").arg("-y").arg("prisma@5.14.0").arg("generate").current_dir(proj_dir);
 
         #[cfg(not(target_os = "windows"))]
         let mut prisma_cmd = tokio::process::Command::new("npx");
         #[cfg(not(target_os = "windows"))]
-        prisma_cmd.arg("-y").arg("prisma").arg("generate").current_dir(proj_dir);
+        prisma_cmd.arg("-y").arg("prisma@5.14.0").arg("generate").current_dir(proj_dir);
 
         #[cfg(target_os = "windows")]
         {
@@ -5609,6 +5722,10 @@ async fn heal_prisma_schema_loop(
             || error_log.contains("command not found")
         {
             return Err("Node.js (npx) nije pronađen u sistemu. Proverite internet konekciju za automatsko preuzimanje Node.js-a.".to_string());
+        }
+
+        if error_log.contains("CLI.UNKNOWN_COMMAND") || error_log.contains("No command registered for") {
+            return Err("Neodgovarajuća verzija Prisma CLI paketa u kešu. Pokušajte ponovo (sistem je automatski zaključao verziju na prisma@5.14.0).".to_string());
         }
 
         if attempt == MAX_AI_HEALS {
@@ -6442,12 +6559,12 @@ async fn project_run_prisma_generate(project_id: String) -> Result<String, Strin
     #[cfg(target_os = "windows")]
     let mut cmd = Command::new("cmd");
     #[cfg(target_os = "windows")]
-    cmd.arg("/C").arg("npx").arg("-y").arg("prisma").arg("generate").current_dir(&proj_dir);
+    cmd.arg("/C").arg("npx").arg("-y").arg("prisma@5.14.0").arg("generate").current_dir(&proj_dir);
     
     #[cfg(not(target_os = "windows"))]
     let mut cmd = Command::new("npx");
     #[cfg(not(target_os = "windows"))]
-    cmd.arg("-y").arg("prisma").arg("generate").current_dir(&proj_dir);
+    cmd.arg("-y").arg("prisma@5.14.0").arg("generate").current_dir(&proj_dir);
     
     #[cfg(target_os = "windows")]
     cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
@@ -6717,6 +6834,7 @@ fn scan_and_fix_imports(dir: &std::path::Path, src_root: &std::path::Path, index
                                     };
                                     
                                     let variations = [
+                                        target_abs.clone(),
                                         target_abs.with_extension("ts"),
                                         target_abs.with_extension("tsx"),
                                         target_abs.with_extension("js"),
@@ -6834,6 +6952,7 @@ fn collect_missing_imports(
                                     };
                                     
                                     let variations = [
+                                        target_abs.clone(),
                                         target_abs.with_extension("ts"),
                                         target_abs.with_extension("tsx"),
                                         target_abs.with_extension("js"),
@@ -9430,6 +9549,9 @@ export default function RootLayout({
         overrides_desc.push_str("- Use default stable versions\n");
     }
 
+    // Ensure local Ollama server is running before manifest expansion (especially important on cold-start deep links)
+    let _ = ollama_start_server().await;
+
     // Manifest Expansion Phase
     emit_progress("manifest-expansion", "Expanding manifest structure with local AI...", 12.0);
     
@@ -9625,6 +9747,7 @@ export default function RootLayout({
             }
             Ok(Err(e)) => {
                 debug_log_to_file(format!("[Orchestrator] Manifest expansion request error (Attempt {}): {}", expansion_attempts, e));
+                let _ = ollama_start_server().await;
             }
             Err(_) => {
                 debug_log_to_file(format!("[Orchestrator] Manifest expansion initial connection timed out after 120s (Attempt {})", expansion_attempts));
@@ -9857,6 +9980,7 @@ export default function RootLayout({
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
                     debug_log_to_file(format!("[Orchestrator] Connection error for {} (Attempt {}): {}", file_path, attempts, e));
+                    let _ = ollama_start_server().await;
                     continue;
                 }
                 Err(_) => {
@@ -9969,7 +10093,8 @@ export default function RootLayout({
                     "[Orchestrator] Warning: Max attempts reached for {}. Generating safe fallback stub to avoid blocking pipeline.",
                     file_path
                 ));
-                processed_content = get_safe_fallback_content(file_path, lang, desc);
+                let fallback = get_safe_fallback_content(file_path, lang, desc);
+                processed_content = post_process_generated_file(file_path, &fallback, &metamanifest, has_tailwind);
             }
         }
 
@@ -10039,12 +10164,12 @@ export default function RootLayout({
         #[cfg(target_os = "windows")]
         let mut push_cmd = std::process::Command::new("cmd");
         #[cfg(target_os = "windows")]
-        push_cmd.arg("/C").arg("npx").arg("-y").arg("prisma").arg("db").arg("push").arg("--accept-data-loss").current_dir(&proj_dir);
+        push_cmd.arg("/C").arg("npx").arg("-y").arg("prisma@5.14.0").arg("db").arg("push").arg("--accept-data-loss").current_dir(&proj_dir);
         
         #[cfg(not(target_os = "windows"))]
         let mut push_cmd = std::process::Command::new("npx");
         #[cfg(not(target_os = "windows"))]
-        push_cmd.arg("-y").arg("prisma").arg("db").arg("push").arg("--accept-data-loss").current_dir(&proj_dir);
+        push_cmd.arg("-y").arg("prisma@5.14.0").arg("db").arg("push").arg("--accept-data-loss").current_dir(&proj_dir);
         
         #[cfg(target_os = "windows")]
         {
