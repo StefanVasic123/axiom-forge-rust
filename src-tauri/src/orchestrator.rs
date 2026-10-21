@@ -761,7 +761,8 @@ pub fn get_expert_system_prompt(
                2. Every relation must have an opposite relation field defined on both models. For example, if model `Message` has `sender User @relation(fields: [senderId], references: [id])`, then model `User` MUST have `messages Message[]`.\n\
                3. For implicit many-to-many relations, do NOT specify any `fields` or `references` arguments.\n\
                4. The `@relation` attribute MUST ONLY be placed on relational object fields, never on scalar fields.\n\
-               5. For NextAuth schema, the VerificationToken model does not have a direct relation back to the User model.\n".to_string();
+               5. For NextAuth schema, the VerificationToken model does not have a direct relation back to the User model.\n\
+                6. CONSTANTS & ENUMS: Fixed sets of values (such as roles, statuses, priorities, tiers) MUST be defined using Prisma `enum Name { VAL1 VAL2 }`, NEVER as a relational `model`. Never place `@default(...)` on a relation field pointing to another model.\n".to_string();
 
         if let Some(ref lbg) = lbg_val {
             if let Some(db_models) = lbg.get("sharedContracts").and_then(|c| c.get("database")).and_then(|d| d.get("models")) {

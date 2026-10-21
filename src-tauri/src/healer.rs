@@ -362,6 +362,20 @@ pub async fn heal_prisma_schema_loop(
         }));
 
         let local_prisma_js = proj_dir.join("node_modules").join("prisma").join("build").join("index.js");
+        if local_prisma_js.exists() {
+            #[cfg(target_os = "windows")]
+            let mut fmt_cmd = tokio::process::Command::new("node");
+            #[cfg(target_os = "windows")]
+            {
+                fmt_cmd.arg(&local_prisma_js).arg("format").current_dir(proj_dir);
+                fmt_cmd.creation_flags(0x08000000);
+            }
+            #[cfg(not(target_os = "windows"))]
+            let mut fmt_cmd = tokio::process::Command::new("node");
+            #[cfg(not(target_os = "windows"))]
+            fmt_cmd.arg(&local_prisma_js).arg("format").current_dir(proj_dir);
+            let _ = fmt_cmd.output().await;
+        }
         let mut prisma_cmd = if local_prisma_js.exists() {
             let mut cmd = tokio::process::Command::new("node");
             cmd.arg(&local_prisma_js).arg("generate").current_dir(proj_dir);
@@ -451,7 +465,9 @@ pub async fn heal_prisma_schema_loop(
             4. The @relation attribute (e.g. `@relation(fields: [userId], references: [id])`) MUST ONLY be placed on relational object fields (like `user User`), never on scalar fields (like `userId String`). Placing @relation on a scalar field will throw an 'Invalid field type, not a relation' error. \
             5. For NextAuth schema, the VerificationToken model does not have a direct relation back to the User model; do not define a verificationTokens relation field on the User model. \
             6. Every relation needs an opposite field on the other model (e.g. `user User @relation(...)` on the child and `accounts Account[]` on User). \
-            Respond ONLY with the complete corrected schema.prisma contents. Do not include any explanations, introduction, or markdown code blocks.";
+            7. Fields pointing to another model (relations) CANNOT have a `@default()` attribute. For default values, use an `enum` or a scalar type (e.g. `String @default(\"USER\")`). \
+            First, in exactly 1 concise sentence, identify the compiler rule that was violated on the failing line. \
+            Then, provide the complete corrected schema.prisma code wrapped in a ```prisma code block.";
 
         let mut user_prompt = format!(
             "Prisma CLI error log:\n{}\n\nCurrent schema.prisma content:\n{}\n",
@@ -467,11 +483,11 @@ pub async fn heal_prisma_schema_loop(
         if previous_ai_unchanged {
             user_prompt.push_str(
                 "\nIMPORTANT: Your previous answer returned the schema UNCHANGED and the same errors remained. \
-                 Do not repeat it. Edit the failing lines listed above so the error disappears \
-                 (for example, remove an @relation attribute from a scalar field).\n",
+                 Do not repeat it. You MUST directly modify the failing line(s) reported by the compiler to resolve the error. \
+                 Address the specific error message provided by the compiler.\n",
             );
         }
-        user_prompt.push_str("\nPlease provide the complete corrected schema.prisma code.");
+        user_prompt.push_str("\nPlease provide the concise 1-sentence analysis followed by the complete corrected schema.prisma code in a ```prisma code block.");
 
         let ollama_req = serde_json::json!({
             "model": resolved_model,

@@ -683,7 +683,58 @@ pub fn post_process_generated_file(
             i = absolute_idx + 1;
         }
 
-        // 4. Strip @relation from scalar fields
+        // 4a. Strip @relation with fields/references from array fields (e.g. Project[] @relation(...))
+        let array_rel_regex = regex::Regex::new(r"(?m)(\b\w+\[\]\s*)@relation\([^)]*\)").ok();
+        if let Some(re) = array_rel_regex {
+            processed = re.replace_all(&processed, "$1").to_string();
+        }
+
+        // 4b. Strip invalid @default(...) from relation fields pointing to another model (e.g. role Role @default(...))
+        let model_names: Vec<String> = regex::Regex::new(r"(?m)^model\s+(\w+)\s*\{")
+            .ok()
+            .map(|re| re.captures_iter(&processed).filter_map(|c| c.get(1).map(|m| m.as_str().to_string())).collect())
+            .unwrap_or_default();
+        let enum_names: Vec<String> = regex::Regex::new(r"(?m)^enum\s+(\w+)\s*\{")
+            .ok()
+            .map(|re| re.captures_iter(&processed).filter_map(|c| c.get(1).map(|m| m.as_str().to_string())).collect())
+            .unwrap_or_default();
+
+        let mut lines_san: Vec<String> = processed.lines().map(|s| s.to_string()).collect();
+        for line in lines_san.iter_mut() {
+            let trimmed = line.trim();
+            if trimmed.contains("@default") {
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    let clean_type = parts[1].replace('?', "").replace('[', "").replace(']', "");
+                    if model_names.contains(&clean_type) && !enum_names.contains(&clean_type) {
+                        // This is a relation to another model; it cannot have @default
+                        if clean_type == "Role" && trimmed.starts_with("role") {
+                            // Standardize common role pattern to String @default("USER")
+                            *line = "  role             String   @default(\"USER\")".to_string();
+                        } else if let Some(def_idx) = line.find("@default") {
+                            let mut paren_count = 0;
+                            let mut end_idx = def_idx;
+                            let chars: Vec<char> = line.chars().collect();
+                            for k in def_idx..chars.len() {
+                                if chars[k] == '(' { paren_count += 1; }
+                                else if chars[k] == ')' {
+                                    paren_count -= 1;
+                                    if paren_count == 0 { end_idx = k + 1; break; }
+                                }
+                            }
+                            if end_idx > def_idx {
+                                let mut new_l = line[..def_idx].to_string();
+                                new_l.push_str(line[end_idx..].trim_start());
+                                *line = new_l;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        processed = lines_san.join("\n");
+
+        // 4c. Strip @relation from scalar fields
         let mut lines: Vec<String> = processed.lines().map(|s| s.to_string()).collect();
         let primitives = ["String", "Boolean", "Int", "BigInt", "Float", "Decimal", "DateTime", "Json", "Bytes"];
         for line in lines.iter_mut() {
