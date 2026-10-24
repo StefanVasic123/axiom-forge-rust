@@ -285,7 +285,7 @@ pub fn normalize_project_structure(files: &mut Vec<Value>, metamanifest: &Value,
 }
 
 pub fn get_axiom_inspector_script() -> &'static str {
-    "      <script dangerouslySetInnerHTML={{ __html: `\n        if (!window.__axiom_inspect_injected) {\n          window.__axiom_inspect_injected = true;\n          let isInspectActive = false;\n          window.addEventListener('message', (e) => {\n            if (e.data && e.data.channel === 'axiom-toggle-inspect') {\n              isInspectActive = !!e.data.enabled;\n              if (!isInspectActive && highlightedElement) {\n                highlightedElement.classList.remove('axiom-inspect-highlight');\n                highlightedElement = null;\n              }\n            }\n          });\n          const styleEl = document.createElement('style');\n          styleEl.textContent = \\`\n            .axiom-inspect-highlight {\n              outline: 2px solid #6366f1 !important;\n              outline-offset: -2px !important;\n              cursor: crosshair !important;\n              background-color: rgba(99, 102, 241, 0.12) !important;\n              transition: all 0.1s ease;\n            }\n          \\`;\n          document.head.appendChild(styleEl);\n          let highlightedElement = null;\n          function findAxiomTarget(el) {\n            if (!el || el === document.body || el === document.documentElement) return null;\n            let cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              if (cur.dataset && (cur.dataset.axiomFile || cur.dataset.axiomComponent)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            const validTags = ['h1','h2','h3','h4','h5','h6','p','button','a','input','textarea','select','header','footer','nav','section','article','aside','li'];\n            cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              const tag = cur.tagName.toLowerCase();\n              if (validTags.includes(tag) || (cur.innerText && cur.innerText.trim().length > 0 && cur.children.length === 0)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            return el !== document.body && el !== document.documentElement ? el : null;\n          }\n          document.addEventListener('mouseover', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (highlightedElement && highlightedElement !== target) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n            }\n            if (target) {\n              target.classList.add('axiom-inspect-highlight');\n              highlightedElement = target;\n            }\n          }, true);\n          document.addEventListener('mouseout', (e) => {\n            if (highlightedElement) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n              highlightedElement = null;\n            }\n          }, true);\n          document.addEventListener('click', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (target) {\n              e.preventDefault();\n              e.stopPropagation();\n              const payload = {\n                file: target.dataset?.axiomFile || null,\n                component: target.dataset?.axiomComponent || null,\n                tagName: target.tagName.toLowerCase(),\n                text: (target.innerText || target.value || '').trim().substring(0, 80),\n                path: window.location.pathname\n              };\n              window.parent.postMessage({ channel: 'axiom-inspect-click', payload }, '*');\n            }\n          }, true);\n        }\n      ` }} />"
+    "      <script dangerouslySetInnerHTML={{ __html: `\n        if (!window.__axiom_inspect_injected) {\n          window.__axiom_inspect_injected = true;\n          let isInspectActive = false;\n          function reportAxiomRoute() { try { window.parent.postMessage({ channel: 'axiom-preview-route', pathname: window.location.pathname, url: window.location.href }, '*'); } catch(e) {} }\n          reportAxiomRoute();\n          window.addEventListener('popstate', reportAxiomRoute);\n          setInterval(reportAxiomRoute, 2000);\n          window.addEventListener('error', function(e) { try { window.parent.postMessage({ channel: 'axiom-preview-error', message: e.message || 'Unknown runtime error', path: window.location.pathname }, '*'); } catch(err) {} });\n          window.addEventListener('unhandledrejection', function(e) { try { window.parent.postMessage({ channel: 'axiom-preview-error', message: e.reason?.message || String(e.reason || 'Unhandled promise rejection'), path: window.location.pathname }, '*'); } catch(err) {} });\n          window.addEventListener('message', (e) => {\n            if (e.data && e.data.channel === 'axiom-toggle-inspect') {\n              isInspectActive = !!e.data.enabled;\n              if (!isInspectActive && highlightedElement) {\n                highlightedElement.classList.remove('axiom-inspect-highlight');\n                highlightedElement = null;\n              }\n            }\n          });\n          const styleEl = document.createElement('style');\n          styleEl.textContent = \\`\n            .axiom-inspect-highlight {\n              outline: 2px solid #6366f1 !important;\n              outline-offset: -2px !important;\n              cursor: crosshair !important;\n              background-color: rgba(99, 102, 241, 0.12) !important;\n              transition: all 0.1s ease;\n            }\n          \\`;\n          document.head.appendChild(styleEl);\n          let highlightedElement = null;\n          function findAxiomTarget(el) {\n            if (!el || el === document.body || el === document.documentElement) return null;\n            let cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              if (cur.dataset && (cur.dataset.axiomFile || cur.dataset.axiomComponent)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            const validTags = ['h1','h2','h3','h4','h5','h6','p','button','a','input','textarea','select','header','footer','nav','section','article','aside','li'];\n            cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              const tag = cur.tagName.toLowerCase();\n              if (validTags.includes(tag) || (cur.innerText && cur.innerText.trim().length > 0 && cur.children.length === 0)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            return el !== document.body && el !== document.documentElement ? el : null;\n          }\n          document.addEventListener('mouseover', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (highlightedElement && highlightedElement !== target) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n            }\n            if (target) {\n              target.classList.add('axiom-inspect-highlight');\n              highlightedElement = target;\n            }\n          }, true);\n          document.addEventListener('mouseout', (e) => {\n            if (highlightedElement) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n              highlightedElement = null;\n            }\n          }, true);\n          document.addEventListener('click', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (target) {\n              e.preventDefault();\n              e.stopPropagation();\n              const payload = {\n                file: target.dataset?.axiomFile || null,\n                component: target.dataset?.axiomComponent || null,\n                tagName: target.tagName.toLowerCase(),\n                text: (target.innerText || target.value || '').trim().substring(0, 80),\n                path: window.location.pathname\n              };\n              window.parent.postMessage({ channel: 'axiom-inspect-click', payload }, '*');\n            }\n          }, true);\n        }\n      ` }} />"
 }
 
 pub fn ensure_axiom_inspector_injected(proj_dir: &std::path::Path) {
@@ -567,6 +567,89 @@ pub fn sanitize_unhandled_session_loading(content: &str) -> String {
     content.to_string()
 }
 
+pub fn sanitize_tanstack_query_v5(content: &str) -> String {
+    if !content.contains("useQuery") && !content.contains("useMutation") {
+        return content.to_string();
+    }
+
+    let mut modified = content.to_string();
+
+    // 1. Fix useQuery positional arguments:
+    // Matches: useQuery<Type, Error>('key', fetchFn) or useQuery('key', fetchFn) or useQuery(['key'], fetchFn)
+    if let Ok(re) = regex::Regex::new(r"useQuery(?P<generics><[^>]+>)?\s*\(\s*(?P<key>['\"][^'\"]+['\"]|\[[^\]]+\])\s*,\s*(?P<fn>[^,\)]+)\s*\)") {
+        for cap in re.captures_iter(content) {
+            let full_match = cap.get(0).unwrap().as_str();
+            if full_match.contains("queryKey") {
+                continue;
+            }
+            let generics = cap.name("generics").map(|m| m.as_str()).unwrap_or("");
+            let raw_key = cap.name("key").unwrap().as_str().trim();
+            let query_fn = cap.name("fn").unwrap().as_str().trim();
+
+            let normalized_key = if raw_key.starts_with('[') {
+                raw_key.to_string()
+            } else {
+                format!("[{}]", raw_key)
+            };
+
+            let replacement = format!(
+                "useQuery{}({{ queryKey: {}, queryFn: {} }})",
+                generics, normalized_key, query_fn
+            );
+            modified = modified.replace(full_match, &replacement);
+        }
+    }
+
+    // 2. Fix useMutation positional argument:
+    // Matches: useMutation(mutationFn) or useMutation<Type, Error>(mutationFn)
+    if let Ok(re_mut) = regex::Regex::new(r"useMutation(?P<generics><[^>]+>)?\s*\(\s*(?P<fn>[a-zA-Z0-9_]+)\s*\)") {
+        for cap in re_mut.captures_iter(&modified.clone()) {
+            let full_match = cap.get(0).unwrap().as_str();
+            if full_match.contains("mutationFn") {
+                continue;
+            }
+            let generics = cap.name("generics").map(|m| m.as_str()).unwrap_or("");
+            let mutation_fn = cap.name("fn").unwrap().as_str().trim();
+
+            let replacement = format!(
+                "useMutation{}({{ mutationFn: {} }})",
+                generics, mutation_fn
+            );
+            modified = modified.replace(full_match, &replacement);
+        }
+    }
+
+    modified
+}
+
+pub fn sanitize_next_link_imports(content: &str) -> String {
+    let mut modified = content.to_string();
+
+    // 1. Normalize named import: import { Link } from 'next/link' -> import Link from 'next/link'
+    if modified.contains("import { Link } from 'next/link'") {
+        modified = modified.replace("import { Link } from 'next/link'", "import Link from 'next/link'");
+    }
+    if modified.contains("import { Link } from \"next/link\"") {
+        modified = modified.replace("import { Link } from \"next/link\"", "import Link from \"next/link\"");
+    }
+
+    // 2. Auto-insert missing import Link from 'next/link' if <Link is present
+    if (modified.contains("<Link ") || modified.contains("<Link\n") || modified.contains("<Link>"))
+        && !modified.contains("from 'next/link'")
+        && !modified.contains("from \"next/link\"")
+    {
+        if modified.starts_with("\"use client\";") {
+            modified = modified.replacen("\"use client\";", "\"use client\";\n\nimport Link from 'next/link';", 1);
+        } else if modified.starts_with("'use client';") {
+            modified = modified.replacen("'use client';", "'use client';\n\nimport Link from 'next/link';", 1);
+        } else {
+            modified = format!("import Link from 'next/link';\n{}", modified);
+        }
+    }
+
+    modified
+}
+
 pub fn normalize_project_route_links(proj_dir: &std::path::Path, valid_routes: &[String]) {
     fn walk_and_sanitize(dir: &std::path::Path, valid_routes: &[String]) {
         if let Ok(entries) = std::fs::read_dir(dir) {
@@ -828,6 +911,15 @@ pub fn post_process_generated_file(
 
     if (path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx")) && processed.contains("useSession") {
         processed = sanitize_unhandled_session_loading(&processed);
+    }
+
+    if path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx") || path_lower.ends_with(".ts") || path_lower.ends_with(".js") {
+        if processed.contains("useQuery") || processed.contains("useMutation") {
+            processed = sanitize_tanstack_query_v5(&processed);
+        }
+        if processed.contains("<Link") || processed.contains("import { Link } from") {
+            processed = sanitize_next_link_imports(&processed);
+        }
     }
 
     // Apply learned global healing rules

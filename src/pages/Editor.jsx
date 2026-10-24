@@ -171,7 +171,11 @@ function AIPanel({
   onDiscardProjectFile,
   onApplyAllProjectChanges,
   onDiscardAllProjectChanges,
-  onReviewProjectFile
+  onReviewProjectFile,
+
+  // External trigger props
+  externalPrompt,
+  onClearExternalPrompt
 }) {
   const [messages, setMessages] = useState([
     { role: 'assistant', content: 'Hello! I\'m connected to your local Ollama model. Tell me what you\'d like to change.' }
@@ -183,6 +187,13 @@ function AIPanel({
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  useEffect(() => {
+    if (externalPrompt) {
+      handleSend(externalPrompt);
+      onClearExternalPrompt?.();
+    }
+  }, [externalPrompt]);
 
   useEffect(() => {
     // Slušamo direktivu
@@ -214,11 +225,12 @@ function AIPanel({
     };
   }, []);
 
-  const handleSend = async () => {
-    if (!input.trim() || isThinking) return;
+  const handleSend = async (overrideMsg = null) => {
+    const rawMsg = typeof overrideMsg === 'string' ? overrideMsg : input;
+    if (!rawMsg.trim() || isThinking) return;
 
-    const userMsg = input.trim();
-    setInput('');
+    const userMsg = rawMsg.trim();
+    if (!overrideMsg) setInput('');
     setMessages(m => [...m, { role: 'user', content: userMsg }]);
     setIsThinking(true);
 
@@ -231,9 +243,17 @@ function AIPanel({
       setPendingContent(null);
 
       try {
+        let contentToUse = activeContent;
+        if (!contentToUse && activeFile?.path) {
+          try {
+            const res = await window.electronAPI.project.readFile(projectId, activeFile.path);
+            if (res && res.success) contentToUse = res.content;
+          } catch (e) {}
+        }
+
         const result = await window.electronAPI.editor.aiEdit(
           activeFile.path,
-          activeContent,
+          contentToUse || '',
           userMsg,
           projectId,
           visualContext
@@ -569,6 +589,43 @@ export default function EditorPage() {
     syncInspectMode(isInspectMode);
   }, [isInspectMode, syncInspectMode]);
 
+  // Preview Route Tracking & Runtime Error Bridge
+  const [currentPreviewRoute, setCurrentPreviewRoute] = useState('/');
+  const [previewRuntimeError, setPreviewRuntimeError] = useState(null);
+  const [aiExternalPrompt, setAiExternalPrompt] = useState(null);
+
+  // Helper to resolve route path to actual project file
+  const resolveRouteToFile = useCallback((routePath) => {
+    if (!files || files.length === 0) return null;
+    const cleanRoute = (routePath || '').replace(/^\/(en|sr|es|pt|fr|de|it)/, '').replace(/\/$/, '') || '';
+    const candidateSuffixes = [
+      cleanRoute ? `${cleanRoute}/page.tsx` : 'src/app/page.tsx',
+      cleanRoute ? `${cleanRoute}/page.jsx` : 'src/app/page.jsx',
+      cleanRoute ? `${cleanRoute}/page.tsx` : 'app/page.tsx',
+      cleanRoute ? `${cleanRoute}/page.jsx` : 'app/page.jsx',
+      cleanRoute ? `${cleanRoute}.tsx` : 'src/pages/index.tsx',
+      cleanRoute ? `${cleanRoute}.jsx` : 'src/pages/index.jsx',
+      cleanRoute ? `${cleanRoute}/route.ts` : 'src/app/api/route.ts',
+    ];
+    const candidateMatches = [
+      cleanRoute ? `/${cleanRoute}/page.tsx` : '/page.tsx',
+      cleanRoute ? `/${cleanRoute}/page.jsx` : '/page.jsx',
+      cleanRoute ? `/${cleanRoute}.tsx` : '/index.tsx',
+      cleanRoute ? `/${cleanRoute}.jsx` : '/index.jsx',
+    ];
+
+    return files.find(f => {
+      const norm = f.path.replace(/\\/g, '/');
+      if (candidateSuffixes.some(s => norm.endsWith(s))) return true;
+      if (candidateMatches.some(m => norm.includes(m))) return true;
+      return false;
+    }) || null;
+  }, [files]);
+
+  const activePreviewFile = useMemo(() => {
+    return resolveRouteToFile(currentPreviewRoute);
+  }, [resolveRouteToFile, currentPreviewRoute]);
+
   // Project-level AI states
   const [aiScope, setAiScope] = useState('file'); // 'file' or 'project'
   const [pendingProjectChanges, setPendingProjectChanges] = useState(null); // { [filePath]: newContent }
@@ -596,6 +653,34 @@ export default function EditorPage() {
     setOpenTabs(tabs => [...tabs, tab]);
     setActiveTabPath(node.path);
   }, [openTabs, projectId]);
+
+  // One-click AI fix for current preview page / runtime error
+  const handleAIFixCurrentPage = useCallback(async (customPrompt) => {
+    let targetFile = activeTab;
+    if (!targetFile && activePreviewFile) {
+      await openFile(activePreviewFile);
+      targetFile = activePreviewFile;
+    } else if (activePreviewFile && activeTab?.path !== activePreviewFile?.path) {
+      await openFile(activePreviewFile);
+      targetFile = activePreviewFile;
+    }
+
+    if (!targetFile && files && files.length > 0) {
+      const homePage = files.find(f => f.path.endsWith('page.tsx') || f.path.endsWith('page.jsx'));
+      if (homePage) {
+        await openFile(homePage);
+        targetFile = homePage;
+      }
+    }
+
+    const promptText = typeof customPrompt === 'string' && customPrompt.trim().length > 0
+      ? customPrompt
+      : (previewRuntimeError
+          ? `Ispravi sledeću runtime grešku na ovoj stranici: "${previewRuntimeError.message}". Osiguraj ispravne React hook pozive i da se stranica bez greške renderuje u preview-u.`
+          : `Ova stranica (${targetFile?.path || 'trenutna stranica'}) se ne prikazuje u preview-u ili ima problem sa učitavanjem/loading stanjem. Pregledaj kod, osiguraj realne mock podatke i pravilan završetak učitavanja (setLoading(false)) tako da se stranica odmah uspešno prikaže u preview modu.`);
+
+    setAiExternalPrompt(promptText);
+  }, [activeTab, activePreviewFile, files, openFile, previewRuntimeError]);
 
   // Auto-scroll terminal
   useEffect(() => {
@@ -650,6 +735,14 @@ export default function EditorPage() {
           }
           console.log('[Editor] Auto-detected local server URL from logs:', detectedUrl);
           setPreviewUrl(detectedUrl);
+        }
+
+        const routeMatch = text.match(/(?:Compiling|GET|POST)\s+(\/[a-zA-Z0-9_\-\/]+)/i);
+        if (routeMatch) {
+          const r = routeMatch[1];
+          if (!r.startsWith('/_next') && !r.startsWith('/api') && r !== '/') {
+            setCurrentPreviewRoute(r);
+          }
         }
       }
     });
@@ -730,6 +823,7 @@ export default function EditorPage() {
 
   const handleReloadPreview = () => {
     setIframeLoading(true);
+    setPreviewRuntimeError(null);
     if (webviewRef.current) {
       try {
         webviewRef.current.src = previewUrl;
@@ -997,6 +1091,22 @@ export default function EditorPage() {
   useEffect(() => {
     const handleWindowMessage = (event) => {
       const data = event.data;
+      if (data && data.channel === 'axiom-preview-route') {
+        if (data.pathname) {
+          setCurrentPreviewRoute(data.pathname);
+          setPreviewRuntimeError(null);
+        }
+      }
+
+      if (data && data.channel === 'axiom-preview-error') {
+        console.log('[Editor] Preview runtime error caught:', data);
+        setPreviewRuntimeError({
+          message: data.message || 'Nepoznata runtime greška',
+          path: data.path || currentPreviewRoute,
+          time: Date.now()
+        });
+      }
+
       if (data && data.channel === 'axiom-inspect-click') {
         const payload = data.args ? data.args[0] : data.payload;
         console.log('[Editor] Inspect click received:', payload);
@@ -1604,6 +1714,15 @@ export default function EditorPage() {
                         <Crosshair className="w-3 h-3" /> Live Edit
                       </button>
                     </div>
+
+                    <button
+                      onClick={() => handleAIFixCurrentPage()}
+                      className="flex items-center gap-1.5 px-2.5 py-1 text-[10px] font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded shadow-sm transition-all shrink-0 ml-1"
+                      title="Zatraži od AI-ja da analizira i popravi trenutnu stranicu ako je prazna ili ima problem sa prikazom"
+                    >
+                      <Sparkles className="w-3 h-3 text-indigo-200" />
+                      <span>AI Popravi prikaz</span>
+                    </button>
                   </div>
                   
                   {/* Premium Warning Box */}
@@ -1707,6 +1826,24 @@ export default function EditorPage() {
                     </div>
                   ) : (
                     <div className="flex-1 w-full relative flex flex-col bg-slate-950">
+                      {/* Runtime Error Banner in Preview */}
+                      {previewRuntimeError && (
+                        <div className="z-30 flex items-center justify-between px-3 py-2 bg-rose-950/95 border-b border-rose-800 text-xs text-rose-200 shrink-0 shadow-md">
+                          <div className="flex items-center gap-2 truncate">
+                            <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                            <span className="truncate font-medium">
+                              Runtime greška na ruti <code className="bg-rose-900/60 px-1 py-0.5 rounded text-rose-300 font-mono">{previewRuntimeError.path || currentPreviewRoute}</code>: {previewRuntimeError.message}
+                            </span>
+                          </div>
+                          <button
+                            onClick={() => handleAIFixCurrentPage(`Ispravi runtime grešku na ovoj stranici: "${previewRuntimeError.message}". Osiguraj ispravan rad sa React hook/query pozivima.`)}
+                            className="flex items-center gap-1.5 px-3 py-1 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded text-[11px] shadow transition-colors shrink-0 ml-3"
+                          >
+                            <Sparkles className="w-3.5 h-3.5" />
+                            <span>AI Popravi grešku</span>
+                          </button>
+                        </div>
+                      )}
                       {/* Server Not Running Placeholder */}
                       {!serverRunning && !isServerStarting && (
                         <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-slate-900/95 text-center px-6">
@@ -1952,7 +2089,7 @@ export default function EditorPage() {
         {/* AI PANEL */}
         <div className="w-80 shrink-0">
           <AIPanel
-            activeFile={activeTab}
+            activeFile={activeTab || (showPreview ? activePreviewFile : null)}
             activeContent={activeTab?.content}
             projectId={projectId}
             pendingContent={pendingContent}
@@ -1960,6 +2097,8 @@ export default function EditorPage() {
             visualContext={selectedElement}
             onClearVisualContext={() => setSelectedElement(null)}
             onApply={handleAIApply}
+            externalPrompt={aiExternalPrompt}
+            onClearExternalPrompt={() => setAiExternalPrompt(null)}
             
             // Project props
             aiScope={aiScope}
