@@ -917,4 +917,11 @@ export const version = "1.0.0";
         assert!(output.contains("setLoading(false);"));
     }
 
+
+    #[test]
+    fn test_nextjs_react_rulepack_contains_tanstack_query_v5() {
+        assert!(NEXTJS_REACT_RULEPACK.contains("TANSTACK REACT QUERY V5 OBJECT SIGNATURE"));
+        assert!(NEXTJS_REACT_RULEPACK.contains("useQuery({ queryKey: ['metrics'], queryFn: fetchMetrics })"));
+    }
+
 }
