@@ -135,11 +135,22 @@ pub fn apply_targeted_edit(content: &str, target: &str, replacement: &str) -> Re
         return Err("Target block is empty".to_string());
     }
 
+    let is_specific_target = |t: &str| -> bool {
+        let trimmed = t.trim();
+        trimmed.len() >= 15 
+            || trimmed.contains("<Link") 
+            || trimmed.contains("href=") 
+            || trimmed.contains('\n')
+    };
+
     // 1. Try exact match
     let exact_matches: Vec<_> = content.match_indices(target).collect();
     if exact_matches.len() == 1 {
         return Ok(content.replace(target, replacement));
     } else if exact_matches.len() > 1 {
+        if is_specific_target(target) {
+            return Ok(content.replace(target, replacement));
+        }
         return Err(format!("Target block is duplicated ({}) in file. It must be unique.", exact_matches.len()));
     }
 
@@ -148,6 +159,9 @@ pub fn apply_targeted_edit(content: &str, target: &str, replacement: &str) -> Re
     if trimmed_matches.len() == 1 {
         return Ok(content.replace(target_trimmed, replacement.trim()));
     } else if trimmed_matches.len() > 1 {
+        if is_specific_target(target_trimmed) {
+            return Ok(content.replace(target_trimmed, replacement.trim()));
+        }
         return Err(format!("Trimmed target block is duplicated ({}) in file.", trimmed_matches.len()));
     }
 
@@ -194,6 +208,13 @@ pub fn apply_targeted_edit(content: &str, target: &str, replacement: &str) -> Re
             result.push_str(&content[end..]);
             return Ok(result);
         } else if matches_found.len() > 1 {
+            if is_specific_target(target) {
+                let mut result = content.to_string();
+                for &(start, end) in matches_found.iter().rev() {
+                    result.replace_range(start..end, replacement);
+                }
+                return Ok(result);
+            }
             return Err(format!("Normalized target matches multiple ({}) places in file.", matches_found.len()));
         }
     }
@@ -224,6 +245,13 @@ pub fn apply_targeted_edit(content: &str, target: &str, replacement: &str) -> Re
             let lines_after: String = content_lines[match_line_idx + target_lines.len()..].join("\n");
             let suffix = if lines_after.is_empty() { String::new() } else { format!("\n{}", lines_after) };
             return Ok(format!("{}{}{}", prefix, replacement, suffix));
+        } else if line_matches.len() > 1 && is_specific_target(target) {
+            let mut modified_lines = content_lines.clone();
+            let replacement_lines: Vec<&str> = replacement.lines().collect();
+            for &idx in line_matches.iter().rev() {
+                modified_lines.splice(idx..idx + target_lines.len(), replacement_lines.clone());
+            }
+            return Ok(modified_lines.join("\n"));
         }
     }
 
@@ -308,6 +336,23 @@ pub async fn editor_ai_edit(
     } else {
         file_path.replace('\\', "/")
     };
+
+    let path_lower = rel_file_path.to_lowercase();
+    let is_nav_or_link = path_lower.contains("navbar") 
+        || path_lower.contains("sidebar") 
+        || path_lower.contains("footer") 
+        || path_lower.contains("header") 
+        || path_lower.contains("nav")
+        || content.contains("<Link") 
+        || content.contains("next/link");
+
+    if is_nav_or_link {
+        let project_routes = get_project_routes_from_dir(&proj_dir);
+        let routes_prompt = format_routes_prompt(&project_routes);
+        if !routes_prompt.is_empty() {
+            system_prompt.push_str(&routes_prompt);
+        }
+    }
 
     let mut related_files_context = String::new();
     if metadata_path.exists() {

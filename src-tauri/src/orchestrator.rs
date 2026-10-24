@@ -178,12 +178,139 @@ Respond ONLY with a JSON object in this format: { \"valid\": true } or { \"valid
     Ok(())
 }
 
+pub fn resolve_app_router_route(rel_path: &str) -> Option<String> {
+    let normalized = rel_path.replace('\\', "/");
+    let lower = normalized.to_lowercase();
+    
+    let subpath = if lower.starts_with("src/app/") {
+        &normalized["src/app/".len()..]
+    } else if lower.starts_with("app/") {
+        &normalized["app/".len()..]
+    } else {
+        return None;
+    };
+
+    let sub_lower = subpath.to_lowercase();
+    let is_page = sub_lower == "page.tsx" 
+        || sub_lower == "page.jsx" 
+        || sub_lower == "page.js" 
+        || sub_lower == "page.ts"
+        || sub_lower.ends_with("/page.tsx")
+        || sub_lower.ends_with("/page.jsx")
+        || sub_lower.ends_with("/page.js")
+        || sub_lower.ends_with("/page.ts");
+
+    if !is_page {
+        return None;
+    }
+
+    let parts: Vec<&str> = subpath.split('/').collect();
+    let dir_parts = if parts.len() > 1 {
+        &parts[..parts.len() - 1]
+    } else {
+        &[] as &[&str]
+    };
+
+    let mut route_segments = Vec::new();
+    for seg in dir_parts {
+        let seg_trimmed = seg.trim();
+        if seg_trimmed.is_empty() {
+            continue;
+        }
+        // Next.js Route groups e.g. (marketing), (auth), (dashboard) do not affect URL path
+        if seg_trimmed.starts_with('(') && seg_trimmed.ends_with(')') {
+            continue;
+        }
+        // Parallel routes e.g. @modal or private folders _components
+        if seg_trimmed.starts_with('@') || seg_trimmed.starts_with('_') {
+            continue;
+        }
+        route_segments.push(seg_trimmed);
+    }
+
+    if route_segments.is_empty() {
+        Some("/".to_string())
+    } else {
+        Some(format!("/{}", route_segments.join("/")))
+    }
+}
+
+pub fn get_project_routes_from_dir(proj_dir: &std::path::Path) -> Vec<(String, String)> {
+    let mut routes = Vec::new();
+    
+    // 1. Try reading axiom-map.json first if it exists
+    let axiom_map_path = proj_dir.join("axiom-map.json");
+    if axiom_map_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&axiom_map_path) {
+            if let Ok(parsed) = serde_json::from_str::<Value>(&content) {
+                if let Some(routes_obj) = parsed.get("routes").and_then(|r| r.as_object()) {
+                    for (route, meta) in routes_obj {
+                        let file = meta.get("file").and_then(|f| f.as_str()).unwrap_or("");
+                        routes.push((route.clone(), file.to_string()));
+                    }
+                    if !routes.is_empty() {
+                        routes.sort_by(|a, b| a.0.cmp(&b.0));
+                        return routes;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Scan directory directly
+    fn scan_pages(dir: &std::path::Path, base_dir: &std::path::Path, routes: &mut Vec<(String, String)>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if name != "node_modules" && name != ".next" && name != "build" && name != "dist" {
+                        scan_pages(&path, base_dir, routes);
+                    }
+                } else if path.is_file() {
+                    if let Ok(rel_path) = path.strip_prefix(base_dir) {
+                        let rel_str = rel_path.to_string_lossy().replace('\\', "/");
+                        if let Some(route) = resolve_app_router_route(&rel_str) {
+                            routes.push((route, rel_str));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    scan_pages(proj_dir, proj_dir, &mut routes);
+    routes.sort_by(|a, b| a.0.cmp(&b.0));
+    routes.dedup_by(|a, b| a.0 == b.0);
+    routes
+}
+
+pub fn format_routes_prompt(routes: &[(String, String)]) -> String {
+    if routes.is_empty() {
+        return String::new();
+    }
+    let mut prompt = String::new();
+    prompt.push_str("\n=== VERIFIED APPLICATION ROUTES (SINGLE SOURCE OF TRUTH) ===\n");
+    prompt.push_str("The following routes are strictly defined and implemented in this Next.js App Router application.\n");
+    prompt.push_str("All navigation components (<Navbar>, <Sidebar>, <Footer>, <Header>, links, buttons) MUST link exclusively to these exact routes:\n");
+    for (route, file_path) in routes {
+        prompt.push_str(&format!("  - Route '{}' -> maps to file '{}'\n", route, file_path));
+    }
+    prompt.push_str("\nROUTING RULES:\n");
+    prompt.push_str("1. LINK TARGETS: Every `<Link href=\"...\">` MUST use one of the exact route paths listed above.\n");
+    prompt.push_str("2. NEVER FLATTEN ROUTES: Never invent flat root URLs like `/data-grid` or `/settings` if the page is located in a nested folder (e.g. `src/app/dashboard/data-grid/page.tsx` -> route is `/dashboard/data-grid`). Flat URLs for nested routes cause fatal 404 Not Found errors!\n");
+    prompt.push_str("3. CLEAN NEXT.JS LINKS: Always use `<Link href=\"...\" prefetch={false} className=\"...\">` with no nested <a> tag.\n");
+    prompt.push_str("============================================================\n");
+    prompt
+}
+
 pub fn generate_axiom_map(proj_dir: &std::path::Path) -> Result<(), String> {
     use std::fs;
     use std::path::{Path, PathBuf};
     
     let mut files_map = serde_json::Map::new();
     let mut methods_map = serde_json::Map::new();
+    let mut routes_map = serde_json::Map::new();
     
     let mut source_files = Vec::new();
     
@@ -214,6 +341,15 @@ pub fn generate_axiom_map(proj_dir: &std::path::Path) -> Result<(), String> {
         let Ok(content) = fs::read_to_string(file_path) else { continue; };
         let Ok(rel_path) = file_path.strip_prefix(proj_dir) else { continue; };
         let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
+        
+        if let Some(route) = resolve_app_router_route(&rel_path_str) {
+            routes_map.insert(
+                route,
+                serde_json::json!({
+                    "file": rel_path_str.clone()
+                })
+            );
+        }
         
         let mut imports = Vec::new();
         let mut exports = Vec::new();
@@ -333,6 +469,7 @@ pub fn generate_axiom_map(proj_dir: &std::path::Path) -> Result<(), String> {
     }
     
     let axiom_map = serde_json::json!({
+        "routes": routes_map,
         "files": files_map,
         "methods": methods_map
     });
@@ -345,46 +482,17 @@ pub fn generate_axiom_map(proj_dir: &std::path::Path) -> Result<(), String> {
 }
 
 pub fn get_project_routes_prompt(files: &[Value]) -> String {
-    let mut prompt = String::new();
     let mut routes = Vec::new();
-    
     for file in files {
         if let Some(path_str) = file.get("path").and_then(|p| p.as_str()) {
-            let path_lower = path_str.to_lowercase().replace('\\', "/");
-            if path_lower.starts_with("src/app/") && path_lower.ends_with("/page.tsx") {
-                let route = path_lower
-                    .strip_prefix("src/app/")
-                    .unwrap_or(&path_lower)
-                    .strip_suffix("/page.tsx")
-                    .unwrap_or("");
-                if route.is_empty() {
-                    routes.push(("/".to_string(), path_str.to_string()));
-                } else {
-                    routes.push((format!("/{}", route), path_str.to_string()));
-                }
-            } else if path_lower.starts_with("app/") && path_lower.ends_with("/page.tsx") {
-                let route = path_lower
-                    .strip_prefix("app/")
-                    .unwrap_or(&path_lower)
-                    .strip_suffix("/page.tsx")
-                    .unwrap_or("");
-                if route.is_empty() {
-                    routes.push(("/".to_string(), path_str.to_string()));
-                } else {
-                    routes.push((format!("/{}", route), path_str.to_string()));
-                }
+            if let Some(route) = resolve_app_router_route(path_str) {
+                routes.push((route, path_str.to_string()));
             }
         }
     }
-    
-    if !routes.is_empty() {
-        prompt.push_str("\nAvailable Pages/Routes in this Next.js project. You MUST use these exact paths for navigation links:\n");
-        for (route, file_path) in routes {
-            prompt.push_str(&format!("- Route '{}' -> maps to file '{}'\n", route, file_path));
-        }
-    }
-    
-    prompt
+    routes.sort_by(|a, b| a.0.cmp(&b.0));
+    routes.dedup_by(|a, b| a.0 == b.0);
+    format_routes_prompt(&routes)
 }
 
 pub const NEXTJS_REACT_RULEPACK: &str = r#"REACT JSX SYNTAX, HOOKS & STYLING RULES:
@@ -428,7 +536,8 @@ pub const NEXT_INTL_RULEPACK: &str = r#"NEXT-INTL (INTERNATIONALIZATION) RULES:
 
 pub const NEXT_LINK_RULEPACK: &str = r#"NEXT.JS LINK COMPONENT RULES:
 1. NO NESTED ANCHOR TAGS: In Next.js 13+, do NOT place <a> tags inside <Link href="...">. Place className and styling directly on the <Link> component (e.g. `<Link href="/about" className="...">About</Link>`).
-2. PREFETCH OPTIMIZATION: Always add `prefetch={false}` to <Link> components (e.g. `<Link href="/dashboard" prefetch={false}>`) to prevent aggressive edge request amplification on Vercel."#;
+2. PREFETCH OPTIMIZATION: Always add `prefetch={false}` to <Link> components (e.g. `<Link href="/dashboard" prefetch={false}>`) to prevent aggressive edge request amplification on Vercel.
+3. ROUTE INTEGRITY & NO PATH FLATTENING: In Next.js App Router, the `href` attribute in `<Link>` MUST match the exact folder structure under `src/app/` (or `app/`). If a page file is located at `src/app/dashboard/data-grid/page.tsx`, the link MUST be `<Link href="/dashboard/data-grid">`. NEVER flatten nested routes to the root (e.g. NEVER write `<Link href="/data-grid">` when the page is in `src/app/dashboard/data-grid/`). Root-flattened links result in fatal 404 (Not Found) runtime errors. Always include the full parent folder prefix (e.g. `/dashboard/...`) for all nested subpages. Route groups in parentheses (e.g. `(auth)` or `(marketing)`) do not appear in the URL path, but all regular directory folders MUST be preserved."#;
 
 pub const NEXTJS_MIDDLEWARE_RULEPACK: &str = r#"NEXT.JS MIDDLEWARE & EDGE ROUTING RULES:
 1. PATH-TO-REGEXP MATCHERS: In `src/middleware.ts` or root `middleware.ts`, `config.matcher` strictly parses paths using `path-to-regexp`. Wildcards for subpaths MUST use named parameters (e.g. `'/dashboard/:path*'`, `'/profile/:path*'`, `'/admin/:path*'`) or regex filters (e.g. `'/((?!api|_next|_vercel|.*\\..*).*)'`). NEVER write glob wildcards like `'/dashboard/*'` or `'/profile/*'`. Unnamed wildcards (`/*` or `/**`) throw fatal syntax crashes: "Error parsing /.../* Reason: Unexpected MODIFIER, expected END: Invalid middlewares found".
@@ -645,7 +754,7 @@ pub fn get_expert_system_prompt(
     _overrides_desc: &str,
     _pkg_db_summary: &str,
     context_ref: &str,
-    _routes_ref: &str,
+    routes_ref: &str,
     proj_dir: &std::path::Path,
 ) -> String {
     let path_lower = file_path.to_lowercase().replace('\\', "/");
@@ -852,9 +961,19 @@ pub fn get_expert_system_prompt(
                  - PRISMA SERVER-ONLY RULE: You are on the CLIENT side. NEVER import `@prisma/client` in React components. Fetch data from `/api/...` endpoints.\n\
                  - STRICT TYPE DEFINITIONS: Any TypeScript types/interfaces used MUST be declared in the file or imported.\n\
                  - NEXT.JS LINK RULE: Do NOT place <a> tags inside <Link>. Put className directly on <Link>, and add `prefetch={false}`.\n\
+                 - ROUTE ACCURACY: When writing navigation links (<Link href=\"...\">), use the exact verified route path from the Verified Application Routes list below. Never flatten nested routes to the root.\n\
                  - NO DEAD IMPORTS: Do not import components unless they exist; implement inline if needed.\n\
                  - Use modern Tailwind CSS with responsive flex/grid layouts, nice borders, shadows, and hover states.\n\
                  - NO MANUAL AXIOM ATTRS: Never declare or use 'data-axiom-component' or 'data-axiom-file' props.\n\n"
+            );
+        }
+
+        if path_lower.contains("navbar") || path_lower.contains("sidebar") || path_lower.contains("footer") || path_lower.contains("header") || path_lower.contains("/nav") {
+            prompt.push_str(
+                "SCOPED NAVIGATION COMPONENT RULES:\n\
+                 - ROUTE CONSISTENCY: Every `<Link>` and navigation item in this component MUST strictly point to a verified route from the VERIFIED APPLICATION ROUTES list below.\n\
+                 - ABSOLUTE SUBPATHS: Never strip parent folders from nested routes (e.g. use `/dashboard/data-grid`, NOT `/data-grid`). Unmapped or flattened routes cause fatal 404 errors!\n\
+                 - ACTIVE STATE HIGHLIGHT: Use `usePathname()` from 'next/navigation' to detect active route and visually highlight current link.\n\n"
             );
         }
 
@@ -899,6 +1018,18 @@ pub fn get_expert_system_prompt(
             }
             if let Some(api_contracts) = lbg.get("sharedContracts").and_then(|c| c.get("api")).and_then(|a| a.get("endpoints")) {
                 prompt.push_str(&format!("- Available API Endpoints to Fetch:\n{}\n", api_contracts));
+            }
+        }
+
+        if !routes_ref.trim().is_empty() {
+            prompt.push_str(routes_ref);
+            prompt.push_str("\n");
+        } else {
+            let disk_routes = get_project_routes_from_dir(proj_dir);
+            let formatted = format_routes_prompt(&disk_routes);
+            if !formatted.is_empty() {
+                prompt.push_str(&formatted);
+                prompt.push_str("\n");
             }
         }
 

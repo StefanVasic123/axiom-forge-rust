@@ -834,5 +834,38 @@ export const version = "1.0.0";
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
+
+    #[test]
+    fn test_resolve_app_router_route() {
+        assert_eq!(resolve_app_router_route("src/app/page.tsx"), Some("/".to_string()));
+        assert_eq!(resolve_app_router_route("src/app/page.jsx"), Some("/".to_string()));
+        assert_eq!(resolve_app_router_route("src/app/dashboard/page.tsx"), Some("/dashboard".to_string()));
+        assert_eq!(resolve_app_router_route("src/app/dashboard/data-grid/page.tsx"), Some("/dashboard/data-grid".to_string()));
+        assert_eq!(resolve_app_router_route("src/app/(auth)/login/page.tsx"), Some("/login".to_string()));
+        assert_eq!(resolve_app_router_route("src/app/(dashboard)/analytics/page.tsx"), Some("/analytics".to_string()));
+        assert_eq!(resolve_app_router_route("src/app/users/[id]/page.tsx"), Some("/users/[id]".to_string()));
+        assert_eq!(resolve_app_router_route("src/components/Navbar.tsx"), None);
+        assert_eq!(resolve_app_router_route("src/app/api/auth/route.ts"), None);
+    }
+
+    #[test]
+    fn test_apply_targeted_edit_duplicated_links() {
+        let content = "
+        <nav className=\"hidden md:flex\">
+          <Link href=\"/data-grid\" className=\"text-gray-700\">Data Grid</Link>
+        </nav>
+        <div className=\"mobile-menu md:hidden\">
+          <Link href=\"/data-grid\" className=\"text-gray-700\">Data Grid</Link>
+        </div>
+        ";
+        let target = "<Link href=\"/data-grid\" className=\"text-gray-700\">Data Grid</Link>";
+        let replacement = "<Link href=\"/dashboard/data-grid\" className=\"text-gray-700\">Data Grid</Link>";
+
+        let result = apply_targeted_edit(content, target, replacement);
+        assert!(result.is_ok(), "Specific duplicate target should be replaced across all occurrences");
+        let modified = result.unwrap();
+        assert!(!modified.contains("href=\"/data-grid\""));
+        assert_eq!(modified.matches("href=\"/dashboard/data-grid\"").count(), 2);
+    }
 }
 

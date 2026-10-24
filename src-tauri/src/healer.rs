@@ -822,6 +822,24 @@ pub async fn project_heal_compile_error(
         file_path.replace('\\', "/")
     };
 
+    let path_lower = rel_file_path.to_lowercase();
+    let is_nav_or_link = path_lower.contains("navbar") 
+        || path_lower.contains("sidebar") 
+        || path_lower.contains("footer") 
+        || path_lower.contains("header") 
+        || path_lower.contains("nav")
+        || file_content.contains("<Link") 
+        || file_content.contains("next/link")
+        || error_msg.to_lowercase().contains("404");
+
+    if is_nav_or_link {
+        let project_routes = get_project_routes_from_dir(&proj_dir);
+        let routes_prompt = format_routes_prompt(&project_routes);
+        if !routes_prompt.is_empty() {
+            system_prompt.push_str(&routes_prompt);
+        }
+    }
+
     let mut project_context = String::new();
     let features_path = proj_dir.join("axiom-features.json");
     if features_path.exists() {
