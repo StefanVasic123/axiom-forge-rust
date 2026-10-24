@@ -394,9 +394,9 @@ pub fn sanitize_react_icons_imports(content: &str) -> String {
         let trimmed = line.trim();
         let is_bare_react_icons = (trimmed.starts_with("import ") || trimmed.starts_with("import{"))
             && (trimmed.ends_with("from 'react-icons';") 
-                || trimmed.ends_with("from "react-icons";")
+                || trimmed.ends_with(r#"from "react-icons";"#)
                 || trimmed.ends_with("from 'react-icons'")
-                || trimmed.ends_with("from "react-icons""));
+                || trimmed.ends_with(r#"from "react-icons""#));
 
         if is_bare_react_icons {
             if let Some(open_brace) = line.find('{') {

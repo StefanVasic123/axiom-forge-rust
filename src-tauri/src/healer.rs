@@ -614,7 +614,7 @@ pub fn is_valid_file_path(s: &str) -> bool {
     if has_valid_ext {
         return true;
     }
-    (lower.starts_with("src/") || lower.starts_with("app/") || lower.starts_with("prisma/"))
+    lower.starts_with("src/") || lower.starts_with("app/") || lower.starts_with("prisma/")
 }
 
 pub fn recursively_find_edits(value: &Value, current_path: &str, edits: &mut Vec<Value>) {
