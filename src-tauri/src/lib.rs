@@ -924,39 +924,4 @@ export const version = "1.0.0";
         assert!(NEXTJS_REACT_RULEPACK.contains("useQuery({ queryKey: ['metrics'], queryFn: fetchMetrics })"));
     }
 
-    #[test]
-    fn test_sanitize_tanstack_query_v5() {
-        let input1 = "const { data: metrics } = useQuery<EngagementMetric[], Error>('engagementMetrics', fetchEngagementMetrics);";
-        let output1 = sanitize_tanstack_query_v5(input1);
-        assert_eq!(
-            output1,
-            "const { data: metrics } = useQuery<EngagementMetric[], Error>({ queryKey: ['engagementMetrics'], queryFn: fetchEngagementMetrics });"
-        );
-
-        let input2 = "const query = useQuery(['metrics'], fetchMetrics);";
-        let output2 = sanitize_tanstack_query_v5(input2);
-        assert_eq!(
-            output2,
-            "const query = useQuery({ queryKey: ['metrics'], queryFn: fetchMetrics });"
-        );
-
-        let input3 = "const mutation = useMutation(createPost);";
-        let output3 = sanitize_tanstack_query_v5(input3);
-        assert_eq!(
-            output3,
-            "const mutation = useMutation({ mutationFn: createPost });"
-        );
-    }
-
-    #[test]
-    fn test_sanitize_next_link_imports() {
-        let input1 = "\"use client\";\n\nimport React from 'react';\n\nexport default function Page() { return <Link href=\"/home\">Home</Link>; }";
-        let output1 = sanitize_next_link_imports(input1);
-        assert!(output1.contains("import Link from 'next/link';"));
-
-        let input2 = "import { Link } from 'next/link';";
-        let output2 = sanitize_next_link_imports(input2);
-        assert_eq!(output2, "import Link from 'next/link';");
-    }
-
 }

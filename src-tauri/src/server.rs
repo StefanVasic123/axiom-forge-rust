@@ -315,7 +315,7 @@ impl CompileErrorDetector {
 
 
 
-pub fn ensure_project_files_sanitized(proj_dir: &std::path::Path) {
+pub fn ensure_react_icons_sanitized(proj_dir: &std::path::Path) {
     fn walk_and_fix(dir: &std::path::Path) {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
@@ -329,21 +329,11 @@ pub fn ensure_project_files_sanitized(proj_dir: &std::path::Path) {
                     let path_str = path.to_string_lossy();
                     if path_str.ends_with(".tsx") || path_str.ends_with(".jsx") || path_str.ends_with(".ts") || path_str.ends_with(".js") {
                         if let Ok(content) = std::fs::read_to_string(&path) {
-                            let mut fixed = content.clone();
-                            if fixed.contains("from 'react-icons'") || fixed.contains("from \"react-icons\"") {
-                                fixed = sanitize_react_icons_imports(&fixed);
-                            }
-                            if fixed.contains("useSession") && fixed.contains("setLoading") {
-                                fixed = sanitize_unhandled_session_loading(&fixed);
-                            }
-                            if fixed.contains("useQuery") || fixed.contains("useMutation") {
-                                fixed = sanitize_tanstack_query_v5(&fixed);
-                            }
-                            if fixed.contains("<Link") || fixed.contains("import { Link } from") {
-                                fixed = sanitize_next_link_imports(&fixed);
-                            }
-                            if fixed != content {
-                                let _ = std::fs::write(&path, fixed);
+                            if content.contains("from 'react-icons'") || content.contains("from \"react-icons\"") {
+                                let fixed = sanitize_react_icons_imports(&content);
+                                if fixed != content {
+                                    let _ = std::fs::write(&path, fixed);
+                                }
                             }
                         }
                     }
@@ -353,10 +343,6 @@ pub fn ensure_project_files_sanitized(proj_dir: &std::path::Path) {
     }
 
     walk_and_fix(proj_dir);
-}
-
-pub fn ensure_react_icons_sanitized(proj_dir: &std::path::Path) {
-    ensure_project_files_sanitized(proj_dir);
 }
 
 #[derive(Serialize, Deserialize)]
@@ -403,8 +389,8 @@ pub async fn server_start(
         let _ = std::fs::remove_dir_all(proj_dir.join("src/pages/api"));
     }
 
-    // Pre-flight: Auto-sanitize project files (react-icons, unhandled session loading, TanStack v5, Link imports)
-    ensure_project_files_sanitized(&proj_dir);
+    // Pre-flight: Auto-sanitize any bare 'react-icons' imports into specific subpaths (e.g. react-icons/hi)
+    ensure_react_icons_sanitized(&proj_dir);
 
     // Pre-flight: Normalize any App Router route links across the project
     let project_routes = get_project_routes_from_dir(&proj_dir);
