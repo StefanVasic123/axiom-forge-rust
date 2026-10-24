@@ -599,7 +599,7 @@ pub fn is_valid_file_path(s: &str) -> bool {
         return false;
     }
     let lower = trimmed.to_lowercase().replace('\\', "/");
-    lower.ends_with(".tsx")
+    let has_valid_ext = lower.ends_with(".tsx")
         || lower.ends_with(".ts")
         || lower.ends_with(".jsx")
         || lower.ends_with(".js")
@@ -609,8 +609,12 @@ pub fn is_valid_file_path(s: &str) -> bool {
         || lower.ends_with(".json")
         || lower.ends_with(".html")
         || lower.ends_with(".md")
-        || lower.ends_with(".svg")
-        || (lower.contains('/') && !lower.contains("import") && !lower.contains("export"))
+        || lower.ends_with(".svg");
+
+    if has_valid_ext {
+        return true;
+    }
+    (lower.starts_with("src/") || lower.starts_with("app/") || lower.starts_with("prisma/"))
 }
 
 pub fn recursively_find_edits(value: &Value, current_path: &str, edits: &mut Vec<Value>) {
@@ -631,6 +635,22 @@ pub fn recursively_find_edits(value: &Value, current_path: &str, edits: &mut Vec
                             detected_path = Some(s.to_string());
                         }
                     }
+                }
+            }
+
+            // Check if object is an import rewrite rule (e.g. { "type": "import", "from": "react-icons", "to": "react-icons/hi", "symbol": "HiOutlineChartBar" })
+            let has_import_fix = map.get("type").and_then(|t| t.as_str()) == Some("import")
+                || (map.contains_key("from") && map.contains_key("to"));
+            if has_import_fix {
+                let from_str = map.get("from").and_then(|f| f.as_str()).unwrap_or("");
+                let to_str = map.get("to").and_then(|t| t.as_str()).unwrap_or("");
+                if !from_str.is_empty() && !to_str.is_empty() {
+                    edits.push(serde_json::json!({
+                        "path": context_path.clone(),
+                        "target": format!("'{}'", from_str),
+                        "replacement": format!("'{}'", to_str)
+                    }));
+                    return;
                 }
             }
 
@@ -1050,6 +1070,13 @@ pub async fn project_heal_compile_error(
                         if resolved_edits.is_empty() {
                             let err_msg = "Model response could not be parsed as targeted JSON edits or valid whole-file code replacement.".to_string();
                             debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
+                            let _ = window.emit("server:log", serde_json::json!({
+                                "text": format!("> [AI Auto-Healing Error] {}\n", err_msg),
+                                "type": "error"
+                            }));
+                            let _ = window.emit("server:heal-status", serde_json::json!({
+                                "status": format!("Greška: {}", err_msg)
+                            }));
                             return Err(err_msg);
                         }
 

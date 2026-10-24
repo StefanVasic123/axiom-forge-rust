@@ -386,6 +386,108 @@ pub fn ensure_valid_tsconfig(proj_dir: &std::path::Path) {
     }
 }
 
+pub fn sanitize_react_icons_imports(content: &str) -> String {
+    let mut result = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
+    
+    for line in lines {
+        let trimmed = line.trim();
+        let is_bare_react_icons = (trimmed.starts_with("import ") || trimmed.starts_with("import{"))
+            && (trimmed.ends_with("from 'react-icons';") 
+                || trimmed.ends_with("from "react-icons";")
+                || trimmed.ends_with("from 'react-icons'")
+                || trimmed.ends_with("from "react-icons""));
+
+        if is_bare_react_icons {
+            if let Some(open_brace) = line.find('{') {
+                if let Some(close_brace) = line.find('}') {
+                    let icons_str = &line[open_brace + 1..close_brace];
+                    let mut subpath_map: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+                    
+                    for raw_icon in icons_str.split(',') {
+                        let icon = raw_icon.trim();
+                        if icon.is_empty() {
+                            continue;
+                        }
+                        
+                        let ident = icon.split_whitespace().next().unwrap_or(icon);
+                        
+                        let subpath = if ident.starts_with("Hi2") {
+                            "react-icons/hi2"
+                        } else if ident.starts_with("Hi") {
+                            "react-icons/hi"
+                        } else if ident.starts_with("Fa6") {
+                            "react-icons/fa6"
+                        } else if ident.starts_with("Fa") {
+                            "react-icons/fa"
+                        } else if ident.starts_with("Fi") {
+                            "react-icons/fi"
+                        } else if ident.starts_with("Md") {
+                            "react-icons/md"
+                        } else if ident.starts_with("Io5") || ident.starts_with("IoMd") || ident.starts_with("IoIos") || ident.starts_with("Io") {
+                            "react-icons/io5"
+                        } else if ident.starts_with("Ai") {
+                            "react-icons/ai"
+                        } else if ident.starts_with("Bs") {
+                            "react-icons/bs"
+                        } else if ident.starts_with("Ri") {
+                            "react-icons/ri"
+                        } else if ident.starts_with("Bi") {
+                            "react-icons/bi"
+                        } else if ident.starts_with("Tb") {
+                            "react-icons/tb"
+                        } else if ident.starts_with("Lu") {
+                            "react-icons/lu"
+                        } else if ident.starts_with("Si") {
+                            "react-icons/si"
+                        } else if ident.starts_with("Gi") {
+                            "react-icons/gi"
+                        } else if ident.starts_with("Ti") {
+                            "react-icons/ti"
+                        } else if ident.starts_with("Wi") {
+                            "react-icons/wi"
+                        } else if ident.starts_with("Cg") {
+                            "react-icons/cg"
+                        } else if ident.starts_with("Vsc") {
+                            "react-icons/vsc"
+                        } else if ident.starts_with("Go") {
+                            "react-icons/go"
+                        } else if ident.starts_with("Gr") {
+                            "react-icons/gr"
+                        } else if ident.starts_with("Rx") {
+                            "react-icons/rx"
+                        } else if ident.starts_with("Pi") {
+                            "react-icons/pi"
+                        } else if ident.starts_with("Im") {
+                            "react-icons/im"
+                        } else if ident.starts_with("Sl") {
+                            "react-icons/sl"
+                        } else if ident.starts_with("Tfi") {
+                            "react-icons/tfi"
+                        } else if ident.starts_with("Lia") {
+                            "react-icons/lia"
+                        } else {
+                            "react-icons/hi"
+                        };
+                        
+                        subpath_map.entry(subpath).or_default().push(icon);
+                    }
+                    
+                    if !subpath_map.is_empty() {
+                        for (subpath, icon_list) in subpath_map {
+                            result.push(format!("import {{ {} }} from '{}';", icon_list.join(", "), subpath));
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
+        result.push(line.to_string());
+    }
+    
+    result.join("\n")
+}
+
 pub fn post_process_generated_file(
     file_path: &str,
     content: &str,
@@ -1316,6 +1418,11 @@ export const config = {
                     .replace("import { Link } from 'next/link'", "import Link from 'next/link'")
                     .replace("import { Link } from \"next/link\"", "import Link from \"next/link\"")
                     .replace("NavLink", "Link");
+            }
+
+            // react-icons root import normalization (converts bare 'react-icons' imports into specific subpaths)
+            if processed.contains("from 'react-icons'") || processed.contains("from \"react-icons\"") {
+                processed = sanitize_react_icons_imports(&processed);
             }
 
             // Clean invalid page level react-router configurations

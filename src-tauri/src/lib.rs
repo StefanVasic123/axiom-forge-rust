@@ -867,5 +867,14 @@ export const version = "1.0.0";
         assert!(!modified.contains("href=\"/data-grid\""));
         assert_eq!(modified.matches("href=\"/dashboard/data-grid\"").count(), 2);
     }
+
+    #[test]
+    fn test_sanitize_react_icons_imports() {
+        let input = "import { HiOutlineChartBar, FaBars } from 'react-icons';\nimport React from 'react';";
+        let output = sanitize_react_icons_imports(input);
+        assert!(output.contains("import { FaBars } from 'react-icons/fa';"));
+        assert!(output.contains("import { HiOutlineChartBar } from 'react-icons/hi';"));
+        assert!(!output.contains("from 'react-icons';"));
+    }
 }
 

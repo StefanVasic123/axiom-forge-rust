@@ -22,7 +22,7 @@ import {
   File, Folder, FolderOpen, Send, Loader2, Check, X,
   RotateCcw, Sparkles, Code2, AlertCircle, Eye, Monitor,
   FunctionSquare, Search, Info, Terminal, Settings,
-  MousePointer, Crosshair
+  MousePointer, Crosshair, Play
 } from 'lucide-react';
 
 // ==================== HELPERS ====================
@@ -522,6 +522,9 @@ export default function EditorPage() {
   const [previewUrl, setPreviewUrl] = useState('http://localhost:5173');
   // Dev Server State
   const [serverRunning, setServerRunning] = useState(false);
+  const [isServerStarting, setIsServerStarting] = useState(false);
+  const [isServerStopping, setIsServerStopping] = useState(false);
+  const [iframeLoading, setIframeLoading] = useState(true);
   const [serverLogs, setServerLogs] = useState([]);
   const [cdpPort, setCdpPort] = useState(null);
   const [cdpConnected, setCdpConnected] = useState(false);
@@ -631,6 +634,11 @@ export default function EditorPage() {
         return newLogs.slice(-200); // Keep last 200 logs
       });
 
+      // If server logs indicate ready or compiling progress, update starting state
+      if (text.includes('Ready in') || text.includes('Local:') || text.includes('ready on') || text.includes('compiled successfully') || text.includes('Compiled /')) {
+        setIsServerStarting(false);
+      }
+
       // Auto-detect preview URL from server output (e.g. Next.js or Vite logs)
       if (text) {
         const match = text.match(/https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|192\.\d+\.\d+\.\d+):(\d+)/i);
@@ -691,19 +699,30 @@ export default function EditorPage() {
 
   const toggleServer = async () => {
     if (serverRunning) {
-      await window.electronAPI.server.stop(projectId);
-      setCdpPort(null);
-      setCdpConnected(false);
+      setIsServerStopping(true);
+      try {
+        await window.electronAPI.server.stop(projectId);
+        setCdpPort(null);
+        setCdpConnected(false);
+      } finally {
+        setIsServerStopping(false);
+      }
     } else {
+      setIsServerStarting(true);
+      setIframeLoading(true);
       setServerLogs([{ text: '> Starting server...', type: 'info', id: Date.now() }]);
       setShowTerminal(true);
-      const res = await window.electronAPI.server.start({ 
-        projectId, 
-        platform: project?.manifest?.platform || 'web',
-        techStack: project?.manifest?.techStack?.framework || 'nextjs'
-      });
-      if (res.success && res.cdpPort) {
-        setCdpPort(res.cdpPort);
+      try {
+        const res = await window.electronAPI.server.start({ 
+          projectId, 
+          platform: project?.manifest?.platform || 'web',
+          techStack: project?.manifest?.techStack?.framework || 'nextjs'
+        });
+        if (res.success && res.cdpPort) {
+          setCdpPort(res.cdpPort);
+        }
+      } catch (err) {
+        setIsServerStarting(false);
       }
     }
   };
@@ -724,6 +743,11 @@ export default function EditorPage() {
     } catch (err) {
       console.error("Auto-healing error:", err);
       setHealStatus('Greška pri popravci: ' + err.toString());
+      setServerLogs(prev => [...prev, {
+        text: '> [AI Auto-Healing Greška] ' + err.toString(),
+        type: 'error',
+        id: Date.now()
+      }]);
     } finally {
       setHealingInProgress(false);
     }
@@ -1303,13 +1327,22 @@ export default function EditorPage() {
 
         <button
           onClick={toggleServer}
+          disabled={isServerStarting || isServerStopping}
           className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold rounded-lg transition-colors border ${
-            serverRunning 
+            isServerStarting
+              ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+              : isServerStopping
+              ? 'bg-slate-700/50 text-slate-400 border-slate-600'
+              : serverRunning 
               ? 'bg-red-500/10 text-red-400 border-red-500/20 hover:bg-red-500/20' 
               : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20 hover:bg-emerald-500/20'
           }`}
         >
-          {serverRunning ? (
+          {isServerStarting ? (
+            <><Loader2 className="w-3.5 h-3.5 animate-spin text-amber-400" /> Pokretanje servera...</>
+          ) : isServerStopping ? (
+            <><Loader2 className="w-3.5 h-3.5 animate-spin text-slate-400" /> Zaustavljanje...</>
+          ) : serverRunning ? (
             <><div className="w-2 h-2 rounded-sm bg-red-400" /> Stop Server</>
           ) : (
             <><div className="w-0 h-0 border-t-[5px] border-t-transparent border-l-[8px] border-l-emerald-400 border-b-[5px] border-b-transparent ml-0.5" /> Start Server</>
@@ -1638,14 +1671,52 @@ export default function EditorPage() {
                       </p>
                     </div>
                   ) : (
-                    <iframe
-                      ref={webviewRef}
-                      src={previewUrl}
-                      className="flex-1 w-full border-none bg-white"
-                      title="Project Preview"
-                      sandbox="allow-same-origin allow-scripts allow-popups allow-forms"
-                      onLoad={() => syncInspectMode(isInspectMode)}
-                    />
+                    <div className="flex-1 w-full relative flex flex-col bg-slate-950">
+                      {/* Server Not Running Placeholder */}
+                      {!serverRunning && !isServerStarting && (
+                        <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-slate-900/95 text-center px-6">
+                          <Monitor className="w-14 h-14 text-indigo-400/40 mb-4" />
+                          <h3 className="text-lg font-bold text-white mb-2">Razvojni server nije pokrenut</h3>
+                          <p className="text-slate-400 text-sm max-w-md mb-5">
+                            Pokrenite lokalni Next.js dev server kako biste videli interaktivni prikaz (Preview) aplikacije u realnom vremenu.
+                          </p>
+                          <button
+                            onClick={toggleServer}
+                            className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg font-semibold text-xs shadow-lg shadow-indigo-600/30 transition-all"
+                          >
+                            <Play className="w-4 h-4 fill-white" /> Pokreni Dev Server
+                          </button>
+                        </div>
+                      )}
+
+                      {/* Server Starting / Loading Spinner Overlay */}
+                      {(isServerStarting || (serverRunning && iframeLoading)) && (
+                        <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-slate-900/90 backdrop-blur-sm text-center px-6 transition-all duration-300">
+                          <div className="relative mb-4">
+                            <div className="w-12 h-12 rounded-full border-2 border-indigo-500/20 border-t-indigo-500 animate-spin" />
+                            <Monitor className="w-5 h-5 text-indigo-400 absolute inset-0 m-auto" />
+                          </div>
+                          <h4 className="text-sm font-semibold text-white mb-1">
+                            {isServerStarting ? 'Inicijalizacija servera...' : 'Kompajliranje projekta u toku...'}
+                          </h4>
+                          <p className="text-xs text-slate-400 max-w-sm">
+                            Next.js priprema rute, komponente i bazu. Stranica će se automatski prikazati čim bude spremna.
+                          </p>
+                        </div>
+                      )}
+
+                      <iframe
+                        ref={webviewRef}
+                        src={previewUrl}
+                        className="flex-1 w-full border-none bg-white"
+                        title="Project Preview"
+                        sandbox="allow-same-origin allow-scripts allow-popups allow-forms"
+                        onLoad={() => {
+                          setIframeLoading(false);
+                          syncInspectMode(isInspectMode);
+                        }}
+                      />
+                    </div>
                   )}
                 </div>
               );
