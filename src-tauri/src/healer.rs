@@ -1180,7 +1180,13 @@ pub async fn project_heal_compile_error(
                         }));
 
                         for (edit_path, processed_content) in modified_files {
-                            let processed = post_process_generated_file(&edit_path, &processed_content, &serde_json::json!({}), has_tailwind);
+                            let mut processed = post_process_generated_file(&edit_path, &processed_content, &serde_json::json!({}), has_tailwind);
+                            let project_routes = get_project_routes_from_dir(&proj_dir);
+                            let routes_list: Vec<String> = project_routes.into_iter().map(|(r, _)| r).collect();
+                            if !routes_list.is_empty() {
+                                processed = sanitize_app_router_links_with_routes(&processed, &routes_list);
+                            }
+                            processed = sanitize_unhandled_session_loading(&processed);
                             let target_full_path = proj_dir.join(&edit_path);
                             std::fs::write(&target_full_path, &processed)
                                 .map_err(|e| {

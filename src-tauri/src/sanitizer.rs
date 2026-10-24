@@ -488,6 +488,115 @@ pub fn sanitize_react_icons_imports(content: &str) -> String {
     result.join("\n")
 }
 
+
+pub fn resolve_best_matching_route(href: &str, valid_routes: &[String]) -> Option<String> {
+    let clean = href.trim().trim_end_matches('/');
+    if valid_routes.iter().any(|r| r == clean) {
+        return None;
+    }
+    let slug = clean.split('/').filter(|s| !s.is_empty()).last()?;
+    let stripped_slug = slug.trim_end_matches("-panel").trim_end_matches("-view").trim_end_matches("-page");
+
+    let matches: Vec<&String> = valid_routes
+        .iter()
+        .filter(|r| {
+            let r_clean = r.trim_end_matches('/');
+            r_clean.ends_with(&format!("/{}", slug)) 
+                || (slug != stripped_slug && r_clean.ends_with(&format!("/{}", stripped_slug)))
+        })
+        .collect();
+
+    if matches.len() == 1 {
+        return Some(matches[0].clone());
+    }
+    None
+}
+
+pub fn sanitize_app_router_links_with_routes(content: &str, valid_routes: &[String]) -> String {
+    if valid_routes.is_empty() || (!content.contains("<Link") && !content.contains("router.push")) {
+        return content.to_string();
+    }
+
+    let mut result = content.to_string();
+
+    if let Ok(re) = regex::Regex::new(r#"href\s*=\s*(["'])(/[^"']*)\1"#) {
+        for cap in re.captures_iter(content) {
+            let quote = cap.get(1).map(|m| m.as_str()).unwrap_or("\"");
+            let href = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+            if let Some(replacement) = resolve_best_matching_route(href, valid_routes) {
+                let old_target = format!("href={}{}{}", quote, href, quote);
+                let new_target = format!("href={}{}{}", quote, replacement, quote);
+                result = result.replace(&old_target, &new_target);
+            }
+        }
+    }
+
+    if let Ok(re) = regex::Regex::new(r#"router\.push\s*\(\s*(["'])(/[^"']*)\1\s*\)"#) {
+        for cap in re.captures_iter(content) {
+            let quote = cap.get(1).map(|m| m.as_str()).unwrap_or("\"");
+            let href = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+            if let Some(replacement) = resolve_best_matching_route(href, valid_routes) {
+                let old_target = format!("router.push({}{}{})", quote, href, quote);
+                let new_target = format!("router.push({}{}{})", quote, replacement, quote);
+                result = result.replace(&old_target, &new_target);
+            }
+        }
+    }
+
+    result
+}
+
+pub fn sanitize_unhandled_session_loading(content: &str) -> String {
+    if !content.contains("useSession") || !content.contains("setLoading") {
+        return content.to_string();
+    }
+
+    if let Ok(re) = regex::Regex::new(r"(?s)if\s*\(\s*session\s*\)\s*\{([^}]+)\}(?!\s*else)") {
+        let mut modified = content.to_string();
+        for cap in re.captures_iter(content) {
+            let full_match = cap.get(0).unwrap().as_str();
+            let body = cap.get(1).unwrap().as_str();
+            if !full_match.contains("else") {
+                let replacement = format!("if (session) {{{}\n    }} else {{\n      setLoading(false);\n    }}", body);
+                modified = modified.replace(full_match, &replacement);
+            }
+        }
+        return modified;
+    }
+
+    content.to_string()
+}
+
+pub fn normalize_project_route_links(proj_dir: &std::path::Path, valid_routes: &[String]) {
+    fn walk_and_sanitize(dir: &std::path::Path, valid_routes: &[String]) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if name != "node_modules" && name != ".next" && name != "build" && name != "dist" && name != ".git" {
+                        walk_and_sanitize(&path, valid_routes);
+                    }
+                } else if path.is_file() {
+                    let path_str = path.to_string_lossy();
+                    if path_str.ends_with(".tsx") || path_str.ends_with(".jsx") {
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            if content.contains("<Link") || content.contains("router.push") {
+                                let sanitized = sanitize_app_router_links_with_routes(&content, valid_routes);
+                                if sanitized != content {
+                                    let _ = std::fs::write(&path, sanitized);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    walk_and_sanitize(proj_dir, valid_routes);
+}
+
 pub fn post_process_generated_file(
     file_path: &str,
     content: &str,
@@ -715,6 +824,10 @@ pub fn post_process_generated_file(
         if !processed.contains("legacyBehavior") {
             processed = processed.replace("<Link ", "<Link legacyBehavior ");
         }
+    }
+
+    if (path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx")) && processed.contains("useSession") {
+        processed = sanitize_unhandled_session_loading(&processed);
     }
 
     // Apply learned global healing rules

@@ -876,5 +876,45 @@ export const version = "1.0.0";
         assert!(output.contains("import { HiOutlineChartBar } from 'react-icons/hi';"));
         assert!(!output.contains("from 'react-icons';"));
     }
-}
 
+    #[test]
+    fn test_resolve_best_matching_route() {
+        let valid_routes = vec![
+            "/".to_string(),
+            "/dashboard".to_string(),
+            "/dashboard/data-grid".to_string(),
+            "/dashboard/detailed-analytics".to_string(),
+            "/dashboard/kpi-widgets".to_string(),
+            "/dashboard/settings".to_string(),
+        ];
+
+        assert_eq!(resolve_best_matching_route("/data-grid", &valid_routes), Some("/dashboard/data-grid".to_string()));
+        assert_eq!(resolve_best_matching_route("/detailed-analytics", &valid_routes), Some("/dashboard/detailed-analytics".to_string()));
+        assert_eq!(resolve_best_matching_route("/settings-panel", &valid_routes), Some("/dashboard/settings".to_string()));
+        assert_eq!(resolve_best_matching_route("/dashboard", &valid_routes), None);
+        assert_eq!(resolve_best_matching_route("/", &valid_routes), None);
+    }
+
+    #[test]
+    fn test_sanitize_app_router_links_with_routes() {
+        let valid_routes = vec![
+            "/".to_string(),
+            "/dashboard".to_string(),
+            "/dashboard/data-grid".to_string(),
+            "/dashboard/settings".to_string(),
+        ];
+        let input = r#"<Link href="/data-grid">Data Grid</Link><Link href="/settings-panel">Settings</Link>"#;
+        let output = sanitize_app_router_links_with_routes(input, &valid_routes);
+        assert!(output.contains(r#"href="/dashboard/data-grid""#));
+        assert!(output.contains(r#"href="/dashboard/settings""#));
+    }
+
+    #[test]
+    fn test_sanitize_unhandled_session_loading() {
+        let input = "import { useSession } from 'next-auth/react';\nconst [loading, setLoading] = useState(true);\nuseEffect(() => {\n  if (session) {\n    fetchKpis();\n  }\n}, [session]);";
+        let output = sanitize_unhandled_session_loading(input);
+        assert!(output.contains("else {"));
+        assert!(output.contains("setLoading(false);"));
+    }
+
+}

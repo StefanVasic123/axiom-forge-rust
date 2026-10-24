@@ -437,6 +437,12 @@ pub async fn editor_ai_edit(
                                     }
                                     
                                     if !apply_failed {
+                                        let project_routes = get_project_routes_from_dir(&proj_dir);
+                                        let routes_list: Vec<String> = project_routes.into_iter().map(|(r, _)| r).collect();
+                                        if !routes_list.is_empty() {
+                                            temp_content = sanitize_app_router_links_with_routes(&temp_content, &routes_list);
+                                        }
+                                        temp_content = sanitize_unhandled_session_loading(&temp_content);
                                         final_content = temp_content;
                                         parsed_ok = true;
                                     } else {

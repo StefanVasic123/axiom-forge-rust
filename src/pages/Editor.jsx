@@ -20,7 +20,7 @@ loader.config({
 import {
   ArrowLeft, Save, GitCommit, ChevronRight, ChevronDown,
   File, Folder, FolderOpen, Send, Loader2, Check, X,
-  RotateCcw, Sparkles, Code2, AlertCircle, Eye, Monitor,
+  RotateCcw, RotateCw, Sparkles, Code2, AlertCircle, Eye, Monitor,
   FunctionSquare, Search, Info, Terminal, Settings,
   MousePointer, Crosshair, Play
 } from 'lucide-react';
@@ -725,6 +725,19 @@ export default function EditorPage() {
         setIsServerStarting(false);
       }
     }
+  };
+
+
+  const handleReloadPreview = () => {
+    setIframeLoading(true);
+    if (webviewRef.current) {
+      try {
+        webviewRef.current.src = previewUrl;
+      } catch (e) {
+        console.warn('Reload preview error:', e);
+      }
+    }
+    setTimeout(() => setIframeLoading(false), 2500);
   };
 
   const handleHealError = async () => {
@@ -1542,8 +1555,18 @@ export default function EditorPage() {
                       <div className="w-2.5 h-2.5 rounded-full bg-yellow-400" />
                       <div className="w-2.5 h-2.5 rounded-full bg-green-400" />
                     </div>
-                    <div className="flex-1 bg-white border border-slate-300 rounded px-2 py-0.5 text-[10px] text-slate-500 flex items-center gap-2">
-                      <Info className="w-3 h-3" /> {previewUrl}
+                    <div className="flex-1 bg-white border border-slate-300 rounded px-2 py-0.5 text-[10px] text-slate-500 flex items-center justify-between gap-2 shadow-sm">
+                      <div className="flex items-center gap-1.5 truncate">
+                        <Info className="w-3 h-3 text-slate-400 shrink-0" />
+                        <span className="truncate font-mono">{previewUrl}</span>
+                      </div>
+                      <button
+                        onClick={handleReloadPreview}
+                        className="p-1 text-slate-400 hover:text-indigo-600 hover:bg-slate-100 rounded transition-colors"
+                        title="Osveži Preview stranicu"
+                      >
+                        <RotateCw className={`w-3 h-3 ${iframeLoading ? 'animate-spin text-indigo-600' : ''}`} />
+                      </button>
                     </div>
                     <div className="flex items-center bg-slate-200 p-0.5 rounded gap-1 text-[10px]">
                       <button
