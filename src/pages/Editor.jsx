@@ -751,7 +751,19 @@ export default function EditorPage() {
         compileError.errorMessage
       );
       if (res) {
+        const healedFilePath = compileError.filePath;
         setCompileError(null);
+        // Reload healed file from disk into Monaco openTabs so editor state is not stale!
+        try {
+          const readRes = await window.electronAPI.project.readFile(projectId, healedFilePath);
+          if (readRes && readRes.success && readRes.content) {
+            setOpenTabs(tabs => tabs.map(t =>
+              t.path === healedFilePath ? { ...t, content: readRes.content, isDirty: false } : t
+            ));
+          }
+        } catch (e) {
+          console.warn('Could not reload healed tab:', e);
+        }
       }
     } catch (err) {
       console.error("Auto-healing error:", err);

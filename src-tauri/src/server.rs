@@ -314,6 +314,37 @@ impl CompileErrorDetector {
 }
 
 
+
+pub fn ensure_react_icons_sanitized(proj_dir: &std::path::Path) {
+    fn walk_and_fix(dir: &std::path::Path) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if name != "node_modules" && name != ".next" && name != "build" && name != "dist" && name != ".git" {
+                        walk_and_fix(&path);
+                    }
+                } else if path.is_file() {
+                    let path_str = path.to_string_lossy();
+                    if path_str.ends_with(".tsx") || path_str.ends_with(".jsx") || path_str.ends_with(".ts") || path_str.ends_with(".js") {
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            if content.contains("from 'react-icons'") || content.contains("from \"react-icons\"") {
+                                let fixed = sanitize_react_icons_imports(&content);
+                                if fixed != content {
+                                    let _ = std::fs::write(&path, fixed);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    walk_and_fix(proj_dir);
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct ServerStartOptions {
     #[serde(rename = "projectId")]
@@ -357,6 +388,17 @@ pub async fn server_start(
     if proj_dir.join("src/app/api").exists() && proj_dir.join("src/pages/api").exists() {
         let _ = std::fs::remove_dir_all(proj_dir.join("src/pages/api"));
     }
+
+    // Pre-flight: Auto-sanitize any bare 'react-icons' imports into specific subpaths (e.g. react-icons/hi)
+    ensure_react_icons_sanitized(&proj_dir);
+
+    // Pre-flight: Normalize any App Router route links across the project
+    let project_routes = get_project_routes_from_dir(&proj_dir);
+    let routes_list: Vec<String> = project_routes.into_iter().map(|(r, _)| r).collect();
+    if !routes_list.is_empty() {
+        normalize_project_route_links(&proj_dir, &routes_list);
+    }
+
     
     // Auto-install dependencies if node_modules is missing or incomplete
     let node_modules_dir = proj_dir.join("node_modules");
