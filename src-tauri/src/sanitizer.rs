@@ -308,9 +308,9 @@ pub fn ensure_axiom_inspector_injected(proj_dir: &std::path::Path) {
         let full_path = proj_dir.join(rel_path);
         if full_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&full_path) {
-                if !content.contains("axiom-toggle-inspect") {
-                    let cleaned = if content.contains("axiom-inspect-click") {
-                        let start_marker = "<script dangerouslySetInnerHTML={{ __html: `\n        if (!window.__axiom_inspect_injected)";
+                if !content.contains("axiom-preview-error") {
+                    let cleaned = if content.contains("axiom-inspect-click") || content.contains("axiom-toggle-inspect") {
+                        let start_marker = "<script dangerouslySetInnerHTML={{ __html: `";
                         if let Some(s_idx) = content.find(start_marker) {
                             if let Some(end_rel) = content[s_idx..].find("` }} />") {
                                 let mut c = content.clone();
