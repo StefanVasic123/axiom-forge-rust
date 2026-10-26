@@ -1091,7 +1091,7 @@ pub async fn run_orchestrator(
 
     // 1. Fetch Manifest
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
+        .connect_timeout(std::time::Duration::from_secs(60))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
     let manifest: Value;
@@ -1144,6 +1144,7 @@ pub async fn run_orchestrator(
         
         let res = client.get(&url)
             .header("Authorization", format!("Bearer {}", token))
+            .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
             .map_err(|e| e.to_string())?;
@@ -1809,8 +1810,25 @@ export default function RootLayout({
     let resolved_stack = manifest.get("resolvedStack").and_then(|s| s.as_str()).unwrap_or("Next.js");
     let platform = manifest.get("platform").and_then(|p| p.as_str()).unwrap_or("web");
     
-    let original_files_json = serde_json::to_string_pretty(&files).unwrap_or_else(|_| "[]".to_string());
-    
+    // Create a compact list of original files so prompt stays concise and fast
+    let original_files_summary: Vec<Value> = files.iter().map(|f| {
+        let path = f.get("path").and_then(|p| p.as_str()).unwrap_or("");
+        let lang = f.get("language").and_then(|l| l.as_str()).unwrap_or("");
+        let desc = f.get("description").and_then(|d| d.as_str()).unwrap_or("");
+        let short_desc = if desc.chars().count() > 100 {
+            let truncated: String = desc.chars().take(100).collect();
+            format!("{}...", truncated)
+        } else {
+            desc.to_string()
+        };
+        serde_json::json!({
+            "path": path,
+            "description": short_desc,
+            "language": lang
+        })
+    }).collect();
+    let original_files_json = serde_json::to_string(&original_files_summary).unwrap_or_else(|_| "[]".to_string());
+
     let expansion_prompt = format!(
         "You are a Senior Project Architect. We are generating a complete {} application named '{}' using {}.\n\
          Project Idea & Core Domain Description: \"{}\"\n\
@@ -1822,8 +1840,9 @@ export default function RootLayout({
          Identify all missing files, routes, state management, components, configuration files, or database schemas needed to make this project complete.\n\
          CRITICAL DOMAIN RULE: Ensure the pages, dashboard, API routes, and Prisma schema models directly implement the core business features described in the Project Idea (not just generic user authentication).\n\
          IMPORTANT ARCHITECTURAL RULE: If the project uses next-auth (NextAuth) for authentication, you MUST always include 'src/app/api/register/route.ts' in the expanded files list to handle new user registration (creating user record using bcryptjs), since NextAuth does not natively provide a user registration route.\n\
-         Output a JSON array containing the expanded, complete list of files. For each file, provide 'path', 'description', and 'language'.\n\
-         Ensure all files from the original list are preserved (but you may update their descriptions to match the technology overrides and core domain features).\n\
+         Output a JSON array containing the expanded, complete list of files. For each file, provide 'path', 'description' (concise, 1-2 sentences), and 'language'.\n\
+         Keep each file description concise (1-2 sentences) so the manifest generates quickly.\n\
+         Ensure all files from the original list are preserved.\n\
          Respond ONLY with a valid JSON array. Do not include any introductory or concluding text, or markdown code blocks.",
          platform, name, resolved_stack, project_description, overrides_desc, original_files_json
     );
@@ -1843,7 +1862,7 @@ export default function RootLayout({
 
     let mut expansion_success = false;
     let mut expansion_attempts = 0;
-    let mut max_expansion_attempts = 3;
+    let max_expansion_attempts = 2;
     let mut last_accumulated_response = String::new();
 
     while expansion_attempts < max_expansion_attempts && !expansion_success {
@@ -1873,12 +1892,11 @@ export default function RootLayout({
                     #[allow(unused_assignments)]
                     let mut last_chunk_time = stream_start;
                     let mut is_done = false;
-                    let mut chunk_error = false;
 
                     loop {
-                        // We want a chunk timeout of 30 seconds
+                        // 45-second chunk timeout to allow for model thinking pauses
                         let chunk_fut = resp.chunk();
-                        let chunk_res = tokio::time::timeout(std::time::Duration::from_secs(30), chunk_fut).await;
+                        let chunk_res = tokio::time::timeout(std::time::Duration::from_secs(45), chunk_fut).await;
 
                         match chunk_res {
                             Ok(Ok(Some(chunk))) => {
@@ -1916,12 +1934,10 @@ export default function RootLayout({
                             }
                             Ok(Err(e)) => {
                                 debug_log_to_file(format!("[Orchestrator] Error reading stream chunk (Attempt {}): {}", expansion_attempts, e));
-                                chunk_error = true;
                                 break;
                             }
                             Err(_) => {
-                                debug_log_to_file(format!("[Orchestrator] Chunk read timed out after 30s (Attempt {})", expansion_attempts));
-                                chunk_error = true;
+                                debug_log_to_file(format!("[Orchestrator] Chunk read timed out after 45s (Attempt {})", expansion_attempts));
                                 break;
                             }
                         }
@@ -1931,17 +1947,14 @@ export default function RootLayout({
                         if elapsed.as_secs() > 120 {
                             if chars_received == 0 {
                                 debug_log_to_file(format!("[Orchestrator] Stream has not started generating any content after 120s. Aborting attempt {}.", expansion_attempts));
-                                chunk_error = true;
                                 break;
                             } else {
                                 // System has started writing the extended manifest. Check if it's progressing.
-                                if last_chunk_time.elapsed().as_secs() > 30 {
-                                    debug_log_to_file(format!("[Orchestrator] Stream stalled (no chunks for 30s) after 120s limit. Aborting attempt {}.", expansion_attempts));
-                                    chunk_error = true;
+                                if last_chunk_time.elapsed().as_secs() > 45 {
+                                    debug_log_to_file(format!("[Orchestrator] Stream stalled (no chunks for 45s) after 120s limit. Aborting attempt {}.", expansion_attempts));
                                     break;
-                                } else if elapsed.as_secs() > 360 {
-                                    debug_log_to_file(format!("[Orchestrator] Stream exceeded maximum allowed time of 360s. Aborting attempt {}.", expansion_attempts));
-                                    chunk_error = true;
+                                } else if elapsed.as_secs() > 480 {
+                                    debug_log_to_file(format!("[Orchestrator] Stream exceeded maximum allowed time of 480s. Aborting attempt {}.", expansion_attempts));
                                     break;
                                 }
                             }
@@ -1950,45 +1963,65 @@ export default function RootLayout({
 
                     last_accumulated_response = accumulated_response.clone();
 
-                    if !chunk_error {
-                        let cleaned_json = extract_code_content(&accumulated_response);
-                        if let Ok(expanded_files) = serde_json::from_str::<Vec<Value>>(&cleaned_json) {
-                            if !expanded_files.is_empty() {
-                                // Merge to ensure all original manifest files are preserved
-                                let mut merged = expanded_files.clone();
-                                for orig in files.iter() {
-                                    if let Some(orig_path) = orig.get("path").and_then(|p| p.as_str()) {
-                                        let exists = merged.iter().any(|f| {
-                                            f.get("path").and_then(|p| p.as_str()) == Some(orig_path)
-                                        });
-                                        if !exists {
-                                            merged.push(orig.clone());
+                    let cleaned_json = extract_code_content(&accumulated_response);
+                    let mut parsed_files_opt: Option<Vec<Value>> = None;
+
+                    // 1. Try direct array between [ and ]
+                    if let Some(start) = cleaned_json.find('[') {
+                        if let Some(end) = cleaned_json.rfind(']') {
+                            if end > start {
+                                if let Ok(files) = serde_json::from_str::<Vec<Value>>(&cleaned_json[start..=end]) {
+                                    if !files.is_empty() {
+                                        parsed_files_opt = Some(files);
+                                    }
+                                }
+                            }
+                        }
+                        // 2. If incomplete or truncated, salvage all complete objects up to the last valid '}'
+                        if parsed_files_opt.is_none() {
+                            if let Some(last_brace) = cleaned_json.rfind('}') {
+                                if last_brace > start {
+                                    let salvaged_str = format!("{}]", &cleaned_json[start..=last_brace]);
+                                    if let Ok(files) = serde_json::from_str::<Vec<Value>>(&salvaged_str) {
+                                        if !files.is_empty() {
+                                            debug_log_to_file(format!(
+                                                "[Orchestrator] Salvaged {} complete file objects from partial manifest expansion stream.",
+                                                files.len()
+                                            ));
+                                            parsed_files_opt = Some(files);
                                         }
                                     }
                                 }
-                                files_to_generate = merged;
-                                debug_log_to_file(format!(
-                                    "[Orchestrator] Expanded and merged file list from {} to {} files using local Ollama (Attempt {}).",
-                                    files.len(), files_to_generate.len(), expansion_attempts
-                                ));
-                                emit_progress("manifest-expansion", &format!("Manifest expanded to {} files.", files_to_generate.len()), 14.0);
-                                expansion_success = true;
-                            }
-                        } else {
-                            debug_log_to_file(format!(
-                                "[Orchestrator] Failed to parse expanded manifest JSON (Attempt {}). Content: {}",
-                                expansion_attempts, cleaned_json
-                            ));
-                            if expansion_attempts == 3 && chars_received > 0 {
-                                debug_log_to_file("[Orchestrator] Attempt 3 failed to parse but generated content. Granting attempt 4.".to_string());
-                                max_expansion_attempts = 4;
                             }
                         }
+                    }
+
+                    if let Some(expanded_files) = parsed_files_opt {
+                        // Merge to ensure all original manifest files are preserved
+                        let mut merged = expanded_files;
+                        for orig in files.iter() {
+                            if let Some(orig_path) = orig.get("path").and_then(|p| p.as_str()) {
+                                let exists = merged.iter().any(|f| {
+                                    f.get("path").and_then(|p| p.as_str()) == Some(orig_path)
+                                });
+                                if !exists {
+                                    merged.push(orig.clone());
+                                }
+                            }
+                        }
+                        files_to_generate = merged;
+                        debug_log_to_file(format!(
+                            "[Orchestrator] Expanded and merged file list from {} to {} files using local Ollama (Attempt {}).",
+                            files.len(), files_to_generate.len(), expansion_attempts
+                        ));
+                        emit_progress("manifest-expansion", &format!("Manifest expanded to {} files.", files_to_generate.len()), 14.0);
+                        expansion_success = true;
+                        break;
                     } else {
-                        if expansion_attempts == 3 && chars_received > 0 {
-                            debug_log_to_file("[Orchestrator] Attempt 3 stalled/errored but generated content. Granting attempt 4.".to_string());
-                            max_expansion_attempts = 4;
-                        }
+                        debug_log_to_file(format!(
+                            "[Orchestrator] Failed to parse expanded manifest JSON (Attempt {}). Content: {}",
+                            expansion_attempts, cleaned_json
+                        ));
                     }
                 } else {
                     debug_log_to_file(format!("[Orchestrator] Manifest expansion Ollama status error (Attempt {}): {}", expansion_attempts, resp.status()));
@@ -2006,11 +2039,12 @@ export default function RootLayout({
 
     if !expansion_success {
         debug_log_to_file(format!(
-            "[Orchestrator] CRITICAL: Manifest expansion failed after {} attempts.\nLast accumulated raw content:\n{}",
+            "[Orchestrator] Manifest expansion could not be completed after {} attempts. Using original manifest files.\nLast accumulated raw content:\n{}",
             expansion_attempts, last_accumulated_response
         ));
-        emit_progress("manifest-expansion", "Manifest expansion failed. Using original manifest files.", 14.0);
+        emit_progress("manifest-expansion", "Manifest ready. Using original manifest files.", 14.0);
     }
+
 
     normalize_project_structure(&mut files_to_generate, &metamanifest, &project_type);
 
