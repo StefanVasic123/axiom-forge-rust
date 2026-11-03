@@ -1374,6 +1374,16 @@ export { handler as GET, handler as POST };
 "#.to_string();
         }
 
+        // React Native web icon leakage safeguard (auto-correct to lucide-react-native)
+        if path_lower.contains("react-native") || path_lower.contains("expo") {
+            if processed.contains("from 'lucide-react'") {
+                processed = processed.replace("from 'lucide-react'", "from 'lucide-react-native'");
+            }
+            if processed.contains("from \"lucide-react\"") {
+                processed = processed.replace("from \"lucide-react\"", "from \"lucide-react-native\"");
+            }
+        }
+
         // Next.js Edge Middleware safeguard: prevent Express middleware leakage or missing middleware export
         if path_lower.ends_with("middleware.ts") || path_lower.ends_with("middleware.js") {
             let has_express = processed.contains("'express'") || processed.contains("\"express\"") || processed.contains("NextFunction");

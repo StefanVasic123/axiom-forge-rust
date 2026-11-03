@@ -654,7 +654,12 @@ pub const REACT_NATIVE_EXPO_RULEPACK: &str = r#"REACT NATIVE & EXPO MOBILE RULES
 11. FONT & SPLASH SCREEN LOADING: Call `SplashScreen.preventAutoHideAsync()` at module load and gate UI rendering on font load completion: `const [loaded] = useFonts({...}); if (!loaded) return null;`.
 12. ICONS IMPORT SOURCE: Always import icons from `@expo/vector-icons` (e.g. `Ionicons`, `MaterialIcons`). Never import web icon packages (e.g. `react-icons`) which depend on the DOM.
 13. LIST VIRTUALIZATION: Never render large arrays using ScrollView + .map(). Always use `<FlatList data={items} keyExtractor={(item) => item.id} renderItem={({item}) => <Row item={item} />} />` with a stable unique keyExtractor.
-14. SAFE AREA AWARENESS: Wrap top-level screens in `<SafeAreaView style={{ flex: 1 }}>` (from `react-native-safe-area-context`) to avoid rendering behind the device notch, status bar, or home indicator."#;
+14. SAFE AREA AWARENESS: Wrap top-level screens in `<SafeAreaView style={{ flex: 1 }}>` (from `react-native-safe-area-context`) to avoid rendering behind the device notch, status bar, or home indicator.
+15. NO COMPOSITE BORDER OR BOXSHADOW STRINGS: In React Native, `border: "1px solid #ccc"` and `boxShadow: "..."` are strictly INVALID and will crash the JavaScript runtime. Always split borders into individual numeric properties: `{ borderWidth: 1, borderColor: '#ccc', borderStyle: 'solid' }`. For shadows, use platform-specific styling: Android uses `{ elevation: 4 }`; iOS uses `{ shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.15, shadowRadius: 4 }`.
+16. MANDATORY CONTENTCONTAINERSTYLE FOR SCROLLABLE CONTAINERS: Inside `<ScrollView>` and `<FlatList>`, internal padding, bottom margins, and item alignment MUST be applied via `contentContainerStyle={{ padding: 16, paddingBottom: 80 }}`. Applying padding to `style` clips content and prevents scrolling to the bottom.
+17. ICONS IMPORT RESTRICTION (NO WEB LUCIDE OR REACT-ICONS): Never import from 'lucide-react' or 'react-icons'. They depend on browser SVG elements and crash React Native. Always import icons from '@expo/vector-icons' (e.g. `import { Ionicons } from '@expo/vector-icons'`) or 'lucide-react-native'.
+18. EXPO ROUTER (V3/V4) NAVIGATION STANDARD: Modern Expo projects use file-based Expo Router under `app/`. Every route file must export a default component (`export default function Screen()`). Navigate using `import { useRouter } from 'expo-router'; const router = useRouter(); router.push('/details');`. Never wrap screens in `<NavigationContainer>` when using Expo Router.
+19. OFFLINE-FIRST RESILIENCE & ERROR BOUNDARIES: All network requests (e.g. `fetch` or `axios`) must be wrapped in `try/catch`. On network failure, populate state with cached data from `@react-native-async-storage/async-storage` or render an informative offline fallback view with a retry action. Never leave screens blank on network failure."#;
 
 pub const DESKTOP_RULEPACK: &str = r#"DESKTOP (ELECTRON & TAURI) RULES:
 1. ELECTRON CONTEXT ISOLATION: Never call require('electron'), require('fs'), or use ipcRenderer directly inside renderer/React components. In `main.js`, configure `webPreferences: { contextIsolation: true, nodeIntegration: false, preload: path.join(__dirname, 'preload.js') }`.
@@ -668,7 +673,12 @@ pub const DESKTOP_RULEPACK: &str = r#"DESKTOP (ELECTRON & TAURI) RULES:
 9. TAURI STATE MANAGEMENT: Access shared state via `tauri::State<Mutex<AppState>>` registered with `.manage(Mutex::new(AppState::default()))`. Never block the UI thread with long-running synchronous operations.
 10. TAURI V2 CAPABILITIES & PERMISSIONS: In Tauri v2, declare all plugin permissions (e.g. `"fs:allow-read-file"`) in `src-tauri/capabilities/*.json`. Calls to unlisted permissions will be rejected by ACL.
 11. EVENT SYSTEM VS COMMAND INVOKE: Use `window.emit("channel", payload)` from backend and `listen("channel", callback)` from frontend for backend-pushed notifications (progress, file watchers). Use commands for frontend-initiated calls.
-12. NO CROSS-PLATFORM POLLUTION: Never reference `window.electronAPI` inside Tauri applications, and never use Tauri `invoke` inside Electron."#;
+12. NO CROSS-PLATFORM POLLUTION: Never reference `window.electronAPI` inside Tauri applications, and never use Tauri `invoke` inside Electron.
+13. NO MUTEXGUARD ACROSS .AWAIT (SEND TRAIT RULE): In async Rust code, NEVER hold a standard `std::sync::MutexGuard` across an `.await` boundary. Standard `MutexGuard` does not implement `Send`, causing fatal compiler error: "future cannot be sent between threads safely". Either use `tokio::sync::Mutex`, or acquire the lock, clone the needed value into a local variable, drop the guard (`drop(guard)`), and only then execute `.await`.
+14. TAURI V2 EMITTER & EVENT SYSTEM: In Tauri v2, emitting events from backend requires the `tauri::Emitter` trait: always add `use tauri::Emitter;` at the top of the file when calling `window.emit("channel", payload)` or `app_handle.emit("channel", payload)`. Listening requires `use tauri::Listener;`.
+15. SERDE DERIVE ON ALL IPC DATA STRUCTURES: Any struct, enum, or DTO sent to or received from frontend commands MUST implement `serde::Serialize` and `serde::Deserialize`: always annotate with `#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]`. Omitting these causes fatal trait bound errors in `#[tauri::command]`.
+16. LIFETIME-SAFE ERROR CONVERSION: Never return static string slices `Result<T, &'static str>` or dangling references from Tauri commands. Always map errors into owned `String` instances using `.map_err(|e| e.to_string())`.
+17. NON-BLOCKING TOKIO WORKERS: CPU-intensive operations (heavy computation, cryptographic operations like `bcrypt`) and blocking filesystem calls must be offloaded using `tokio::task::spawn_blocking(move || { ... }).await` to prevent starving the Tokio async worker pool and freezing the application window."#;
 
 pub const PRISMA_DATABASE_RULEPACK: &str = r#"PRISMA ORM & DATABASE RULES:
 1. SERVER-ONLY BOUNDARY: Prisma Client (`@prisma/client`) must NEVER be imported or instantiated in client components or files marked with `'use client'`. Database operations belong strictly in Server Components, Route Handlers (`app/api/**/route.ts`), or Server Actions (`'use server'`).
@@ -847,8 +857,11 @@ pub fn get_expert_system_prompt(
              RUST IMPLEMENTATION RULES:\n\
              - Write idiomatic, memory-safe Rust adhering to ownership, borrowing, and lifetime rules.\n\
              - Implement robust error handling with Result<T, E> and Option<T>, avoiding bare unwrap() in production paths.\n\
-             - Use serde::{{Serialize, Deserialize}} for data structures requiring serialization.\n\
-             - If this file defines Tauri commands, annotate handlers with #[tauri::command] and return clean Result types.\n\
+             - Use serde::{{Serialize, Deserialize}} for data structures requiring serialization: annotate structs with #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)].\n\
+             - If this file defines Tauri commands, annotate handlers with #[tauri::command] and return clean Result<T, String> types mapped via .map_err(|e| e.to_string()).\n\
+             - NO MUTEXGUARD ACROSS .AWAIT: Never hold a std::sync::MutexGuard across an .await boundary. Use tokio::sync::Mutex or drop the guard before awaiting.\n\
+             - TAURI V2 EVENTS: When emitting events via window.emit() or app_handle.emit(), always import `use tauri::Emitter;` at the top of the file.\n\
+             - NON-BLOCKING WORKERS: Offload CPU-heavy or blocking filesystem operations using tokio::task::spawn_blocking.\n\
              - STRICTLY NO JavaScript, TypeScript, HTML, CSS, or Node.js imports in Rust code.\n\
              FILE: {}\n",
             file_path
@@ -891,8 +904,11 @@ pub fn get_expert_system_prompt(
             "You are a Senior React Native Mobile Engineer. Write only clean, production-ready React Native / Expo code wrapped in markdown code blocks. No explanations.\n\n\
              REACT NATIVE RULES:\n\
              - MOBILE UI ONLY: NEVER use HTML DOM tags (no <div>, <p>, <span>, <a>, <button>, or <html>). ALWAYS use React Native core components (<View>, <Text>, <TouchableOpacity>, <ScrollView>, <FlatList>, <TextInput>, <SafeAreaView>).\n\
-             - STYLING: Use StyleSheet.create({{ ... }}) or NativeWind classes. Do NOT use web CSS stylesheets.\n\
-             - NAVIGATION: Use React Navigation or Expo Router conventions (never Next.js Link or Next.js router).\n\
+             - NO CSS STRINGS OR BOXSHADOW: Never write `border: \"1px solid ...\"` or `boxShadow`. Use individual border properties (`borderWidth: 1, borderColor: '#...'`) and elevation (Android) / shadow* (iOS).\n\
+             - SCROLL CONTAINER STYLING: Always use `contentContainerStyle={{ padding: 16 }}` on ScrollView and FlatList for inner padding, not `style`.\n\
+             - ICONS: NEVER import from 'lucide-react' or 'react-icons'. Import from '@expo/vector-icons' (e.g. Ionicons) or 'lucide-react-native'.\n\
+             - NAVIGATION: Use Expo Router (`import {{ useRouter }} from 'expo-router'`) or React Navigation. Never use Next.js Link or router.\n\
+             - OFFLINE RESILIENCE: Wrap fetch calls in try/catch and provide fallback data or cached AsyncStorage state.\n\
              - CLIENT-SIDE ONLY: Never import @prisma/client or Node.js server modules.\n\
              FILE: {}\n",
             file_path
