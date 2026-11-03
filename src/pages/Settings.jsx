@@ -5,7 +5,8 @@
 
 import React, { useState, useEffect } from 'react';
 import { 
-  Key, 
+  Key,
+  Globe, 
   Server, 
   Shield, 
   ExternalLink, 
@@ -23,6 +24,7 @@ import {
   Loader2
 } from 'lucide-react';
 import { useAppStore } from '../hooks/useAppStore';
+import { useI18n, LanguageSelector } from '../i18n/I18nContext';
 import { verifyCompatibility } from '../lib/compatibility';
 
 // Token input component
@@ -199,6 +201,7 @@ function TokenInput({
 }
 
 function Settings() {
+  const { t, locale, setLocale, locales } = useI18n();
   const { saveToken, checkTokens, tokensConfigured, setAppMode } = useAppStore();
   const [ollamaHost, setOllamaHost] = useState('http://127.0.0.1:11434');
   const [builderModel, setBuilderModel] = useState('');
@@ -397,9 +400,46 @@ function Settings() {
     <div className="max-w-3xl mx-auto space-y-8">
       {/* Header */}
       <div>
-        <h1 className="text-2xl font-bold text-white">Settings</h1>
-        <p className="text-slate-400">Manage your API tokens and preferences</p>
+        <h1 className="text-2xl font-bold text-white">{t('settings.title')}</h1>
+        <p className="text-slate-400">{t('settings.subtitle')}</p>
       </div>
+
+      {/* Language Section */}
+      <section className="card p-6 space-y-6">
+        <div className="flex items-center justify-between pb-4 border-b border-slate-800">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-lg bg-indigo-500/10 flex items-center justify-center">
+              <Globe className="w-5 h-5 text-indigo-400" />
+            </div>
+            <div>
+              <h2 className="text-lg font-semibold text-white">{t('settings.languageTitle')}</h2>
+              <p className="text-sm text-slate-500">{t('settings.languageSubtitle')}</p>
+            </div>
+          </div>
+          <LanguageSelector />
+        </div>
+
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+          {Object.values(locales).map((item) => (
+            <button
+              key={item.code}
+              type="button"
+              onClick={() => setLocale(item.code)}
+              className={`p-3 rounded-xl border flex items-center gap-3 transition-all ${
+                locale === item.code
+                  ? 'bg-indigo-600/20 border-indigo-500 text-white shadow-sm shadow-indigo-500/20'
+                  : 'bg-slate-900/40 border-slate-800 text-slate-400 hover:text-white hover:bg-slate-800/40'
+              }`}
+            >
+              <span className="text-xl">{item.flag}</span>
+              <div className="text-left">
+                <p className="text-xs font-semibold">{item.nativeName}</p>
+                <p className="text-[10px] text-slate-500">{item.name}</p>
+              </div>
+            </button>
+          ))}
+        </div>
+      </section>
 
       {/* API Tokens Section */}
       <section className="card p-6 space-y-6">
@@ -408,10 +448,8 @@ function Settings() {
             <Key className="w-5 h-5 text-indigo-400" />
           </div>
           <div>
-            <h2 className="text-lg font-semibold text-white">API Tokens</h2>
-            <p className="text-sm text-slate-500">
-              Your tokens are encrypted and stored locally
-            </p>
+            <h2 className="text-lg font-semibold text-white">{t('settings.tokensTitle')}</h2>
+            <p className="text-sm text-slate-500">{t('settings.tokensSubtitle')}</p>
           </div>
         </div>
 
@@ -482,16 +520,14 @@ function Settings() {
             <Server className="w-5 h-5 text-orange-400" />
           </div>
           <div>
-            <h2 className="text-lg font-semibold text-white">Ollama & AI Model</h2>
-            <p className="text-sm text-slate-500">
-              Configure your local AI engine and generation model
-            </p>
+            <h2 className="text-lg font-semibold text-white">{t('settings.ollamaTitle')}</h2>
+            <p className="text-sm text-slate-500">{t('settings.ollamaSubtitle')}</p>
           </div>
         </div>
 
         <div className="space-y-4">
           <div>
-            <label className="label">Ollama Host</label>
+            <label className="label">{t('settings.ollamaHost')}</label>
             <div className="flex gap-2">
               <input
                 type="text"
@@ -516,13 +552,13 @@ function Settings() {
             {ollamaStatus === 'connected' && (
               <p className="text-xs text-emerald-400 mt-2 flex items-center gap-1">
                 <CheckCircle2 className="w-3 h-3" />
-                Connected to Ollama
+                {t('settings.connectedOllama')}
               </p>
             )}
             {ollamaStatus === 'error' && (
               <p className="text-xs text-rose-400 mt-2 flex items-center gap-1">
                 <AlertCircle className="w-3 h-3" />
-                Could not connect to Ollama
+                {t('settings.couldNotConnect')}
               </p>
             )}
           </div>
@@ -561,7 +597,7 @@ function Settings() {
           <div>
             <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 mb-4">
               <div>
-                <label className="label mb-0">AI Model Suite</label>
+                <label className="label mb-0">{t('settings.modelSuite')}</label>
                 <span className="text-xs text-slate-500 block mt-0.5">Select models for code building and code editing roles</span>
               </div>
               <div className="flex bg-slate-900/80 p-1 rounded-xl border border-slate-800/80 w-fit">
@@ -574,7 +610,7 @@ function Settings() {
                       : 'text-slate-400 hover:text-slate-200'
                   }`}
                 >
-                  🛠️ Code Builder
+                  🛠️ {t('settings.builderRole')}
                 </button>
                 <button
                   type="button"
@@ -585,7 +621,7 @@ function Settings() {
                       : 'text-slate-400 hover:text-slate-200'
                   }`}
                 >
-                  ✏️ Code Editor
+                  ✏️ {t('settings.editorRole')}
                 </button>
               </div>
             </div>
@@ -972,10 +1008,8 @@ function Settings() {
             <Shield className="w-5 h-5 text-emerald-400" />
           </div>
           <div>
-            <h2 className="text-lg font-semibold text-white">Security</h2>
-            <p className="text-sm text-slate-500">
-              Manage your stored data
-            </p>
+            <h2 className="text-lg font-semibold text-white">{t('settings.securityTitle')}</h2>
+            <p className="text-sm text-slate-500">{t('settings.securitySubtitle')}</p>
           </div>
         </div>
 
@@ -987,16 +1021,16 @@ function Settings() {
             </p>
             <button
               onClick={async () => {
-                if (confirm('Are you sure you want to clear all tokens?')) {
+                if (confirm(t('settings.clearAllConfirm'))) {
                   await window.electronAPI.security.clearAllTokens();
                   await checkTokens();
-                  alert('All tokens cleared');
+                  alert(t('settings.allTokensCleared'));
                 }
               }}
               className="btn-danger"
             >
               <Trash2 className="w-4 h-4" />
-              Clear All Tokens
+              {t('settings.clearAllTokens')}
             </button>
           </div>
 
@@ -1017,20 +1051,16 @@ function Settings() {
             <Sliders className="w-5 h-5 text-indigo-400" />
           </div>
           <div>
-            <h2 className="text-lg font-semibold text-white">Agency & Dual-Mode</h2>
-            <p className="text-sm text-slate-500">
-              Configure agency setup and client-facing mode
-            </p>
+            <h2 className="text-lg font-semibold text-white">{t('settings.agencyTitle')}</h2>
+            <p className="text-sm text-slate-500">{t('settings.agencySubtitle')}</p>
           </div>
         </div>
 
         <div className="space-y-4">
           <div className="p-4 bg-slate-800/50 rounded-lg flex items-center justify-between">
             <div>
-              <h3 className="font-medium text-white mb-1">Switch to Client Mode</h3>
-              <p className="text-xs text-slate-400">
-                Locks the UI into a simplified float overlay for non-technical clients.
-              </p>
+              <h3 className="font-medium text-white mb-1">{t('settings.clientModeTitle')}</h3>
+              <p className="text-xs text-slate-400">{t('settings.clientModeDesc')}</p>
             </div>
             <button
               onClick={async () => {
@@ -1042,7 +1072,7 @@ function Settings() {
               }}
               className="btn-secondary text-xs px-4 py-2"
             >
-              Enter Client Mode
+              {t('settings.enterClientMode')}
             </button>
           </div>
         </div>
@@ -1052,10 +1082,8 @@ function Settings() {
       <section className="card p-6">
         <div className="flex items-center justify-between">
           <div>
-            <h2 className="text-lg font-semibold text-white">About Axiom Forge</h2>
-            <p className="text-sm text-slate-500">
-              Open-source local agent for the idea-to-app pipeline
-            </p>
+            <h2 className="text-lg font-semibold text-white">{t('settings.aboutTitle')}</h2>
+            <p className="text-sm text-slate-500">{t('settings.aboutSubtitle')}</p>
           </div>
           <div className="text-right">
             <p className="text-sm text-slate-400 font-mono">Version 1.1.9</p>
@@ -1067,7 +1095,7 @@ function Settings() {
               }}
               className="text-xs text-indigo-400 hover:text-indigo-300"
             >
-              View on GitHub
+              {t('settings.viewGithub')}
             </a>
           </div>
         </div>

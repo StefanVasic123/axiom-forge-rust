@@ -19,6 +19,7 @@ import {
   Shield
 } from 'lucide-react';
 import { useAppStore } from '../hooks/useAppStore';
+import { useI18n } from '../i18n/I18nContext';
 
 // Environment variable field with help tooltip
 function EnvField({ 
@@ -210,6 +211,7 @@ const SERVICE_PRESETS = {
 
 // Main ProjectConfig Component
 function ProjectConfig() {
+  const { t } = useI18n();
   const { projectId } = useParams();
   const navigate = useNavigate();
   const { 
@@ -376,7 +378,7 @@ function ProjectConfig() {
           <ArrowLeft className="w-5 h-5" />
         </button>
         <div>
-          <h1 className="text-2xl font-bold text-white">Configure Project</h1>
+          <h1 className="text-2xl font-bold text-white">{t('projectConfig.title')}</h1>
           <p className="text-slate-400">Set up environment variables for {project.name}</p>
         </div>
       </div>
@@ -582,7 +584,7 @@ function ProjectConfig() {
           <div className="flex items-start gap-3">
             <CheckCircle2 className="w-5 h-5 text-emerald-400 flex-shrink-0 mt-0.5" />
             <p className="text-sm text-emerald-400">
-              Configuration saved successfully! Redirecting...
+              {t('projectConfig.savedSuccess')}
             </p>
           </div>
         </div>
@@ -610,7 +612,7 @@ function ProjectConfig() {
           ) : (
             <>
               <Save className="w-4 h-4" />
-              Save Configuration
+              {t('projectConfig.saveConfig')}
             </>
           )}
         </button>

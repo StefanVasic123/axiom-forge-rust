@@ -7,6 +7,7 @@ import ReactDOM from 'react-dom/client';
 import { HashRouter, Routes, Route } from 'react-router-dom';
 import App from './App';
 import FloatingProgress from './components/FloatingProgress';
+import { I18nProvider } from './i18n/I18nContext';
 import './styles/index.css';
 import './lib/ipc-bridge';
 
@@ -73,12 +74,14 @@ const isFloatingWindow = window.location.hash.includes('/floating') ||
 
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
-    {isFloatingWindow ? (
-      <FloatingProgress />
-    ) : (
-      <HashRouter>
-        <App />
-      </HashRouter>
-    )}
+    <I18nProvider>
+      {isFloatingWindow ? (
+        <FloatingProgress />
+      ) : (
+        <HashRouter>
+          <App />
+        </HashRouter>
+      )}
+    </I18nProvider>
   </React.StrictMode>
 );

@@ -35,6 +35,7 @@ const PHASE_DISPLAY = {
 };
 
 function FloatingProgress() {
+  const { t } = useI18n();
   const [isMinimized, setIsMinimized] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
   const [showStopConfirm, setShowStopConfirm] = useState(false);
@@ -306,7 +307,8 @@ function FloatingProgress() {
           </div>
         </div>
         
-        <div className="flex items-center gap-1 window-no-drag">
+        <div className="flex items-center gap-2 window-no-drag">
+          <LanguageSelector />
           <button
             onClick={() => setShowLogs(!showLogs)}
             className={`p-2 rounded-lg transition-colors ${
@@ -434,19 +436,19 @@ function FloatingProgress() {
                 onClick={handlePause}
                 disabled={isActionLoading}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500/10 text-amber-400 hover:bg-amber-500/20 transition-colors text-xs font-medium"
-                title="Pauziraj generisanje"
+                title={t('floating.pauseTooltip')}
               >
                 <Pause className="w-3.5 h-3.5" />
-                Pauziraj
+                {t('common.pause')}
               </button>
               <button
                 onClick={handleRequestStop}
                 disabled={isActionLoading}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rose-500/10 text-rose-400 hover:bg-rose-500/20 transition-colors text-xs font-medium"
-                title="Prekini generisanje"
+                title={t('floating.stopTooltip')}
               >
                 <X className="w-3.5 h-3.5" />
-                Prekini
+                {t('common.stop')}
               </button>
             </>
           )}
@@ -458,10 +460,10 @@ function FloatingProgress() {
                 onClick={handleResume}
                 disabled={isActionLoading}
                 className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-emerald-600 text-white hover:bg-emerald-500 shadow-md shadow-emerald-600/20 transition-colors text-xs font-semibold"
-                title="Nastavi generisanje"
+                title={t('floating.resumeTooltip')}
               >
                 <Play className="w-3.5 h-3.5" />
-                Nastavi
+                {t('common.resume')}
               </button>
               <button
                 onClick={handleRequestStop}

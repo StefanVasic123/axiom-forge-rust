@@ -19,6 +19,7 @@ import {
   Globe
 } from 'lucide-react';
 import { useAppStore } from '../hooks/useAppStore';
+import { useI18n, LanguageSelector } from '../i18n/I18nContext';
 
 const STEPS = [
   { id: 'welcome', title: 'Welcome', description: 'Get started with Axiom Forge' },
@@ -68,6 +69,7 @@ function StepIndicator({ currentStep, steps }) {
 }
 
 function WelcomeStep({ onNext }) {
+  const { t } = useI18n();
   return (
     <div className="text-center space-y-6">
       <div className="w-20 h-20 mx-auto rounded-2xl bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center shadow-xl shadow-indigo-500/20">

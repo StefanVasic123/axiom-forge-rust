@@ -21,10 +21,12 @@ import {
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useAppStore } from '../hooks/useAppStore';
+import { useI18n, LanguageSelector } from '../i18n/I18nContext';
 
 function Sidebar() {
   const location = useLocation();
   const { tokensConfigured } = useAppStore();
+  const { t } = useI18n();
   const [version, setVersion] = React.useState('...');
 
   React.useEffect(() => {
@@ -36,10 +38,10 @@ function Sidebar() {
   }, []);
 
   const navItems = [
-    { path: '/', icon: LayoutDashboard, label: 'Dashboard' },
-    { path: '/agency-dashboard', icon: GitPullRequest, label: 'Agency Review' },
-    { path: '/ai-optimizer', icon: Brain, label: 'AI Optimizer' },
-    { path: '/settings', icon: Settings, label: 'Settings' }
+    { path: '/', icon: LayoutDashboard, label: t('nav.dashboard') },
+    { path: '/agency-dashboard', icon: GitPullRequest, label: t('nav.agencyReview') },
+    { path: '/ai-optimizer', icon: Brain, label: t('nav.aiOptimizer') },
+    { path: '/settings', icon: Settings, label: t('nav.settings') }
   ];
 
   const isActive = (path) => location.pathname === path;
@@ -54,7 +56,7 @@ function Sidebar() {
           </div>
           <div>
             <h1 className="font-bold text-lg text-white">Axiom Forge</h1>
-            <p className="text-xs text-slate-500">Idea to App Pipeline</p>
+            <p className="text-xs text-slate-500">{t('nav.appPipeline')}</p>
           </div>
         </Link>
       </div>
@@ -85,13 +87,13 @@ function Sidebar() {
           className="w-full flex items-center gap-3 px-4 py-3 mt-4 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white transition-all shadow-lg shadow-indigo-500/20"
         >
           <Plus className="w-5 h-5" />
-          <span className="font-medium">New Project</span>
+          <span className="font-medium">{t('nav.newProject')}</span>
         </button>
       </nav>
 
       {/* Token Status */}
       <div className="p-4 border-t border-slate-800">
-        <p className="text-xs text-slate-500 mb-3 uppercase tracking-wider">Services</p>
+        <p className="text-xs text-slate-500 mb-3 uppercase tracking-wider">{t('nav.services')}</p>
         <div className="space-y-2">
           <div className="flex items-center gap-2 text-sm">
             <div className={`w-2 h-2 rounded-full ${tokensConfigured.github ? 'bg-emerald-500' : 'bg-slate-600'}`} />
@@ -121,7 +123,7 @@ function Sidebar() {
           className="flex items-center gap-2 text-sm text-slate-500 hover:text-slate-300 transition-colors"
         >
           <Github className="w-4 h-4" />
-          <span>Open Source</span>
+          <span>{t('nav.openSource')}</span>
         </a>
         <div className="text-[10px] text-slate-600 font-bold uppercase tracking-[0.2em] pl-1">
           Axiom Forge v{version}
@@ -133,13 +135,14 @@ function Sidebar() {
 
 function Header() {
   const location = useLocation();
+  const { t } = useI18n();
   
   const getPageTitle = () => {
     const path = location.pathname;
-    if (path === '/') return 'Dashboard';
-    if (path === '/agency-dashboard') return 'Agency Review Dashboard';
-    if (path === '/settings') return 'Settings';
-    if (path.startsWith('/projects/')) return 'Project Details';
+    if (path === '/') return t('nav.dashboard');
+    if (path === '/agency-dashboard') return t('nav.agencyReview');
+    if (path === '/settings') return t('nav.settings');
+    if (path.startsWith('/projects/')) return t('dashboard.viewDetails');
     return 'Axiom Forge';
   };
 
@@ -147,11 +150,12 @@ function Header() {
     <header className="h-16 border-b border-slate-800 bg-slate-950/50 backdrop-blur-sm flex items-center justify-between px-6">
       <h2 className="text-xl font-semibold text-white">{getPageTitle()}</h2>
       
-      <div className="flex items-center gap-4">
+      <div className="flex items-center gap-3">
+        <LanguageSelector />
         {/* Status Indicator */}
         <div className="flex items-center gap-2 px-3 py-1.5 bg-emerald-500/10 border border-emerald-500/20 rounded-full">
           <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-          <span className="text-xs font-medium text-emerald-400">System Ready</span>
+          <span className="text-xs font-medium text-emerald-400">{t('nav.systemReady')}</span>
         </div>
       </div>
     </header>
@@ -160,6 +164,7 @@ function Header() {
 
 function Layout() {
   const { taskProgress } = useAppStore();
+  const { t } = useI18n();
   const [dismissedTaskId, setDismissedTaskId] = React.useState(null);
   const navigate = useNavigate();
 
@@ -221,9 +226,9 @@ function Layout() {
                 </div>
                 <div>
                   <h3 className="font-semibold text-sm text-white">
-                    {isComplete ? 'Generation Complete!' :
-                     isError ? 'Generation Failed' :
-                     'Forging Codebase...'}
+                    {isComplete ? t('taskOverlay.complete') :
+                     isError ? t('taskOverlay.failed') :
+                     t('taskOverlay.forging')}
                   </h3>
                   <p className="text-[10px] text-slate-500">
                     Task ID: {activeTask.taskId.substring(0, 13)}
@@ -239,7 +244,7 @@ function Layout() {
                   <X className="w-4 h-4" />
                 </button>
                 <div className="pointer-events-none absolute right-full mr-2 top-1/2 -translate-y-1/2 z-50 w-52 opacity-0 scale-95 group-hover/dismiss:opacity-100 group-hover/dismiss:scale-100 transition-all duration-75 bg-slate-950/95 border border-slate-700 text-slate-200 text-[10px] leading-snug px-2.5 py-1.5 rounded-lg shadow-xl">
-                  Sakrij karticu statusa (proces u pozadini nastavlja sa radom)
+                  {t('taskOverlay.hideTooltip')}
                 </div>
               </div>
             </div>
@@ -252,7 +257,7 @@ function Layout() {
             
             {isRunning && (
               <div className="mt-3 flex items-center justify-between text-[10px] text-slate-500">
-                <span>Progress</span>
+                <span>{t('taskOverlay.progress')}</span>
                 <span className="font-medium text-slate-300">{Math.round(activeTask.progress || 0)}%</span>
               </div>
             )}
@@ -263,7 +268,7 @@ function Layout() {
                   onClick={handleViewProject}
                   className="w-full py-2 px-3 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold shadow-lg shadow-emerald-600/20 transition-all text-center"
                 >
-                  View Generated Project
+                  {t('taskOverlay.viewProject')}
                 </button>
               </div>
             )}

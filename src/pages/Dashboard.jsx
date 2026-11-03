@@ -24,6 +24,7 @@ import {
   X
 } from 'lucide-react';
 import { useAppStore } from '../hooks/useAppStore';
+import { useI18n } from '../i18n/I18nContext';
 
 // Status badge component
 function StatusBadge({ status }) {
@@ -56,6 +57,7 @@ function StatusBadge({ status }) {
 function ProjectCard({ project, onDelete }) {
   const [showMenu, setShowMenu] = useState(false);
   const navigate = useNavigate();
+  const { t } = useI18n();
 
   const formatDate = (dateString) => {
     const date = new Date(dateString);
@@ -88,7 +90,7 @@ function ProjectCard({ project, onDelete }) {
               {project.name}
             </h3>
             <p className="text-xs text-slate-500">
-              Created {formatDate(project.createdAt)}
+              {t('dashboard.created', { date: formatDate(project.createdAt) })}
             </p>
           </div>
         </div>
@@ -114,7 +116,7 @@ function ProjectCard({ project, onDelete }) {
                   className="flex items-center gap-2 px-4 py-2 text-sm text-slate-300 hover:bg-slate-800 hover:text-white"
                 >
                   <ExternalLink className="w-4 h-4" />
-                  View Details
+                  {t('dashboard.viewDetails')}
                 </Link>
                 {project.status === 'awaiting-keys' && (
                   <Link
@@ -122,7 +124,7 @@ function ProjectCard({ project, onDelete }) {
                     className="flex items-center gap-2 px-4 py-2 text-sm text-amber-400 hover:bg-slate-800"
                   >
                     <Settings className="w-4 h-4" />
-                    Configure
+                    {t('dashboard.configure')}
                   </Link>
                 )}
                 {(project.status === 'generating' || project.status === 'paused' || project.status === 'stopped') && (
@@ -137,7 +139,7 @@ function ProjectCard({ project, onDelete }) {
                     className="w-full flex items-center gap-2 px-4 py-2 text-sm text-indigo-400 hover:bg-slate-800"
                   >
                     <Play className="w-4 h-4" />
-                    {project.status === 'generating' ? 'View Progress' : 'Resume Generation'}
+                    {project.status === 'generating' ? t('dashboard.viewProgress') : t('dashboard.resumeGen')}
                   </button>
                 )}
                 {project.status === 'ready' && (
@@ -150,7 +152,7 @@ function ProjectCard({ project, onDelete }) {
                     className="w-full flex items-center gap-2 px-4 py-2 text-sm text-emerald-400 hover:bg-slate-800"
                   >
                     <Play className="w-4 h-4" />
-                    Deploy
+                    {t('dashboard.deploy')}
                   </button>
                 )}
                 <hr className="my-1 border-slate-800" />
@@ -162,7 +164,7 @@ function ProjectCard({ project, onDelete }) {
                   className="w-full flex items-center gap-2 px-4 py-2 text-sm text-rose-400 hover:bg-slate-800"
                 >
                   <Trash2 className="w-4 h-4" />
-                  Delete
+                  {t('dashboard.deleteProject')}
                 </button>
               </div>
             </>
@@ -172,7 +174,7 @@ function ProjectCard({ project, onDelete }) {
 
       {/* Description */}
       <p className="text-sm text-slate-400 mb-4 line-clamp-2">
-        {project.description || 'No description provided'}
+        {project.description || t('dashboard.noDescription')}
       </p>
 
       {/* Footer */}
@@ -192,7 +194,7 @@ function ProjectCard({ project, onDelete }) {
               title="Resume Generation"
             >
               <Play className="w-3.5 h-3.5" />
-              <span>{project.status === 'generating' ? 'View' : 'Resume'}</span>
+              <span>{project.status === 'generating' ? t('common.view') : t('common.resume')}</span>
             </button>
           )}
         </div>
@@ -246,23 +248,23 @@ function ProjectCard({ project, onDelete }) {
 
 // Empty state component
 function EmptyState() {
+  const { t } = useI18n();
   return (
     <div className="text-center py-16">
       <div className="w-20 h-20 mx-auto rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-center mb-6">
         <Plus className="w-10 h-10 text-slate-600" />
       </div>
       <h3 className="text-xl font-semibold text-white mb-2">
-        No projects yet
+        {t('dashboard.noProjectsTitle')}
       </h3>
       <p className="text-slate-400 max-w-md mx-auto mb-6">
-        Start by browsing templates on Axiom Forge and click "Build with Axiom Forge" 
-        to create your first project.
+        {t('dashboard.noProjectsDesc')}
       </p>
       <button
         onClick={() => window.electronAPI.shell.openExternal('https://axiomforge.io/templates')}
         className="btn-primary"
       >
-        Browse Templates
+        {t('dashboard.browseTemplates')}
         <ExternalLink className="w-4 h-4" />
       </button>
     </div>
@@ -272,6 +274,7 @@ function EmptyState() {
 // Main Dashboard Component
 function Dashboard() {
   const { projects, loadProjects, removeProject, isLoading } = useAppStore();
+  const { t } = useI18n();
   const [searchQuery, setSearchQuery] = useState('');
   const [filterStatus, setFilterStatus] = useState('all');
   const [showFilterMenu, setShowFilterMenu] = useState(false);
@@ -290,21 +293,21 @@ function Dashboard() {
   });
 
   const handleDelete = async (projectId) => {
-    if (confirm('Are you sure you want to delete this project?')) {
+    if (confirm(t('dashboard.deleteConfirm'))) {
       await removeProject(projectId);
     }
   };
 
   const statusFilters = [
-    { value: 'all', label: 'All Projects' },
-    { value: 'generating', label: 'Generating' },
-    { value: 'paused', label: 'Paused' },
-    { value: 'stopped', label: 'Interrupted' },
-    { value: 'awaiting-keys', label: 'Awaiting Keys' },
-    { value: 'ready', label: 'Ready' },
-    { value: 'deploying', label: 'Deploying' },
-    { value: 'live', label: 'Live' },
-    { value: 'error', label: 'Error' }
+    { value: 'all', label: t('dashboard.allProjects') },
+    { value: 'generating', label: t('status.generating') },
+    { value: 'paused', label: t('status.paused') },
+    { value: 'stopped', label: t('status.stopped') },
+    { value: 'awaiting-keys', label: t('status.awaitingKeys') },
+    { value: 'ready', label: t('status.ready') },
+    { value: 'deploying', label: t('status.deploying') },
+    { value: 'live', label: t('status.live') },
+    { value: 'error', label: t('status.error') }
   ];
 
   return (
@@ -312,7 +315,7 @@ function Dashboard() {
       {/* Header Actions */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold text-white">Projects</h1>
+          <h1 className="text-2xl font-bold text-white">{t('dashboard.title')}</h1>
           <p className="text-slate-400">
             {projects.length} project{projects.length !== 1 ? 's' : ''} total
           </p>
@@ -324,7 +327,7 @@ function Dashboard() {
             className="btn-secondary"
           >
             <FolderOpen className="w-4 h-4 text-indigo-400" />
-            Import Project
+            {t('dashboard.importProject')}
           </button>
           
           <button
@@ -332,7 +335,7 @@ function Dashboard() {
             className="btn-primary"
           >
             <Plus className="w-5 h-5" />
-            New Project
+            {t('dashboard.newProject')}
           </button>
         </div>
       </div>
@@ -343,7 +346,7 @@ function Dashboard() {
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-500" />
           <input
             type="text"
-            placeholder="Search projects..."
+            placeholder={t('dashboard.searchPlaceholder')}
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             className="input pl-10"

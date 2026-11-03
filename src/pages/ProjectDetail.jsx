@@ -21,6 +21,7 @@ import {
   Code2
 } from 'lucide-react';
 import { useAppStore } from '../hooks/useAppStore';
+import { useI18n } from '../i18n/I18nContext';
 
 // File tree component
 function FileTree({ files, onSelect }) {
@@ -102,15 +103,16 @@ function FileTree({ files, onSelect }) {
 
 // Status badge
 function StatusBadge({ status }) {
+  const { t } = useI18n();
   const configs = {
-    'generating': { icon: Loader2, className: 'text-amber-400', text: 'Generating', animate: true },
-    'paused': { icon: Clock, className: 'text-amber-400', text: 'Paused' },
-    'stopped': { icon: AlertCircle, className: 'text-rose-400', text: 'Interrupted' },
-    'awaiting-keys': { icon: AlertCircle, className: 'text-amber-400', text: 'Awaiting Keys' },
-    'ready': { icon: CheckCircle2, className: 'text-indigo-400', text: 'Ready' },
-    'deploying': { icon: Loader2, className: 'text-amber-400', text: 'Deploying', animate: true },
-    'live': { icon: Globe, className: 'text-emerald-400', text: 'Live' },
-    'error': { icon: AlertCircle, className: 'text-rose-400', text: 'Error' }
+    'generating': { icon: Loader2, className: 'text-amber-400', text: t('status.generating'), animate: true },
+    'paused': { icon: Clock, className: 'text-amber-400', text: t('status.paused') },
+    'stopped': { icon: AlertCircle, className: 'text-rose-400', text: t('status.stopped') },
+    'awaiting-keys': { icon: AlertCircle, className: 'text-amber-400', text: t('status.awaitingKeys') },
+    'ready': { icon: CheckCircle2, className: 'text-indigo-400', text: t('status.ready') },
+    'deploying': { icon: Loader2, className: 'text-amber-400', text: t('status.deploying'), animate: true },
+    'live': { icon: Globe, className: 'text-emerald-400', text: t('status.live') },
+    'error': { icon: AlertCircle, className: 'text-rose-400', text: t('status.error') }
   };
 
   const config = configs[status] || configs['ready'];
@@ -207,7 +209,7 @@ function ProjectDetail() {
   };
 
   const handleDelete = async () => {
-    if (confirm('Are you sure you want to delete this project?')) {
+    if (confirm(t('projectDetail.deleteConfirm'))) {
       await removeProject(projectId);
       navigate('/');
     }
@@ -267,7 +269,7 @@ function ProjectDetail() {
             title="Open AI-powered code editor"
           >
             <Code2 className="w-4 h-4" />
-            Open Editor
+            {t('projectDetail.openEditor')}
           </button>
 
           {(project.status === 'generating' || project.status === 'paused' || project.status === 'stopped') && (
@@ -281,7 +283,7 @@ function ProjectDetail() {
               className="btn-primary"
             >
               <Play className="w-4 h-4" />
-              {project.status === 'generating' ? 'View Generation' : 'Resume Generation'}
+              {project.status === 'generating' ? t('projectDetail.viewProgressBtn') : t('projectDetail.resumeBtn')}
             </button>
           )}
 
@@ -291,7 +293,7 @@ function ProjectDetail() {
               className="btn-secondary"
             >
               <Settings className="w-4 h-4" />
-              Configure
+              {t('projectDetail.configure')}
             </Link>
           )}
           
@@ -304,12 +306,12 @@ function ProjectDetail() {
               {isDeploying ? (
                 <>
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  Deploying...
+                  {t('projectDetail.deploying')}
                 </>
               ) : (
                 <>
                   <Play className="w-4 h-4" />
-                  {project.status === 'error' ? 'Retry Deploy' : 'Deploy'}
+                  {project.status === 'error' ? t('projectDetail.retryDeploy') : t('projectDetail.deploy')}
                 </>
               )}
             </button>
@@ -323,9 +325,9 @@ function ProjectDetail() {
               title="Commit & push to GitHub without redeploying to Vercel"
             >
               {isCommitting ? (
-                <><Loader2 className="w-4 h-4 animate-spin" />Committing...</>
+                <><Loader2 className="w-4 h-4 animate-spin" />{t('projectDetail.committing')}</>
               ) : (
-                <><Github className="w-4 h-4" />Commit to GitHub</>
+                <><Github className="w-4 h-4" />{t('projectDetail.commitGithub')}</>
               )}
             </button>
           )}
@@ -354,7 +356,7 @@ function ProjectDetail() {
               className="btn-success"
             >
               <Globe className="w-4 h-4" />
-              Live Site
+              {t('projectDetail.liveSite')}
             </a>
           )}
 
@@ -379,10 +381,10 @@ function ProjectDetail() {
             <Clock className="w-5 h-5 text-indigo-400" />
             <div>
               <p className="text-sm font-medium text-white">
-                {project.status === 'paused' ? 'Generisanje je pauzirano' : project.status === 'stopped' ? 'Generisanje je prekinuto' : 'Generisanje koda je u toku'}
+                {project.status === 'paused' ? t('projectDetail.interruptedBannerPaused') : project.status === 'stopped' ? t('projectDetail.interruptedBannerStopped') : t('projectDetail.interruptedBannerGenerating')}
               </p>
               <p className="text-xs text-slate-400">
-                Možete nastaviti generisanje tačno od fajla na kojem je stalo ili pratiti napredak u realnom vremenu.
+                {t('projectDetail.interruptedBannerDesc')}
               </p>
             </div>
           </div>
@@ -396,7 +398,7 @@ function ProjectDetail() {
             className="btn-primary py-1.5 px-3 text-xs"
           >
             <Play className="w-3.5 h-3.5" />
-            {project.status === 'generating' ? 'Pogledaj napredak' : 'Nastavi generisanje'}
+            {project.status === 'generating' ? t('projectDetail.viewProgressBtn') : t('projectDetail.resumeBtn')}
           </button>
         </div>
       )}
@@ -444,18 +446,18 @@ function ProjectDetail() {
             <div className="card p-4">
               <h3 className="font-semibold text-white mb-4 flex items-center gap-2">
                 <Folder className="w-4 h-4" />
-                Files
+                {t('projectDetail.files')}
                 {isLoadingFiles && <Loader2 className="w-3 h-3 animate-spin text-slate-500 ml-1" />}
               </h3>
               {isLoadingFiles ? (
-                <p className="text-sm text-slate-500">Scanning project files...</p>
+                <p className="text-sm text-slate-500">{t('projectDetail.loadingFiles')}</p>
               ) : diskFiles.length > 0 ? (
                 <FileTree 
                   files={diskFiles} 
                   onSelect={handleFileSelect}
                 />
               ) : (
-                <p className="text-sm text-slate-500">No files found on disk</p>
+                <p className="text-sm text-slate-500">{t('projectDetail.noFiles')}</p>
               )}
             </div>
           </div>
