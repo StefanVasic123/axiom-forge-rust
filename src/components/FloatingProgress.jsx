@@ -1,6 +1,7 @@
 /**
  * Axiom Forge - Floating Progress Window
  * Always-on-top draggable window for generation/deployment progress
+ * Supports Play/Pause, Stop with confirmation modal, and Crash/Kill Recovery.
  */
 
 import React, { useState, useEffect } from 'react';
@@ -19,12 +20,16 @@ import {
 // Progress phase display
 const PHASE_DISPLAY = {
   'fetch-manifest': { label: 'Fetching Manifest', icon: Loader2 },
+  'manifest-expansion': { label: 'Expanding Structure', icon: Loader2 },
   'generate-files': { label: 'Generating Code', icon: Loader2 },
+  'install-deps': { label: 'Configuring Environment', icon: Loader2 },
   'pull-model': { label: 'Pulling Model', icon: Loader2 },
   'save-project': { label: 'Saving Project', icon: Loader2 },
   'push-github': { label: 'Pushing to GitHub', icon: Loader2 },
   'deploy-vercel': { label: 'Deploying to Vercel', icon: Loader2 },
   'verify-deployment': { label: 'Verifying Deployment', icon: Loader2 },
+  'paused': { label: 'Pauzirano', icon: Pause },
+  'stopped': { label: 'Prekinuto', icon: AlertCircle },
   'complete': { label: 'Complete!', icon: CheckCircle2 },
   'error': { label: 'Error', icon: AlertCircle }
 };
@@ -32,8 +37,12 @@ const PHASE_DISPLAY = {
 function FloatingProgress() {
   const [isMinimized, setIsMinimized] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
+  const [showStopConfirm, setShowStopConfirm] = useState(false);
+  const [isActionLoading, setIsActionLoading] = useState(false);
+  
   const [progress, setProgress] = useState({
     phase: 'idle',
+    status: 'idle',
     message: 'Waiting to start...',
     progress: 0,
     projectId: null,
@@ -44,7 +53,7 @@ function FloatingProgress() {
 
   const [version, setVersion] = useState('v1.1.9');
 
-  // Subscribe to task progress
+  // Subscribe to task progress and synchronize initial state
   useEffect(() => {
     // Get real version
     window.electronAPI.app.getVersion().then(res => {
@@ -55,7 +64,7 @@ function FloatingProgress() {
     const params = new URLSearchParams(window.location.search);
     const projectId = params.get('projectId');
 
-    // 2. Initial sync - check if there's already an active task
+    // 2. Initial sync - check if there's already an active task or checkpoint on disk
     const syncStatus = async () => {
       if (projectId) {
         try {
@@ -64,9 +73,11 @@ function FloatingProgress() {
             setProgress(prev => ({
               ...prev,
               ...result.task,
+              projectId: projectId,
               phase: result.task.phase || prev.phase,
+              status: result.task.status || prev.status,
               message: result.task.message || prev.message || 'Restoring session...',
-              history: [...(prev.history || []), { time: Date.now(), msg: 'Synced with background task' }]
+              history: [...(prev.history || []), { time: Date.now(), msg: 'Synced with background task / checkpoint' }]
             }));
           }
         } catch (error) {
@@ -83,6 +94,7 @@ function FloatingProgress() {
         ...prev,
         ...data,
         phase: data.phase || prev.phase,
+        status: data.status || prev.status,
         message: data.message || prev.message,
         history: [...(prev.history || []), { time: Date.now(), msg: data.message }]
       }));
@@ -96,36 +108,118 @@ function FloatingProgress() {
     window.electronAPI.window.hideFloating();
   };
 
-  const handleStop = async () => {
-    if (progress.taskId) {
-      await window.electronAPI.task.stop(progress.taskId);
+  // Play / Pause / Stop Handlers
+  const handlePause = async () => {
+    setIsActionLoading(true);
+    try {
+      const tId = progress.taskId || progress.projectId;
+      if (tId) {
+        await window.electronAPI.task.pause(tId);
+        setProgress(p => ({
+          ...p,
+          phase: 'paused',
+          status: 'paused',
+          message: 'Generisanje je pauzirano.'
+        }));
+      }
+    } catch (err) {
+      console.error('Failed to pause:', err);
+    } finally {
+      setIsActionLoading(false);
+    }
+  };
+
+  const handleResume = async () => {
+    setIsActionLoading(true);
+    try {
+      const tId = progress.taskId || progress.projectId;
+      if (tId) {
+        await window.electronAPI.task.resume(tId);
+        setProgress(p => ({
+          ...p,
+          phase: 'generate-files',
+          status: 'generating',
+          message: 'Generisanje se nastavlja...'
+        }));
+      }
+    } catch (err) {
+      console.error('Failed to resume:', err);
+    } finally {
+      setIsActionLoading(false);
+    }
+  };
+
+  const handleRequestStop = () => {
+    setShowStopConfirm(true);
+  };
+
+  const handleConfirmStop = async () => {
+    setShowStopConfirm(false);
+    setIsActionLoading(true);
+    try {
+      const tId = progress.taskId || progress.projectId;
+      if (tId) {
+        await window.electronAPI.task.stop(tId);
+        setProgress(p => ({
+          ...p,
+          phase: 'stopped',
+          status: 'stopped',
+          message: 'Generisanje je prekinuto. Svi do sada generisani fajlovi su sačuvani na disku.'
+        }));
+      }
+    } catch (err) {
+      console.error('Failed to stop task:', err);
+    } finally {
+      setIsActionLoading(false);
+    }
+  };
+
+  const handleResumeInterrupted = async () => {
+    setIsActionLoading(true);
+    try {
+      if (progress.projectId) {
+        setProgress(p => ({
+          ...p,
+          phase: 'generate-files',
+          status: 'generating',
+          message: 'Učitavanje sačuvanog stanja sa diska i nastavak...'
+        }));
+        await window.electronAPI.task.resumeGeneration(progress.projectId);
+      }
+    } catch (err) {
+      console.error('Failed to resume generation:', err);
+      setProgress(p => ({ ...p, phase: 'error', error: err.message || String(err) }));
+    } finally {
+      setIsActionLoading(false);
     }
   };
 
   const handleRestart = () => {
-    // Restart the current task
     if (progress.projectId) {
       window.electronAPI.task.startGeneration(progress.projectId);
     }
   };
 
-  const phaseInfo = PHASE_DISPLAY[progress.phase] || PHASE_DISPLAY['fetch-manifest'];
-  const PhaseIcon = phaseInfo.icon;
+  const isPaused = progress.phase === 'paused' || progress.status === 'paused';
+  const isStopped = progress.phase === 'stopped' || progress.status === 'stopped';
   const isComplete = progress.phase === 'complete';
   const isError = progress.phase === 'error';
-  const isRunning = !isComplete && !isError;
+  const isRunning = !isComplete && !isError && !isStopped;
+
+  const phaseInfo = PHASE_DISPLAY[progress.phase] || PHASE_DISPLAY['fetch-manifest'];
+  const PhaseIcon = phaseInfo.icon;
 
   if (isMinimized) {
     return (
       <div 
         className="window-drag bg-slate-900/95 backdrop-blur-xl border border-slate-700 rounded-xl shadow-2xl overflow-hidden"
-        style={{ width: '200px' }}
+        style={{ width: '220px' }}
       >
         <div className="flex items-center justify-between p-3">
           <div className="flex items-center gap-2">
-            <PhaseIcon className={`w-4 h-4 ${isRunning ? 'text-indigo-400 animate-spin' : 'text-emerald-400'}`} />
+            <PhaseIcon className={`w-4 h-4 ${isRunning && !isPaused ? 'text-indigo-400 animate-spin' : isPaused ? 'text-amber-400' : isComplete ? 'text-emerald-400' : 'text-slate-400'}`} />
             <span className="text-xs font-medium text-slate-300 truncate">
-              {phaseInfo.label}
+              {isPaused ? 'Pauzirano' : phaseInfo.label}
             </span>
           </div>
           <button
@@ -139,7 +233,9 @@ function FloatingProgress() {
         {/* Mini progress bar */}
         <div className="h-1 bg-slate-800">
           <div 
-            className="h-full bg-gradient-to-r from-indigo-500 to-violet-500 transition-all duration-300"
+            className={`h-full transition-all duration-300 ${
+              isPaused ? 'bg-amber-500' : isComplete ? 'bg-emerald-500' : 'bg-gradient-to-r from-indigo-500 to-violet-500'
+            }`}
             style={{ width: `${progress.progress}%` }}
           />
         </div>
@@ -149,25 +245,58 @@ function FloatingProgress() {
 
   return (
     <div 
-      className="window-drag bg-slate-900/95 backdrop-blur-xl border border-slate-700 rounded-xl shadow-2xl overflow-hidden"
-      style={{ width: '400px' }}
+      className="relative window-drag bg-slate-900/95 backdrop-blur-xl border border-slate-700 rounded-xl shadow-2xl overflow-hidden"
+      style={{ width: '420px' }}
     >
+      {/* Confirmation Modal for Stop */}
+      {showStopConfirm && (
+        <div className="absolute inset-0 z-50 bg-slate-950/95 backdrop-blur-sm p-5 flex flex-col justify-center items-center text-center window-no-drag animate-in fade-in duration-150">
+          <div className="w-10 h-10 rounded-full bg-rose-500/20 text-rose-400 flex items-center justify-center mb-3">
+            <AlertCircle className="w-5 h-5" />
+          </div>
+          <h4 className="text-sm font-semibold text-white mb-1.5">Da li ste sigurni da želite da prekinete?</h4>
+          <p className="text-xs text-slate-400 mb-5 leading-relaxed max-w-[280px]">
+            Svi do sada generisani fajlovi ostaju sačuvani na disku. U bilo kom trenutku možete nastaviti generisanje tačno tamo gde ste stali.
+          </p>
+          <div className="flex gap-2 w-full justify-center">
+            <button
+              onClick={() => setShowStopConfirm(false)}
+              className="px-4 py-2 rounded-lg bg-slate-800 text-slate-300 hover:bg-slate-700 text-xs font-medium transition-colors"
+            >
+              Odustani
+            </button>
+            <button
+              onClick={handleConfirmStop}
+              className="px-4 py-2 rounded-lg bg-rose-600 text-white hover:bg-rose-500 text-xs font-semibold shadow-lg shadow-rose-600/20 transition-colors"
+            >
+              Da, prekini generisanje
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Header */}
       <div className="flex items-center justify-between p-4 border-b border-slate-800">
         <div className="flex items-center gap-3">
           <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
             isComplete ? 'bg-emerald-500/20' : 
             isError ? 'bg-rose-500/20' : 
+            isPaused ? 'bg-amber-500/20' :
+            isStopped ? 'bg-slate-800' :
             'bg-indigo-500/20'
           }`}>
             <PhaseIcon className={`w-4 h-4 ${
               isComplete ? 'text-emerald-400' : 
               isError ? 'text-rose-400' : 
+              isPaused ? 'text-amber-400' :
+              isStopped ? 'text-slate-400' :
               'text-indigo-400 animate-spin'
             }`} />
           </div>
           <div>
-            <h3 className="font-semibold text-white text-sm">{phaseInfo.label}</h3>
+            <h3 className="font-semibold text-white text-sm">
+              {isPaused ? 'Generisanje pauzirano' : isStopped ? 'Generisanje zaustavljeno' : phaseInfo.label}
+            </h3>
             <div className="flex items-center gap-2">
               <p className="text-xs text-slate-500">Axiom Forge</p>
               <span className="px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-400 text-[10px] font-bold border border-indigo-500/30">
@@ -214,7 +343,9 @@ function FloatingProgress() {
         {/* Progress Bar */}
         <div className="space-y-1">
           <div className="flex items-center justify-between text-xs">
-            <span className="text-slate-500">Progress</span>
+            <span className="text-slate-500">
+              {isPaused ? 'Pauzirano' : isStopped ? 'Prekinuto' : 'Progress'}
+            </span>
             <span className="text-slate-400">{Math.round(progress.progress)}%</span>
           </div>
           <div className="h-2 bg-slate-800 rounded-full overflow-hidden">
@@ -222,6 +353,8 @@ function FloatingProgress() {
               className={`h-full rounded-full transition-all duration-300 ${
                 isComplete ? 'bg-emerald-500' : 
                 isError ? 'bg-rose-500' : 
+                isPaused ? 'bg-amber-500' :
+                isStopped ? 'bg-slate-600' :
                 'bg-gradient-to-r from-indigo-500 to-violet-500'
               }`}
               style={{ width: `${progress.progress}%` }}
@@ -268,7 +401,7 @@ function FloatingProgress() {
         {showLogs && (
           <div className="space-y-2 pt-2 border-t border-slate-800">
             <p className="text-[10px] text-slate-500 uppercase tracking-wider">Engine Logs</p>
-            <div className="max-h-80 overflow-y-auto space-y-1 bg-black/30 rounded p-2 font-mono text-[10px]">
+            <div className="max-h-60 overflow-y-auto space-y-1 bg-black/30 rounded p-2 font-mono text-[10px]">
               {progress.history?.length > 0 ? (
                 progress.history.slice().reverse().map((log, i) => (
                   <div key={i} className="flex gap-2">
@@ -293,33 +426,88 @@ function FloatingProgress() {
 
       {/* Footer Actions */}
       <div className="flex items-center justify-between p-4 border-t border-slate-800 window-no-drag">
-        {isRunning ? (
-          <button
-            onClick={handleStop}
-            className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-rose-500/10 text-rose-400 hover:bg-rose-500/20 transition-colors text-sm"
-          >
-            <Pause className="w-4 h-4" />
-            Stop
-          </button>
-        ) : isError ? (
-          <button
-            onClick={handleRestart}
-            className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-indigo-500/10 text-indigo-400 hover:bg-indigo-500/20 transition-colors text-sm"
-          >
-            <RotateCcw className="w-4 h-4" />
-            Retry
-          </button>
-        ) : (
-          <div />
-        )}
+        <div className="flex items-center gap-2">
+          {/* Active Running (Not Paused, Not Stopped) */}
+          {isRunning && !isPaused && (
+            <>
+              <button
+                onClick={handlePause}
+                disabled={isActionLoading}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500/10 text-amber-400 hover:bg-amber-500/20 transition-colors text-xs font-medium"
+                title="Pauziraj generisanje"
+              >
+                <Pause className="w-3.5 h-3.5" />
+                Pauziraj
+              </button>
+              <button
+                onClick={handleRequestStop}
+                disabled={isActionLoading}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rose-500/10 text-rose-400 hover:bg-rose-500/20 transition-colors text-xs font-medium"
+                title="Prekini generisanje"
+              >
+                <X className="w-3.5 h-3.5" />
+                Prekini
+              </button>
+            </>
+          )}
 
+          {/* Paused State */}
+          {isPaused && (
+            <>
+              <button
+                onClick={handleResume}
+                disabled={isActionLoading}
+                className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-emerald-600 text-white hover:bg-emerald-500 shadow-md shadow-emerald-600/20 transition-colors text-xs font-semibold"
+                title="Nastavi generisanje"
+              >
+                <Play className="w-3.5 h-3.5" />
+                Nastavi
+              </button>
+              <button
+                onClick={handleRequestStop}
+                disabled={isActionLoading}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rose-500/10 text-rose-400 hover:bg-rose-500/20 transition-colors text-xs font-medium"
+                title="Prekini generisanje"
+              >
+                <X className="w-3.5 h-3.5" />
+                Prekini
+              </button>
+            </>
+          )}
+
+          {/* Stopped or Interrupted Recovery State */}
+          {isStopped && (
+            <button
+              onClick={handleResumeInterrupted}
+              disabled={isActionLoading}
+              className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-indigo-600 text-white hover:bg-indigo-500 shadow-md shadow-indigo-600/20 transition-colors text-xs font-semibold"
+            >
+              <Play className="w-3.5 h-3.5" />
+              Nastavi tamo gde je stao
+            </button>
+          )}
+
+          {/* Error State */}
+          {isError && (
+            <button
+              onClick={handleRestart}
+              disabled={isActionLoading}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-500/10 text-indigo-400 hover:bg-indigo-500/20 transition-colors text-xs font-medium"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              Pokušaj ponovo
+            </button>
+          )}
+        </div>
+
+        {/* Complete State */}
         {isComplete && (
           <button
             onClick={handleClose}
-            className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 transition-colors text-sm"
+            className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-emerald-600 text-white hover:bg-emerald-500 text-xs font-semibold transition-colors"
           >
-            <CheckCircle2 className="w-4 h-4" />
-            Done
+            <CheckCircle2 className="w-3.5 h-3.5" />
+            Završi
           </button>
         )}
       </div>

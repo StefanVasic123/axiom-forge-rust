@@ -198,6 +198,43 @@ export function useAppStore() {
     }
   }, [actions]);
 
+  const pauseGeneration = useCallback(async (taskId) => {
+    try {
+      return await window.electronAPI.task.pause(taskId);
+    } catch (error) {
+      actions.setError(error.message);
+      throw error;
+    }
+  }, [actions]);
+
+  const resumeGeneration = useCallback(async (taskId) => {
+    try {
+      return await window.electronAPI.task.resume(taskId);
+    } catch (error) {
+      actions.setError(error.message);
+      throw error;
+    }
+  }, [actions]);
+
+  const resumeProjectGeneration = useCallback(async (projectId) => {
+    try {
+      await window.electronAPI.window.showFloating({ id: projectId });
+      return await window.electronAPI.task.resumeGeneration(projectId);
+    } catch (error) {
+      actions.setError(error.message);
+      throw error;
+    }
+  }, [actions]);
+
+  const getProjectCheckpoint = useCallback(async (projectId) => {
+    try {
+      return await window.electronAPI.task.getCheckpoint(projectId);
+    } catch (error) {
+      console.error('Failed to get checkpoint:', error);
+      return null;
+    }
+  }, []);
+
   const stopTask = useCallback(async (taskId) => {
     try {
       const result = await window.electronAPI.task.stop(taskId);
@@ -313,6 +350,10 @@ export function useAppStore() {
     configureProject,
     startDeployment,
     stopTask,
+    pauseGeneration,
+    resumeGeneration,
+    resumeProjectGeneration,
+    getProjectCheckpoint,
     importLocalFolder,
     importGithub,
     detectMissingEnvKeys,

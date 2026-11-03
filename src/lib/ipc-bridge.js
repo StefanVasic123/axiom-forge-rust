@@ -421,11 +421,75 @@ window.electronAPI = {
     onProgress: (callback) => {
       return registerGlobalListener('task:progress', callback);
     },
+    pause: async (taskId) => {
+      try {
+        await invoke('task_pause_generation', { taskId });
+        return { success: true };
+      } catch (e) {
+        console.error('Failed to pause task:', e);
+        throw e;
+      }
+    },
+    resume: async (taskId) => {
+      try {
+        await invoke('task_resume_generation', { taskId });
+        return { success: true };
+      } catch (e) {
+        console.error('Failed to resume task:', e);
+        throw e;
+      }
+    },
     stop: async (taskId) => {
-      return { success: true };
+      try {
+        await invoke('task_stop_generation', { taskId });
+        return { success: true };
+      } catch (e) {
+        console.error('Failed to stop task:', e);
+        throw e;
+      }
+    },
+    getCheckpoint: async (projectId) => {
+      try {
+        return await invoke('task_get_project_checkpoint', { projectId });
+      } catch (e) {
+        console.error('Failed to get checkpoint:', e);
+        return null;
+      }
+    },
+    resumeGeneration: async (projectId) => {
+      try {
+        return await invoke('task_resume_project_generation', { projectId });
+      } catch (e) {
+        console.error('Failed to resume generation:', e);
+        throw e;
+      }
     },
     getActiveTaskByProject: async (projectId) => {
-      return { success: false };
+      try {
+        const checkpoint = await invoke('task_get_project_checkpoint', { projectId });
+        if (checkpoint) {
+          const completedCount = checkpoint.completedFiles ? checkpoint.completedFiles.length : 0;
+          const totalCount = checkpoint.totalFiles || 1;
+          const calcProgress = Math.min(Math.round((completedCount / totalCount) * 100), 100);
+          return { 
+            success: true, 
+            task: {
+              taskId: checkpoint.taskId,
+              projectId: checkpoint.projectId,
+              phase: checkpoint.phase || checkpoint.status,
+              status: checkpoint.status,
+              message: checkpoint.status === 'paused' ? 'Generation paused' : 
+                       checkpoint.status === 'stopped' ? 'Generation stopped' : 
+                       `Checkpoint: ${completedCount}/${totalCount} files generated`,
+              progress: calcProgress,
+              checkpoint
+            }
+          };
+        }
+        return { success: false };
+      } catch {
+        return { success: false };
+      }
     }
   },
   server: {

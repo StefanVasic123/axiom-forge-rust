@@ -1,4 +1,78 @@
 use crate::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::sync::Notify;
+
+pub struct TaskControl {
+    pub task_id: String,
+    pub project_id: String,
+    pub paused: Arc<AtomicBool>,
+    pub stopped: Arc<AtomicBool>,
+    pub notify: Arc<Notify>,
+}
+
+static ACTIVE_TASKS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Arc<TaskControl>>>> = std::sync::OnceLock::new();
+
+fn get_active_tasks() -> &'static std::sync::Mutex<std::collections::HashMap<String, Arc<TaskControl>>> {
+    ACTIVE_TASKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub fn register_task_control(task_id: &str, project_id: &str) -> Arc<TaskControl> {
+    let control = Arc::new(TaskControl {
+        task_id: task_id.to_string(),
+        project_id: project_id.to_string(),
+        paused: Arc::new(AtomicBool::new(false)),
+        stopped: Arc::new(AtomicBool::new(false)),
+        notify: Arc::new(Notify::new()),
+    });
+    let mut map = get_active_tasks().lock().unwrap();
+    map.insert(task_id.to_string(), Arc::clone(&control));
+    map.insert(format!("proj:{}", project_id), Arc::clone(&control));
+    control
+}
+
+pub fn unregister_task_control(task_id: &str, project_id: &str) {
+    let mut map = get_active_tasks().lock().unwrap();
+    map.remove(task_id);
+    map.remove(&format!("proj:{}", project_id));
+}
+
+pub fn find_task_control(id: &str) -> Option<Arc<TaskControl>> {
+    let map = get_active_tasks().lock().unwrap();
+    if let Some(c) = map.get(id) {
+        return Some(Arc::clone(c));
+    }
+    if let Some(c) = map.get(&format!("proj:{}", id)) {
+        return Some(Arc::clone(c));
+    }
+    None
+}
+
+pub fn get_checkpoint_path(proj_dir: &std::path::Path) -> std::path::PathBuf {
+    proj_dir.join(".axiom").join("generation_state.json")
+}
+
+pub fn load_generation_checkpoint(proj_dir: &std::path::Path) -> Option<Value> {
+    let path = get_checkpoint_path(proj_dir);
+    if path.exists() {
+        if let Ok(content) = fs::read_to_string(&path) {
+            if let Ok(val) = serde_json::from_str::<Value>(&content) {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
+pub fn save_generation_checkpoint(proj_dir: &std::path::Path, checkpoint: &Value) {
+    let path = get_checkpoint_path(proj_dir);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(content) = serde_json::to_string_pretty(checkpoint) {
+        let _ = fs::write(&path, content);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GenerationPhase {
@@ -1087,6 +1161,35 @@ pub async fn run_orchestrator(
         }));
     };
 
+    let proj_dir = get_project_path(&project_id);
+    let _ = fs::create_dir_all(&proj_dir);
+    let axiom_dir = proj_dir.join(".axiom");
+    let _ = fs::create_dir_all(&axiom_dir);
+
+    let task_control = register_task_control(&task_id, &project_id);
+
+    let existing_checkpoint = load_generation_checkpoint(&proj_dir);
+    let mut completed_files: Vec<String> = Vec::new();
+    let mut files_to_generate_from_cp: Option<Vec<Value>> = None;
+
+    if let Some(ref cp) = existing_checkpoint {
+        let cp_status = cp.get("status").and_then(|s| s.as_str()).unwrap_or("");
+        if cp_status != "completed" {
+            if let Some(arr) = cp.get("completedFiles").and_then(|a| a.as_array()) {
+                completed_files = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+            }
+            if let Some(ftg) = cp.get("filesToGenerate").and_then(|f| f.as_array()) {
+                if !ftg.is_empty() {
+                    files_to_generate_from_cp = Some(ftg.clone());
+                    debug_log_to_file(format!(
+                        "[Orchestrator] Resuming from checkpoint on disk: {} completed files, {} total files in manifest.",
+                        completed_files.len(), ftg.len()
+                    ));
+                }
+            }
+        }
+    }
+
     emit_progress("fetch-manifest", "Initializing generation pipeline...", 1.0);
 
     // 1. Fetch Manifest
@@ -1847,7 +1950,13 @@ export default function RootLayout({
          platform, name, resolved_stack, project_description, overrides_desc, original_files_json
     );
 
-    let mut files_to_generate = files.clone();
+    let mut files_to_generate = if let Some(ref saved_files) = files_to_generate_from_cp {
+        debug_log_to_file(format!("[Orchestrator] Reusing {} expanded files from checkpoint.", saved_files.len()));
+        emit_progress("manifest-expansion", &format!("Resumed manifest structure with {} files.", saved_files.len()), 14.0);
+        saved_files.clone()
+    } else {
+        files.clone()
+    };
     
     let manifest_runtime_cfg = get_ollama_runtime_config(&model_id);
     let ollama_req = serde_json::json!({
@@ -1860,13 +1969,19 @@ export default function RootLayout({
         "options": build_ollama_options(&model_id, 0.2, Some(manifest_runtime_cfg.manifest_num_predict))
     });
 
-    let mut expansion_success = false;
+    let mut expansion_success = files_to_generate_from_cp.is_some();
     let mut expansion_attempts = 0;
     let max_expansion_attempts = 2;
     let mut last_accumulated_response = String::new();
 
     while expansion_attempts < max_expansion_attempts && !expansion_success {
         expansion_attempts += 1;
+        if task_control.stopped.load(Ordering::SeqCst) {
+            unregister_task_control(&task_id, &project_id);
+            let _ = project_update_status(project_id.clone(), "stopped".to_string(), serde_json::json!({}));
+            emit_progress("stopped", "Generation stopped by user.", 10.0);
+            return Ok(());
+        }
         if expansion_attempts > 1 {
             debug_log_to_file(format!(
                 "[Orchestrator] Retrying manifest expansion (Attempt {}/{})",
@@ -2129,7 +2244,26 @@ export default function RootLayout({
 
     // 2. Generation Loop
     let total_files = files_to_generate.len() as f64;
-    let proj_dir = get_project_path(&project_id);
+
+    let mut checkpoint_state = serde_json::json!({
+        "taskId": task_id,
+        "manifestId": manifest_id,
+        "projectId": project_id,
+        "name": name,
+        "projectDescription": project_description,
+        "projectType": project_type,
+        "modelId": model_id,
+        "token": token,
+        "host": host,
+        "status": "generating",
+        "phase": "generate-files",
+        "currentFileIndex": completed_files.len(),
+        "totalFiles": files_to_generate.len(),
+        "filesToGenerate": files_to_generate,
+        "completedFiles": completed_files,
+        "updatedAt": chrono::Utc::now().to_rfc3339()
+    });
+    save_generation_checkpoint(&proj_dir, &checkpoint_state);
 
     // Initialize and write the Live Builder Guide (LBG) to disk
     let axiom_dir = proj_dir.join(".axiom");
@@ -2176,8 +2310,53 @@ export default function RootLayout({
         let desc = file_spec.get("description").and_then(|d| d.as_str()).unwrap_or("");
         let lang = file_spec.get("language").and_then(|l| l.as_str()).unwrap_or("txt");
 
-        let msg = format!("Generating {}/{} - {}", i + 1, files_to_generate.len(), file_path);
         let current_progress = 25.0 + ((i as f64) / total_files) * 55.0;
+
+        // 1. Check if STOPPED
+        if task_control.stopped.load(Ordering::SeqCst) {
+            debug_log_to_file(format!("[Orchestrator] Task {} stopped before file {}", task_id, file_path));
+            checkpoint_state["status"] = serde_json::json!("stopped");
+            checkpoint_state["phase"] = serde_json::json!("stopped");
+            checkpoint_state["updatedAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+            save_generation_checkpoint(&proj_dir, &checkpoint_state);
+            let _ = project_update_status(project_id.clone(), "stopped".to_string(), serde_json::json!({}));
+            emit_progress("stopped", "Generation stopped by user.", current_progress);
+            unregister_task_control(&task_id, &project_id);
+            return Ok(());
+        }
+
+        // 2. Check if PAUSED
+        while task_control.paused.load(Ordering::SeqCst) {
+            if task_control.stopped.load(Ordering::SeqCst) {
+                checkpoint_state["status"] = serde_json::json!("stopped");
+                checkpoint_state["phase"] = serde_json::json!("stopped");
+                checkpoint_state["updatedAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+                save_generation_checkpoint(&proj_dir, &checkpoint_state);
+                let _ = project_update_status(project_id.clone(), "stopped".to_string(), serde_json::json!({}));
+                emit_progress("stopped", "Generation stopped by user.", current_progress);
+                unregister_task_control(&task_id, &project_id);
+                return Ok(());
+            }
+            emit_progress("paused", &format!("Paused at file {}/{} ({})", i + 1, files_to_generate.len(), file_path), current_progress);
+            tokio::select! {
+                _ = task_control.notify.notified() => {},
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+            }
+        }
+
+        // 3. Check if ALREADY GENERATED (Resume / Recovery from checkpoint on disk)
+        let full_disk_path = proj_dir.join(file_path);
+        let already_on_disk = completed_files.contains(&file_path.to_string())
+            && full_disk_path.exists()
+            && fs::metadata(&full_disk_path).map(|m| m.len() > 0).unwrap_or(false);
+
+        if already_on_disk {
+            let msg = format!("Verified existing file {}/{} - {}", i + 1, files_to_generate.len(), file_path);
+            emit_progress("generate-files", &msg, current_progress);
+            continue;
+        }
+
+        let msg = format!("Generating {}/{} - {}", i + 1, files_to_generate.len(), file_path);
         emit_progress("generate-files", &msg, current_progress);
 
         let overrides_desc_str = if !overrides_desc.trim().is_empty() {
@@ -2325,6 +2504,11 @@ export default function RootLayout({
                     }
                 }
 
+                if task_control.stopped.load(Ordering::SeqCst) {
+                    debug_log_to_file(format!("[Orchestrator] Task {} stopped during chunk generation for {}", task_id, file_path));
+                    loop_detected = true;
+                    break;
+                }
                 if loop_detected {
                     break;
                 }
@@ -2384,6 +2568,28 @@ export default function RootLayout({
             let _ = fs::create_dir_all(parent);
         }
         let _ = fs::write(&full_disk_path, &processed_content);
+
+        // Update completed files and persist checkpoint immediately
+        if !completed_files.contains(&file_path.to_string()) {
+            completed_files.push(file_path.to_string());
+        }
+        checkpoint_state["completedFiles"] = serde_json::json!(completed_files);
+        checkpoint_state["currentFileIndex"] = serde_json::json!(i + 1);
+        checkpoint_state["currentFilePath"] = serde_json::json!(file_path);
+        checkpoint_state["updatedAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+        save_generation_checkpoint(&proj_dir, &checkpoint_state);
+    }
+
+    // Check if stopped before post-processing
+    if task_control.stopped.load(Ordering::SeqCst) {
+        checkpoint_state["status"] = serde_json::json!("stopped");
+        checkpoint_state["phase"] = serde_json::json!("stopped");
+        checkpoint_state["updatedAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+        save_generation_checkpoint(&proj_dir, &checkpoint_state);
+        let _ = project_update_status(project_id.clone(), "stopped".to_string(), serde_json::json!({}));
+        emit_progress("stopped", "Generation stopped by user.", 75.0);
+        unregister_task_control(&task_id, &project_id);
+        return Ok(());
     }
 
     // Setup local PostgreSQL database if project uses Prisma
@@ -2500,6 +2706,12 @@ export default function RootLayout({
     });
     let _ = project_save(new_proj);
 
+    checkpoint_state["status"] = serde_json::json!("completed");
+    checkpoint_state["phase"] = serde_json::json!("complete");
+    checkpoint_state["updatedAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+    save_generation_checkpoint(&proj_dir, &checkpoint_state);
+    unregister_task_control(&task_id, &project_id);
+
     emit_progress("complete", "Generation completed successfully!", 100.0);
 
     Ok(())
@@ -2545,3 +2757,96 @@ pub async fn task_start_generation(
 
     Ok(task_id)
 }
+
+#[tauri::command]
+pub fn task_pause_generation(task_id: String) -> Result<(), String> {
+    debug_log_to_file(format!("[IPC Rust Command] task_pause_generation called for {}", task_id));
+    if let Some(control) = find_task_control(&task_id) {
+        control.paused.store(true, Ordering::SeqCst);
+        let proj_dir = get_project_path(&control.project_id);
+        if let Some(mut cp) = load_generation_checkpoint(&proj_dir) {
+            cp["status"] = serde_json::json!("paused");
+            cp["phase"] = serde_json::json!("paused");
+            cp["updatedAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+            save_generation_checkpoint(&proj_dir, &cp);
+        }
+        let _ = project_update_status(control.project_id.clone(), "paused".to_string(), serde_json::json!({}));
+        Ok(())
+    } else {
+        Err(format!("Active task '{}' not found", task_id))
+    }
+}
+
+#[tauri::command]
+pub fn task_resume_generation(task_id: String) -> Result<(), String> {
+    debug_log_to_file(format!("[IPC Rust Command] task_resume_generation called for {}", task_id));
+    if let Some(control) = find_task_control(&task_id) {
+        control.paused.store(false, Ordering::SeqCst);
+        control.notify.notify_waiters();
+        let proj_dir = get_project_path(&control.project_id);
+        if let Some(mut cp) = load_generation_checkpoint(&proj_dir) {
+            cp["status"] = serde_json::json!("generating");
+            cp["phase"] = serde_json::json!("generate-files");
+            cp["updatedAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+            save_generation_checkpoint(&proj_dir, &cp);
+        }
+        let _ = project_update_status(control.project_id.clone(), "generating".to_string(), serde_json::json!({}));
+        Ok(())
+    } else {
+        Err(format!("Active task '{}' not found", task_id))
+    }
+}
+
+#[tauri::command]
+pub fn task_stop_generation(task_id: String) -> Result<(), String> {
+    debug_log_to_file(format!("[IPC Rust Command] task_stop_generation called for {}", task_id));
+    if let Some(control) = find_task_control(&task_id) {
+        control.stopped.store(true, Ordering::SeqCst);
+        control.paused.store(false, Ordering::SeqCst);
+        control.notify.notify_waiters();
+        let proj_dir = get_project_path(&control.project_id);
+        if let Some(mut cp) = load_generation_checkpoint(&proj_dir) {
+            cp["status"] = serde_json::json!("stopped");
+            cp["phase"] = serde_json::json!("stopped");
+            cp["updatedAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+            save_generation_checkpoint(&proj_dir, &cp);
+        }
+        let _ = project_update_status(control.project_id.clone(), "stopped".to_string(), serde_json::json!({}));
+        Ok(())
+    } else {
+        let proj_dir = get_project_path(&task_id);
+        if let Some(mut cp) = load_generation_checkpoint(&proj_dir) {
+            cp["status"] = serde_json::json!("stopped");
+            cp["phase"] = serde_json::json!("stopped");
+            cp["updatedAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+            save_generation_checkpoint(&proj_dir, &cp);
+            let _ = project_update_status(task_id, "stopped".to_string(), serde_json::json!({}));
+        }
+        Ok(())
+    }
+}
+
+#[tauri::command]
+pub fn task_get_project_checkpoint(project_id: String) -> Result<Option<Value>, String> {
+    let proj_dir = get_project_path(&project_id);
+    Ok(load_generation_checkpoint(&proj_dir))
+}
+
+#[tauri::command]
+pub async fn task_resume_project_generation(
+    window: tauri::Window,
+    project_id: String,
+) -> Result<String, String> {
+    debug_log_to_file(format!("[IPC Rust Command] task_resume_project_generation called for {}", project_id));
+    let proj_dir = get_project_path(&project_id);
+    let cp = load_generation_checkpoint(&proj_dir)
+        .ok_or_else(|| format!("No checkpoint found for project {}", project_id))?;
+
+    let manifest_id = cp.get("manifestId").and_then(|v| v.as_str()).unwrap_or("TEST_LOCAL").to_string();
+    let token = cp.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let model_id = cp.get("modelId").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let host = cp.get("host").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    task_start_generation(window, manifest_id, Some(project_id), token, model_id, host).await
+}
+

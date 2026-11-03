@@ -104,6 +104,8 @@ function FileTree({ files, onSelect }) {
 function StatusBadge({ status }) {
   const configs = {
     'generating': { icon: Loader2, className: 'text-amber-400', text: 'Generating', animate: true },
+    'paused': { icon: Clock, className: 'text-amber-400', text: 'Paused' },
+    'stopped': { icon: AlertCircle, className: 'text-rose-400', text: 'Interrupted' },
     'awaiting-keys': { icon: AlertCircle, className: 'text-amber-400', text: 'Awaiting Keys' },
     'ready': { icon: CheckCircle2, className: 'text-indigo-400', text: 'Ready' },
     'deploying': { icon: Loader2, className: 'text-amber-400', text: 'Deploying', animate: true },
@@ -268,6 +270,21 @@ function ProjectDetail() {
             Open Editor
           </button>
 
+          {(project.status === 'generating' || project.status === 'paused' || project.status === 'stopped') && (
+            <button
+              onClick={async () => {
+                await window.electronAPI.window.showFloating({ id: projectId });
+                if (project.status === 'stopped' || project.status === 'paused') {
+                  await window.electronAPI.task.resumeGeneration(projectId);
+                }
+              }}
+              className="btn-primary"
+            >
+              <Play className="w-4 h-4" />
+              {project.status === 'generating' ? 'View Generation' : 'Resume Generation'}
+            </button>
+          )}
+
           {project.status === 'awaiting-keys' && (
             <Link
               to={`/projects/${projectId}/config`}
@@ -353,6 +370,35 @@ function ProjectDetail() {
       {/* Description */}
       {project.description && (
         <p className="text-slate-400">{project.description}</p>
+      )}
+
+      {/* Interrupted / Paused Banner */}
+      {(project.status === 'paused' || project.status === 'stopped' || project.status === 'generating') && (
+        <div className="card p-4 bg-indigo-950/40 border-indigo-500/40 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <Clock className="w-5 h-5 text-indigo-400" />
+            <div>
+              <p className="text-sm font-medium text-white">
+                {project.status === 'paused' ? 'Generisanje je pauzirano' : project.status === 'stopped' ? 'Generisanje je prekinuto' : 'Generisanje koda je u toku'}
+              </p>
+              <p className="text-xs text-slate-400">
+                Možete nastaviti generisanje tačno od fajla na kojem je stalo ili pratiti napredak u realnom vremenu.
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={async () => {
+              await window.electronAPI.window.showFloating({ id: projectId });
+              if (project.status === 'stopped' || project.status === 'paused') {
+                await window.electronAPI.task.resumeGeneration(projectId);
+              }
+            }}
+            className="btn-primary py-1.5 px-3 text-xs"
+          >
+            <Play className="w-3.5 h-3.5" />
+            {project.status === 'generating' ? 'Pogledaj napredak' : 'Nastavi generisanje'}
+          </button>
+        </div>
       )}
 
       {/* Deployment Progress */}

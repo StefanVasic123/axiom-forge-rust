@@ -29,6 +29,8 @@ import { useAppStore } from '../hooks/useAppStore';
 function StatusBadge({ status }) {
   const configs = {
     'generating': { icon: Loader2, className: 'badge-amber', text: 'Generating', animate: true },
+    'paused': { icon: Clock, className: 'badge-amber', text: 'Paused' },
+    'stopped': { icon: AlertCircle, className: 'badge-rose', text: 'Interrupted' },
     'awaiting-keys': { icon: AlertCircle, className: 'badge-amber', text: 'Awaiting Keys' },
     'ready': { icon: CheckCircle2, className: 'badge-indigo', text: 'Ready' },
     'generated': { icon: CheckCircle2, className: 'badge-indigo', text: 'Ready' },
@@ -123,6 +125,21 @@ function ProjectCard({ project, onDelete }) {
                     Configure
                   </Link>
                 )}
+                {(project.status === 'generating' || project.status === 'paused' || project.status === 'stopped') && (
+                  <button
+                    onClick={async () => {
+                      setShowMenu(false);
+                      await window.electronAPI.window.showFloating({ id: project.id });
+                      if (project.status === 'stopped' || project.status === 'paused') {
+                        await window.electronAPI.task.resumeGeneration(project.id);
+                      }
+                    }}
+                    className="w-full flex items-center gap-2 px-4 py-2 text-sm text-indigo-400 hover:bg-slate-800"
+                  >
+                    <Play className="w-4 h-4" />
+                    {project.status === 'generating' ? 'View Progress' : 'Resume Generation'}
+                  </button>
+                )}
                 {project.status === 'ready' && (
                   <button
                     onClick={() => {
@@ -160,7 +177,25 @@ function ProjectCard({ project, onDelete }) {
 
       {/* Footer */}
       <div className="flex items-center justify-between">
-        <StatusBadge status={project.status} />
+        <div className="flex items-center gap-2">
+          <StatusBadge status={project.status} />
+          {(project.status === 'generating' || project.status === 'paused' || project.status === 'stopped') && (
+            <button
+              onClick={async (e) => {
+                e.stopPropagation();
+                await window.electronAPI.window.showFloating({ id: project.id });
+                if (project.status === 'stopped' || project.status === 'paused') {
+                  await window.electronAPI.task.resumeGeneration(project.id);
+                }
+              }}
+              className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium bg-indigo-600/20 text-indigo-400 hover:bg-indigo-600/30 border border-indigo-500/30 rounded-lg transition-colors"
+              title="Resume Generation"
+            >
+              <Play className="w-3.5 h-3.5" />
+              <span>{project.status === 'generating' ? 'View' : 'Resume'}</span>
+            </button>
+          )}
+        </div>
         
         <div className="flex items-center gap-2">
           {project.metadata?.githubUrl && (
@@ -263,6 +298,8 @@ function Dashboard() {
   const statusFilters = [
     { value: 'all', label: 'All Projects' },
     { value: 'generating', label: 'Generating' },
+    { value: 'paused', label: 'Paused' },
+    { value: 'stopped', label: 'Interrupted' },
     { value: 'awaiting-keys', label: 'Awaiting Keys' },
     { value: 'ready', label: 'Ready' },
     { value: 'deploying', label: 'Deploying' },
