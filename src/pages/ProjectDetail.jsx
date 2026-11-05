@@ -143,6 +143,7 @@ function ProjectDetail() {
   const [selectedFile, setSelectedFile] = useState(null);
   const [isDeploying, setIsDeploying] = useState(false);
   const [isCommitting, setIsCommitting] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
   const [deployMessage, setDeployMessage] = useState(null);
   const [fileContent, setFileContent] = useState('');
   const [diskFiles, setDiskFiles] = useState([]);
@@ -211,12 +212,14 @@ function ProjectDetail() {
 
   const handleDelete = async () => {
     if (confirm(t('projectDetail.deleteConfirm'))) {
+      setIsDeleting(true);
       try {
         await removeProject(projectId);
         navigate('/');
       } catch (err) {
         console.error('Failed to delete project:', err);
         alert(err?.message || 'Greška pri brisanju projekta');
+        setIsDeleting(false);
       }
     }
   };
@@ -368,9 +371,18 @@ function ProjectDetail() {
 
           <button
             onClick={handleDelete}
-            className="btn-danger"
+            disabled={isDeleting}
+            className="btn-danger flex items-center gap-1.5"
+            title={t('projectDetail.deleteProject')}
           >
-            <Trash2 className="w-4 h-4" />
+            {isDeleting ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin text-rose-300" />
+                <span className="text-xs">{t('dashboard.deleting') || 'Brisanje...'}</span>
+              </>
+            ) : (
+              <Trash2 className="w-4 h-4" />
+            )}
           </button>
         </div>
       </div>

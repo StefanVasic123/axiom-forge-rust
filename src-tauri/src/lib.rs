@@ -256,6 +256,7 @@ pub fn run() {
             project_get_all,
             project_save,
             project_delete,
+            project_bulk_delete,
             project_update_status,
             project_get_files,
             project_commit,

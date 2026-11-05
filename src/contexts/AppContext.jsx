@@ -50,6 +50,7 @@ const ACTIONS = {
   ADD_PROJECT: 'ADD_PROJECT',
   UPDATE_PROJECT: 'UPDATE_PROJECT',
   DELETE_PROJECT: 'DELETE_PROJECT',
+  DELETE_PROJECTS: 'DELETE_PROJECTS',
   SET_CURRENT_PROJECT: 'SET_CURRENT_PROJECT',
   SET_TASK_PROGRESS: 'SET_TASK_PROGRESS',
   UPDATE_SETTINGS: 'UPDATE_SETTINGS',
@@ -91,6 +92,14 @@ function appReducer(state, action) {
         ...state,
         projects: state.projects.filter(p => p.id !== action.payload)
       };
+      
+    case ACTIONS.DELETE_PROJECTS: {
+      const idSet = new Set(action.payload);
+      return {
+        ...state,
+        projects: state.projects.filter(p => !idSet.has(p.id))
+      };
+    }
       
     case ACTIONS.SET_CURRENT_PROJECT:
       return { ...state, currentProject: action.payload };
@@ -163,6 +172,10 @@ export function AppProvider({ children }) {
     dispatch({ type: ACTIONS.DELETE_PROJECT, payload: projectId });
   }, []);
 
+  const deleteProjects = useCallback((projectIds) => {
+    dispatch({ type: ACTIONS.DELETE_PROJECTS, payload: projectIds });
+  }, []);
+
   const setCurrentProject = useCallback((project) => {
     dispatch({ type: ACTIONS.SET_CURRENT_PROJECT, payload: project });
   }, []);
@@ -191,6 +204,7 @@ export function AppProvider({ children }) {
     addProject,
     updateProject,
     deleteProject,
+    deleteProjects,
     setCurrentProject,
     setTaskProgress,
     updateSettings,
@@ -198,7 +212,7 @@ export function AppProvider({ children }) {
     setAppMode
   }), [
     setFirstRun, setLoading, setError, setProjects,
-    addProject, updateProject, deleteProject,
+    addProject, updateProject, deleteProject, deleteProjects,
     setCurrentProject, setTaskProgress, updateSettings,
     setTokensConfigured, setAppMode
   ]);

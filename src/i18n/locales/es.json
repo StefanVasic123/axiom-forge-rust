@@ -62,7 +62,15 @@
     "deleteProject": "Eliminar",
     "deleteConfirm": "¿Estás seguro de que deseas eliminar este proyecto?",
     "resumeGen": "Reanudar Generación",
-    "viewProgress": "Ver Progreso"
+    "viewProgress": "Ver Progreso",
+    "deleting": "Eliminando...",
+    "select": "Seleccionar",
+    "deselect": "Deseleccionar",
+    "selectAll": "Seleccionar todo",
+    "deselectAll": "Deseleccionar todo",
+    "deleteSelected": "Eliminar seleccionados",
+    "selectedCount": "{count} seleccionados",
+    "bulkDeleteConfirm": "¿Estás seguro de que deseas eliminar {count} proyectos seleccionados?"
   },
   "status": {
     "generating": "Generando",

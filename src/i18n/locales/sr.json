@@ -62,7 +62,15 @@
     "deleteProject": "Obriši",
     "deleteConfirm": "Da li ste sigurni da želite da obrišete ovaj projekat?",
     "resumeGen": "Nastavi generisanje",
-    "viewProgress": "Pogledaj napredak"
+    "viewProgress": "Pogledaj napredak",
+    "deleting": "Brisanje...",
+    "select": "Označi",
+    "deselect": "Poništi",
+    "selectAll": "Označi sve",
+    "deselectAll": "Poništi izbor",
+    "deleteSelected": "Obriši označene",
+    "selectedCount": "Označeno: {count}",
+    "bulkDeleteConfirm": "Da li ste sigurni da želite da obrišete {count} označenih projekata?"
   },
   "status": {
     "generating": "Generisanje",

@@ -62,7 +62,15 @@
     "deleteProject": "Löschen",
     "deleteConfirm": "Sind Sie sicher, dass Sie dieses Projekt löschen möchten?",
     "resumeGen": "Generierung fortsetzen",
-    "viewProgress": "Fortschritt anzeigen"
+    "viewProgress": "Fortschritt anzeigen",
+    "deleting": "Löschen...",
+    "select": "Auswählen",
+    "deselect": "Abwählen",
+    "selectAll": "Alle auswählen",
+    "deselectAll": "Auswahl aufheben",
+    "deleteSelected": "Ausgewählte löschen",
+    "selectedCount": "{count} ausgewählt",
+    "bulkDeleteConfirm": "Sind Sie sicher, dass Sie {count} ausgewählte Projekte löschen möchten?"
   },
   "status": {
     "generating": "Wird generiert",

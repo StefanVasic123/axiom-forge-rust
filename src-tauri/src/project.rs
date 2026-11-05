@@ -223,6 +223,46 @@ pub fn project_delete(id: String) -> Result<bool, String> {
 }
 
 #[tauri::command]
+pub fn project_bulk_delete(ids: Vec<String>) -> Result<Vec<String>, String> {
+    let file_path = get_projects_file();
+    let projects_base = get_projects_dir();
+
+    // 1. Resolve project directories BEFORE removing from projects.json
+    let mut dirs_to_remove: Vec<PathBuf> = Vec::new();
+    for id in &ids {
+        let proj_dir = get_project_path(id);
+        let fallback_dir = projects_base.join(id);
+        if proj_dir.exists() && proj_dir.starts_with(&projects_base) {
+            dirs_to_remove.push(proj_dir);
+        }
+        if fallback_dir.exists() && !dirs_to_remove.contains(&fallback_dir) {
+            dirs_to_remove.push(fallback_dir);
+        }
+    }
+
+    // 2. Remove projects from projects.json
+    if file_path.exists() {
+        let content = fs::read_to_string(&file_path).unwrap_or_else(|_| "[]".to_string());
+        let mut projects: Vec<Value> = serde_json::from_str(&content).unwrap_or_else(|_| vec![]);
+        projects.retain(|p| {
+            if let Some(id_val) = p.get("id").and_then(|i| i.as_str()) {
+                !ids.iter().any(|id| id == id_val)
+            } else {
+                true
+            }
+        });
+        let _ = fs::write(&file_path, serde_json::to_string_pretty(&projects).unwrap_or_default());
+    }
+
+    // 3. Remove all targeted directories
+    for dir in dirs_to_remove {
+        force_remove_dir(&dir);
+    }
+
+    Ok(ids)
+}
+
+#[tauri::command]
 pub fn project_import_local_folder(path: String) -> Result<Value, String> {
     let folder_path = PathBuf::from(&path);
     if !folder_path.exists() || !folder_path.is_dir() {

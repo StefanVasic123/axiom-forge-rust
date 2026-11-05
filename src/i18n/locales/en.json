@@ -62,7 +62,15 @@
     "deleteProject": "Delete",
     "deleteConfirm": "Are you sure you want to delete this project?",
     "resumeGen": "Resume Generation",
-    "viewProgress": "View Progress"
+    "viewProgress": "View Progress",
+    "deleting": "Deleting...",
+    "select": "Select",
+    "deselect": "Deselect",
+    "selectAll": "Select All",
+    "deselectAll": "Deselect All",
+    "deleteSelected": "Delete Selected",
+    "selectedCount": "{count} selected",
+    "bulkDeleteConfirm": "Are you sure you want to delete {count} selected projects?"
   },
   "status": {
     "generating": "Generating",

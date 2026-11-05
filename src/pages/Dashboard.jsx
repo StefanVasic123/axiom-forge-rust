@@ -21,7 +21,9 @@ import {
   Play,
   Settings,
   FolderOpen,
-  X
+  X,
+  Check,
+  CheckSquare
 } from 'lucide-react';
 import { useAppStore } from '../hooks/useAppStore';
 import { useI18n } from '../i18n/I18nContext';
@@ -54,7 +56,14 @@ function StatusBadge({ status }) {
 }
 
 // Project card component
-function ProjectCard({ project, onDelete }) {
+function ProjectCard({ 
+  project, 
+  onDelete, 
+  isDeleting, 
+  isSelected, 
+  onToggleSelect, 
+  hasSelection 
+}) {
   const [showMenu, setShowMenu] = useState(false);
   const navigate = useNavigate();
   const { t } = useI18n();
@@ -75,18 +84,49 @@ function ProjectCard({ project, onDelete }) {
           navigate(`/projects/${project.id}`);
         }
       }}
-      className="card-hover p-5 group relative cursor-pointer"
+      className={`card-hover p-5 group relative cursor-pointer transition-all duration-150 ${
+        isSelected 
+          ? 'ring-2 ring-indigo-500/80 border-indigo-500/50 bg-indigo-950/20' 
+          : ''
+      } ${isDeleting ? 'opacity-50 pointer-events-none' : ''}`}
     >
+      {/* Minimal Deleting State Overlay - scoped only to this card */}
+      {isDeleting && (
+        <div className="absolute inset-0 bg-slate-950/70 backdrop-blur-[2px] rounded-xl flex items-center justify-center z-30 transition-all duration-200">
+          <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-rose-500/15 border border-rose-500/30 text-rose-300 text-xs font-medium shadow-lg animate-pulse">
+            <Loader2 className="w-3.5 h-3.5 animate-spin text-rose-400" />
+            <span>{t('dashboard.deleting') || 'Brisanje...'}</span>
+          </div>
+        </div>
+      )}
+
       {/* Header */}
       <div className="flex items-start justify-between mb-4">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-indigo-500/20 to-violet-500/20 flex items-center justify-center border border-indigo-500/20">
+        <div className="flex items-center gap-3 min-w-0">
+          {/* Selection Checkbox */}
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleSelect(project.id);
+            }}
+            className={`w-5 h-5 rounded-md flex items-center justify-center border transition-all flex-shrink-0 cursor-pointer ${
+              isSelected 
+                ? 'bg-indigo-600 border-indigo-500 text-white shadow-sm shadow-indigo-500/30 opacity-100' 
+                : 'border-slate-700 hover:border-slate-500 bg-slate-900/60 opacity-0 group-hover:opacity-100'
+            } ${hasSelection ? '!opacity-100' : ''}`}
+            title={isSelected ? (t('dashboard.deselect') || 'Poništi') : (t('dashboard.select') || 'Označi')}
+          >
+            {isSelected && <Check className="w-3.5 h-3.5 stroke-[2.5]" />}
+          </button>
+
+          <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-indigo-500/20 to-violet-500/20 flex items-center justify-center border border-indigo-500/20 flex-shrink-0">
             <span className="text-lg font-bold text-indigo-400">
               {project.name.charAt(0).toUpperCase()}
             </span>
           </div>
-          <div>
-            <h3 className="font-semibold text-white group-hover:text-indigo-400 transition-colors">
+          <div className="min-w-0">
+            <h3 className="font-semibold text-white group-hover:text-indigo-400 transition-colors truncate">
               {project.name}
             </h3>
             <p className="text-xs text-slate-500">
@@ -289,12 +329,15 @@ function EmptyState() {
 
 // Main Dashboard Component
 function Dashboard() {
-  const { projects, loadProjects, removeProject, isLoading } = useAppStore();
+  const { projects, loadProjects, removeProject, removeProjects, isLoading } = useAppStore();
   const { t } = useI18n();
   const [searchQuery, setSearchQuery] = useState('');
   const [filterStatus, setFilterStatus] = useState('all');
   const [showFilterMenu, setShowFilterMenu] = useState(false);
   const [showImportModal, setShowImportModal] = useState(false);
+  const [selectedIds, setSelectedIds] = useState(new Set());
+  const [deletingIds, setDeletingIds] = useState(new Set());
+  const [isBulkDeleting, setIsBulkDeleting] = useState(false);
 
   useEffect(() => {
     loadProjects();
@@ -308,14 +351,72 @@ function Dashboard() {
     return matchesSearch && matchesFilter;
   });
 
+  const toggleSelect = (id) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
+  const toggleSelectAll = () => {
+    if (selectedIds.size === filteredProjects.length) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(filteredProjects.map(p => p.id)));
+    }
+  };
+
   const handleDelete = async (projectId) => {
     if (confirm(t('dashboard.deleteConfirm'))) {
+      setDeletingIds(prev => new Set(prev).add(projectId));
       try {
         await removeProject(projectId);
+        setSelectedIds(prev => {
+          const next = new Set(prev);
+          next.delete(projectId);
+          return next;
+        });
       } catch (err) {
         console.error('Failed to delete project:', err);
         alert(err?.message || 'Greška pri brisanju projekta');
+      } finally {
+        setDeletingIds(prev => {
+          const next = new Set(prev);
+          next.delete(projectId);
+          return next;
+        });
       }
+    }
+  };
+
+  const handleBulkDelete = async () => {
+    const count = selectedIds.size;
+    if (count === 0) return;
+    const confirmMsg = t('dashboard.bulkDeleteConfirm', { count }) || 
+      `Da li ste sigurni da želite da obrišete ${count} označenih projekata?`;
+    if (!confirm(confirmMsg)) return;
+
+    const idsToDelete = Array.from(selectedIds);
+    setIsBulkDeleting(true);
+    setDeletingIds(prev => new Set([...prev, ...idsToDelete]));
+    try {
+      await removeProjects(idsToDelete);
+      setSelectedIds(new Set());
+    } catch (err) {
+      console.error('Failed to bulk delete projects:', err);
+      alert(err?.message || 'Greška pri masovnom brisanju projekata');
+    } finally {
+      setIsBulkDeleting(false);
+      setDeletingIds(prev => {
+        const next = new Set(prev);
+        idsToDelete.forEach(id => next.delete(id));
+        return next;
+      });
     }
   };
 
@@ -374,6 +475,24 @@ function Dashboard() {
           />
         </div>
         
+        {filteredProjects.length > 0 && (
+          <button
+            type="button"
+            onClick={toggleSelectAll}
+            className={`btn-secondary flex items-center gap-2 cursor-pointer transition-all ${
+              selectedIds.size > 0 ? 'border-indigo-500/60 text-indigo-400 bg-indigo-500/10' : ''
+            }`}
+            title={selectedIds.size > 0 ? (t('dashboard.deselectAll') || 'Poništi sve') : (t('dashboard.selectAll') || 'Označi sve')}
+          >
+            <CheckSquare className="w-4 h-4" />
+            <span className="text-xs">
+              {selectedIds.size === filteredProjects.length && filteredProjects.length > 0
+                ? (t('dashboard.deselectAll') || 'Poništi sve')
+                : (t('dashboard.selectAll') || 'Označi sve')}
+            </span>
+          </button>
+        )}
+
         <div className="relative">
           <button
             onClick={() => setShowFilterMenu(!showFilterMenu)}
@@ -422,6 +541,10 @@ function Dashboard() {
               key={project.id} 
               project={project} 
               onDelete={handleDelete}
+              isDeleting={deletingIds.has(project.id)}
+              isSelected={selectedIds.has(project.id)}
+              onToggleSelect={toggleSelect}
+              hasSelection={selectedIds.size > 0}
             />
           ))}
         </div>
@@ -433,6 +556,58 @@ function Dashboard() {
         </div>
       )}
       <ImportModal isOpen={showImportModal} onClose={() => setShowImportModal(false)} />
+
+      {/* Floating Bulk Action Bar */}
+      {selectedIds.size > 0 && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-40 bg-slate-900/95 backdrop-blur-md border border-slate-700/80 shadow-2xl rounded-2xl px-5 py-3 flex items-center gap-4 text-sm animate-in fade-in slide-in-from-bottom-4 duration-200">
+          <div className="flex items-center gap-2 font-medium text-white">
+            <CheckSquare className="w-4 h-4 text-indigo-400" />
+            <span>
+              {t('dashboard.selectedCount', { count: selectedIds.size }) || `${selectedIds.size} označeno`}
+            </span>
+          </div>
+          
+          <div className="h-4 w-px bg-slate-700" />
+          
+          <button
+            type="button"
+            onClick={toggleSelectAll}
+            className="text-xs text-slate-300 hover:text-white px-2.5 py-1.5 rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
+          >
+            {selectedIds.size === filteredProjects.length
+              ? (t('dashboard.deselectAll') || 'Poništi sve')
+              : (t('dashboard.selectAll') || 'Označi sve')}
+          </button>
+          
+          <button
+            type="button"
+            onClick={handleBulkDelete}
+            disabled={isBulkDeleting}
+            className="flex items-center gap-2 px-3.5 py-1.5 bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white text-xs font-semibold rounded-lg shadow-sm transition-colors cursor-pointer"
+          >
+            {isBulkDeleting ? (
+              <>
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                <span>{t('dashboard.deleting') || 'Brisanje...'}</span>
+              </>
+            ) : (
+              <>
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>{t('dashboard.deleteSelected') || 'Obriši označene'} ({selectedIds.size})</span>
+              </>
+            )}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setSelectedIds(new Set())}
+            className="p-1 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white transition-colors cursor-pointer"
+            title={t('common.close') || 'Zatvori'}
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
     </div>
   );
 }

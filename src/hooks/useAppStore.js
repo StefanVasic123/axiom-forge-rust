@@ -104,6 +104,21 @@ export function useAppStore() {
     }
   }, [actions]);
 
+  const removeProjects = useCallback(async (projectIds) => {
+    try {
+      const result = await window.electronAPI.project.bulkDelete(projectIds);
+      if (result.success) {
+        actions.deleteProjects(projectIds);
+      } else {
+        throw new Error(result.error || 'Failed to bulk delete projects');
+      }
+      return result;
+    } catch (error) {
+      actions.setError(error.message);
+      throw error;
+    }
+  }, [actions]);
+
   const removeProject = useCallback(async (projectId) => {
     try {
       const result = await window.electronAPI.project.delete({ id: projectId });
@@ -345,6 +360,7 @@ export function useAppStore() {
     createProject,
     saveProject,
     removeProject,
+    removeProjects,
     updateProjectStatus,
     checkTokens,
     saveToken,
