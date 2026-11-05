@@ -290,6 +290,9 @@ pub fn run() {
             git_engine::git_create_client_proposal,
             git_engine::git_get_client_proposals,
             git_engine::git_update_proposal_status,
+            git_engine::git_checkout_proposal_branch,
+            git_engine::git_restore_main_branch,
+            git_engine::git_refine_proposal_with_ai,
             relay::relay_submit_proposal
         ])
         .run(tauri::generate_context!())

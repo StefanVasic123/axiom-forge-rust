@@ -519,7 +519,7 @@ pub fn sanitize_app_router_links_with_routes(content: &str, valid_routes: &[Stri
 
     let mut result = content.to_string();
 
-    if let Ok(re) = regex::Regex::new(r#"href\s*=\s*(["'])(/[^"']*)\1"#) {
+    if let Ok(re) = regex::Regex::new(r#"href\s*=\s*(["'])(/[^"'\s>]+)["']"#) {
         for cap in re.captures_iter(content) {
             let quote = cap.get(1).map(|m| m.as_str()).unwrap_or("\"");
             let href = cap.get(2).map(|m| m.as_str()).unwrap_or("");
@@ -531,7 +531,7 @@ pub fn sanitize_app_router_links_with_routes(content: &str, valid_routes: &[Stri
         }
     }
 
-    if let Ok(re) = regex::Regex::new(r#"router\.push\s*\(\s*(["'])(/[^"']*)\1\s*\)"#) {
+    if let Ok(re) = regex::Regex::new(r#"router\.push\s*\(\s*(["'])(/[^"'\s)]+)["']\s*\)"#) {
         for cap in re.captures_iter(content) {
             let quote = cap.get(1).map(|m| m.as_str()).unwrap_or("\"");
             let href = cap.get(2).map(|m| m.as_str()).unwrap_or("");
@@ -551,14 +551,17 @@ pub fn sanitize_unhandled_session_loading(content: &str) -> String {
         return content.to_string();
     }
 
-    if let Ok(re) = regex::Regex::new(r"(?s)if\s*\(\s*session\s*\)\s*\{([^}]+)\}(?!\s*else)") {
+    if let Ok(re) = regex::Regex::new(r"(?s)if\s*\(\s*session\s*\)\s*\{([^}]+)\}") {
         let mut modified = content.to_string();
         for cap in re.captures_iter(content) {
             let full_match = cap.get(0).unwrap().as_str();
             let body = cap.get(1).unwrap().as_str();
-            if !full_match.contains("else") {
-                let replacement = format!("if (session) {{{}\n    }} else {{\n      setLoading(false);\n    }}", body);
-                modified = modified.replace(full_match, &replacement);
+            if let Some(pos) = content.find(full_match) {
+                let after = content[pos + full_match.len()..].trim_start();
+                if !after.starts_with("else") {
+                    let replacement = format!("if (session) {{{}\n  }} else {{\n    setLoading(false);\n  }}", body);
+                    modified = modified.replace(full_match, &replacement);
+                }
             }
         }
         return modified;

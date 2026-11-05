@@ -728,6 +728,30 @@ window.electronAPI = {
         return [];
       }
     },
+    checkoutProposalBranch: async (projectId, branchName) => {
+      try {
+        return await invoke('git_checkout_proposal_branch', { projectId, branchName });
+      } catch (e) {
+        console.error('Failed to checkout proposal branch:', e);
+        throw e;
+      }
+    },
+    restoreMainBranch: async (projectId) => {
+      try {
+        return await invoke('git_restore_main_branch', { projectId });
+      } catch (e) {
+        console.error('Failed to restore main branch:', e);
+        throw e;
+      }
+    },
+    refineProposalWithAi: async (projectId, proposalId, developerPrompt, modelId) => {
+      try {
+        return await invoke('git_refine_proposal_with_ai', { projectId, proposalId, developerPrompt, modelId });
+      } catch (e) {
+        console.error('Failed to refine proposal with AI:', e);
+        throw e;
+      }
+    },
     updateProposalStatus: async (projectId, proposalId, status) => {
       try {
         return await invoke('git_update_proposal_status', { projectId, proposalId, status });

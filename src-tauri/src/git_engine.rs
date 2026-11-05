@@ -52,6 +52,16 @@ async fn ensure_git_repo(proj_dir: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
+async fn get_default_branch(proj_dir: &PathBuf) -> String {
+    if run_git_cmd(proj_dir, &["rev-parse", "--verify", "main"]).await.is_ok() {
+        "main".to_string()
+    } else if run_git_cmd(proj_dir, &["rev-parse", "--verify", "master"]).await.is_ok() {
+        "master".to_string()
+    } else {
+        "main".to_string()
+    }
+}
+
 #[tauri::command]
 pub async fn git_create_client_proposal(
     project_id: String,
@@ -79,22 +89,33 @@ pub async fn git_create_client_proposal(
     // 3. Stage changes
     let _ = run_git_cmd(&proj_dir, &["add", "."]).await;
 
-    // 4. Extract diff before commit
-    let diff_raw = run_git_cmd(&proj_dir, &["diff", "--staged"]).await.unwrap_or_default();
-
-    // 5. Commit changes on proposal branch
-    let commit_msg = format!("Client Proposal: {}", prompt);
-    let _ = run_git_cmd(&proj_dir, &["commit", "-m", &commit_msg]).await?;
-
-    // 6. Parse diff into file list
+    // 4. Extract diff before commit per file
+    let name_only = run_git_cmd(&proj_dir, &["diff", "--name-only", "--staged"]).await.unwrap_or_default();
     let mut files = Vec::new();
-    if !diff_raw.is_empty() {
+    for f in name_only.lines() {
+        let f_trim = f.trim();
+        if !f_trim.is_empty() {
+            let f_diff = run_git_cmd(&proj_dir, &["diff", "--staged", "--", f_trim]).await.unwrap_or_default();
+            files.push(ProposalFileDiff {
+                file_path: f_trim.to_string(),
+                diff: f_diff,
+                is_new: false,
+            });
+        }
+    }
+
+    let diff_raw = run_git_cmd(&proj_dir, &["diff", "--staged"]).await.unwrap_or_default();
+    if files.is_empty() && !diff_raw.is_empty() {
         files.push(ProposalFileDiff {
             file_path: "Modified Files".to_string(),
             diff: diff_raw,
             is_new: false,
         });
     }
+
+    // 5. Commit changes on proposal branch
+    let commit_msg = format!("Client Proposal: {}", prompt);
+    let _ = run_git_cmd(&proj_dir, &["commit", "-m", &commit_msg]).await?;
 
     let proposal = ClientProposal {
         id: proposal_id.clone(),
@@ -106,14 +127,14 @@ pub async fn git_create_client_proposal(
         files,
     };
 
-    // 7. Save proposal JSON locally
+    // 6. Save proposal JSON locally
     let prop_dir = get_proposals_dir(&proj_dir);
     let _ = fs::create_dir_all(&prop_dir);
     let prop_file = prop_dir.join(format!("{}.json", proposal_id));
     let content = serde_json::to_string_pretty(&proposal).map_err(|e| e.to_string())?;
     fs::write(prop_file, content).map_err(|e| e.to_string())?;
 
-    // 8. Return to original branch
+    // 7. Return to original branch
     let _ = run_git_cmd(&proj_dir, &["checkout", &original_branch]).await;
 
     Ok(proposal)
@@ -150,6 +171,113 @@ pub async fn git_get_client_proposals(
 }
 
 #[tauri::command]
+pub async fn git_checkout_proposal_branch(
+    project_id: String,
+    branch_name: String,
+) -> Result<(), String> {
+    let proj_dir = get_project_path(&project_id);
+    if !proj_dir.exists() {
+        return Err("Project directory not found".to_string());
+    }
+    run_git_cmd(&proj_dir, &["checkout", &branch_name]).await.map(|_| ())
+}
+
+#[tauri::command]
+pub async fn git_restore_main_branch(
+    project_id: String,
+) -> Result<(), String> {
+    let proj_dir = get_project_path(&project_id);
+    if !proj_dir.exists() {
+        return Err("Project directory not found".to_string());
+    }
+    let default_branch = get_default_branch(&proj_dir).await;
+    run_git_cmd(&proj_dir, &["checkout", &default_branch]).await.map(|_| ())
+}
+
+#[tauri::command]
+pub async fn git_refine_proposal_with_ai(
+    window: tauri::Window,
+    project_id: String,
+    proposal_id: String,
+    developer_prompt: String,
+    model_id: Option<String>,
+) -> Result<ClientProposal, String> {
+    let proj_dir = get_project_path(&project_id);
+    let prop_file = get_proposals_dir(&proj_dir).join(format!("{}.json", proposal_id));
+
+    if !prop_file.exists() {
+        return Err("Proposal not found".to_string());
+    }
+
+    let content = fs::read_to_string(&prop_file).map_err(|e| e.to_string())?;
+    let mut proposal: ClientProposal = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+
+    // 1. Checkout the proposal branch
+    run_git_cmd(&proj_dir, &["checkout", &proposal.branch_name]).await?;
+
+    // 2. Call editor_ai_project_edit to apply changes
+    let edit_res = crate::editor_ai::editor_ai_project_edit(
+        window,
+        project_id.clone(),
+        developer_prompt.clone(),
+        model_id,
+    ).await?;
+
+    if !edit_res.success {
+        // Return to default branch before erroring
+        let default_branch = get_default_branch(&proj_dir).await;
+        let _ = run_git_cmd(&proj_dir, &["checkout", &default_branch]).await;
+        return Err(edit_res.error.unwrap_or_else(|| "AI edit failed".to_string()));
+    }
+
+    // 3. Stage changes
+    let _ = run_git_cmd(&proj_dir, &["add", "."]).await;
+
+    // 4. Commit changes
+    let commit_msg = format!("Developer Refinement: {}", developer_prompt);
+    let _ = run_git_cmd(&proj_dir, &["commit", "-m", &commit_msg]).await;
+
+    // 5. Recompute diff against main branch
+    let default_branch = get_default_branch(&proj_dir).await;
+    let name_only = run_git_cmd(&proj_dir, &["diff", "--name-only", &default_branch, "HEAD"]).await.unwrap_or_default();
+    let mut files = Vec::new();
+    for f in name_only.lines() {
+        let f_trim = f.trim();
+        if !f_trim.is_empty() {
+            let f_diff = run_git_cmd(&proj_dir, &["diff", &default_branch, "HEAD", "--", f_trim]).await.unwrap_or_default();
+            files.push(ProposalFileDiff {
+                file_path: f_trim.to_string(),
+                diff: f_diff,
+                is_new: false,
+            });
+        }
+    }
+
+    if files.is_empty() {
+        let diff_raw = run_git_cmd(&proj_dir, &["diff", &default_branch, "HEAD"]).await.unwrap_or_default();
+        if !diff_raw.is_empty() {
+            files.push(ProposalFileDiff {
+                file_path: "Modified Files".to_string(),
+                diff: diff_raw,
+                is_new: false,
+            });
+        }
+    }
+
+    proposal.files = files;
+    proposal.prompt = format!("{} [AI Dorada: {}]", proposal.prompt, developer_prompt);
+
+    // 6. Save updated proposal JSON
+    let updated_content = serde_json::to_string_pretty(&proposal).map_err(|e| e.to_string())?;
+    fs::write(prop_file, updated_content).map_err(|e| e.to_string())?;
+
+    // 7. Return to default branch so background repository state stays on main
+    let _ = run_git_cmd(&proj_dir, &["checkout", &default_branch]).await;
+
+    Ok(proposal)
+}
+
+#[tauri::command]
 pub async fn git_update_proposal_status(
     project_id: String,
     proposal_id: String,
@@ -167,14 +295,12 @@ pub async fn git_update_proposal_status(
 
     proposal.status = status.clone();
 
-    // If approved, merge the proposal branch into current branch
+    // If approved, merge the proposal branch into default branch
     if status == "approved" {
-        let current_branch = run_git_cmd(&proj_dir, &["rev-parse", "--abbrev-ref", "HEAD"])
-            .await
-            .unwrap_or_else(|_| "main".to_string());
-
+        let default_branch = get_default_branch(&proj_dir).await;
+        // Make sure we are on default branch before merging
+        let _ = run_git_cmd(&proj_dir, &["checkout", &default_branch]).await;
         let _ = run_git_cmd(&proj_dir, &["merge", &proposal.branch_name]).await?;
-        let _ = run_git_cmd(&proj_dir, &["checkout", &current_branch]).await;
     }
 
     let updated_content = serde_json::to_string_pretty(&proposal).map_err(|e| e.to_string())?;

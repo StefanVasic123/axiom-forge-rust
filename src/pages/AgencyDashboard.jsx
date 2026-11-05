@@ -201,6 +201,10 @@ export default function AgencyDashboard() {
           proposal={selectedProposal}
           onClose={() => setSelectedProposal(null)}
           onUpdateStatus={handleUpdateStatus}
+          onProposalUpdated={(updated) => {
+            setProposals(prev => prev.map(p => p.id === updated.id ? updated : p));
+            setSelectedProposal(updated);
+          }}
         />
       )}
     </div>

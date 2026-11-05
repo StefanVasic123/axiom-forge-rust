@@ -5,7 +5,7 @@
  */
 
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useLocation } from 'react-router-dom';
 
 import Editor, { DiffEditor, loader } from '@monaco-editor/react';
 
@@ -522,6 +522,36 @@ function AIPanel({
 export default function EditorPage() {
   const { projectId } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
+
+  const queryParams = useMemo(() => new URLSearchParams(location.search), [location.search]);
+  const proposalId = queryParams.get('proposalId');
+  const proposalBranch = queryParams.get('branch');
+  const proposalPrompt = queryParams.get('prompt');
+
+  const handleCancelProposalReview = async () => {
+    try {
+      if (window.electronAPI?.agency?.restoreMainBranch) {
+        await window.electronAPI.agency.restoreMainBranch(projectId);
+      }
+      navigate('/agency-dashboard');
+    } catch (err) {
+      console.error('Failed to restore main branch:', err);
+      navigate('/agency-dashboard');
+    }
+  };
+
+  const handleApproveProposalFromEditor = async () => {
+    try {
+      if (window.electronAPI?.agency?.updateProposalStatus) {
+        await window.electronAPI.agency.updateProposalStatus(projectId, proposalId, 'approved');
+      }
+      navigate('/agency-dashboard');
+    } catch (err) {
+      console.error('Failed to approve proposal from editor:', err);
+      alert('Greška pri spajanju predloga: ' + (err?.message || err));
+    }
+  };
 
   const [project, setProject] = useState(null);
   const [files, setFiles] = useState([]);
@@ -1516,6 +1546,48 @@ export default function EditorPage() {
           </button>
         </div>
       </div>
+
+      {proposalId && proposalBranch && (
+        <div className="bg-gradient-to-r from-indigo-950 via-slate-900 to-indigo-950 border-b border-indigo-500/30 px-6 py-2.5 flex items-center justify-between shrink-0 shadow-lg">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="w-8 h-8 rounded-lg bg-indigo-500/20 border border-indigo-500/30 flex items-center justify-center text-indigo-400 shrink-0">
+              <GitCommit className="w-4 h-4 animate-pulse" />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold text-white uppercase tracking-wider">
+                  Režim Dorade Klijentskog Predloga
+                </span>
+                <span className="font-mono text-[11px] px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-300 border border-indigo-500/20">
+                  {proposalBranch}
+                </span>
+              </div>
+              {proposalPrompt && (
+                <p className="text-xs text-slate-400 truncate mt-0.5">
+                  Zahtev klijenta: <span className="text-slate-200 font-medium">"{proposalPrompt}"</span>
+                </p>
+              )}
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3 shrink-0">
+            <button
+              onClick={handleCancelProposalReview}
+              className="px-3.5 py-1.5 rounded-lg border border-slate-700 bg-slate-800/80 hover:bg-slate-700 text-slate-300 text-xs font-medium transition-colors"
+            >
+              Otkaži / Vrati na Main
+            </button>
+
+            <button
+              onClick={handleApproveProposalFromEditor}
+              className="px-4 py-1.5 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-500 hover:from-emerald-500 hover:to-teal-400 text-white text-xs font-semibold shadow-lg shadow-emerald-600/20 transition-all flex items-center gap-1.5"
+            >
+              <Check className="w-3.5 h-3.5" />
+              Odobri i Spoji u Main
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* ── MAIN AREA ── */}
       <div className="flex flex-1 overflow-hidden">
