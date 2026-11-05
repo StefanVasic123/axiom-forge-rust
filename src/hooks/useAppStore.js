@@ -109,6 +109,8 @@ export function useAppStore() {
       const result = await window.electronAPI.project.delete({ id: projectId });
       if (result.success) {
         actions.deleteProject(projectId);
+      } else {
+        throw new Error(result.error || 'Failed to delete project');
       }
     } catch (error) {
       actions.setError(error.message);

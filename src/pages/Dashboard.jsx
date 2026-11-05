@@ -98,7 +98,10 @@ function ProjectCard({ project, onDelete }) {
         {/* Actions Menu */}
         <div className="relative">
           <button
-            onClick={() => setShowMenu(!showMenu)}
+            onClick={(e) => {
+              e.stopPropagation();
+              setShowMenu(!showMenu);
+            }}
             className="p-2 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white transition-colors"
           >
             <MoreVertical className="w-4 h-4" />
@@ -108,11 +111,18 @@ function ProjectCard({ project, onDelete }) {
             <>
               <div 
                 className="fixed inset-0 z-10" 
-                onClick={() => setShowMenu(false)}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setShowMenu(false);
+                }}
               />
-              <div className="absolute right-0 top-full mt-1 w-48 bg-slate-900 border border-slate-800 rounded-lg shadow-xl z-20 py-1">
+              <div className="absolute right-0 top-full mt-1 w-48 bg-slate-900 border border-slate-800 rounded-lg shadow-xl z-20 py-1" onClick={(e) => e.stopPropagation()}>
                 <Link
                   to={`/projects/${project.id}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setShowMenu(false);
+                  }}
                   className="flex items-center gap-2 px-4 py-2 text-sm text-slate-300 hover:bg-slate-800 hover:text-white"
                 >
                   <ExternalLink className="w-4 h-4" />
@@ -121,6 +131,10 @@ function ProjectCard({ project, onDelete }) {
                 {project.status === 'awaiting-keys' && (
                   <Link
                     to={`/projects/${project.id}/config`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setShowMenu(false);
+                    }}
                     className="flex items-center gap-2 px-4 py-2 text-sm text-amber-400 hover:bg-slate-800"
                   >
                     <Settings className="w-4 h-4" />
@@ -129,7 +143,8 @@ function ProjectCard({ project, onDelete }) {
                 )}
                 {(project.status === 'generating' || project.status === 'paused' || project.status === 'stopped') && (
                   <button
-                    onClick={async () => {
+                    onClick={async (e) => {
+                      e.stopPropagation();
                       setShowMenu(false);
                       await window.electronAPI.window.showFloating({ id: project.id });
                       if (project.status === 'stopped' || project.status === 'paused') {
@@ -144,10 +159,10 @@ function ProjectCard({ project, onDelete }) {
                 )}
                 {project.status === 'ready' && (
                   <button
-                    onClick={() => {
-                      // Trigger deployment
-                      window.electronAPI.task.startDeployment(project.id);
+                    onClick={(e) => {
+                      e.stopPropagation();
                       setShowMenu(false);
+                      window.electronAPI.task.startDeployment(project.id);
                     }}
                     className="w-full flex items-center gap-2 px-4 py-2 text-sm text-emerald-400 hover:bg-slate-800"
                   >
@@ -157,9 +172,10 @@ function ProjectCard({ project, onDelete }) {
                 )}
                 <hr className="my-1 border-slate-800" />
                 <button
-                  onClick={() => {
-                    onDelete(project.id);
+                  onClick={(e) => {
+                    e.stopPropagation();
                     setShowMenu(false);
+                    onDelete(project.id);
                   }}
                   className="w-full flex items-center gap-2 px-4 py-2 text-sm text-rose-400 hover:bg-slate-800"
                 >
@@ -294,7 +310,12 @@ function Dashboard() {
 
   const handleDelete = async (projectId) => {
     if (confirm(t('dashboard.deleteConfirm'))) {
-      await removeProject(projectId);
+      try {
+        await removeProject(projectId);
+      } catch (err) {
+        console.error('Failed to delete project:', err);
+        alert(err?.message || 'Greška pri brisanju projekta');
+      }
     }
   };
 

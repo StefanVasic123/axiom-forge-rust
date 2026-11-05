@@ -7,6 +7,7 @@ import ReactDOM from 'react-dom/client';
 import { HashRouter, Routes, Route } from 'react-router-dom';
 import App from './App';
 import FloatingProgress from './components/FloatingProgress';
+import ErrorBoundary from './components/ErrorBoundary';
 import { I18nProvider } from './i18n/I18nContext';
 import './styles/index.css';
 import './lib/ipc-bridge';
@@ -36,7 +37,15 @@ const displayError = (msg, err) => {
     <pre style="white-space: pre-wrap; font-size: 0.85rem; line-height: 1.5;">${msg}\n\n${err}</pre>
   `;
   document.body.appendChild(div);
-  document.getElementById('close-crash-log')?.addEventListener('click', () => div.remove());
+  document.getElementById('close-crash-log')?.addEventListener('click', () => {
+    div.remove();
+    // If root was unmounted by React, reload cleanly to Dashboard to prevent infinite spinner
+    const root = document.getElementById('root');
+    if (!root || !root.children.length) {
+      window.location.hash = '#/';
+      window.location.reload();
+    }
+  });
 };
 
 const isBenignError = (errStr) => {
@@ -74,14 +83,16 @@ const isFloatingWindow = window.location.hash.includes('/floating') ||
 
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
-    <I18nProvider>
-      {isFloatingWindow ? (
-        <FloatingProgress />
-      ) : (
-        <HashRouter>
-          <App />
-        </HashRouter>
-      )}
-    </I18nProvider>
+    <ErrorBoundary>
+      <I18nProvider>
+        {isFloatingWindow ? (
+          <FloatingProgress />
+        ) : (
+          <HashRouter>
+            <App />
+          </HashRouter>
+        )}
+      </I18nProvider>
+    </ErrorBoundary>
   </React.StrictMode>
 );

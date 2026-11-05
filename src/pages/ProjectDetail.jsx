@@ -129,6 +129,7 @@ function StatusBadge({ status }) {
 function ProjectDetail() {
   const { projectId } = useParams();
   const navigate = useNavigate();
+  const { t } = useI18n();
   const { 
     projects, 
     loadProjects, 
@@ -148,7 +149,7 @@ function ProjectDetail() {
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
 
   // Find active task for this project
-  const activeTask = Object.values(taskProgress).find(t => t.projectId === projectId);
+  const activeTask = Object.values(taskProgress).find(task => task.projectId === projectId);
 
   useEffect(() => {
     loadProjects();
@@ -210,8 +211,13 @@ function ProjectDetail() {
 
   const handleDelete = async () => {
     if (confirm(t('projectDetail.deleteConfirm'))) {
-      await removeProject(projectId);
-      navigate('/');
+      try {
+        await removeProject(projectId);
+        navigate('/');
+      } catch (err) {
+        console.error('Failed to delete project:', err);
+        alert(err?.message || 'Greška pri brisanju projekta');
+      }
     }
   };
 

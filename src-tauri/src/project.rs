@@ -143,25 +143,82 @@ pub fn project_save(mut project_data: Value) -> ProjectSaveResult {
 
     let _ = fs::write(&file_path, serde_json::to_string_pretty(&projects).unwrap());
     ProjectSaveResult { success: true, project: Some(project_data), error: None }
-}#[tauri::command]
+}pub fn force_remove_dir(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+
+    fn make_writable_and_remove(p: &Path) {
+        if p.is_dir() {
+            if let Ok(entries) = fs::read_dir(p) {
+                for entry in entries.flatten() {
+                    make_writable_and_remove(&entry.path());
+                }
+            }
+            if let Ok(metadata) = p.metadata() {
+                let mut perms = metadata.permissions();
+                if perms.readonly() {
+                    perms.set_readonly(false);
+                    let _ = fs::set_permissions(p, perms);
+                }
+            }
+            let _ = fs::remove_dir(p);
+        } else {
+            if let Ok(metadata) = p.metadata() {
+                let mut perms = metadata.permissions();
+                if perms.readonly() {
+                    perms.set_readonly(false);
+                    let _ = fs::set_permissions(p, perms);
+                }
+            }
+            let _ = fs::remove_file(p);
+        }
+    }
+
+    make_writable_and_remove(path);
+
+    #[cfg(target_os = "windows")]
+    {
+        if path.exists() {
+            use std::process::Command;
+            let path_str = path.to_string_lossy();
+            let mut cmd = Command::new("cmd");
+            cmd.args(&["/C", "rmdir", "/S", "/Q", &path_str]);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            }
+            let _ = cmd.output();
+        }
+    }
+}
+
+#[tauri::command]
 pub fn project_delete(id: String) -> Result<bool, String> {
     let file_path = get_projects_file();
-    if !file_path.exists() { return Ok(true); }
+    let projects_base = get_projects_dir();
 
-    let content = fs::read_to_string(&file_path).unwrap_or_else(|_| "[]".to_string());
-    let mut projects: Vec<Value> = serde_json::from_str(&content).unwrap_or_else(|_| vec![]);
-    
-    projects.retain(|p| p.get("id").and_then(|i| i.as_str()) != Some(&id));
-    
-    let _ = fs::write(&file_path, serde_json::to_string_pretty(&projects).unwrap());
-    
-    // Also delete the folder if it exists and is internal
+    // 1. Resolve project directory BEFORE removing from projects.json
     let proj_dir = get_project_path(&id);
-    let is_internal = proj_dir.starts_with(get_projects_dir());
-    if proj_dir.exists() && is_internal {
-        let _ = fs::remove_dir_all(proj_dir);
+    let fallback_dir = projects_base.join(&id);
+
+    // 2. Remove project from projects.json
+    if file_path.exists() {
+        let content = fs::read_to_string(&file_path).unwrap_or_else(|_| "[]".to_string());
+        let mut projects: Vec<Value> = serde_json::from_str(&content).unwrap_or_else(|_| vec![]);
+        projects.retain(|p| p.get("id").and_then(|i| i.as_str()) != Some(&id));
+        let _ = fs::write(&file_path, serde_json::to_string_pretty(&projects).unwrap_or_default());
     }
-    
+
+    // 3. Delete directory if it is inside internal projects directory
+    if proj_dir.exists() && proj_dir.starts_with(&projects_base) {
+        force_remove_dir(&proj_dir);
+    }
+    if fallback_dir.exists() {
+        force_remove_dir(&fallback_dir);
+    }
+
     Ok(true)
 }
 

@@ -271,8 +271,9 @@ window.electronAPI = {
     save: async (projectData) => {
       return await invoke('project_save', { projectData });
     },
-    delete: async ({ id }) => {
+    delete: async (arg) => {
       try {
+        const id = typeof arg === 'string' ? arg : (arg?.id || arg?.projectId);
         const res = await invoke('project_delete', { id });
         return { success: res };
       } catch (e) {
