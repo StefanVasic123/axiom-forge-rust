@@ -464,7 +464,7 @@ pub async fn heal_prisma_schema_loop(
             3. Do not use @db.Json native type annotation on String[] fields. Use standard Prisma types. \
             4. The @relation attribute (e.g. `@relation(fields: [userId], references: [id])`) MUST ONLY be placed on relational object fields (like `user User`), never on scalar fields (like `userId String`). Placing @relation on a scalar field will throw an 'Invalid field type, not a relation' error. \
             5. For NextAuth schema, the VerificationToken model does not have a direct relation back to the User model; do not define a verificationTokens relation field on the User model. \
-            6. Every relation needs an opposite field on the other model (e.g. `user User @relation(...)` on the child and `accounts Account[]` on User). \
+            6. Every relation needs an opposite field on the other model (e.g. `user User @relation(...)` on the child and `dashboards Dashboard[]` on User). If the relation uses a name (e.g. `name: \"TeamMember\"`), the opposite relation array MUST use the exact same name (e.g. `teams Team[] @relation(\"TeamMember\")`). CRITICAL: NEVER delete foreign key scalar fields (like `userId String` or `projectId String`). Always ADD the opposite relation field instead! \
             7. Fields pointing to another model (relations) CANNOT have a `@default()` attribute. For default values, use an `enum` or a scalar type (e.g. `String @default(\"USER\")`). \
             First, in exactly 1 concise sentence, identify the compiler rule that was violated on the failing line. \
             Then, provide the complete corrected schema.prisma code wrapped in a ```prisma code block.";

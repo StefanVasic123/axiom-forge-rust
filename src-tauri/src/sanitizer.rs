@@ -901,11 +901,40 @@ pub fn post_process_generated_file(
             i = absolute_idx + 1;
         }
 
-        // 4a. Strip @relation with fields/references from array fields (e.g. Project[] @relation(...))
-        let array_rel_regex = regex::Regex::new(r"(?m)(\b\w+\[\]\s*)@relation\([^)]*\)").ok();
-        if let Some(re) = array_rel_regex {
-            processed = re.replace_all(&processed, "$1").to_string();
+        // 4a. Strip invalid fields/references from array fields while PRESERVING relation names:
+        // e.g. Team[] @relation(fields: [x], references: [y]) -> Team[]
+        // e.g. Team[] @relation("TeamMember", fields: [x], references: [y]) -> Team[] @relation("TeamMember")
+        // e.g. Team[] @relation("TeamMember") -> PRESERVED!
+        let mut lines_arr: Vec<String> = processed.lines().map(|s| s.to_string()).collect();
+        for line in lines_arr.iter_mut() {
+            let trimmed = line.trim();
+            if trimmed.contains("[]") && trimmed.contains("@relation") {
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() >= 2 && parts[1].contains("[]") {
+                    if let Some(rel_idx) = line.find("@relation") {
+                        let after_rel = &line[rel_idx..];
+                        if let (Some(open_p), Some(close_p)) = (after_rel.find('('), after_rel.find(')')) {
+                            let inner = &after_rel[open_p + 1..close_p];
+                            if inner.contains("fields:") || inner.contains("references:") {
+                                let name_re = regex::Regex::new(r#"(?:name:\s*["']([^"']+)["']|["']([^"']+)["'])"#).ok();
+                                let rel_name = name_re.as_ref().and_then(|r| {
+                                    r.captures(inner).and_then(|c| c.get(1).or_else(|| c.get(2)).map(|m| m.as_str()))
+                                });
+                                match rel_name {
+                                    Some(name) => {
+                                        *line = format!("{}@relation(\"{}\"){}", &line[..rel_idx], name, &after_rel[close_p + 1..]);
+                                    }
+                                    None => {
+                                        *line = format!("{}{}", &line[..rel_idx].trim_end(), &after_rel[close_p + 1..]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
+        processed = lines_arr.join("\n");
 
         // 4b. Strip invalid @default(...) from relation fields pointing to another model (e.g. role Role @default(...))
         let model_names: Vec<String> = regex::Regex::new(r"(?m)^model\s+(\w+)\s*\{")
@@ -993,6 +1022,9 @@ pub fn post_process_generated_file(
 
         // 5. Enforce the canonical NextAuth Prisma Adapter models (Account / Session)
         processed = apply_nextauth_prisma_template(&processed);
+
+        // 6. Ensure all @relation definitions have their opposite relation on the target model
+        processed = ensure_prisma_opposite_relations(&processed);
     }
 
     let is_js_ts_file = path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx") || path_lower.ends_with(".ts") || path_lower.ends_with(".js");
@@ -1613,3 +1645,179 @@ export default function Home() {
     processed
 }
 
+
+/// Automatically identifies any @relation(fields: [...], references: [...]) that lacks
+/// an opposite relation field on the referenced model and deterministically injects it.
+/// Preserves explicit relation names (e.g. name: "TeamMember").
+pub fn ensure_prisma_opposite_relations(schema: &str) -> String {
+    let model_re = match regex::Regex::new(r"(?ms)^model\s+(\w+)\s*\{([^}]+)\}") {
+        Ok(r) => r,
+        Err(_) => return schema.to_string(),
+    };
+
+    let mut model_names: Vec<String> = Vec::new();
+    let mut model_bodies: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    for cap in model_re.captures_iter(schema) {
+        if let (Some(m_name), Some(m_body)) = (cap.get(1), cap.get(2)) {
+            let name = m_name.as_str().to_string();
+            let body = m_body.as_str().to_string();
+            model_names.push(name.clone());
+            model_bodies.insert(name, body);
+        }
+    }
+
+    if model_names.is_empty() {
+        return schema.to_string();
+    }
+
+    let mut pending_inserts: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for m in &model_names {
+        pending_inserts.insert(m.clone(), Vec::new());
+    }
+
+    let rel_name_re = regex::Regex::new(r#"@relation\([^)]*(?:name:\s*["']([^"']+)["']|["']([^"']+)["'])"#).ok();
+
+    for source_model in &model_names {
+        let body = match model_bodies.get(source_model) {
+            Some(b) => b,
+            None => continue,
+        };
+
+        for line in body.lines() {
+            let trimmed = line.trim();
+            if !trimmed.contains("@relation") || !trimmed.contains("fields:") || !trimmed.contains("references:") {
+                continue;
+            }
+
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() < 2 {
+                continue;
+            }
+
+            let clean_target = parts[1].replace(['?', '[', ']'], "");
+            if !model_names.contains(&clean_target) || clean_target == *source_model {
+                continue;
+            }
+
+            // Extract relation name if present
+            let rel_name: Option<String> = if let Some(ref re) = rel_name_re {
+                re.captures(trimmed).and_then(|c| {
+                    c.get(1).or_else(|| c.get(2)).map(|m| m.as_str().to_string())
+                })
+            } else {
+                None
+            };
+
+            let target_body = match model_bodies.get(&clean_target) {
+                Some(b) => b,
+                None => continue,
+            };
+
+            let mut has_opposite = false;
+            for t_line in target_body.lines() {
+                let t_trim = t_line.trim();
+                let t_parts: Vec<&str> = t_trim.split_whitespace().collect();
+                if t_parts.len() >= 2 {
+                    let t_clean_type = t_parts[1].replace(['?', '[', ']'], "");
+                    if t_clean_type == *source_model {
+                        if let Some(ref name) = rel_name {
+                            if t_trim.contains(&format!("\"{}\"", name)) || t_trim.contains(&format!("'{}'", name)) {
+                                has_opposite = true;
+                                break;
+                            }
+                        } else {
+                            has_opposite = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if !has_opposite {
+                // Check if foreign key is unique (1-to-1 relation)
+                let is_one_to_one = if let Some(open_f) = trimmed.find("fields: [") {
+                    let fk_slice = &trimmed[open_f + 9..];
+                    if let Some(close_f) = fk_slice.find(']') {
+                        let fk_name = fk_slice[..close_f].trim();
+                        body.lines().any(|l| {
+                            let lt = l.trim();
+                            lt.starts_with(fk_name) && lt.contains("@unique")
+                        })
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                let mut field_name = if is_one_to_one {
+                    let s = source_model.to_string();
+                    if let Some(first_char) = s.chars().next() {
+                        format!("{}{}", first_char.to_lowercase(), &s[first_char.len_utf8()..])
+                    } else {
+                        s
+                    }
+                } else {
+                    let mut plural = source_model.to_string();
+                    if let Some(first_char) = plural.chars().next() {
+                        plural = format!("{}{}", first_char.to_lowercase(), &plural[first_char.len_utf8()..]);
+                    }
+
+                    if plural.ends_with('y') && !plural.ends_with("ey") && !plural.ends_with("ay") && !plural.ends_with("oy") {
+                        plural.pop();
+                        plural.push_str("ies");
+                    } else if !plural.ends_with('s') {
+                        plural.push('s');
+                    }
+                    plural
+                };
+
+                let field_type = if is_one_to_one {
+                    format!("{}?", source_model)
+                } else {
+                    format!("{}[]", source_model)
+                };
+
+                // Check collisions with existing fields or pending inserts
+                let existing_inserts = pending_inserts.get(&clean_target).cloned().unwrap_or_default();
+                let has_collision = target_body.lines().any(|l| l.trim().starts_with(&field_name))
+                    || existing_inserts.iter().any(|i| i.trim().starts_with(&field_name));
+                if has_collision {
+                    field_name = format!("{}{}", field_name, source_model);
+                }
+
+                let insert_line = match rel_name {
+                    Some(name) => format!("  {:12} {} @relation(\"{}\")", field_name, field_type, name),
+                    None => format!("  {:12} {}", field_name, field_type),
+                };
+
+                if let Some(inserts) = pending_inserts.get_mut(&clean_target) {
+                    if !inserts.contains(&insert_line) {
+                        inserts.push(insert_line);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut result = schema.to_string();
+    for (target_model, inserts) in pending_inserts {
+        if inserts.is_empty() {
+            continue;
+        }
+
+        let pattern = format!(r"(?ms)(model\s+{}\s*\{{)([\s\S]*?)(\n*\}})", target_model);
+        if let Ok(block_re) = regex::Regex::new(&pattern) {
+            let insert_str = inserts.join("\n");
+            result = block_re.replace(&result, |caps: &regex::Captures| {
+                let p1 = &caps[1];
+                let p2 = &caps[2];
+                let p3 = &caps[3];
+                format!("{}{}\n{}\n{}", p1, p2.trim_end(), insert_str, p3.trim_start())
+            }).to_string();
+        }
+    }
+
+    result
+}

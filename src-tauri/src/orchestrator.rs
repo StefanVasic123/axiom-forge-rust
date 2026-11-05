@@ -963,7 +963,7 @@ pub fn get_expert_system_prompt(
              - Always include necessary relation annotations cleanly and explicitly.\n\
              - PRISMA RELATION RULES:\n\
                1. In a one-to-many relation, the `@relation` attribute (specifying `fields` and `references`) MUST ONLY be defined on the model that contains the actual foreign key column (the \"many\" side). The parent model (the \"one\" side, returning an array `Model[]`) MUST NOT specify any `fields` or `references` in its `@relation` attribute.\n\
-               2. Every relation must have an opposite relation field defined on both models. For example, if model `Message` has `sender User @relation(fields: [senderId], references: [id])`, then model `User` MUST have `messages Message[]`.\n\
+                2. Every relation must have an opposite relation field defined on both models. For example, if model `Message` has `sender User @relation(fields: [senderId], references: [id])`, then model `User` MUST have `messages Message[]`. If `@relation` has a name (e.g. `name: \"TeamMember\"`), the opposite field MUST specify the same name: `@relation(\"TeamMember\")`.\n\
                3. For implicit many-to-many relations, do NOT specify any `fields` or `references` arguments.\n\
                4. The `@relation` attribute MUST ONLY be placed on relational object fields, never on scalar fields.\n\
                5. For NextAuth schema, the VerificationToken model does not have a direct relation back to the User model.\n\

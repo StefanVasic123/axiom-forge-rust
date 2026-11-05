@@ -522,6 +522,52 @@ mod tests {
         assert_eq!(apply_nextauth_prisma_template(content), content);
     }
 
+
+    #[test]
+    fn test_ensure_prisma_opposite_relations() {
+        let broken = r#"
+model User {
+  id    String @id @default(cuid())
+  email String @unique
+}
+
+model Project {
+  id   String @id @default(cuid())
+  name String
+}
+
+model Team {
+  id        String  @id @default(cuid())
+  userId    String
+  member    User    @relation(fields: [userId], references: [id], name: "TeamMember")
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id])
+}
+
+model Analytics {
+  id        String   @id @default(cuid())
+  timestamp DateTime @default(now())
+  projectId String?
+  project   Project? @relation(fields: [projectId], references: [id])
+}
+
+model Dashboard {
+  id       String @id @default(cuid())
+  settings Json
+  userId   String
+  user     User   @relation(fields: [userId], references: [id])
+}
+"#;
+
+        let fixed = post_process_generated_file("prisma/schema.prisma", broken, &serde_json::json!({}), false);
+        // Opposite relation with relation name preserved
+        assert!(fixed.contains("Team[]") && fixed.contains("@relation(\"TeamMember\")"));
+        // Opposites for Dashboard and Analytics added
+        assert!(fixed.contains("Dashboard[]"));
+        assert!(fixed.contains("Analytics[]"));
+        assert!(fixed.contains("Team[]"));
+    }
+
     #[test]
     fn test_nextjs_middleware_rulepack() {
         let content = r#"import { NextRequest, NextResponse } from 'next/server';
