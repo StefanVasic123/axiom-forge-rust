@@ -1240,9 +1240,15 @@ pub async fn project_heal_compile_error(
                                         *file_content_mut = new_content;
                                     },
                                     Err(err) => {
-                                        let err_msg = format!("Greška pri primeni ispravke u fajlu {}: {}", edit_path, err);
-                                        debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
-                                        return Err(err_msg);
+                                        let has_tw = proj_dir.join("tailwind.config.js").exists() || proj_dir.join("tailwind.config.ts").exists();
+                                        let sanitized_fallback = post_process_generated_file(&edit_path, file_content_mut, &serde_json::json!({}), has_tw);
+                                        if sanitized_fallback != *file_content_mut {
+                                            *file_content_mut = sanitized_fallback;
+                                        } else {
+                                            let err_msg = format!("Greška pri primeni ispravke u fajlu {}: {}", edit_path, err);
+                                            debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
+                                            return Err(err_msg);
+                                        }
                                     }
                                 }
                             }

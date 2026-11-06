@@ -1001,6 +1001,25 @@ export type ButtonProps = {
         assert!(!output.contains("data-axiom-file?:"));
         assert!(output.contains(r#""aria-label"?: string;"#));
         assert!(output.contains(r#""data-testid"?: string;"#));
+
+        let orphan_input = r#"import React from 'react';
+export const Skeleton = () => {
+  return (
+    <div
+      data-axiom-component="Skeleton"
+      data-axiom-file="src/components/ui/skeleton.tsx"
+    />
+  );
+};
+
+data-axiom-component="Skeleton"
+data-axiom-file="src/components/ui/skeleton.tsx"
+
+export default Skeleton;
+"#;
+        let orphan_output = sanitize_ts_interfaces(orphan_input);
+        assert_eq!(orphan_output.matches(r#"data-axiom-component="Skeleton""#).count(), 1);
+        assert_eq!(orphan_output.matches(r#"data-axiom-file="src/components/ui/skeleton.tsx""#).count(), 1);
     }
 
     #[test]
@@ -1077,6 +1096,111 @@ export default function AlertDialog() { return <div />; }
         assert!(!looks_like_code_payload(
             "The error indicates that the name `Skeleton` is defined multiple times in the file. This is likely due to an additional export of the `Skeleton` component without a default export."
         ));
+    }
+
+    #[test]
+    fn test_context_isolation_ui_vs_backend_and_auth() {
+        let temp_dir = std::env::temp_dir().join("axiom_test_ctx_isolation");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(temp_dir.join("prisma")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/lib")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/app/api/auth/[...nextauth]")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/hooks")).unwrap();
+
+        std::fs::write(temp_dir.join("prisma/schema.prisma"), "model Project { id String @id }").unwrap();
+        std::fs::write(temp_dir.join("src/lib/prisma.ts"), "export const prisma = {};").unwrap();
+        std::fs::write(temp_dir.join("src/app/api/auth/[...nextauth]/route.ts"), "export const authOptions = {};").unwrap();
+        std::fs::write(temp_dir.join("src/hooks/useProjects.ts"), "export const useProjects = () => [];").unwrap();
+
+        let ui_ctx = get_context_files_for("src/app/dashboard/analytics/page.tsx", &temp_dir);
+        assert!(!ui_ctx.contains("schema.prisma"));
+        assert!(!ui_ctx.contains("src/lib/prisma.ts"));
+        assert!(!ui_ctx.contains("[...nextauth]"));
+        assert!(ui_ctx.contains("src/hooks/useProjects.ts"));
+
+        let navbar_ctx = get_context_files_for("src/components/Navbar.tsx", &temp_dir);
+        assert!(!navbar_ctx.contains("schema.prisma"));
+        assert!(!navbar_ctx.contains("src/hooks/useProjects.ts"));
+
+        let api_ctx = get_context_files_for("src/app/api/projects/route.ts", &temp_dir);
+        assert!(api_ctx.contains("schema.prisma"));
+        assert!(api_ctx.contains("src/lib/prisma.ts"));
+        assert!(!api_ctx.contains("[...nextauth]"));
+
+        let auth_ctx = get_context_files_for("src/app/login/page.tsx", &temp_dir);
+        assert!(auth_ctx.contains("[...nextauth]"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_scoped_ui_rules_and_design_archetype() {
+        let navbar_rules = get_scoped_ui_rules("src/components/Navbar.tsx");
+        assert!(navbar_rules.contains("BRAND LOGO LOCKUP"));
+        assert!(navbar_rules.contains("HAMBURGER MENU"));
+        assert!(!navbar_rules.contains("SCOPED FOOTER LAYOUT & COMPACTNESS RULES"));
+        assert!(!navbar_rules.contains("SCOPED ANALYTICS, KPI & DATA VISUALIZATION RULES"));
+
+        let footer_rules = get_scoped_ui_rules("src/components/Footer.tsx");
+        assert!(footer_rules.contains("SCOPED FOOTER LAYOUT & COMPACTNESS RULES"));
+        assert!(!footer_rules.contains("BRAND LOGO LOCKUP"));
+
+        let analytics_rules = get_scoped_ui_rules("src/app/dashboard/analytics/page.tsx");
+        assert!(analytics_rules.contains("SCOPED ANALYTICS, KPI & DATA VISUALIZATION RULES"));
+        assert!(analytics_rules.contains("SCOPED PAGE & DASHBOARD PREVIEW RESILIENCE RULES"));
+
+        let api_rulepacks = get_stack_rulepacks("src/app/api/projects/route.ts", "import { NextResponse } from 'next/server';", None);
+        assert!(!api_rulepacks.contains("UI DESIGN & LAYOUT FOUNDATION"));
+
+        let archetype = resolve_design_archetype_prompt("NexusFlow Serbia", "B2B SaaS project management and analytics dashboard", "saas");
+        assert!(archetype.contains("Executive B2B SaaS & Collaborative Workspace"));
+    }
+
+    #[test]
+    fn test_sanitize_unhandled_session_loading_strips_preview_blockers() {
+        let analytics_input = r#"
+"use client";
+import React from 'react';
+import { useSession } from 'next-auth/react';
+
+const AnalyticsPage = () => {
+  const { data: session } = useSession();
+
+  if (!session) {
+    return <div>Loading...</div>;
+  }
+
+  return (
+    <div className="max-w-7xl mx-auto p-6">
+      <h1>Analytics Overview</h1>
+    </div>
+  );
+};
+export default AnalyticsPage;
+"#;
+        let processed = post_process_generated_file("src/app/dashboard/analytics/page.tsx", analytics_input, &serde_json::json!({}), true);
+        assert!(!processed.contains("return <div>Loading...</div>;"));
+        assert!(processed.contains(r#"<div data-axiom-component="Page" data-axiom-file="src/app/dashboard/analytics/page.tsx" className="max-w-7xl mx-auto p-6">"#));
+
+        let dash_input = r#"
+"use client";
+import React from 'react';
+import { useSession } from 'next-auth/react';
+import Link from 'next/link';
+
+export default function DashboardPage() {
+  const { status } = useSession();
+  if (status === 'unauthenticated') return <Link href="/login">Log in</Link>;
+  return (
+    <main className="p-8">
+      <h1>Dashboard KPI</h1>
+    </main>
+  );
+}
+"#;
+        let processed_dash = post_process_generated_file("src/app/dashboard/page.tsx", dash_input, &serde_json::json!({}), true);
+        assert!(!processed_dash.contains("return <Link href=\"/login\">Log in</Link>;"));
+        assert!(processed_dash.contains("<h1>Dashboard KPI</h1>"));
     }
 
 }

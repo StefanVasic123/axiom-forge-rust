@@ -706,8 +706,8 @@ export default function EditorPage() {
     const promptText = typeof customPrompt === 'string' && customPrompt.trim().length > 0
       ? customPrompt
       : (previewRuntimeError
-          ? `Ispravi sledeću runtime grešku na ovoj stranici: "${previewRuntimeError.message}". Osiguraj ispravne React hook pozive i da se stranica bez greške renderuje u preview-u.`
-          : `Ova stranica (${targetFile?.path || 'trenutna stranica'}) se ne prikazuje u preview-u ili ima problem sa učitavanjem/loading stanjem. Pregledaj kod, osiguraj realne mock podatke i pravilan završetak učitavanja (setLoading(false)) tako da se stranica odmah uspešno prikaže u preview modu.`);
+          ? `Ispravi sledeću runtime grešku na ovoj stranici: "${previewRuntimeError.message}". Osiguraj ispravne React hook pozive, bezbedno formatiranje datuma (new Date(val).toLocaleDateString()) i da se stranica bez greške renderuje u preview-u.`
+          : `Unapredi prikaz i funkcionalnost ovog fajla (${targetFile?.path || 'trenutna stranica'}): 1) Ukloni sve early-return blokade za sesiju (if (!session) return Loading ili if (status === 'unauthenticated') return Log in) kako bi se stranica odmah prikazala u preview modu; 2) Inicijalizuj useState sa 4 do 6 realističnih domenskih mock stavki (ili kompletnim podacima za grafikone) tako da interfejs nikada ne bude prazan; 3) Primeni moderan, responzivan Tailwind dizajn (max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8, kartice sa rounded-xl border shadow-sm, dugmad sa inline-flex items-center gap-2).`);
 
     setAiExternalPrompt(promptText);
   }, [activeTab, activePreviewFile, files, openFile, previewRuntimeError]);

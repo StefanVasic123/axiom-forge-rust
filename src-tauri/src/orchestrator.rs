@@ -140,42 +140,95 @@ pub fn get_generation_phase(file_path: &str, project_type: &str) -> GenerationPh
 
 pub fn get_context_files_for(file_path: &str, proj_dir: &std::path::Path) -> String {
     let mut context = String::new();
-    
-    let prisma_path = proj_dir.join("prisma/schema.prisma");
-    let prisma_path_alt = proj_dir.join("schema.prisma");
-    let actual_prisma = if prisma_path.exists() { Some(prisma_path) } else if prisma_path_alt.exists() { Some(prisma_path_alt) } else { None };
-    
-    if let Some(p_path) = actual_prisma {
-        if file_path != "prisma/schema.prisma" && file_path != "schema.prisma" {
-            if let Ok(content) = std::fs::read_to_string(&p_path) {
-                context.push_str(&format!("\nReference: Database Schema (schema.prisma):\n```prisma\n{}\n```\n", content));
+    let path_lower = file_path.to_lowercase().replace('\\', "/");
+
+    let is_backend_or_db = path_lower.contains("/api/")
+        || path_lower.ends_with("route.ts")
+        || path_lower.ends_with("route.js")
+        || path_lower.contains("prisma")
+        || path_lower.contains("server.")
+        || path_lower.contains("/models/")
+        || path_lower.contains("seed.");
+
+    let is_auth_file = path_lower.contains("/login")
+        || path_lower.contains("/register")
+        || path_lower.contains("/signup")
+        || path_lower.contains("auth");
+
+    // 1. Database Schema & Prisma Singleton: strictly isolated to backend/API/database files.
+    // Never leak raw Prisma schemas into UI components or client pages!
+    if is_backend_or_db {
+        let prisma_path = proj_dir.join("prisma/schema.prisma");
+        let prisma_path_alt = proj_dir.join("schema.prisma");
+        let actual_prisma = if prisma_path.exists() {
+            Some(prisma_path)
+        } else if prisma_path_alt.exists() {
+            Some(prisma_path_alt)
+        } else {
+            None
+        };
+
+        if let Some(p_path) = actual_prisma {
+            if path_lower != "prisma/schema.prisma" && path_lower != "schema.prisma" {
+                if let Ok(content) = std::fs::read_to_string(&p_path) {
+                    context.push_str(&format!(
+                        "\nReference: Database Schema (schema.prisma):\n```prisma\n{}\n```\n",
+                        content
+                    ));
+                }
+            }
+        }
+
+        let prisma_lib = proj_dir.join("src/lib/prisma.ts");
+        let prisma_lib_alt = proj_dir.join("src/lib/prisma.js");
+        let actual_prisma_lib = if prisma_lib.exists() {
+            Some(prisma_lib)
+        } else if prisma_lib_alt.exists() {
+            Some(prisma_lib_alt)
+        } else {
+            None
+        };
+        if let Some(pl_path) = actual_prisma_lib {
+            if !path_lower.contains("prisma") {
+                if let Ok(content) = std::fs::read_to_string(&pl_path) {
+                    context.push_str(&format!(
+                        "\nReference: Prisma client export (src/lib/prisma.ts):\n```typescript\n{}\n```\n",
+                        content
+                    ));
+                }
             }
         }
     }
-    
-    let prisma_lib = proj_dir.join("src/lib/prisma.ts");
-    let prisma_lib_alt = proj_dir.join("src/lib/prisma.js");
-    let actual_prisma_lib = if prisma_lib.exists() { Some(prisma_lib) } else if prisma_lib_alt.exists() { Some(prisma_lib_alt) } else { None };
-    if let Some(pl_path) = actual_prisma_lib {
-        if !file_path.contains("prisma") {
-            if let Ok(content) = std::fs::read_to_string(&pl_path) {
-                context.push_str(&format!("\nReference: Prisma client export (src/lib/prisma.ts):\n```typescript\n{}\n```\n", content));
-            }
-        }
-    }
-    
-    let auth_route = proj_dir.join("src/app/api/auth/[...nextauth]/route.ts");
-    let auth_route_alt = proj_dir.join("src/app/api/auth/[...nextauth]/route.js");
-    let actual_auth_route = if auth_route.exists() { Some(auth_route) } else if auth_route_alt.exists() { Some(auth_route_alt) } else { None };
-    if let Some(ar_path) = actual_auth_route {
-        if file_path.contains("hooks") || file_path.contains("components") || file_path.contains("app") {
+
+    // 2. NextAuth configuration: strictly isolated to authentication files (/login, /register, useAuth).
+    // Never inject NextAuth server config into general UI components or dashboard/analytics pages!
+    if is_auth_file && !path_lower.contains("[...nextauth]") {
+        let auth_route = proj_dir.join("src/app/api/auth/[...nextauth]/route.ts");
+        let auth_route_alt = proj_dir.join("src/app/api/auth/[...nextauth]/route.js");
+        let actual_auth_route = if auth_route.exists() {
+            Some(auth_route)
+        } else if auth_route_alt.exists() {
+            Some(auth_route_alt)
+        } else {
+            None
+        };
+        if let Some(ar_path) = actual_auth_route {
             if let Ok(content) = std::fs::read_to_string(&ar_path) {
-                context.push_str(&format!("\nReference: NextAuth configuration (src/app/api/auth/[...nextauth]/route.ts):\n```typescript\n{}\n```\n", content));
+                context.push_str(&format!(
+                    "\nReference: NextAuth configuration (src/app/api/auth/[...nextauth]/route.ts):\n```typescript\n{}\n```\n",
+                    content
+                ));
             }
         }
     }
-    
-    if file_path.contains("components") || (file_path.contains("app") && file_path.ends_with("page.tsx")) {
+
+    // 3. Custom hooks reference: only for feature pages/components, excluding UI primitives and Footer/Navbar
+    let is_feature_ui = (path_lower.contains("components") || (path_lower.contains("app") && path_lower.ends_with("page.tsx")))
+        && !path_lower.contains("components/ui/")
+        && !path_lower.contains("footer")
+        && !path_lower.contains("navbar");
+
+    if is_feature_ui {
         let hooks_dir = proj_dir.join("src/hooks");
         if hooks_dir.exists() {
             if let Ok(entries) = std::fs::read_dir(hooks_dir) {
@@ -184,7 +237,10 @@ pub fn get_context_files_for(file_path: &str, proj_dir: &std::path::Path) -> Str
                     if path.is_file() {
                         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                             if let Ok(content) = std::fs::read_to_string(&path) {
-                                context.push_str(&format!("\nReference: Hook (src/hooks/{}):\n```typescript\n{}\n```\n", name, content));
+                                context.push_str(&format!(
+                                    "\nReference: Hook (src/hooks/{}):\n```typescript\n{}\n```\n",
+                                    name, content
+                                ));
                             }
                         }
                     }
@@ -192,7 +248,7 @@ pub fn get_context_files_for(file_path: &str, proj_dir: &std::path::Path) -> Str
             }
         }
     }
-    
+
     context
 }
 
@@ -695,6 +751,221 @@ pub const PRISMA_DATABASE_RULEPACK: &str = r#"PRISMA ORM & DATABASE RULES:
 12. INDEX DECLARATION FOR QUERY PERFORMANCE: Always add `@@index([status, createdAt])` at the model level for field combinations frequently used in `where` or `orderBy` clauses.
 13. ROUTE HANDLER HTTP METHODS: App Router route handlers in `route.ts` must export named async functions per HTTP verb (`export async function GET(request: Request) { return NextResponse.json({...}); }`). Never use default export `handler(req, res)`."#;
 
+pub const UI_DESIGN_FOUNDATION_RULEPACK: &str = r#"MOBILE-FIRST & RESPONSIVE UI DESIGN FOUNDATION RULES:
+1. CONTAINER & SPACING DISCIPLINE: Wrap page content inside `<div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full space-y-8">`. Never render raw unpadded content flush against the viewport edges.
+2. PAGE HEADER FLEX ALIGNMENT: Every page header (containing a title/subtitle on the left and primary action button(s) on the right) MUST use `<div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-200/80 pb-6">`.
+3. BUTTON & ICON INLINE-FLEX RULE: Every `<button>` or `<Link>` that contains an icon alongside text MUST include `inline-flex items-center justify-center gap-2` (e.g. `<button className="inline-flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold px-4 py-2.5 rounded-xl shadow-sm transition-colors">`). Without `inline-flex items-center`, SVG icons render as block elements and stack vertically above button text!
+4. MOBILE-FIRST GRID CASCADE: Never use fixed multi-column grids (like bare `grid-cols-3`) without mobile breakpoints. Always cascade from 1 column on mobile: `grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6` (or `grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6` for KPI stat cards).
+5. RESPONSIVE TABLE WRAPPER: Always wrap `<table>` elements inside `<div className="w-full overflow-x-auto rounded-2xl border border-slate-200 bg-white shadow-sm">` so wide tables scroll horizontally on mobile devices without breaking page layout.
+6. SAFE DATE FORMATTING: Dates in JSON responses or state may be ISO strings or Date objects. NEVER call `.toLocaleDateString()` directly on a property (e.g. `item.startDate.toLocaleDateString()` throws a TypeError when `startDate` is a string!). Always wrap with `new Date(item.startDate).toLocaleDateString()`."#;
+
+pub const UI_NAVBAR_RULEPACK: &str = r#"SCOPED NAVBAR, BRAND LOGO & HAMBURGER MENU RULES:
+1. STICKY GLASSMORPHISM HEADER: Structure the navbar as `<header className="sticky top-0 z-50 w-full backdrop-blur-md bg-white/90 border-b border-slate-200/80 shadow-sm">` with an inner container `<div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">`.
+2. INLINE SVG BRAND LOGO LOCKUP (NO BROKEN IMAGE FILES):
+   - NEVER use `<img src="/logo.png" />` or `<Image src="/logo.svg" />` (which cause 404 broken image icons), and NEVER render plain unstyled text alone.
+   - Always build a modern Brand Lockup inside `<Link href="/" prefetch={false} className="flex items-center gap-2.5 group shrink-0">`:
+     a) Logo Mark Badge: `<div className="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-600 to-blue-600 flex items-center justify-center text-white shadow-md shadow-indigo-500/20">` containing a crisp inline `<svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2"><path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>`.
+     b) Brand Wordmark: `<span className="text-lg font-extrabold tracking-tight text-slate-900">AppName</span>`.
+3. DESKTOP NAVIGATION PILLS: Place desktop links inside `<div className="hidden md:flex items-center gap-1">`. Highlight the active route (`pathname === href` or `pathname?.startsWith(href)`) using pill styling `bg-indigo-50 text-indigo-600 font-semibold px-3.5 py-2 rounded-lg text-sm transition-colors`, and style inactive links with `text-slate-600 hover:text-slate-900 hover:bg-slate-100 px-3.5 py-2 rounded-lg text-sm font-medium transition-colors`.
+4. STYLED AUTH / CTA ACTIONS: Place right-side actions inside `<div className="hidden md:flex items-center gap-3 shrink-0">`. Style Sign In as `<Link href="/login" prefetch={false} className="text-sm font-semibold text-slate-700 hover:text-indigo-600 px-3.5 py-2 rounded-lg transition-colors">` and Register / Primary CTA as `<Link href="/register" prefetch={false} className="inline-flex items-center justify-center bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold px-4 py-2 rounded-xl shadow-sm transition-colors">`.
+5. FUNCTIONAL HAMBURGER MENU & MOBILE DRAWER:
+   - Declare `const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);`.
+   - Render the mobile toggle button inside `<div className="flex md:hidden">`: `<button type="button" onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)} className="inline-flex items-center justify-center p-2 rounded-lg text-slate-600 hover:text-slate-900 hover:bg-slate-100 focus:outline-none" aria-label="Toggle Menu">` toggling between Hamburger and Close icons.
+   - Immediately below the main header row, render the collapsible mobile drawer: `{isMobileMenuOpen && (<div className="md:hidden border-t border-slate-200 bg-white px-4 pt-3 pb-4 space-y-1.5 shadow-lg">...all navigation & auth <Link onClick={() => setIsMobileMenuOpen(false)} className="block px-3 py-2 rounded-lg text-base font-medium ...">...</div>)}`.
+6. OPTIONAL PROPS FOR STANDALONE MOUNTING: `Navbar` is mounted in `RootLayout` as `<Navbar />` with no arguments. All props in `NavbarProps` MUST be optional (`user?: ... | null`) with safe default parameters (`const Navbar: React.FC<NavbarProps> = ({ user = null } = {}) =>`)."#;
+
+pub const UI_FOOTER_RULEPACK: &str = r#"SCOPED FOOTER LAYOUT & COMPACTNESS RULES:
+1. BAN TALL VERTICAL LINK STACKS: NEVER stack all footer links vertically in a single centered column (`flex-col items-center space-y-4` is STRICTLY FORBIDDEN because it creates a giant dark block occupying half the viewport!).
+2. COMPACT HORIZONTAL / MULTI-COLUMN FOOTER:
+   - Use `<footer className="mt-auto w-full bg-slate-900 text-slate-400 border-t border-slate-800 py-8">`.
+   - Inside `<div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col md:flex-row items-center justify-between gap-6">`:
+     a) Left side: Compact Brand Lockup (small gradient rounded-lg icon + bold white brand name) and `<p className="text-xs text-slate-500 mt-1">&copy; {new Date().getFullYear()} Brand. All rights reserved.</p>`.
+     b) Right side: `<nav className="flex flex-wrap items-center justify-center gap-x-6 gap-y-2 text-sm">` so all footer links sit horizontally in a single clean, compact row (`text-slate-400 hover:text-white transition-colors`)."#;
+
+pub const UI_PRIMITIVES_RULEPACK: &str = r#"SCOPED UI PRIMITIVES RULES (src/components/ui/*):
+1. EXTEND NATIVE HTML ATTRIBUTES: Always extend standard React HTML interfaces (`export interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement>`, `export interface CardProps extends React.HTMLAttributes<HTMLDivElement>`, `export interface InputProps extends React.InputHTMLAttributes<HTMLInputElement>`) and spread `{...props}` onto the underlying DOM element.
+2. SAFE CLASSNAME DEFAULT & ASCHILD DESTRUCTURING: Always default `className = ''` in props destructuring (`({ className = '', children, ...props })`) so template literals never output `"undefined"`. In `button.tsx`, accept `asChild?: boolean` in `ButtonProps` and destructure it out (`{ asChild, variant = 'default', size = 'md', className = '', children, ...props }`) so `asChild` is never passed as an invalid DOM attribute to `<button>`.
+3. POLISHED BASE CLASSES:
+   - `Button`: `inline-flex items-center justify-center gap-2 rounded-xl font-semibold text-sm px-4 py-2.5 transition-all focus:outline-none disabled:opacity-50` with variants (`default`: `bg-indigo-600 text-white hover:bg-indigo-700 shadow-sm`, `outline`: `border border-slate-200 bg-white text-slate-700 hover:bg-slate-50`, `ghost`: `text-slate-600 hover:bg-slate-100`, `destructive`: `bg-rose-600 text-white hover:bg-rose-700`).
+   - `Card`: `bg-white rounded-2xl border border-slate-200/80 shadow-sm` (`CardHeader`: `p-6 pb-3`, `CardTitle`: `text-lg font-bold text-slate-900`, `CardContent`: `p-6 pt-0`).
+   - `Skeleton`: `animate-pulse rounded-xl bg-slate-200/80`.
+4. MANDATORY DUAL EXPORTS: Export BOTH named and default exports (`export { Button }; export default Button;`)."#;
+
+pub const UI_PAGE_AND_DASHBOARD_RULEPACK: &str = r#"SCOPED PAGE & DASHBOARD PREVIEW RESILIENCE RULES:
+1. ZERO AUTH-WALL / ZERO INFINITE LOADING IN PREVIEW (CRITICAL):
+   - NEVER block page rendering with `if (!session) return <div>Loading...</div>;` or `if (status === 'unauthenticated') return <Link href="/login">Log in</Link>;` or `if (loading) return <div>Loading...</div>;`!
+   - Users inspect and test all pages in Live Preview mode before logging in. Every page (`/dashboard`, `/dashboard/projects`, `/dashboard/analytics`, `/dashboard/integrations`, `/dashboard/pricing`, `/dashboard/subscription`, etc.) MUST immediately render its complete, interactive UI with rich domain data even when `session` is null or unauthenticated!
+2. MANDATORY RICH INITIAL MOCK STATE (`INITIAL_MOCK_DATA`):
+   - NEVER initialize domain lists, metrics, or cards with an empty array `useState([])` or `useState(null)`!
+   - Always define a module-level constant (e.g. `const INITIAL_MOCK_PROJECTS: Project[] = [...]`) containing 4 to 6 realistic, domain-specific items (with realistic titles, descriptions, status badges, dates, and metrics tailored to the project's business domain) and initialize state with it: `const [projects, setProjects] = useState<Project[]>(INITIAL_MOCK_PROJECTS);`.
+3. UNCONDITIONAL FETCH WITH NON-EMPTY GUARD:
+   - Inside `useEffect`, do NOT wrap `fetch('/api/...')` inside `if (session)`! Fetch unconditionally on mount, and only overwrite the initial mock state if the API returns a non-empty array or valid object:
+     ```tsx
+     useEffect(() => {
+       fetch('/api/projects')
+         .then((res) => (res.ok ? res.json() : null))
+         .then((data) => {
+           if (Array.isArray(data) && data.length > 0) setProjects(data);
+         })
+         .catch(() => {});
+     }, []);
+     ```
+4. INTERACTIVE OPTIMISTIC CRUD WORKFLOWS:
+   - When the user clicks "New / Add / Create" or "Delete" or toggles a status on the page, provide an interactive modal/form or optimistic state update (`setItems((prev) => [newItem, ...prev])` and `setItems((prev) => prev.filter((i) => i.id !== id))`) alongside the `fetch` call so the UI responds instantaneously in Live Preview!"#;
+
+pub const UI_ANALYTICS_AND_CHARTS_RULEPACK: &str = r#"SCOPED ANALYTICS, KPI & DATA VISUALIZATION RULES:
+1. PRE-POPULATED CHART STATE (NEVER EMPTY):
+   - NEVER initialize chart state with empty `labels: []` or `datasets: []`!
+   - Always initialize `useState` with 6 realistic time-series labels (e.g. `['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun']`) and 1-2 complete datasets with realistic domain numbers and polished colors (`borderColor: '#4f46e5'`, `backgroundColor: 'rgba(79, 70, 229, 0.15)'`, `borderWidth: 2`, `tension: 0.35`, `fill: true`).
+2. EXECUTIVE ANALYTICS DASHBOARD STRUCTURE:
+   - Top Section: A 4-card KPI Summary Grid (`grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6`) displaying key domain metrics (large bold value `text-3xl font-extrabold text-slate-900`, positive/negative trend badge `+18.4%` in `bg-emerald-50 text-emerald-700 px-2.5 py-0.5 rounded-full text-xs font-semibold`, and a domain icon inside a soft tinted badge `w-11 h-11 rounded-xl bg-indigo-50 text-indigo-600 flex items-center justify-center`).
+   - Main Visualization Section: Wrap charts inside a clean card (`bg-white rounded-2xl border border-slate-200/80 shadow-sm p-6`) with a section title, subtitle, and interactive time-range filter pills (`7D`, `30D`, `6M`, `1Y`)."#;
+
+pub fn resolve_design_archetype_prompt(project_name: &str, project_description: &str, category: &str) -> String {
+    let combined = format!("{} {} {}", project_name, project_description, category).to_lowercase();
+
+    let (archetype_name, bg_surface, card_surface, primary_cta, badge_style, aesthetic_notes) = if combined.contains("crypto")
+        || combined.contains("blockchain")
+        || combined.contains("cyber")
+        || combined.contains("security")
+        || combined.contains("trading")
+        || combined.contains("terminal")
+        || combined.contains("devops")
+    {
+        (
+            "FinTech / Cyber / High-Tech Dark Glassmorphism",
+            "bg-slate-950 text-slate-100",
+            "bg-slate-900/80 backdrop-blur-md border border-slate-800 rounded-2xl p-6 shadow-xl hover:border-indigo-500/40 transition-all",
+            "inline-flex items-center justify-center gap-2 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white font-semibold px-4 py-2.5 rounded-xl shadow-lg shadow-indigo-500/20 transition-all",
+            "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-2.5 py-0.5 rounded-full text-xs font-semibold",
+            "Use sleek dark surfaces, subtle glowing borders, high-contrast metric typography, and cyan/indigo/emerald accents."
+        )
+    } else if combined.contains("ecommerce")
+        || combined.contains("e-commerce")
+        || combined.contains("marketplace")
+        || combined.contains("shop")
+        || combined.contains("store")
+        || combined.contains("booking")
+        || combined.contains("hotel")
+        || combined.contains("real estate")
+        || combined.contains("restaurant")
+    {
+        (
+            "Conversion Marketplace & Retail (Airbnb / Shopify Aesthetic)",
+            "bg-stone-50 text-slate-900",
+            "bg-white rounded-2xl border border-stone-200/90 shadow-sm hover:shadow-lg transition-all duration-200 overflow-hidden p-6",
+            "inline-flex items-center justify-center gap-2 bg-rose-600 hover:bg-rose-700 text-white font-semibold px-4 py-2.5 rounded-xl shadow-sm transition-all",
+            "bg-amber-50 text-amber-800 border border-amber-200 px-2.5 py-0.5 rounded-full text-xs font-semibold",
+            "Emphasize visual product/listing cards, clear pricing badges, category filter pills, and warm inviting accents."
+        )
+    } else if combined.contains("health")
+        || combined.contains("medical")
+        || combined.contains("clinic")
+        || combined.contains("patient")
+        || combined.contains("wellness")
+        || combined.contains("edtech")
+        || combined.contains("education")
+        || combined.contains("learning")
+        || combined.contains("school")
+    {
+        (
+            "Calm & Trustworthy HealthTech / EdTech System",
+            "bg-slate-50 text-slate-900",
+            "bg-white rounded-2xl border border-teal-100/90 shadow-sm hover:shadow-md transition-all p-6",
+            "inline-flex items-center justify-center gap-2 bg-teal-600 hover:bg-teal-700 text-white font-semibold px-4 py-2.5 rounded-xl shadow-sm transition-all",
+            "bg-teal-50 text-teal-700 border border-teal-200 px-2.5 py-0.5 rounded-full text-xs font-semibold",
+            "Use clean, calm teal/sky/emerald palettes, clear progress bars, accessible contrast, and structured schedule/course cards."
+        )
+    } else {
+        (
+            "Executive B2B SaaS & Collaborative Workspace (Linear / Stripe / Vercel Aesthetic)",
+            "bg-slate-50 text-slate-900",
+            "bg-white rounded-2xl border border-slate-200/80 shadow-sm hover:shadow-md transition-all duration-200 p-6",
+            "inline-flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold px-4 py-2.5 rounded-xl shadow-sm transition-colors",
+            "bg-indigo-50 text-indigo-700 border border-indigo-200/60 px-2.5 py-0.5 rounded-full text-xs font-semibold",
+            "Use crisp white cards over a soft slate-50 canvas, subtle borders, status pills (emerald for active/completed, amber for in-progress, indigo for primary tags), and clean typographic hierarchy."
+        )
+    };
+
+    format!(
+        "APPLICATION DESIGN SYSTEM ARCHETYPE ({}):\n\
+         - Page Canvas / Background: `{}`\n\
+         - Card & Surface Style: `{}`\n\
+         - Primary Action Button Style: `{}`\n\
+         - Status / Tag Badge Style: `{}`\n\
+         - Visual Direction: {}\n\n",
+        archetype_name, bg_surface, card_surface, primary_cta, badge_style, aesthetic_notes
+    )
+}
+
+pub fn get_project_design_archetype_from_dir(proj_dir: &std::path::Path) -> String {
+    let mut proj_name = String::new();
+    let mut proj_desc = String::new();
+    let mut category = String::new();
+
+    let cp_path = proj_dir.join(".axiom").join("generation_state.json");
+    if cp_path.exists() {
+        if let Ok(content) = fs::read_to_string(&cp_path) {
+            if let Ok(val) = serde_json::from_str::<Value>(&content) {
+                proj_name = val.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                proj_desc = val.get("projectDescription").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            }
+        }
+    }
+
+    let lbg_path = proj_dir.join(".axiom").join("live_builder_guide.json");
+    if lbg_path.exists() {
+        if let Ok(content) = fs::read_to_string(&lbg_path) {
+            if let Ok(val) = serde_json::from_str::<Value>(&content) {
+                if let Some(cat) = val.get("projectSpecification").and_then(|s| s.get("category")).and_then(|c| c.as_str()) {
+                    category = cat.to_string();
+                }
+            }
+        }
+    }
+
+    resolve_design_archetype_prompt(&proj_name, &proj_desc, &category)
+}
+
+pub fn get_scoped_ui_rules(file_path: &str) -> String {
+    let path_lower = file_path.to_lowercase().replace('\\', "/");
+    let mut ui_rules = Vec::new();
+
+    ui_rules.push(UI_DESIGN_FOUNDATION_RULEPACK);
+
+    if path_lower.contains("navbar") || path_lower.contains("header") || path_lower.contains("sidebar") || path_lower.contains("/nav") {
+        ui_rules.push(UI_NAVBAR_RULEPACK);
+    }
+
+    if path_lower.contains("footer") {
+        ui_rules.push(UI_FOOTER_RULEPACK);
+    }
+
+    if path_lower.contains("components/ui/") {
+        ui_rules.push(UI_PRIMITIVES_RULEPACK);
+    }
+
+    let is_page_or_domain_view = path_lower.ends_with("page.tsx")
+        || path_lower.ends_with("page.jsx")
+        || path_lower.contains("dashboard")
+        || path_lower.contains("project")
+        || path_lower.contains("task")
+        || path_lower.contains("integration")
+        || path_lower.contains("team")
+        || path_lower.contains("subscription")
+        || path_lower.contains("pricing");
+
+    if is_page_or_domain_view && !path_lower.contains("/login") && !path_lower.contains("/register") {
+        ui_rules.push(UI_PAGE_AND_DASHBOARD_RULEPACK);
+    }
+
+    if path_lower.contains("analytics") || path_lower.contains("chart") || path_lower.contains("metric") {
+        ui_rules.push(UI_ANALYTICS_AND_CHARTS_RULEPACK);
+    }
+
+    ui_rules.join("\n\n")
+}
+
 pub fn get_stack_rulepacks(file_path: &str, file_content: &str, error_msg: Option<&str>) -> String {
     let path_lower = file_path.to_lowercase().replace('\\', "/");
     let err_lower = error_msg.unwrap_or("").to_lowercase();
@@ -734,8 +1005,29 @@ pub fn get_stack_rulepacks(file_path: &str, file_content: &str, error_msg: Optio
             || err_lower.contains("the `style` prop expects a mapping")
             || err_lower.contains("rendered more hooks");
 
-        if is_react_file {
+        let is_api_or_route_handler = path_lower.contains("/api/")
+            || path_lower.ends_with("route.ts")
+            || path_lower.ends_with("route.js");
+
+        if is_react_file && !is_api_or_route_handler {
             rules.push(NEXTJS_REACT_RULEPACK);
+            rules.push(UI_DESIGN_FOUNDATION_RULEPACK);
+
+            if path_lower.contains("navbar") || path_lower.contains("header") || path_lower.contains("sidebar") || path_lower.contains("/nav") {
+                rules.push(UI_NAVBAR_RULEPACK);
+            }
+            if path_lower.contains("footer") {
+                rules.push(UI_FOOTER_RULEPACK);
+            }
+            if path_lower.contains("components/ui/") {
+                rules.push(UI_PRIMITIVES_RULEPACK);
+            }
+            if path_lower.ends_with("page.tsx") || path_lower.ends_with("page.jsx") || path_lower.contains("dashboard") {
+                rules.push(UI_PAGE_AND_DASHBOARD_RULEPACK);
+            }
+            if path_lower.contains("analytics") || path_lower.contains("chart") || path_lower.contains("metric") {
+                rules.push(UI_ANALYTICS_AND_CHARTS_RULEPACK);
+            }
         }
 
         // 3. Next-Intl (Internationalization)
@@ -792,13 +1084,13 @@ pub fn get_stack_rulepacks(file_path: &str, file_content: &str, error_msg: Optio
         rules.push(DESKTOP_RULEPACK);
     }
 
-    // 7. Prisma & Database Resiliency
+    // 7. Prisma & Database Resiliency (strictly scoped to database/backend files or explicit prisma errors)
+    let is_ui_component_or_page = (path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx")) && !path_lower.contains("/api/");
     let is_prisma = path_lower.ends_with(".prisma")
         || path_lower.contains("/api/")
         || path_lower.contains("route.ts")
         || path_lower.contains("route.js")
-        || content_lower.contains("@prisma/client")
-        || content_lower.contains("prisma.")
+        || (!is_ui_component_or_page && (content_lower.contains("@prisma/client") || content_lower.contains("prisma.")))
         || err_lower.contains("prisma");
 
     if is_prisma {
@@ -983,9 +1275,9 @@ pub fn get_expert_system_prompt(
         let mut prompt = "You are a Senior Backend Developer. Write only clean, production-ready Next.js Route Handler code wrapped in markdown code blocks. No explanations.\n\n\
              BACKEND API DEVELOPMENT RULES:\n\
              - Implement clean Next.js App Router Route Handlers (exporting GET, POST, PUT, DELETE functions).\n\
-             - Wrap database calls in robust try-catch blocks. Implement fallback mock datasets inside catch clauses so the application remains reviewable even if the database is offline.\n\
-             - Strictly validate requests (e.g. using standard parsing or Zod) and return clean, typed JSON responses with appropriate HTTP status codes.\n\
-             - STRICT IMPORT RESOLUTION: Every external dependency ('zod', 'bcryptjs', etc.) MUST be explicitly imported at the top.\n".to_string();
+             - Wrap database calls in robust try-catch blocks. In GET handlers, if the database query returns an empty array `[]` or throws an error in catch, return a rich fallback array of 4-6 realistic domain mockup objects so the frontend preview is immediately populated with realistic data.\n\
+             - GRACEFUL POST/PUT VALIDATION & DEFAULTS: If using Zod (`z.object`), ALWAYS include `import { z } from 'zod';` at the top of the file! Make optional or secondary fields (such as `timeline`, `status`, `startDate`, `endDate`, `description`) `.optional().default(...)` so quick-create requests from the UI succeed without throwing 500/400 validation errors. In catch blocks of POST/PUT handlers, return a 201/200 fallback response with `{ id: 'mock-' + Date.now(), ...body }` so UI creation flows always work in local preview mode.\n\
+             - STRICT IMPORT RESOLUTION: Every external dependency ('zod', 'bcryptjs', '@/lib/prisma', 'next/server') MUST be explicitly imported at the top.\n".to_string();
 
         if path_lower.contains("/api/auth/") || path_lower.contains("nextauth") {
             prompt.push_str(
@@ -1014,6 +1306,9 @@ pub fn get_expert_system_prompt(
                 prompt.push_str(&format!("\nDATABASE MODELS REFERENCE:\n{}\n", db_contracts));
             }
         }
+        if !context_ref.is_empty() {
+            prompt.push_str(context_ref);
+        }
         return prompt;
     }
 
@@ -1028,16 +1323,21 @@ pub fn get_expert_system_prompt(
     }
 
     // 8. FILE-SCOPED PROMPT: Web Client UI Components, Pages & Layouts (.tsx, .jsx)
+    // Strictly isolated from backend Prisma schemas and NextAuth server internals!
     let is_react_frontend = path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx");
     if is_react_frontend {
-        let mut prompt = "You are an expert React and Tailwind UI Engineer. Write only clean, complete, production-ready React code wrapped in markdown code blocks. No explanations.\n\n".to_string();
+        let mut prompt = "You are a Principal React & Tailwind CSS Product Designer and Frontend Engineer. Write only clean, complete, production-ready React code wrapped in markdown code blocks. No explanations.\n\n".to_string();
+
+        // Inject tailored Design Archetype tokens based on the project's domain & category
+        let design_archetype = get_project_design_archetype_from_dir(proj_dir);
+        prompt.push_str(&design_archetype);
 
         if path_lower.ends_with("layout.tsx") || path_lower.ends_with("layout.jsx") {
             prompt.push_str(
                 "ROOT LAYOUT ARCHITECTURE RULES:\n\
-                 - DOM HIERARCHY: Outermost elements returned MUST be `<html lang=\"en\"><body className=\"min-h-screen flex flex-col bg-gray-50 text-gray-900\">...</body></html>`.\n\
+                 - DOM HIERARCHY: Outermost elements returned MUST be `<html lang=\"en\"><body className=\"min-h-screen flex flex-col bg-slate-50 text-slate-900 antialiased selection:bg-indigo-600 selection:text-white\">...</body></html>`.\n\
                  - GLOBAL PROVIDERS: Wrap all global providers inside `<body>` around `{children}`. If NextAuth is configured, wrap with `<SessionProvider>`.\n\
-                 - PERSISTENT NAVIGATION & FOOTER: Always import and mount `<Navbar />` (from `@/components/Navbar`) above main content, wrap `{children}` in `<main className=\"flex-grow flex flex-col w-full\">{children}</main>`, and mount `<Footer />` at the bottom.\n\
+                 - PERSISTENT NAVIGATION & STICKY FOOTER: Always import and mount `<Navbar />` (from `@/components/Navbar`) at the top, wrap `{children}` in `<main className=\"flex-1 flex flex-col w-full\">{children}</main>`, and mount `<Footer />` (from `@/components/Footer`) at the bottom.\n\
                  - MANDATORY DEFAULT EXPORT: RootLayout MUST have `export default function RootLayout({ children }: { children: React.ReactNode })`.\n\
                  - Mark the layout file with 'use client'; at line 1.\n\n"
             );
@@ -1045,56 +1345,52 @@ pub fn get_expert_system_prompt(
             prompt.push_str(
                 "ROOT LANDING PAGE DESIGN RULES:\n\
                  - This is the HOME/LANDING PAGE (`/`). It must NEVER be a blank screen or bare login form.\n\
-                 - HERO SECTION: Include a high-impact Hero banner with compelling headline, engaging description, and clear CTA buttons tailored specifically to the project's business idea.\n\
-                 - CORE FEATURE SHOWCASE: Show primary interactive domain workflows, product cards, or metric widgets.\n\
-                 - VALUE PROPOSITIONS: Display a responsive grid of key benefits/badges.\n\
-                 - DATA RESILIENCY: Fetch data with an immediate fallback to a rich realistic mockup array.\n\
-                 - MANDATORY TAILWIND CSS: Every element must use modern Tailwind CSS classes.\n\n"
+                 - HERO SECTION: Include a high-impact Hero banner with a badge pill, bold headline (`text-4xl sm:text-5xl lg:text-6xl font-extrabold tracking-tight`), engaging value proposition, and clear CTA buttons (`inline-flex items-center justify-center gap-2`) linking to `/dashboard` and key features.\n\
+                 - CORE FEATURE SHOWCASE: Display a responsive `grid grid-cols-1 md:grid-cols-3 gap-6` of interactive domain cards, KPI highlights, and workflow previews.\n\
+                 - DATA RESILIENCY: Pre-populate state with 4-6 realistic domain mockup items so the page is rich and interactive out-of-the-box.\n\n"
             );
         } else {
             prompt.push_str(
-                "FRONTEND COMPONENT RULES:\n\
-                 - PRISMA SERVER-ONLY RULE: You are on the CLIENT side. NEVER import `@prisma/client` in React components. Fetch data from `/api/...` endpoints.\n\
-                 - STRICT TYPE DEFINITIONS: Any TypeScript types/interfaces used MUST be declared in the file or imported.\n\
-                 - NEXT.JS LINK RULE: Do NOT place <a> tags inside <Link>. Put className directly on <Link>, and add `prefetch={false}`.\n\
-                 - ROUTE ACCURACY: When writing navigation links (<Link href=\"...\">), use the exact verified route path from the Verified Application Routes list below. Never flatten nested routes to the root.\n\
-                 - NO DEAD IMPORTS: Do not import components unless they exist; implement inline if needed.\n\
-                 - Use modern Tailwind CSS with responsive flex/grid layouts, nice borders, shadows, and hover states.\n\
+                "CORE FRONTEND COMPONENT RULES:\n\
+                 - CLIENT-SIDE BOUNDARY: NEVER import `@prisma/client` in React components. Fetch data from `/api/...` endpoints.\n\
+                 - STRICT TYPE DEFINITIONS & IMPORTS: Declare TypeScript interfaces cleanly inside the file. Import icons ONLY from valid subpaths (`'react-icons/hi'`, `'react-icons/fa'`, `'react-icons/fi'`, `'react-icons/io5'`, or `'lucide-react'`), NEVER from bare `'react-icons'`.\n\
+                 - NEXT.JS LINK RULE: Do NOT place `<a>` tags inside `<Link>`. Put `className` and `prefetch={false}` directly on `<Link>`.\n\
+                 - NO DEAD IMPORTS: Do not import external local modules unless they exist in the project; prefer clean self-contained components or verified `@/components/ui/*` primitives.\n\
+                 - DUAL EXPORT COMPATIBILITY: Export the component as both a named export (`export { ComponentName }`) and default export (`export default ComponentName`).\n\
                  - NO MANUAL AXIOM ATTRS: Never declare or use 'data-axiom-component' or 'data-axiom-file' props.\n\n"
             );
         }
 
+        // Inject surgical, role-specific UI rulepacks for this exact file
+        let scoped_ui = get_scoped_ui_rules(file_path);
+        if !scoped_ui.is_empty() {
+            prompt.push_str(&scoped_ui);
+            prompt.push_str("\n\n");
+        }
+
         if path_lower.contains("navbar") || path_lower.contains("sidebar") || path_lower.contains("footer") || path_lower.contains("header") || path_lower.contains("/nav") {
             prompt.push_str(
-                "SCOPED NAVIGATION COMPONENT RULES:\n\
+                "SCOPED NAVIGATION ROUTE INTEGRITY RULES:\n\
                  - ROUTE CONSISTENCY: Every `<Link>` and navigation item in this component MUST strictly point to a verified route from the VERIFIED APPLICATION ROUTES list below.\n\
-                 - ABSOLUTE SUBPATHS: Never strip parent folders from nested routes (e.g. use `/dashboard/data-grid`, NOT `/data-grid`). Unmapped or flattened routes cause fatal 404 errors!\n\
+                 - ABSOLUTE SUBPATHS: Never strip parent folders from nested routes (e.g. use `/dashboard/projects`, NOT `/projects`). Unmapped or flattened routes cause fatal 404 errors!\n\
                  - ACTIVE STATE HIGHLIGHT: Use `usePathname()` from 'next/navigation' to detect active route and visually highlight current link.\n\n"
             );
         }
 
-        // Scoped Domain Contexts for Frontend Pages & Components
-        if path_lower.contains("/login") || path_lower.contains("/register") || path_lower.contains("/signup") || path_lower.contains("auth") {
+        // Scoped Auth UI Rules (ONLY for /login, /register, /signup, or auth hooks — never for general UI!)
+        if path_lower.contains("/login") || path_lower.contains("/register") || path_lower.contains("/signup") || path_lower.contains("useauth") {
             prompt.push_str(
                 "SCOPED AUTH UI RULES (ACTIVE ONLY FOR AUTH FILES):\n\
                  - Ensure the Login/Register UI works out-of-the-box locally without any SMTP server configuration.\n\
-                 - Render the email + password form locally (calling `signIn('credentials', { email, password, redirect: false })`) and support passwordless magic-link email form in production.\n\
+                 - Render a polished card (`max-w-md w-full mx-auto bg-white rounded-2xl border border-slate-200 shadow-lg p-8`) with the inline SVG Brand Lockup at the top, email + password inputs (`signIn('credentials', { email, password, redirect: false })`), clear validation feedback, and a link to `/dashboard`.\n\
                  - If defining an auth hook or provider (e.g. `useAuth`), export BOTH named (`export { useAuth }`) and default (`export default useAuth`) exports.\n\n"
             );
         }
 
-        if path_lower.contains("dashboard") || path_lower.contains("analytics") || path_lower.contains("metrics") {
+        if path_lower.contains("pricing") || path_lower.contains("checkout") || path_lower.contains("billing") || path_lower.contains("subscription") {
             prompt.push_str(
-                "SCOPED ANALYTICS & DASHBOARD RULES (ACTIVE ONLY FOR DASHBOARD/ANALYTICS FILES):\n\
-                 - Build domain-specific KPI summary cards, interactive tabs/filters, and data visualizations directly matching the project's business domain.\n\
-                 - Pre-populate state with realistic domain mockup data so charts, tables, and workflows are immediately interactive even before API records are created.\n\n"
-            );
-        }
-
-        if path_lower.contains("pricing") || path_lower.contains("checkout") || path_lower.contains("billing") {
-            prompt.push_str(
-                "SCOPED BILLING & PRICING UI RULES (ACTIVE ONLY FOR PRICING/CHECKOUT FILES):\n\
-                 - Display clear tier comparisons, billing cycle toggles (monthly/annual), and interactive checkout triggers with graceful local preview feedback.\n\n"
+                "SCOPED BILLING & PRICING UI RULES (ACTIVE ONLY FOR PRICING/SUBSCRIPTION FILES):\n\
+                 - Display a responsive 3-tier pricing comparison grid (`Starter`, `Pro / Business` highlighted with a `Most Popular` badge and `border-2 border-indigo-600 shadow-xl`, and `Enterprise`), a Monthly/Annual billing cycle toggle with discount badge, feature checklists with check icons, and interactive plan selection buttons with immediate visual feedback.\n\n"
             );
         }
 
@@ -1622,69 +1918,125 @@ export async function POST(request: Request) {
                 },
                 {
                     "path": "src/components/Navbar.tsx",
-                    "description": "Modern responsive Navbar using prefetch-disabled links for Vercel optimization.",
+                    "description": "Modern responsive Navbar with inline SVG brand lockup and mobile hamburger drawer.",
                     "language": "typescript",
                     "defaultContent": r#""use client";
 
-import React from "react";
+import React, { useState } from "react";
 import Link from "next/link";
+import { usePathname } from "next/navigation";
 import { useSession, signOut } from "next-auth/react";
 
 const Navbar: React.FC = () => {
+  const pathname = usePathname();
   const { data: session } = useSession();
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
 
   return (
-    <nav className="bg-slate-900 text-white shadow-md w-full">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div className="flex items-center justify-between h-16">
-          <div className="flex items-center">
-            <Link href="/" prefetch={false} className="text-xl font-bold tracking-wider text-indigo-400">
-              AxiomApp
-            </Link>
-            <div className="hidden md:block">
-              <div className="ml-10 flex items-baseline space-x-4">
-                <Link href="/dashboard" prefetch={false} className="px-3 py-2 rounded-md text-sm font-medium hover:bg-slate-800 transition-colors">
-                  Dashboard
-                </Link>
-                <Link href="/profile" prefetch={false} className="px-3 py-2 rounded-md text-sm font-medium hover:bg-slate-800 transition-colors">
-                  Profile
-                </Link>
-              </div>
-            </div>
+    <header className="sticky top-0 z-50 w-full backdrop-blur-md bg-white/90 border-b border-slate-200/80 shadow-sm">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">
+        <Link href="/" prefetch={false} className="flex items-center gap-2.5 group shrink-0">
+          <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-600 to-blue-600 flex items-center justify-center text-white shadow-md shadow-indigo-500/20">
+            <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
+            </svg>
           </div>
-          <div className="flex items-center space-x-4">
-            {session ? (
-              <div className="flex items-center space-x-4">
-                <span className="text-sm text-slate-300">{session.user?.name || session.user?.email}</span>
-                <button
-                  onClick={() => signOut({ callbackUrl: "/" })}
-                  className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-md text-sm font-medium transition-colors"
-                >
-                  Logout
-                </button>
-              </div>
-            ) : (
-              <div className="flex space-x-2">
-                <Link href="/login" prefetch={false} className="bg-slate-800 hover:bg-slate-700 text-white px-4 py-2 rounded-md text-sm font-medium transition-colors">
-                  Sign In
-                </Link>
-                <Link href="/register" prefetch={false} className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-md text-sm font-medium transition-colors">
-                  Register
-                </Link>
-              </div>
-            )}
-          </div>
+          <span className="text-lg font-extrabold tracking-tight text-slate-900">AxiomApp</span>
+        </Link>
+
+        <div className="hidden md:flex items-center gap-1">
+          <Link
+            href="/dashboard"
+            prefetch={false}
+            className={`px-3.5 py-2 rounded-lg text-sm transition-colors ${
+              pathname === "/dashboard"
+                ? "bg-indigo-50 text-indigo-600 font-semibold"
+                : "text-slate-600 hover:text-slate-900 hover:bg-slate-100 font-medium"
+            }`}
+          >
+            Dashboard
+          </Link>
+        </div>
+
+        <div className="hidden md:flex items-center gap-3 shrink-0">
+          {session ? (
+            <>
+              <span className="text-sm font-medium text-slate-600">{session.user?.name || session.user?.email}</span>
+              <button
+                onClick={() => signOut({ callbackUrl: "/" })}
+                className="inline-flex items-center justify-center bg-slate-100 hover:bg-slate-200 text-slate-800 px-4 py-2 rounded-xl text-sm font-semibold transition-colors"
+              >
+                Logout
+              </button>
+            </>
+          ) : (
+            <>
+              <Link href="/login" prefetch={false} className="text-sm font-semibold text-slate-700 hover:text-indigo-600 px-3.5 py-2 rounded-lg transition-colors">
+                Sign In
+              </Link>
+              <Link href="/register" prefetch={false} className="inline-flex items-center justify-center bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold px-4 py-2 rounded-xl shadow-sm transition-colors">
+                Register
+              </Link>
+            </>
+          )}
+        </div>
+
+        <div className="flex md:hidden">
+          <button
+            type="button"
+            onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
+            className="inline-flex items-center justify-center p-2 rounded-lg text-slate-600 hover:text-slate-900 hover:bg-slate-100 focus:outline-none"
+            aria-label="Toggle Menu"
+          >
+            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              {isMobileMenuOpen ? (
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              ) : (
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+              )}
+            </svg>
+          </button>
         </div>
       </div>
-    </nav>
+
+      {isMobileMenuOpen && (
+        <div className="md:hidden border-t border-slate-200 bg-white px-4 pt-3 pb-4 space-y-1.5 shadow-lg">
+          <Link
+            href="/dashboard"
+            prefetch={false}
+            onClick={() => setIsMobileMenuOpen(false)}
+            className="block px-3 py-2 rounded-lg text-base font-medium text-slate-700 hover:bg-slate-100"
+          >
+            Dashboard
+          </Link>
+          <Link
+            href="/login"
+            prefetch={false}
+            onClick={() => setIsMobileMenuOpen(false)}
+            className="block px-3 py-2 rounded-lg text-base font-medium text-slate-700 hover:bg-slate-100"
+          >
+            Sign In
+          </Link>
+          <Link
+            href="/register"
+            prefetch={false}
+            onClick={() => setIsMobileMenuOpen(false)}
+            className="block px-3 py-2 rounded-lg text-base font-semibold text-indigo-600 hover:bg-indigo-50"
+          >
+            Register
+          </Link>
+        </div>
+      )}
+    </header>
   );
 };
 
+export { Navbar };
 export default Navbar;"#
                 },
                 {
                     "path": "src/components/Footer.tsx",
-                    "description": "Clean footer utilizing prefoot-disabled links.",
+                    "description": "Compact horizontal footer utilizing prefetch-disabled links.",
                     "language": "typescript",
                     "defaultContent": r#"import React from "react";
 import Link from "next/link";
@@ -1692,25 +2044,29 @@ import Link from "next/link";
 const Footer: React.FC = () => {
   return (
     <footer className="bg-slate-900 text-slate-400 border-t border-slate-800 py-8 mt-auto w-full">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div className="flex flex-col md:flex-row justify-between items-center space-y-4 md:space-y-0">
-          <div>
-            <p className="text-sm">&copy; {new Date().getFullYear()} AxiomApp. All rights reserved.</p>
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col md:flex-row items-center justify-between gap-6">
+        <div className="flex items-center gap-2.5">
+          <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-indigo-600 to-blue-600 flex items-center justify-center text-white">
+            <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
+            </svg>
           </div>
-          <div className="flex space-x-6">
-            <Link href="/privacy" prefetch={false} className="text-sm hover:text-indigo-400 transition-colors">
-              Privacy Policy
-            </Link>
-            <Link href="/terms" prefetch={false} className="text-sm hover:text-indigo-400 transition-colors">
-              Terms of Service
-            </Link>
-          </div>
+          <p className="text-sm text-slate-400">&copy; {new Date().getFullYear()} AxiomApp. All rights reserved.</p>
         </div>
+        <nav className="flex flex-wrap items-center justify-center gap-x-6 gap-y-2 text-sm">
+          <Link href="/" prefetch={false} className="text-slate-400 hover:text-white transition-colors">
+            Home
+          </Link>
+          <Link href="/dashboard" prefetch={false} className="text-slate-400 hover:text-white transition-colors">
+            Dashboard
+          </Link>
+        </nav>
       </div>
     </footer>
   );
 };
 
+export { Footer };
 export default Footer;"#
                 },
                 {
@@ -1735,10 +2091,10 @@ export default function RootLayout({
       <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
       </head>
-      <body className="flex flex-col min-h-screen bg-slate-950 text-slate-100">
+      <body className="flex flex-col min-h-screen bg-slate-50 text-slate-900 antialiased">
         <SessionProvider>
           <Navbar />
-          <main className="flex-grow flex flex-col w-full">{children}</main>
+          <main className="flex-1 flex flex-col w-full">{children}</main>
           <Footer />
         </SessionProvider>
       </body>

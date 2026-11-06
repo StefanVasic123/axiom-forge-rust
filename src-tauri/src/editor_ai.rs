@@ -338,6 +338,13 @@ pub async fn editor_ai_edit(
     };
 
     let path_lower = rel_file_path.to_lowercase();
+    if (path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx")) && !path_lower.contains("/api/") {
+        let design_archetype = get_project_design_archetype_from_dir(&proj_dir);
+        if !design_archetype.is_empty() {
+            system_prompt.push_str(&design_archetype);
+        }
+    }
+
     let is_nav_or_link = path_lower.contains("navbar") 
         || path_lower.contains("sidebar") 
         || path_lower.contains("footer") 
@@ -412,42 +419,39 @@ pub async fn editor_ai_edit(
                         let mut fail_reason = String::new();
                         
                         let is_json_response = clean_content.trim().starts_with('{') 
-                            && (clean_content.contains("\"edits\"") || clean_content.contains("\"explanation\""));
+                            && (clean_content.contains("\"edits\"") || clean_content.contains("\"changes\"") || clean_content.contains("\"explanation\""));
 
                         if let Ok(parsed_json) = serde_json::from_str::<Value>(&clean_content) {
-                            if let Some(edits) = parsed_json.get("edits").and_then(|e| e.as_array()) {
-                                if !edits.is_empty() {
-                                    let mut temp_content = content.clone();
-                                    let mut apply_failed = false;
-                                    
-                                    for edit in edits {
-                                        let target = edit.get("target").and_then(|t| t.as_str()).unwrap_or("");
-                                        let replacement = edit.get("replacement").and_then(|r| r.as_str()).unwrap_or("");
-                                        
-                                        match apply_targeted_edit(&temp_content, target, replacement) {
-                                            Ok(modified) => {
-                                                temp_content = modified;
-                                            }
-                                            Err(err) => {
-                                                apply_failed = true;
-                                                fail_reason = err;
-                                                break;
-                                            }
+                            let extracted_edits = extract_edits_from_json(&parsed_json, &rel_file_path);
+                            if !extracted_edits.is_empty() {
+                                let mut temp_content = content.clone();
+                                let mut apply_failed = false;
+                                
+                                for edit in extracted_edits {
+                                    let target = edit.get("target").and_then(|t| t.as_str()).unwrap_or("");
+                                    let replacement = edit.get("replacement").and_then(|r| r.as_str()).unwrap_or("");
+                                    match apply_targeted_edit(&temp_content, target, replacement) {
+                                        Ok(modified) => {
+                                            temp_content = modified;
+                                        }
+                                        Err(err) => {
+                                            apply_failed = true;
+                                            fail_reason = err;
+                                            break;
                                         }
                                     }
-                                    
-                                    if !apply_failed {
-                                        let project_routes = get_project_routes_from_dir(&proj_dir);
-                                        let routes_list: Vec<String> = project_routes.into_iter().map(|(r, _)| r).collect();
-                                        if !routes_list.is_empty() {
-                                            temp_content = sanitize_app_router_links_with_routes(&temp_content, &routes_list);
-                                        }
-                                        temp_content = sanitize_unhandled_session_loading(&temp_content);
-                                        final_content = temp_content;
-                                        parsed_ok = true;
-                                    } else {
-                                        debug_log_to_file(format!("[AI Edit] Targeted edit apply failed: {}", fail_reason));
+                                }
+                                
+                                if !apply_failed {
+                                    let project_routes = get_project_routes_from_dir(&proj_dir);
+                                    let routes_list: Vec<String> = project_routes.into_iter().map(|(r, _)| r).collect();
+                                    if !routes_list.is_empty() {
+                                        temp_content = sanitize_app_router_links_with_routes(&temp_content, &routes_list);
                                     }
+                                    final_content = post_process_generated_file(&rel_file_path, &temp_content, &serde_json::json!({}), true);
+                                    parsed_ok = true;
+                                } else {
+                                    debug_log_to_file(format!("[AI Edit] Targeted edit apply failed: {}", fail_reason));
                                 }
                             }
                         }
@@ -463,7 +467,13 @@ pub async fn editor_ai_edit(
                                 });
                             } else {
                                 debug_log_to_file("[AI Edit] Falling back to treating model output as full file content.".to_string());
-                                final_content = clean_content;
+                                let mut temp_content = clean_content;
+                                let project_routes = get_project_routes_from_dir(&proj_dir);
+                                let routes_list: Vec<String> = project_routes.into_iter().map(|(r, _)| r).collect();
+                                if !routes_list.is_empty() {
+                                    temp_content = sanitize_app_router_links_with_routes(&temp_content, &routes_list);
+                                }
+                                final_content = post_process_generated_file(&rel_file_path, &temp_content, &serde_json::json!({}), true);
                             }
                         }
                         
@@ -702,9 +712,21 @@ pub async fn editor_ai_project_edit(
         };
 
         // Layer 3: Executor/Coder Agent
-        let coder_system_prompt = "You are an expert assistant. You are helping the user edit a source code file. \
+        let mut coder_system_prompt = "You are an expert assistant. You are helping the user edit a source code file. \
                                    Provide ONLY the modified full content of the file. Do not include any introductory or concluding text. \
-                                   Do not wrap the code in markdown code blocks unless the file itself is a markdown file. Just return the raw code.";
+                                   Do not wrap the code in markdown code blocks unless the file itself is a markdown file. Just return the raw code.\n\
+                                   CRITICAL: NEVER manually declare `data-axiom-component` or `data-axiom-file` in the code.".to_string();
+        let rulepacks = get_stack_rulepacks(file_path, &current_content, None);
+        if !rulepacks.is_empty() {
+            coder_system_prompt.push_str(&rulepacks);
+        }
+        let path_lower = file_path.to_lowercase();
+        if (path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx")) && !path_lower.contains("/api/") {
+            let design_archetype = get_project_design_archetype_from_dir(&proj_dir);
+            if !design_archetype.is_empty() {
+                coder_system_prompt.push_str(&design_archetype);
+            }
+        }
         let coder_user_prompt = format!(
             "Original File Path: {}\nOriginal File Content:\n```\n{}\n```\n\nDirective / Instructions: {}\n\nReturn only the complete updated file content.",
             file_path, current_content, directive
@@ -729,30 +751,14 @@ pub async fn editor_ai_project_edit(
         if coder_res.status().is_success() {
             if let Ok(data) = coder_res.json::<Value>().await {
                 if let Some(msg_content) = data.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
-                    let mut cleaned = msg_content.trim();
-                    let ext = Path::new(file_path).extension().unwrap_or_default().to_string_lossy().to_string();
-                    let prefix1 = format!("```{}\n", ext);
-                    let prefix2 = format!("```{}", ext);
-                    
-                    if cleaned.starts_with(&prefix1) {
-                        cleaned = &cleaned[prefix1.len()..];
-                    } else if cleaned.starts_with(&prefix2) {
-                        cleaned = &cleaned[prefix2.len()..];
-                    } else if cleaned.starts_with("```\n") {
-                        cleaned = &cleaned[4..];
-                    } else if cleaned.starts_with("```") {
-                        if let Some(idx) = cleaned.find('\n') {
-                            if idx < 20 {
-                                cleaned = &cleaned[idx+1..];
-                            }
-                        }
+                    let mut cleaned = extract_code_content(msg_content);
+                    let project_routes = get_project_routes_from_dir(&proj_dir);
+                    let routes_list: Vec<String> = project_routes.into_iter().map(|(r, _)| r).collect();
+                    if !routes_list.is_empty() {
+                        cleaned = sanitize_app_router_links_with_routes(&cleaned, &routes_list);
                     }
-                    
-                    if cleaned.ends_with("```") {
-                        cleaned = &cleaned[..cleaned.len()-3];
-                    }
-                    
-                    modified_files_map.insert(file_path.clone(), cleaned.trim().to_string());
+                    let processed = post_process_generated_file(file_path, &cleaned, &serde_json::json!({}), true);
+                    modified_files_map.insert(file_path.clone(), processed);
                 }
             }
         }

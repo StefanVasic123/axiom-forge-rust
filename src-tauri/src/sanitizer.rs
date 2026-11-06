@@ -547,27 +547,49 @@ pub fn sanitize_app_router_links_with_routes(content: &str, valid_routes: &[Stri
 }
 
 pub fn sanitize_unhandled_session_loading(content: &str) -> String {
-    if !content.contains("useSession") || !content.contains("setLoading") {
+    if !content.contains("useSession") {
         return content.to_string();
     }
 
-    if let Ok(re) = regex::Regex::new(r"(?s)if\s*\(\s*session\s*\)\s*\{([^}]+)\}") {
-        let mut modified = content.to_string();
-        for cap in re.captures_iter(content) {
-            let full_match = cap.get(0).unwrap().as_str();
-            let body = cap.get(1).unwrap().as_str();
-            if let Some(pos) = content.find(full_match) {
-                let after = content[pos + full_match.len()..].trim_start();
-                if !after.starts_with("else") {
-                    let replacement = format!("if (session) {{{}\n  }} else {{\n    setLoading(false);\n  }}", body);
-                    modified = modified.replace(full_match, &replacement);
+    let mut modified = content.to_string();
+
+    // 1. Ensure setLoading(false) is reached when session is null in `if (session) { ... }`
+    if modified.contains("setLoading") {
+        if let Ok(re) = regex::Regex::new(r"(?s)if\s*\(\s*session\s*\)\s*\{([^}]+)\}") {
+            for cap in re.captures_iter(content) {
+                let full_match = cap.get(0).unwrap().as_str();
+                let body = cap.get(1).unwrap().as_str();
+                if let Some(pos) = content.find(full_match) {
+                    let after = content[pos + full_match.len()..].trim_start();
+                    if !after.starts_with("else") {
+                        let replacement = format!("if (session) {{{}\n  }} else {{\n    setLoading(false);\n  }}", body);
+                        modified = modified.replace(full_match, &replacement);
+                    }
                 }
             }
         }
-        return modified;
     }
 
-    content.to_string()
+    // 2. Neutralize preview-blocking early returns (`if (!session) return <div>Loading...</div>;` or `if (status === 'unauthenticated') return <Link...>Log in</Link>;`)
+    // ONLY when the component has a main JSX return block below it.
+    let return_count = modified.matches("return ").count() + modified.matches("return(").count();
+    if return_count >= 2 {
+        // Block form: if (!session) { return ...; } or if (status === 'unauthenticated') { return ...; }
+        if let Ok(re_block) = regex::Regex::new(
+            r#"(?m)^[ \t]*if\s*\(\s*(?:!session|status\s*===\s*['"]unauthenticated['"])\s*\)\s*\{\s*return\s+[^}]*?;\s*\}[ \t]*\r?\n?"#
+        ) {
+            modified = re_block.replace_all(&modified, "").to_string();
+        }
+
+        // Single-line form: if (!session) return ...; or if (status === 'unauthenticated') return ...;
+        if let Ok(re_line) = regex::Regex::new(
+            r#"(?m)^[ \t]*if\s*\(\s*(?:!session|status\s*===\s*['"]unauthenticated['"])\s*\)\s*return\s+[^\n;]+;[ \t]*\r?\n?"#
+        ) {
+            modified = re_line.replace_all(&modified, "").to_string();
+        }
+    }
+
+    modified
 }
 
 pub fn normalize_project_route_links(proj_dir: &std::path::Path, valid_routes: &[String]) {
@@ -803,10 +825,18 @@ pub fn post_process_generated_file(
         }
     }
 
-    let mut processed = if is_html_template_file(&normalized_path) {
-        inject_axiom_attrs(content, &normalized_path)
+    let pre_sanitized_content = if (path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx"))
+        && (content.contains("useSession") || content.contains("!session") || content.contains("status ==="))
+    {
+        sanitize_unhandled_session_loading(content)
     } else {
         content.to_string()
+    };
+
+    let mut processed = if is_html_template_file(&normalized_path) {
+        inject_axiom_attrs(&pre_sanitized_content, &normalized_path)
+    } else {
+        pre_sanitized_content
     };
 
     // Inject Axiom Inspect script into layout files for visual editing mode in development
@@ -827,10 +857,6 @@ pub fn post_process_generated_file(
         if !processed.contains("legacyBehavior") {
             processed = processed.replace("<Link ", "<Link legacyBehavior ");
         }
-    }
-
-    if (path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx")) && processed.contains("useSession") {
-        processed = sanitize_unhandled_session_loading(&processed);
     }
 
     // Apply learned global healing rules
@@ -1857,13 +1883,29 @@ pub fn ensure_prisma_opposite_relations(schema: &str) -> String {
 }
 
 pub fn sanitize_ts_interfaces(content: &str) -> String {
-    let mut output = Vec::new();
+    let mut output: Vec<String> = Vec::new();
     let mut in_interface_or_type = false;
     let mut brace_depth: i32 = 0;
     let kebab_prop_re = regex::Regex::new(r#"^(\s*)([a-zA-Z0-9_]+-[a-zA-Z0-9_-]+)(\s*\??:)"#).ok();
 
     for line in content.lines() {
         let trimmed = line.trim();
+
+        // Strip orphaned data-axiom-* attributes that were misplaced outside of any JSX tag (e.g. after }; at module level)
+        if (trimmed.starts_with("data-axiom-component=") || trimmed.starts_with("data-axiom-file="))
+            && !trimmed.starts_with('<')
+        {
+            let prev_non_empty = output.iter().rev().find(|l| !l.trim().is_empty()).map(|l| l.trim()).unwrap_or("");
+            if prev_non_empty.is_empty()
+                || prev_non_empty.ends_with(';')
+                || prev_non_empty.ends_with("};")
+                || prev_non_empty.ends_with("/>")
+                || prev_non_empty.starts_with("import ")
+                || prev_non_empty.starts_with("export ")
+            {
+                continue;
+            }
+        }
 
         if (trimmed.starts_with("interface ") || trimmed.starts_with("export interface ")
             || (trimmed.starts_with("type ") && (trimmed.contains('=') || trimmed.contains('{')))
