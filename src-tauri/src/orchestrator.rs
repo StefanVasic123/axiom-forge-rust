@@ -1464,7 +1464,7 @@ pub async fn run_orchestrator(
             "[Orchestrator Progress] Emit event - phase: {}, message: {}, progress: {}%",
             phase, msg, progress
         ));
-        let _ = window.emit("task:progress", serde_json::json!({
+        let _ = window.app_handle().emit("task:progress", serde_json::json!({
             "taskId": task_id,
             "projectId": project_id,
             "phase": phase,
@@ -1552,6 +1552,27 @@ pub async fn run_orchestrator(
                     "language": "javascript"
                 }
             ]
+        });
+    } else if let (Some(ref cp), Some(ref saved_files)) = (&existing_checkpoint, &files_to_generate_from_cp) {
+        let cp_name = cp.get("name").and_then(|v| v.as_str()).unwrap_or("Resumed Project");
+        let cp_desc = cp.get("projectDescription").and_then(|v| v.as_str()).unwrap_or("");
+        let cp_type = cp.get("projectType").and_then(|v| v.as_str()).unwrap_or("nextjs");
+        debug_log_to_file(format!(
+            "[Orchestrator] Reconstructing manifest directly from local checkpoint for '{}' ({} files).",
+            cp_name, saved_files.len()
+        ));
+        manifest = serde_json::json!({
+            "manifestId": manifest_id,
+            "platform": "web",
+            "projectType": cp_type,
+            "resolvedStack": if cp_type == "nextjs" { "Next.js" } else { cp_type },
+            "name": cp_name,
+            "description": cp_desc,
+            "metadata": {
+                "name": cp_name,
+                "description": cp_desc
+            },
+            "files": saved_files
         });
     } else {
         let api_base = host.as_deref().unwrap_or("https://idea-analyzer-ten.vercel.app");
@@ -3115,7 +3136,7 @@ pub async fn task_start_generation(
         let err_proj_id = p_id_clone.clone();
         if let Err(e) = run_orchestrator(window.clone(), t_id.clone(), manifest_id, p_id_clone, token, model, host_clone).await {
             debug_log_to_file(format!("[IPC Rust Command] run_orchestrator failed for task_id {}: {}", t_id, e));
-            let _ = window.emit("task:progress", serde_json::json!({
+            let _ = window.app_handle().emit("task:progress", serde_json::json!({
                 "taskId": t_id,
                 "projectId": err_proj_id,
                 "phase": "error",
@@ -3201,7 +3222,28 @@ pub fn task_stop_generation(task_id: String) -> Result<(), String> {
 #[tauri::command]
 pub fn task_get_project_checkpoint(project_id: String) -> Result<Option<Value>, String> {
     let proj_dir = get_project_path(&project_id);
-    Ok(load_generation_checkpoint(&proj_dir))
+    if let Some(mut cp) = load_generation_checkpoint(&proj_dir) {
+        let cp_status = cp.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if let Some(ctrl) = find_task_control(&project_id) {
+            if ctrl.paused.load(Ordering::SeqCst) {
+                cp["status"] = serde_json::json!("paused");
+                cp["phase"] = serde_json::json!("paused");
+            } else if ctrl.stopped.load(Ordering::SeqCst) {
+                cp["status"] = serde_json::json!("stopped");
+                cp["phase"] = serde_json::json!("stopped");
+            }
+        } else if cp_status == "generating" {
+            // Reconcile stale "generating" checkpoint when no worker thread is running
+            cp["status"] = serde_json::json!("stopped");
+            cp["phase"] = serde_json::json!("stopped");
+            cp["updatedAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+            save_generation_checkpoint(&proj_dir, &cp);
+            let _ = project_update_status(project_id, "stopped".to_string(), serde_json::json!({}));
+        }
+        Ok(Some(cp))
+    } else {
+        Ok(None)
+    }
 }
 
 #[tauri::command]
@@ -3210,6 +3252,13 @@ pub async fn task_resume_project_generation(
     project_id: String,
 ) -> Result<String, String> {
     debug_log_to_file(format!("[IPC Rust Command] task_resume_project_generation called for {}", project_id));
+    if let Some(ctrl) = find_task_control(&project_id) {
+        if ctrl.paused.load(Ordering::SeqCst) {
+            let _ = task_resume_generation(project_id);
+        }
+        return Ok(ctrl.task_id.clone());
+    }
+
     let proj_dir = get_project_path(&project_id);
     let cp = load_generation_checkpoint(&proj_dir)
         .ok_or_else(|| format!("No checkpoint found for project {}", project_id))?;

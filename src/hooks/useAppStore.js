@@ -377,7 +377,8 @@ export function useAppStore() {
     detectMissingEnvKeys,
     saveEnvKeys,
     setFirstRun: actions.setFirstRun,
-    setAppMode: actions.setAppMode
+    setAppMode: actions.setAppMode,
+    setTaskProgress: actions.setTaskProgress
   };
 }
 

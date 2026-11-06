@@ -16,6 +16,7 @@ import {
   ExternalLink,
   Minimize2
 } from 'lucide-react';
+import { useI18n, LanguageSelector } from '../i18n/I18nContext';
 
 // Progress phase display
 const PHASE_DISPLAY = {
@@ -61,9 +62,15 @@ function FloatingProgress() {
       if (res.success) setVersion(`v${res.version}`);
     });
 
-    // 1. Parse projectId from URL
-    const params = new URLSearchParams(window.location.search);
-    const projectId = params.get('projectId');
+    // 1. Parse projectId from URL search or hash query string
+    const searchParams = new URLSearchParams(window.location.search);
+    const hashQuery = window.location.hash.includes('?') ? window.location.hash.split('?')[1] : '';
+    const hashParams = new URLSearchParams(hashQuery);
+    const projectId = searchParams.get('projectId') || searchParams.get('id') || hashParams.get('projectId') || hashParams.get('id');
+
+    if (projectId) {
+      setProgress(prev => ({ ...prev, projectId }));
+    }
 
     // 2. Initial sync - check if there's already an active task or checkpoint on disk
     const syncStatus = async () => {
@@ -91,11 +98,13 @@ function FloatingProgress() {
 
     // 3. Listen for future updates
     const unsubscribe = window.electronAPI.task.onProgress((data) => {
+      if (projectId && data.projectId && data.projectId !== projectId) return;
       setProgress(prev => ({
         ...prev,
         ...data,
+        projectId: data.projectId || prev.projectId || projectId,
         phase: data.phase || prev.phase,
-        status: data.status || prev.status,
+        status: data.status || data.phase || prev.status,
         message: data.message || prev.message,
         history: [...(prev.history || []), { time: Date.now(), msg: data.message }]
       }));
@@ -106,7 +115,7 @@ function FloatingProgress() {
 
   // Handle window controls
   const handleClose = () => {
-    window.electronAPI.window.hideFloating();
+    window.electronAPI.window.closeFloating();
   };
 
   // Play / Pause / Stop Handlers

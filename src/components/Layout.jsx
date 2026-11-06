@@ -17,6 +17,8 @@ import {
   Loader2,
   CheckCircle2,
   AlertCircle,
+  Pause,
+  Play,
   X
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
@@ -163,14 +165,42 @@ function Header() {
 }
 
 function Layout() {
-  const { taskProgress } = useAppStore();
+  const { taskProgress, setTaskProgress, loadProjects } = useAppStore();
   const { t } = useI18n();
   const [dismissedTaskId, setDismissedTaskId] = React.useState(null);
+  const [focusedProjectId, setFocusedProjectId] = React.useState(null);
+  const [isTaskActionLoading, setIsTaskActionLoading] = React.useState(false);
   const navigate = useNavigate();
 
-  // Find the first task that is active or recently completed and not dismissed
-  const activeTask = Object.values(taskProgress)
-    .find(t => t.taskId !== dismissedTaskId);
+  React.useEffect(() => {
+    const handleShowProgress = async (e) => {
+      const projectId = e?.detail?.projectId;
+      setDismissedTaskId(null);
+      if (projectId) {
+        setFocusedProjectId(projectId);
+        try {
+          const res = await window.electronAPI.task.getActiveTaskByProject(projectId);
+          if (res?.success && res.task) {
+            setTaskProgress(res.task.taskId, res.task);
+          }
+        } catch (err) {
+          console.warn('Failed to sync task progress on show:', err);
+        }
+      }
+    };
+    window.addEventListener('axiom:show-progress', handleShowProgress);
+    return () => window.removeEventListener('axiom:show-progress', handleShowProgress);
+  }, [setTaskProgress]);
+
+  // Find the task matching focusedProjectId first, or the first non-dismissed task
+  const activeTask = React.useMemo(() => {
+    const tasks = Object.values(taskProgress);
+    if (focusedProjectId) {
+      const focused = tasks.find(tk => tk.projectId === focusedProjectId && tk.taskId !== dismissedTaskId);
+      if (focused) return focused;
+    }
+    return tasks.find(tk => tk.taskId !== dismissedTaskId);
+  }, [taskProgress, focusedProjectId, dismissedTaskId]);
 
   const handleDismiss = () => {
     if (activeTask) {
@@ -187,7 +217,79 @@ function Layout() {
 
   const isComplete = activeTask && (activeTask.phase === 'complete' || activeTask.phase === 'success');
   const isError = activeTask && activeTask.phase === 'error';
-  const isRunning = activeTask && !isComplete && !isError;
+  const isPaused = activeTask && (activeTask.phase === 'paused' || activeTask.status === 'paused');
+  const isStopped = activeTask && (activeTask.phase === 'stopped' || activeTask.status === 'stopped');
+  const isRunning = activeTask && !isComplete && !isError && !isStopped;
+
+  const handlePauseTask = async () => {
+    if (!activeTask) return;
+    setIsTaskActionLoading(true);
+    try {
+      const id = activeTask.taskId || activeTask.projectId;
+      await window.electronAPI.task.pause(id);
+      setTaskProgress(activeTask.taskId, {
+        ...activeTask,
+        phase: 'paused',
+        status: 'paused',
+        message: 'Generisanje je pauzirano.'
+      });
+      await loadProjects();
+    } catch (e) {
+      console.error('Pause failed:', e);
+    } finally {
+      setIsTaskActionLoading(false);
+    }
+  };
+
+  const handleResumeTask = async () => {
+    if (!activeTask) return;
+    setIsTaskActionLoading(true);
+    try {
+      if (isStopped && activeTask.projectId) {
+        setTaskProgress(activeTask.taskId, {
+          ...activeTask,
+          phase: 'generate-files',
+          status: 'generating',
+          message: 'Nastavak generisanja sa sačuvanog checkpoint-a...'
+        });
+        await window.electronAPI.task.resumeGeneration(activeTask.projectId);
+      } else {
+        const id = activeTask.taskId || activeTask.projectId;
+        await window.electronAPI.task.resume(id);
+        setTaskProgress(activeTask.taskId, {
+          ...activeTask,
+          phase: 'generate-files',
+          status: 'generating',
+          message: 'Generisanje se nastavlja...'
+        });
+      }
+      await loadProjects();
+    } catch (e) {
+      console.error('Resume failed:', e);
+    } finally {
+      setIsTaskActionLoading(false);
+    }
+  };
+
+  const handleStopTask = async () => {
+    if (!activeTask) return;
+    setIsTaskActionLoading(true);
+    try {
+      const id = activeTask.taskId || activeTask.projectId;
+      await window.electronAPI.task.stop(id);
+      setTaskProgress(activeTask.taskId, {
+        ...activeTask,
+        phase: 'stopped',
+        status: 'stopped',
+        message: 'Generisanje je zaustavljeno. Svi fajlovi su sačuvani.'
+      });
+      await loadProjects();
+    } catch (e) {
+      console.error('Stop failed:', e);
+    } finally {
+      setIsTaskActionLoading(false);
+    }
+  };
 
   return (
     <div className="min-h-screen bg-slate-950 flex relative">
@@ -201,10 +303,11 @@ function Layout() {
 
       {/* Background Task Progress Overlay */}
       {activeTask && (
-        <div className="fixed bottom-6 right-6 z-50 w-96 bg-slate-900/90 backdrop-blur-xl border border-indigo-500/20 rounded-xl shadow-2xl overflow-hidden animate-fade-in transition-all duration-300">
+        <div className="fixed bottom-6 right-6 z-50 w-96 bg-slate-900/95 backdrop-blur-xl border border-indigo-500/20 rounded-xl shadow-2xl overflow-hidden animate-fade-in transition-all duration-300">
           <div className={`h-1 bg-gradient-to-r ${
             isComplete ? 'from-emerald-500 to-teal-500' :
-            isError ? 'from-rose-500 to-red-500' :
+            isError || isStopped ? 'from-rose-500 to-red-500' :
+            isPaused ? 'from-amber-500 to-orange-500' :
             'from-indigo-500 to-violet-500'
           }`} style={{ width: `${activeTask.progress || 0}%` }} />
           
@@ -213,13 +316,16 @@ function Layout() {
               <div className="flex items-center gap-3">
                 <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
                   isComplete ? 'bg-emerald-500/10 text-emerald-400' :
-                  isError ? 'bg-rose-500/10 text-rose-400' :
+                  isError || isStopped ? 'bg-rose-500/10 text-rose-400' :
+                  isPaused ? 'bg-amber-500/10 text-amber-400' :
                   'bg-indigo-500/10 text-indigo-400'
                 }`}>
                   {isComplete ? (
                     <CheckCircle2 className="w-4 h-4" />
-                  ) : isError ? (
+                  ) : isError || isStopped ? (
                     <AlertCircle className="w-4 h-4" />
+                  ) : isPaused ? (
+                    <Pause className="w-4 h-4" />
                   ) : (
                     <Loader2 className="w-4 h-4 animate-spin" />
                   )}
@@ -228,10 +334,12 @@ function Layout() {
                   <h3 className="font-semibold text-sm text-white">
                     {isComplete ? t('taskOverlay.complete') :
                      isError ? t('taskOverlay.failed') :
+                     isPaused ? 'Generisanje pauzirano' :
+                     isStopped ? 'Generisanje prekinuto' :
                      t('taskOverlay.forging')}
                   </h3>
                   <p className="text-[10px] text-slate-500">
-                    Task ID: {activeTask.taskId.substring(0, 13)}
+                    Task ID: {String(activeTask.taskId || '').substring(0, 13)}
                   </p>
                 </div>
               </div>
@@ -255,10 +363,46 @@ function Layout() {
               </p>
             </div>
             
-            {isRunning && (
+            {(isRunning || isPaused || isStopped) && (
               <div className="mt-3 flex items-center justify-between text-[10px] text-slate-500">
-                <span>{t('taskOverlay.progress')}</span>
+                <span>{isPaused ? 'Pauzirano' : isStopped ? 'Sačuvani napredak' : t('taskOverlay.progress')}</span>
                 <span className="font-medium text-slate-300">{Math.round(activeTask.progress || 0)}%</span>
+              </div>
+            )}
+
+            {/* Interactive Controls inside Main Window Overlay */}
+            {(isRunning || isPaused || isStopped) && (
+              <div className="mt-3 pt-3 border-t border-slate-800 flex items-center gap-2">
+                {isRunning && !isPaused && (
+                  <>
+                    <button
+                      onClick={handlePauseTask}
+                      disabled={isTaskActionLoading}
+                      className="flex-1 flex items-center justify-center gap-1.5 py-1.5 px-2.5 rounded-lg bg-amber-500/10 text-amber-400 hover:bg-amber-500/20 text-xs font-medium transition-colors"
+                    >
+                      <Pause className="w-3.5 h-3.5" />
+                      {t('common.pause') || 'Pause'}
+                    </button>
+                    <button
+                      onClick={handleStopTask}
+                      disabled={isTaskActionLoading}
+                      className="flex-1 flex items-center justify-center gap-1.5 py-1.5 px-2.5 rounded-lg bg-rose-500/10 text-rose-400 hover:bg-rose-500/20 text-xs font-medium transition-colors"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                      {t('common.stop') || 'Stop'}
+                    </button>
+                  </>
+                )}
+                {(isPaused || isStopped) && (
+                  <button
+                    onClick={handleResumeTask}
+                    disabled={isTaskActionLoading}
+                    className="w-full flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold shadow-lg shadow-indigo-600/20 transition-all"
+                  >
+                    <Play className="w-3.5 h-3.5" />
+                    {isStopped ? 'Nastavi tamo gde je stao' : (t('common.resume') || 'Resume')}
+                  </button>
+                )}
               </div>
             )}
             

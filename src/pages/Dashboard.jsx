@@ -186,8 +186,10 @@ function ProjectCard({
                     onClick={async (e) => {
                       e.stopPropagation();
                       setShowMenu(false);
+                      const activeInfo = await window.electronAPI.task.getActiveTaskByProject(project.id);
+                      const realStatus = activeInfo?.task?.status || project.status;
                       await window.electronAPI.window.showFloating({ id: project.id });
-                      if (project.status === 'stopped' || project.status === 'paused') {
+                      if (realStatus === 'stopped' || realStatus === 'paused') {
                         await window.electronAPI.task.resumeGeneration(project.id);
                       }
                     }}
@@ -241,8 +243,10 @@ function ProjectCard({
             <button
               onClick={async (e) => {
                 e.stopPropagation();
+                const activeInfo = await window.electronAPI.task.getActiveTaskByProject(project.id);
+                const realStatus = activeInfo?.task?.status || project.status;
                 await window.electronAPI.window.showFloating({ id: project.id });
-                if (project.status === 'stopped' || project.status === 'paused') {
+                if (realStatus === 'stopped' || realStatus === 'paused') {
                   await window.electronAPI.task.resumeGeneration(project.id);
                 }
               }}

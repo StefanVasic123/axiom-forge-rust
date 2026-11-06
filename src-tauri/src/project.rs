@@ -97,6 +97,33 @@ pub fn project_get_all() -> Result<Vec<Value>, String> {
         }
     }
     
+    // Reconcile stale "generating" statuses left behind after an app force-close or crash
+    for proj in projects.iter_mut() {
+        let pid = proj.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let status = proj.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if !pid.is_empty() && status == "generating" && find_task_control(&pid).is_none() {
+            let proj_dir = get_projects_dir().join(&pid);
+            let mut resolved_status = "stopped".to_string();
+            if let Some(mut cp) = load_generation_checkpoint(&proj_dir) {
+                let cp_status = cp.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                if cp_status == "completed" || cp_status == "complete" {
+                    resolved_status = "ready".to_string();
+                } else if cp_status == "paused" {
+                    resolved_status = "paused".to_string();
+                } else {
+                    cp["status"] = serde_json::json!("stopped");
+                    cp["phase"] = serde_json::json!("stopped");
+                    cp["updatedAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+                    save_generation_checkpoint(&proj_dir, &cp);
+                }
+            }
+            if let Some(obj) = proj.as_object_mut() {
+                obj.insert("status".to_string(), serde_json::json!(resolved_status));
+                obj.insert("updatedAt".to_string(), serde_json::json!(chrono::Utc::now().to_rfc3339()));
+            }
+        }
+    }
+
     let _ = fs::create_dir_all(get_base_dir());
     let _ = fs::write(&file_path, serde_json::to_string_pretty(&projects).unwrap());
 

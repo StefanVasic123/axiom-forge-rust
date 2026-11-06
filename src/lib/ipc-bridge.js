@@ -479,17 +479,20 @@ window.electronAPI = {
         if (checkpoint) {
           const completedCount = checkpoint.completedFiles ? checkpoint.completedFiles.length : 0;
           const totalCount = checkpoint.totalFiles || 1;
-          const calcProgress = Math.min(Math.round((completedCount / totalCount) * 100), 100);
+          const isDone = checkpoint.status === 'completed' || checkpoint.phase === 'complete';
+          const calcProgress = isDone
+            ? 100
+            : Math.min(Math.round(25 + (completedCount / totalCount) * 55), 99);
           return { 
             success: true, 
             task: {
-              taskId: checkpoint.taskId,
-              projectId: checkpoint.projectId,
+              taskId: checkpoint.taskId || `task-${projectId}`,
+              projectId: checkpoint.projectId || projectId,
               phase: checkpoint.phase || checkpoint.status,
               status: checkpoint.status,
-              message: checkpoint.status === 'paused' ? 'Generation paused' : 
-                       checkpoint.status === 'stopped' ? 'Generation stopped' : 
-                       `Checkpoint: ${completedCount}/${totalCount} files generated`,
+              message: checkpoint.status === 'paused' ? `Generisanje pauzirano (${completedCount}/${totalCount} fajlova)` : 
+                       checkpoint.status === 'stopped' ? `Generisanje prekinuto (${completedCount}/${totalCount} fajlova sačuvano)` : 
+                       `Checkpoint: ${completedCount}/${totalCount} fajlova generisano`,
               progress: calcProgress,
               checkpoint
             }
@@ -649,35 +652,32 @@ window.electronAPI = {
     }
   },
   window: {
-    showFloating: async ({ id }) => {
+    showFloating: async (arg) => {
+      const id = typeof arg === 'string' ? arg : (arg?.id || arg?.projectId);
+      if (!id) return;
       try {
-        const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
-        const label = `floating-${id}`;
-        
-        const webview = new WebviewWindow(label, {
-          url: `index.html#/floating?id=${id}`,
-          title: 'Axiom Forge - Generating Codebase',
-          width: 700,
-          height: 500,
-          resizable: true,
-          alwaysOnTop: true,
-        });
+        window.dispatchEvent(new CustomEvent('axiom:show-progress', { detail: { projectId: id } }));
+      } catch (e) {}
+      try {
+        await invoke('show_floating_window', { projectId: id });
       } catch (e) {
         console.error('Failed to show floating window:', e);
       }
     },
     closeFloating: async () => {
       try {
-        const { getCurrentWindow } = await import('@tauri-apps/api/window');
-        const win = getCurrentWindow();
-        if (win && win.label && win.label.startsWith('floating-')) {
-          await win.close();
-        }
+        await invoke('close_floating_window');
       } catch (e) {
         console.error('Failed to close floating window:', e);
       }
     },
-    hideFloating: async () => {}
+    hideFloating: async () => {
+      try {
+        await invoke('close_floating_window');
+      } catch (e) {
+        console.error('Failed to hide floating window:', e);
+      }
+    }
   },
   app: {
     getVersion: async () => {

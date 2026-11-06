@@ -73,6 +73,37 @@ fn clear_pending_deep_link(state: tauri::State<'_, PendingDeepLink>) {
     }
 }
 
+#[tauri::command]
+fn show_floating_window(app: tauri::AppHandle, project_id: String) -> Result<(), String> {
+    let label = format!("floating-{}", project_id);
+    if let Some(existing_win) = app.get_webview_window(&label) {
+        let _ = existing_win.show();
+        let _ = existing_win.unminimize();
+        let _ = existing_win.set_focus();
+        return Ok(());
+    }
+
+    let url = format!("index.html?projectId={}#/floating?id={}", project_id, project_id);
+    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(url.into()))
+        .title("Axiom Forge - Generation Progress")
+        .inner_size(460.0, 440.0)
+        .resizable(true)
+        .always_on_top(true)
+        .center()
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+#[tauri::command]
+fn close_floating_window(window: tauri::Window) -> Result<(), String> {
+    if window.label().starts_with("floating-") {
+        let _ = window.close();
+    }
+    Ok(())
+}
+
 fn handle_axiom_url<R: tauri::Runtime>(app: &tauri::AppHandle<R>, url_str: &str) {
     debug_log_to_file(format!("handle_axiom_url intercepted deep link URL: {}", url_str));
 
@@ -280,6 +311,8 @@ pub fn run() {
             ollama_unload_model,
             get_pending_deep_link,
             clear_pending_deep_link,
+            show_floating_window,
+            close_floating_window,
             debug_log_to_file,
             project_import_local_folder,
             project_import_github,
