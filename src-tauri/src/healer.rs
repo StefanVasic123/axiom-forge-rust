@@ -1160,7 +1160,7 @@ pub async fn project_heal_compile_error(
                                     "target": "",
                                     "replacement": sanitized_fallback
                                 }));
-                                explanation = "Primenjen deterministički sanitizer koda i uvoza (React/Next.js hooks)".to_string();
+                                explanation = "Primenjen deterministički sanitizer koda i uvoza (React hooks, Next.js, Zod)".to_string();
                             }
                         }
 

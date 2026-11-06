@@ -380,6 +380,74 @@ impl CompileErrorDetector {
     }
 }
 
+pub struct LogThrottler {
+    last_line: String,
+    repeat_count: usize,
+    window_start: std::time::Instant,
+    lines_in_window: usize,
+    storm_reported: bool,
+}
+
+impl LogThrottler {
+    pub fn new() -> Self {
+        Self {
+            last_line: String::new(),
+            repeat_count: 0,
+            window_start: std::time::Instant::now(),
+            lines_in_window: 0,
+            storm_reported: false,
+        }
+    }
+
+    pub fn filter_line(&mut self, text: &str) -> Option<String> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let now = std::time::Instant::now();
+        if now.duration_since(self.window_start).as_millis() >= 1000 {
+            self.window_start = now;
+            self.lines_in_window = 0;
+            self.storm_reported = false;
+        }
+
+        self.lines_in_window += 1;
+
+        // If more than 60 lines arrive within 1 second, suppress the deluge
+        if self.lines_in_window > 60 {
+            if !self.storm_reported {
+                self.storm_reported = true;
+                return Some("... [Prekomeran broj logova sa servera u sekundi - privremeno sažeto] ...".to_string());
+            }
+            return None;
+        }
+
+        // Duplicate suppression
+        if trimmed == self.last_line {
+            self.repeat_count += 1;
+            if self.repeat_count == 2 {
+                return Some(format!("{} (ponavlja se...)", trimmed));
+            } else if self.repeat_count % 30 == 0 {
+                return Some(format!("... [Linija ponovljena {} puta]: {}", self.repeat_count, trimmed));
+            }
+            return None;
+        }
+
+        // Line changed
+        let prefix = if self.repeat_count > 2 && (self.repeat_count % 30 != 0) {
+            format!("... [Prethodna poruka ponovljena ukupno {} puta]\n", self.repeat_count)
+        } else {
+            String::new()
+        };
+
+        self.last_line = trimmed.to_string();
+        self.repeat_count = 1;
+
+        Some(format!("{}{}", prefix, text))
+    }
+}
+
 
 
 pub fn ensure_react_icons_sanitized(proj_dir: &std::path::Path) {
@@ -588,25 +656,28 @@ pub async fn server_start(
             tokio::spawn(async move {
                 use tokio::io::{AsyncBufReadExt, BufReader};
                 let mut reader = BufReader::new(stdout).lines();
+                let mut throttler_stdout = LogThrottler::new();
                 while let Ok(Some(line)) = reader.next_line().await {
                     if let Ok(mut det) = detector_stdout.lock() {
                         det.process_line(&line, &window_stdout, &p_id_stdout);
                     }
                     let clean_text = clean_cli_output_for_llm(&line);
-                    let is_important = clean_text.contains('⨯')
-                        || clean_text.contains("Error")
-                        || clean_text.contains("Failed to compile")
-                        || clean_text.contains("Ready in")
-                        || clean_text.contains("Local:")
-                        || clean_text.contains(" 500 in ")
-                        || clean_text.contains("Cannot find module");
-                    if is_important {
-                        debug_log_to_file(format!("[Dev Server stdout] {}", clean_text.trim()));
+                    if let Some(filtered) = throttler_stdout.filter_line(&clean_text) {
+                        let is_important = filtered.contains('⨯')
+                            || filtered.contains("Error")
+                            || filtered.contains("Failed to compile")
+                            || filtered.contains("Ready in")
+                            || filtered.contains("Local:")
+                            || filtered.contains(" 500 in ")
+                            || filtered.contains("Cannot find module");
+                        if is_important {
+                            debug_log_to_file(format!("[Dev Server stdout] {}", filtered.trim()));
+                        }
+                        let _ = window_stdout.emit("server:log", serde_json::json!({
+                            "text": format!("{}\n", filtered),
+                            "type": "info"
+                        }));
                     }
-                    let _ = window_stdout.emit("server:log", serde_json::json!({
-                        "text": format!("{}\n", clean_text),
-                        "type": "info"
-                    }));
                 }
                 if let Ok(mut det) = detector_stdout.lock() {
                     if det.is_recording {
@@ -622,18 +693,19 @@ pub async fn server_start(
             tokio::spawn(async move {
                 use tokio::io::{AsyncBufReadExt, BufReader};
                 let mut reader = BufReader::new(stderr).lines();
+                let mut throttler_stderr = LogThrottler::new();
                 while let Ok(Some(line)) = reader.next_line().await {
                     if let Ok(mut det) = detector_stderr.lock() {
                         det.process_line(&line, &window_stderr, &p_id_stderr);
                     }
                     let clean_text = clean_cli_output_for_llm(&line);
-                    if !clean_text.trim().is_empty() {
-                        debug_log_to_file(format!("[Dev Server stderr] {}", clean_text.trim()));
+                    if let Some(filtered) = throttler_stderr.filter_line(&clean_text) {
+                        debug_log_to_file(format!("[Dev Server stderr] {}", filtered.trim()));
+                        let _ = window_stderr.emit("server:log", serde_json::json!({
+                            "text": format!("{}\n", filtered),
+                            "type": "error"
+                        }));
                     }
-                    let _ = window_stderr.emit("server:log", serde_json::json!({
-                        "text": format!("{}\n", clean_text),
-                        "type": "error"
-                    }));
                 }
                 if let Ok(mut det) = detector_stderr.lock() {
                     if det.is_recording {

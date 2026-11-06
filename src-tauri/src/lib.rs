@@ -456,6 +456,29 @@ mod tests {
     }
 
     #[test]
+    fn test_ensure_zod_imports() {
+        let route_code = "import { NextResponse } from 'next/server';\n\nconst schema = z.object({ id: z.string() });\n\nexport async function POST() { return NextResponse.json({}); }";
+        let with_zod = ensure_zod_imports(route_code);
+        assert!(with_zod.contains("import { z } from 'zod';"));
+
+        let processed = post_process_generated_file("src/app/api/subscriptions/route.ts", route_code, &serde_json::json!({}), false);
+        assert!(processed.contains("import { z } from 'zod';"));
+    }
+
+    #[test]
+    fn test_log_throttler_dedup_and_rate_limit() {
+        let mut throttler = LogThrottler::new();
+        assert!(throttler.filter_line("POST /api/subscriptions 500").is_some());
+        assert!(throttler.filter_line("POST /api/subscriptions 500").is_some());
+        assert!(throttler.filter_line("POST /api/subscriptions 500").is_none());
+        assert!(throttler.filter_line("POST /api/subscriptions 500").is_none());
+
+        let diff = throttler.filter_line("✓ Compiled in 200ms");
+        assert!(diff.is_some());
+        assert!(diff.unwrap().contains("Prethodna poruka ponovljena ukupno 4 puta"));
+    }
+
+    #[test]
     fn test_post_process_use_session_layout() {
         let content = "import { useSession } from 'next-auth/react';\nexport default function RootLayout({ children }) { const { data } = useSession(); return <html><body>{children}</body></html>; }";
         let metamanifest = serde_json::json!({});

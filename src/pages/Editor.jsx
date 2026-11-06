@@ -745,11 +745,26 @@ export default function EditorPage() {
       setServerRunning(status === 'running');
     });
 
-    const unsubLog = window.electronAPI.server.onLog(({ text, type }) => {
+    let logBuffer = [];
+    let logFlushTimeout = null;
+
+    const flushLogBuffer = () => {
+      if (logBuffer.length === 0) return;
+      const batch = logBuffer.splice(0, logBuffer.length);
       setServerLogs(logs => {
-        const newLogs = [...logs, { text, type, id: Date.now() + Math.random() }];
-        return newLogs.slice(-200); // Keep last 200 logs
+        const newLogs = [...logs, ...batch];
+        return newLogs.slice(-250); // Keep last 250 logs
       });
+    };
+
+    const unsubLog = window.electronAPI.server.onLog(({ text, type }) => {
+      logBuffer.push({ text, type, id: Date.now() + Math.random() });
+      if (!logFlushTimeout) {
+        logFlushTimeout = setTimeout(() => {
+          logFlushTimeout = null;
+          flushLogBuffer();
+        }, 100);
+      }
 
       // If server logs indicate ready or compiling progress, update starting state
       if (text.includes('Ready in') || text.includes('Local:') || text.includes('ready on') || text.includes('compiled successfully') || text.includes('Compiled /')) {
@@ -801,6 +816,8 @@ export default function EditorPage() {
       : null;
 
     return () => {
+      if (logFlushTimeout) clearTimeout(logFlushTimeout);
+      flushLogBuffer();
       unsubStatus();
       unsubLog();
       unsubCompileError();

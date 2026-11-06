@@ -1115,6 +1115,10 @@ pub fn post_process_generated_file(
             }
         }
 
+        if path_lower.ends_with(".ts") || path_lower.ends_with(".tsx") || path_lower.ends_with(".js") || path_lower.ends_with(".jsx") {
+            processed = ensure_zod_imports(&processed);
+        }
+
         // Convert old Material-UI (v4) to modern MUI (v5)
         if processed.contains("@material-ui/core") || processed.contains("@material-ui/icons") || processed.contains("createMuiTheme") {
             processed = processed
@@ -2023,6 +2027,34 @@ pub fn insert_import_after_use_client(content: &str, import_line: &str) -> Strin
     lines.insert(insert_idx, import_line.to_string());
     let joined = lines.join("\n");
     hoist_use_client_directive(&joined)
+}
+
+pub fn ensure_zod_imports(content: &str) -> String {
+    let has_zod_call = regex::Regex::new(r"(?m)\bz\.(?:object|string|number|boolean|date|enum|array|record|any|unknown|infer|literal|union|optional|nullable|lazy|coerce)\b")
+        .map(|re| re.is_match(content))
+        .unwrap_or(false);
+
+    if !has_zod_call {
+        return content.to_string();
+    }
+
+    let has_zod_import = content.contains("from 'zod'")
+        || content.contains("from \"zod\"")
+        || content.contains("require('zod')")
+        || content.contains("require(\"zod\")");
+
+    if has_zod_import {
+        return content.to_string();
+    }
+
+    let has_decl = regex::Regex::new(r"(?m)\b(?:const|let|var|function|class)\s+z\s*[:=]")
+        .map(|re| re.is_match(content))
+        .unwrap_or(false);
+    if has_decl {
+        return content.to_string();
+    }
+
+    insert_import_after_use_client(content, "import { z } from 'zod';")
 }
 
 pub fn ensure_react_and_next_hook_imports(content: &str) -> String {
