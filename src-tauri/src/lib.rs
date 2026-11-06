@@ -444,6 +444,11 @@ mod tests {
         let content_with = "\"use client\";\nimport { useState } from 'react';";
         let processed_with = post_process_generated_file("src/app/components/Counter.tsx", content_with, &metamanifest, false);
         assert_eq!(processed_with, content_with.to_string());
+
+        let displaced = "import { useState } from 'react';\n\"use client\";\nimport Link from 'next/link';";
+        let hoisted = hoist_use_client_directive(displaced);
+        assert!(hoisted.starts_with("\"use client\";\nimport { useState }"));
+        assert_eq!(hoisted.matches("\"use client\"").count(), 1);
         
         let mui_content = "import { styled } from '@mui/material/styles';\nconst MyDiv = styled('div')({});";
         let processed_mui = post_process_generated_file("src/app/layout.tsx", mui_content, &metamanifest, false);

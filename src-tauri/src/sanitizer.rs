@@ -1111,6 +1111,7 @@ pub fn post_process_generated_file(
 
             if !path_lower.contains("/api/") && !path_lower.ends_with("route.ts") && !path_lower.ends_with("route.js") {
                 processed = ensure_react_and_next_hook_imports(&processed);
+                processed = hoist_use_client_directive(&processed);
             }
         }
 
@@ -1571,6 +1572,7 @@ export const config = {
                 if has_hooks && !processed.trim_start().starts_with("\"use client\"") && !processed.trim_start().starts_with("'use client'") {
                     processed = format!("\"use client\";\n\n{}", processed);
                 }
+                processed = hoist_use_client_directive(&processed);
             }
 
             // Re-check async client component after potential "use client" injection above
@@ -1952,6 +1954,59 @@ pub fn sanitize_ts_interfaces(content: &str) -> String {
     output.join("\n")
 }
 
+pub fn hoist_use_client_directive(content: &str) -> String {
+    let has_use_client = content.contains("\"use client\"") || content.contains("'use client'");
+    if !has_use_client {
+        return content.to_string();
+    }
+
+    let mut statements_before_use_client = 0;
+    let mut use_client_count = 0;
+    for line in content.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') {
+            continue;
+        }
+        if t.starts_with("\"use client\"") || t.starts_with("'use client'") {
+            use_client_count += 1;
+        } else if use_client_count == 0 {
+            statements_before_use_client += 1;
+        }
+    }
+
+    if statements_before_use_client == 0 && use_client_count == 1 {
+        return content.to_string();
+    }
+
+    let mut filtered_lines: Vec<String> = Vec::new();
+    let mut leading_comments: Vec<String> = Vec::new();
+    let mut in_leading_comments = true;
+
+    for line in content.lines() {
+        let t = line.trim();
+        if t.starts_with("\"use client\"") || t.starts_with("'use client'") {
+            continue;
+        }
+        if in_leading_comments && (t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') || t.is_empty()) {
+            leading_comments.push(line.to_string());
+        } else {
+            in_leading_comments = false;
+            filtered_lines.push(line.to_string());
+        }
+    }
+
+    let mut res = String::new();
+    let comments = leading_comments.join("\n");
+    let trimmed_comments = comments.trim_end();
+    if !trimmed_comments.is_empty() {
+        res.push_str(trimmed_comments);
+        res.push_str("\n\n");
+    }
+    res.push_str("\"use client\";\n");
+    res.push_str(&filtered_lines.join("\n"));
+    res
+}
+
 pub fn insert_import_after_use_client(content: &str, import_line: &str) -> String {
     let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
     let mut insert_idx = 0;
@@ -1966,7 +2021,8 @@ pub fn insert_import_after_use_client(content: &str, import_line: &str) -> Strin
         break;
     }
     lines.insert(insert_idx, import_line.to_string());
-    lines.join("\n")
+    let joined = lines.join("\n");
+    hoist_use_client_directive(&joined)
 }
 
 pub fn ensure_react_and_next_hook_imports(content: &str) -> String {

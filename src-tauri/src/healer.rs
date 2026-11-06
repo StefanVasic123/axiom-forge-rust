@@ -668,12 +668,14 @@ pub fn recursively_find_edits(value: &Value, current_path: &str, edits: &mut Vec
             }
 
             // Check if object is an import rewrite rule (e.g. { "type": "import", "from": "react-icons", "to": "react-icons/hi", "symbol": "HiOutlineChartBar" })
-            let has_import_fix = map.get("type").and_then(|t| t.as_str()) == Some("import")
-                || (map.contains_key("from") && map.contains_key("to"));
+            let is_move = map.get("type").and_then(|t| t.as_str()) == Some("move");
+            let has_import_fix = !is_move && (map.get("type").and_then(|t| t.as_str()) == Some("import")
+                || (map.contains_key("from") && map.contains_key("to")));
             if has_import_fix {
-                let from_str = map.get("from").and_then(|f| f.as_str()).unwrap_or("");
-                let to_str = map.get("to").and_then(|t| t.as_str()).unwrap_or("");
-                if !from_str.is_empty() && !to_str.is_empty() {
+                let from_str = map.get("from").and_then(|f| f.as_str()).unwrap_or("").trim();
+                let to_str = map.get("to").and_then(|t| t.as_str()).unwrap_or("").trim();
+                let is_numeric_ref = from_str.chars().all(|c| c.is_ascii_digit()) || to_str.chars().all(|c| c.is_ascii_digit());
+                if !from_str.is_empty() && !to_str.is_empty() && !is_numeric_ref {
                     edits.push(serde_json::json!({
                         "path": context_path.clone(),
                         "target": format!("'{}'", from_str),
@@ -1070,6 +1072,12 @@ pub async fn project_heal_compile_error(
                         }
 
                         // Try extracting code payload if the model returned malformed/partially-formatted JSON with backticks
+                        resolved_edits.retain(|e| {
+                            let t = e.get("target").and_then(|v| v.as_str()).unwrap_or("");
+                            let unquoted = t.trim_matches('\'').trim_matches('"').trim();
+                            t.is_empty() || !unquoted.chars().all(|c| c.is_ascii_digit())
+                        });
+
                         if resolved_edits.is_empty() {
                             if let Some(malformed_edits) = extract_code_from_malformed_json_response(&clean_content, &rel_file_path) {
                                 debug_log_to_file(format!("[AI Auto-Healing] Extracted embedded code from malformed JSON for: {}", rel_file_path));
@@ -1083,6 +1091,12 @@ pub async fn project_heal_compile_error(
                         }
 
                         // Whole-File Code Fallback: If no valid JSON edits were resolved, but clean_content is strictly raw code (NOT a JSON dictionary)
+                        resolved_edits.retain(|e| {
+                            let t = e.get("target").and_then(|v| v.as_str()).unwrap_or("");
+                            let unquoted = t.trim_matches('\'').trim_matches('"').trim();
+                            t.is_empty() || !unquoted.chars().all(|c| c.is_ascii_digit())
+                        });
+
                         if resolved_edits.is_empty() {
                             let trimmed = clean_content.trim();
                             let is_raw_json = (trimmed.starts_with('{') && trimmed.ends_with('}'))
@@ -1131,6 +1145,12 @@ pub async fn project_heal_compile_error(
                             }
                         }
 
+                        resolved_edits.retain(|e| {
+                            let t = e.get("target").and_then(|v| v.as_str()).unwrap_or("");
+                            let unquoted = t.trim_matches('\'').trim_matches('"').trim();
+                            t.is_empty() || !unquoted.chars().all(|c| c.is_ascii_digit())
+                        });
+
                         if resolved_edits.is_empty() {
                             let has_tw = proj_dir.join("tailwind.config.js").exists() || proj_dir.join("tailwind.config.ts").exists();
                             let sanitized_fallback = post_process_generated_file(&rel_file_path, &file_content, &serde_json::json!({}), has_tw);
@@ -1143,6 +1163,12 @@ pub async fn project_heal_compile_error(
                                 explanation = "Primenjen deterministički sanitizer koda i uvoza (React/Next.js hooks)".to_string();
                             }
                         }
+
+                        resolved_edits.retain(|e| {
+                            let t = e.get("target").and_then(|v| v.as_str()).unwrap_or("");
+                            let unquoted = t.trim_matches('\'').trim_matches('"').trim();
+                            t.is_empty() || !unquoted.chars().all(|c| c.is_ascii_digit())
+                        });
 
                         if resolved_edits.is_empty() {
                             let err_msg = "Model response could not be parsed as targeted JSON edits or valid whole-file code replacement.".to_string();
@@ -1233,7 +1259,8 @@ pub async fn project_heal_compile_error(
 
                                 if is_just_import && !file_content_mut.is_empty() {
                                     if !file_content_mut.contains(repl_trimmed) {
-                                        *file_content_mut = format!("{}\n{}", repl_trimmed, file_content_mut);
+                                        *file_content_mut = insert_import_after_use_client(file_content_mut, repl_trimmed);
+                                        *file_content_mut = hoist_use_client_directive(file_content_mut);
                                     }
                                 } else if is_just_export && !file_content_mut.is_empty() {
                                     if !file_content_mut.contains(repl_trimmed) {
