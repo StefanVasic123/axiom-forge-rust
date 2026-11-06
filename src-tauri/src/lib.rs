@@ -46,7 +46,7 @@ fn debug_log_to_file(message: String) {
     let log_path = projects_dir.join("deeplink_debug.txt");
     println!("[JS/Rust Debug Log] {}", message);
     if let Ok(meta) = std::fs::metadata(&log_path) {
-        if meta.len() > 5 * 1024 * 1024 {
+        if meta.len() > 2 * 1024 * 1024 {
             let backup_path = projects_dir.join("deeplink_debug.old.txt");
             let _ = std::fs::rename(&log_path, &backup_path);
         }
@@ -58,6 +58,48 @@ fn debug_log_to_file(message: String) {
             let time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
             let _ = writeln!(file, "[{}] {}", time, message);
         }
+}
+
+pub fn get_agent_bridge_dir() -> PathBuf {
+    let dir = get_base_dir().join("agent_bridge");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+#[tauri::command]
+fn agent_update_live_state(state_json: Value) -> Result<(), String> {
+    let bridge_dir = get_agent_bridge_dir();
+    let state_path = bridge_dir.join("live_state.json");
+    if let Ok(pretty) = serde_json::to_string_pretty(&state_json) {
+        let _ = std::fs::write(&state_path, pretty);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn agent_poll_command() -> Option<Value> {
+    let bridge_dir = get_agent_bridge_dir();
+    let cmd_path = bridge_dir.join("command.json");
+    if !cmd_path.exists() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&cmd_path).ok()?;
+    let _ = std::fs::remove_file(&cmd_path);
+    serde_json::from_str::<Value>(&content).ok()
+}
+
+#[tauri::command]
+fn agent_write_command_result(result_json: Value) -> Result<(), String> {
+    let bridge_dir = get_agent_bridge_dir();
+    let res_path = bridge_dir.join("command_result.json");
+    if let Ok(pretty) = serde_json::to_string_pretty(&result_json) {
+        let _ = std::fs::write(&res_path, pretty);
+    }
+    let cmd_id = result_json.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let action = result_json.get("action").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let ok = result_json.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    debug_log_to_file(format!("[Agent Bridge] Command '{}' (action: {}) completed: success={}", cmd_id, action, ok));
+    Ok(())
 }
 
 #[tauri::command]
@@ -311,6 +353,9 @@ pub fn run() {
             show_floating_window,
             close_floating_window,
             debug_log_to_file,
+            agent_update_live_state,
+            agent_poll_command,
+            agent_write_command_result,
             project_import_local_folder,
             project_import_github,
             project_detect_missing_env_keys,
@@ -1231,6 +1276,27 @@ export default function DashboardPage() {
         let processed_dash = post_process_generated_file("src/app/dashboard/page.tsx", dash_input, &serde_json::json!({}), true);
         assert!(!processed_dash.contains("return <Link href=\"/login\">Log in</Link>;"));
         assert!(processed_dash.contains("<h1>Dashboard KPI</h1>"));
+    }
+
+    #[test]
+    fn test_extract_file_path_windows_and_react_hook_imports() {
+        let win_line = " ⨯ src\\components\\Navbar.tsx (14:51) @ useState";
+        assert_eq!(extract_file_path_from_line(win_line), Some("src\\components\\Navbar.tsx".to_string()));
+
+        let navbar_missing_usestate = r#"import React from 'react';
+import Link from 'next/link';
+import { usePathname } from 'next/navigation';
+
+const Navbar: React.FC = () => {
+  const pathname = usePathname();
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  return <nav className="p-4">Brand</nav>;
+};
+export default Navbar;
+"#;
+        let processed = post_process_generated_file("src/components/Navbar.tsx", navbar_missing_usestate, &serde_json::json!({}), true);
+        assert!(processed.starts_with("\"use client\";"));
+        assert!(processed.contains("import React, { useState } from 'react';"));
     }
 
 }

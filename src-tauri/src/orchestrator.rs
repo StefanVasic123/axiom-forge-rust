@@ -1487,6 +1487,13 @@ pub async fn run_orchestrator(
         task_id, manifest_id, project_id, model_id, host
     ));
     let emit_progress = |phase: &str, msg: &str, progress: f64| {
+        let status = match phase {
+            "paused" => "paused",
+            "stopped" => "stopped",
+            "complete" | "success" => "completed",
+            "error" => "error",
+            _ => "generating",
+        };
         debug_log_to_file(format!(
             "[Orchestrator Progress] Emit event - phase: {}, message: {}, progress: {}%",
             phase, msg, progress
@@ -1495,15 +1502,24 @@ pub async fn run_orchestrator(
             "taskId": task_id,
             "projectId": project_id,
             "phase": phase,
+            "status": status,
             "message": msg,
             "progress": progress
         }));
     };
     let emit_live_code = |phase: &str, msg: &str, progress: f64, current_file: &str, file_desc: &str, file_idx: usize, total_files: usize, token_count: usize, live_code: &str| {
+        let status = match phase {
+            "paused" => "paused",
+            "stopped" => "stopped",
+            "complete" | "success" => "completed",
+            "error" => "error",
+            _ => "generating",
+        };
         let _ = window.app_handle().emit("task:progress", serde_json::json!({
             "taskId": task_id,
             "projectId": project_id,
             "phase": phase,
+            "status": status,
             "message": msg,
             "progress": progress,
             "currentFile": current_file,
@@ -2952,6 +2968,35 @@ export default function RootLayout({
             let mut stream_stalled = false;
 
             loop {
+                while task_control.paused.load(Ordering::SeqCst) {
+                    if task_control.stopped.load(Ordering::SeqCst) {
+                        loop_detected = true;
+                        break;
+                    }
+                    let preview = extract_live_code_preview(&full_content);
+                    let sub_progress = current_progress + ((token_count as f64 / 600.0).min(0.9) * (55.0 / total_files.max(1.0)));
+                    emit_live_code(
+                        "paused",
+                        &format!("Generisanje pauzirano na fajlu {}/{} ({} tokena)", i + 1, files_to_generate.len(), token_count),
+                        sub_progress,
+                        file_path,
+                        desc,
+                        i + 1,
+                        files_to_generate.len(),
+                        token_count,
+                        &preview,
+                    );
+                    tokio::select! {
+                        _ = task_control.notify.notified() => {},
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(400)) => {}
+                    }
+                }
+                if task_control.stopped.load(Ordering::SeqCst) {
+                    debug_log_to_file(format!("[Orchestrator] Task {} stopped during chunk generation for {}", task_id, file_path));
+                    loop_detected = true;
+                    break;
+                }
+
                 let chunk_fut = resp.chunk();
                 // 60-second timeout per streaming chunk
                 let chunk_res = tokio::time::timeout(std::time::Duration::from_secs(60), chunk_fut).await;
@@ -3325,7 +3370,15 @@ pub fn task_pause_generation(task_id: String) -> Result<(), String> {
         let _ = project_update_status(control.project_id.clone(), "paused".to_string(), serde_json::json!({}));
         Ok(())
     } else {
-        Err(format!("Active task '{}' not found", task_id))
+        let proj_dir = get_project_path(&task_id);
+        if let Some(mut cp) = load_generation_checkpoint(&proj_dir) {
+            cp["status"] = serde_json::json!("paused");
+            cp["phase"] = serde_json::json!("paused");
+            cp["updatedAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+            save_generation_checkpoint(&proj_dir, &cp);
+            let _ = project_update_status(task_id, "paused".to_string(), serde_json::json!({}));
+        }
+        Ok(())
     }
 }
 

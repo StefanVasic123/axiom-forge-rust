@@ -831,6 +831,8 @@ pub async fn project_heal_compile_error(
     }));
 
     let proj_dir = get_project_path(&project_id);
+    let file_path = resolve_project_file_candidate(&proj_dir, &file_path)
+        .unwrap_or_else(|| file_path.replace('\\', "/"));
     let full_path = proj_dir.join(&file_path);
     if !full_path.exists() {
         let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Greška: Fajl ne postoji" }));
@@ -1126,6 +1128,19 @@ pub async fn project_heal_compile_error(
                                     }));
                                     explanation = "Primenjena dopuna koda u fajl".to_string();
                                 }
+                            }
+                        }
+
+                        if resolved_edits.is_empty() {
+                            let has_tw = proj_dir.join("tailwind.config.js").exists() || proj_dir.join("tailwind.config.ts").exists();
+                            let sanitized_fallback = post_process_generated_file(&rel_file_path, &file_content, &serde_json::json!({}), has_tw);
+                            if sanitized_fallback != file_content {
+                                resolved_edits.push(serde_json::json!({
+                                    "path": rel_file_path.clone(),
+                                    "target": "",
+                                    "replacement": sanitized_fallback
+                                }));
+                                explanation = "Primenjen deterministički sanitizer koda i uvoza (React/Next.js hooks)".to_string();
                             }
                         }
 

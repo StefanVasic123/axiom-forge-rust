@@ -285,7 +285,7 @@ pub fn normalize_project_structure(files: &mut Vec<Value>, metamanifest: &Value,
 }
 
 pub fn get_axiom_inspector_script() -> &'static str {
-    "      <script dangerouslySetInnerHTML={{ __html: `\n        if (!window.__axiom_inspect_injected) {\n          window.__axiom_inspect_injected = true;\n          let isInspectActive = false;\n          function reportAxiomRoute() { try { window.parent.postMessage({ channel: 'axiom-preview-route', pathname: window.location.pathname, url: window.location.href }, '*'); } catch(e) {} }\n          reportAxiomRoute();\n          window.addEventListener('popstate', reportAxiomRoute);\n          setInterval(reportAxiomRoute, 2000);\n          window.addEventListener('error', function(e) { try { window.parent.postMessage({ channel: 'axiom-preview-error', message: e.message || 'Unknown runtime error', path: window.location.pathname }, '*'); } catch(err) {} });\n          window.addEventListener('unhandledrejection', function(e) { try { window.parent.postMessage({ channel: 'axiom-preview-error', message: e.reason?.message || String(e.reason || 'Unhandled promise rejection'), path: window.location.pathname }, '*'); } catch(err) {} });\n          window.addEventListener('message', (e) => {\n            if (e.data && e.data.channel === 'axiom-toggle-inspect') {\n              isInspectActive = !!e.data.enabled;\n              if (!isInspectActive && highlightedElement) {\n                highlightedElement.classList.remove('axiom-inspect-highlight');\n                highlightedElement = null;\n              }\n            }\n          });\n          const styleEl = document.createElement('style');\n          styleEl.textContent = \\`\n            .axiom-inspect-highlight {\n              outline: 2px solid #6366f1 !important;\n              outline-offset: -2px !important;\n              cursor: crosshair !important;\n              background-color: rgba(99, 102, 241, 0.12) !important;\n              transition: all 0.1s ease;\n            }\n          \\`;\n          document.head.appendChild(styleEl);\n          let highlightedElement = null;\n          function findAxiomTarget(el) {\n            if (!el || el === document.body || el === document.documentElement) return null;\n            let cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              if (cur.dataset && (cur.dataset.axiomFile || cur.dataset.axiomComponent)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            const validTags = ['h1','h2','h3','h4','h5','h6','p','button','a','input','textarea','select','header','footer','nav','section','article','aside','li'];\n            cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              const tag = cur.tagName.toLowerCase();\n              if (validTags.includes(tag) || (cur.innerText && cur.innerText.trim().length > 0 && cur.children.length === 0)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            return el !== document.body && el !== document.documentElement ? el : null;\n          }\n          document.addEventListener('mouseover', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (highlightedElement && highlightedElement !== target) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n            }\n            if (target) {\n              target.classList.add('axiom-inspect-highlight');\n              highlightedElement = target;\n            }\n          }, true);\n          document.addEventListener('mouseout', (e) => {\n            if (highlightedElement) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n              highlightedElement = null;\n            }\n          }, true);\n          document.addEventListener('click', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (target) {\n              e.preventDefault();\n              e.stopPropagation();\n              const payload = {\n                file: target.dataset?.axiomFile || null,\n                component: target.dataset?.axiomComponent || null,\n                tagName: target.tagName.toLowerCase(),\n                text: (target.innerText || target.value || '').trim().substring(0, 80),\n                path: window.location.pathname\n              };\n              window.parent.postMessage({ channel: 'axiom-inspect-click', payload }, '*');\n            }\n          }, true);\n        }\n      ` }} />"
+    "      <script dangerouslySetInnerHTML={{ __html: `\n        if (!window.__axiom_inspect_injected) {\n          window.__axiom_inspect_injected = true;\n          let isInspectActive = false;\n          let lastReportedOverlaySig = '';\n          function extractNextjsOverlay() {\n            try {\n              const portal = document.querySelector('nextjs-portal');\n              const root = (portal && portal.shadowRoot) ? portal.shadowRoot : document;\n              const dialog = root.querySelector('[data-nextjs-dialog], [role=\"dialog\"], #nextjs__container_errors_label');\n              const rawText = (root !== document && root.textContent) ? root.textContent.trim() : (dialog ? dialog.textContent.trim() : '');\n              if (!rawText || (!rawText.includes('Error') && !rawText.includes('Failed to compile'))) return null;\n              const fileMatch = rawText.match(/(?:\\.\\/|src[\\/\\\\]|app[\\/\\\\]|pages[\\/\\\\]|components[\\/\\\\])[A-Za-z0-9_\\-\\/\\\\.]+\\.(?:tsx|ts|jsx|js)/);\n              const sourceFile = fileMatch ? fileMatch[0].replace(/\\\\/g, '/').replace(/^\\.\\//, '') : null;\n              const errMatch = rawText.match(/(?:ReferenceError|TypeError|SyntaxError|Error):\\s*[^\\n]+/);\n              const message = errMatch ? errMatch[0].trim() : rawText.substring(0, 220).replace(/\\s+/g, ' ');\n              return { hasError: true, message, sourceFile, rawText: rawText.substring(0, 1200) };\n            } catch (e) { return null; }\n          }\n          function collectAxiomUiSnapshot() {\n            try {\n              const isVis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };\n              const headings = Array.from(document.querySelectorAll('h1, h2, h3')).slice(0, 20).map(h => ({ tag: h.tagName.toLowerCase(), text: (h.innerText || '').trim().substring(0, 120) })).filter(h => h.text);\n              const buttons = Array.from(document.querySelectorAll('button, [role=\"button\"]')).slice(0, 35).map(b => ({ text: (b.innerText || '').trim().substring(0, 80), ariaLabel: b.getAttribute('aria-label') || '', disabled: !!b.disabled, visible: isVis(b) }));\n              const links = Array.from(document.querySelectorAll('a')).slice(0, 35).map(a => ({ text: (a.innerText || '').trim().substring(0, 80), href: a.getAttribute('href') || '', visible: isVis(a) }));\n              const inputs = Array.from(document.querySelectorAll('input, select, textarea')).slice(0, 25).map(i => ({ tag: i.tagName.toLowerCase(), type: i.getAttribute('type') || '', name: i.getAttribute('name') || '', placeholder: i.getAttribute('placeholder') || '', value: (i.value || '').substring(0, 80) }));\n              const overlay = extractNextjsOverlay();\n              const bodyText = (document.body ? document.body.innerText : '').trim();\n              return {\n                url: window.location.href,\n                pathname: window.location.pathname,\n                title: document.title || '',\n                nextjsOverlay: overlay,\n                headings,\n                buttons,\n                links,\n                inputs,\n                layout: {\n                  viewportWidth: window.innerWidth,\n                  viewportHeight: window.innerHeight,\n                  scrollWidth: document.documentElement ? document.documentElement.scrollWidth : 0,\n                  scrollHeight: document.documentElement ? document.documentElement.scrollHeight : 0,\n                  hasHorizontalOverflow: (document.documentElement ? document.documentElement.scrollWidth : 0) > window.innerWidth + 4,\n                  hasNavbar: !!document.querySelector('nav, header'),\n                  hasFooter: !!document.querySelector('footer'),\n                  visibleTextPreview: bodyText.substring(0, 600)\n                }\n              };\n            } catch (e) { return { error: String(e) }; }\n          }\n          function reportAxiomRoute() {\n            try {\n              const overlay = extractNextjsOverlay();\n              if (overlay && overlay.hasError) {\n                const sig = (overlay.sourceFile || '') + '::' + overlay.message;\n                if (sig !== lastReportedOverlaySig) {\n                  lastReportedOverlaySig = sig;\n                  window.parent.postMessage({ channel: 'axiom-preview-error', message: overlay.message, sourceFile: overlay.sourceFile, details: overlay.rawText, path: window.location.pathname }, '*');\n                }\n              }\n              window.parent.postMessage({ channel: 'axiom-preview-route', pathname: window.location.pathname, url: window.location.href, snapshot: collectAxiomUiSnapshot() }, '*');\n            } catch(e) {}\n          }\n          setTimeout(reportAxiomRoute, 400);\n          window.addEventListener('popstate', reportAxiomRoute);\n          setInterval(reportAxiomRoute, 2000);\n          window.addEventListener('error', function(e) { try { window.parent.postMessage({ channel: 'axiom-preview-error', message: e.message || 'Unknown runtime error', sourceFile: e.filename || null, path: window.location.pathname }, '*'); } catch(err) {} });\n          window.addEventListener('unhandledrejection', function(e) { try { window.parent.postMessage({ channel: 'axiom-preview-error', message: e.reason?.message || String(e.reason || 'Unhandled promise rejection'), path: window.location.pathname }, '*'); } catch(err) {} });\n          window.addEventListener('message', (e) => {\n            if (e.data && e.data.channel === 'axiom-toggle-inspect') {\n              isInspectActive = !!e.data.enabled;\n              if (!isInspectActive && highlightedElement) {\n                highlightedElement.classList.remove('axiom-inspect-highlight');\n                highlightedElement = null;\n              }\n            }\n            if (e.data && e.data.channel === 'axiom-agent-dom-cmd') {\n              const cmd = e.data;\n              try {\n                if (cmd.action === 'snapshot') {\n                  window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'ok', snapshot: collectAxiomUiSnapshot() }, '*');\n                } else if (cmd.action === 'click') {\n                  let el = cmd.selector ? document.querySelector(cmd.selector) : null;\n                  if (!el && cmd.text) {\n                    const needle = cmd.text.toLowerCase();\n                    const candidates = Array.from(document.querySelectorAll('button, a, [role=\"button\"], li, span'));\n                    el = candidates.find(c => ((c.innerText || '').trim().toLowerCase().includes(needle)) || ((c.getAttribute('aria-label') || '').toLowerCase().includes(needle)));\n                  }\n                  if (el) {\n                    el.click();\n                    setTimeout(() => {\n                      window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'clicked: ' + (el.innerText || el.tagName).trim().substring(0, 50), snapshot: collectAxiomUiSnapshot() }, '*');\n                    }, 600);\n                  } else {\n                    window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'element_not_found', snapshot: collectAxiomUiSnapshot() }, '*');\n                  }\n                } else if (cmd.action === 'type') {\n                  let el = cmd.selector ? document.querySelector(cmd.selector) : null;\n                  if (!el && cmd.placeholder) {\n                    const needle = cmd.placeholder.toLowerCase();\n                    el = Array.from(document.querySelectorAll('input, textarea')).find(i => (i.getAttribute('placeholder') || '').toLowerCase().includes(needle) || (i.getAttribute('name') || '').toLowerCase().includes(needle));\n                  }\n                  if (el) {\n                    const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;\n                    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;\n                    if (setter) setter.call(el, cmd.value || ''); else el.value = cmd.value || '';\n                    el.dispatchEvent(new Event('input', { bubbles: true }));\n                    el.dispatchEvent(new Event('change', { bubbles: true }));\n                    setTimeout(() => {\n                      window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'typed', snapshot: collectAxiomUiSnapshot() }, '*');\n                    }, 300);\n                  } else {\n                    window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'input_not_found', snapshot: collectAxiomUiSnapshot() }, '*');\n                  }\n                } else if (cmd.action === 'navigate' && cmd.route) {\n                  window.location.href = cmd.route;\n                }\n              } catch (err) {\n                window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'error: ' + String(err), snapshot: collectAxiomUiSnapshot() }, '*');\n              }\n            }\n          });\n          const styleEl = document.createElement('style');\n          styleEl.textContent = \\`\n            .axiom-inspect-highlight {\n              outline: 2px solid #6366f1 !important;\n              outline-offset: -2px !important;\n              cursor: crosshair !important;\n              background-color: rgba(99, 102, 241, 0.12) !important;\n              transition: all 0.1s ease;\n            }\n          \\`;\n          document.head.appendChild(styleEl);\n          let highlightedElement = null;\n          function findAxiomTarget(el) {\n            if (!el || el === document.body || el === document.documentElement) return null;\n            let cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              if (cur.dataset && (cur.dataset.axiomFile || cur.dataset.axiomComponent)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            const validTags = ['h1','h2','h3','h4','h5','h6','p','button','a','input','textarea','select','header','footer','nav','section','article','aside','li'];\n            cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              const tag = cur.tagName.toLowerCase();\n              if (validTags.includes(tag) || (cur.innerText && cur.innerText.trim().length > 0 && cur.children.length === 0)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            return el !== document.body && el !== document.documentElement ? el : null;\n          }\n          document.addEventListener('mouseover', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (highlightedElement && highlightedElement !== target) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n            }\n            if (target) {\n              target.classList.add('axiom-inspect-highlight');\n              highlightedElement = target;\n            }\n          }, true);\n          document.addEventListener('mouseout', (e) => {\n            if (highlightedElement) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n              highlightedElement = null;\n            }\n          }, true);\n          document.addEventListener('click', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (target) {\n              e.preventDefault();\n              e.stopPropagation();\n              const payload = {\n                file: target.dataset?.axiomFile || null,\n                component: target.dataset?.axiomComponent || null,\n                tagName: target.tagName.toLowerCase(),\n                text: (target.innerText || target.value || '').trim().substring(0, 80),\n                path: window.location.pathname\n              };\n              window.parent.postMessage({ channel: 'axiom-inspect-click', payload }, '*');\n            }\n          }, true);\n        }\n      ` }} />"
 }
 
 pub fn ensure_axiom_inspector_injected(proj_dir: &std::path::Path) {
@@ -308,8 +308,8 @@ pub fn ensure_axiom_inspector_injected(proj_dir: &std::path::Path) {
         let full_path = proj_dir.join(rel_path);
         if full_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&full_path) {
-                if !content.contains("axiom-preview-error") {
-                    let cleaned = if content.contains("axiom-inspect-click") || content.contains("axiom-toggle-inspect") {
+                if !content.contains("axiom-agent-dom-cmd") {
+                    let cleaned = if content.contains("axiom-inspect-click") || content.contains("axiom-toggle-inspect") || content.contains("axiom-preview-error") {
                         let start_marker = "<script dangerouslySetInnerHTML={{ __html: `";
                         if let Some(s_idx) = content.find(start_marker) {
                             if let Some(end_rel) = content[s_idx..].find("` }} />") {
@@ -1107,6 +1107,10 @@ pub fn post_process_generated_file(
                 
             if (has_client_hooks || has_mui_styles) && !processed.contains("\"use client\"") && !processed.contains("'use client'") {
                 processed = format!("\"use client\";\n\n{}", processed);
+            }
+
+            if !path_lower.contains("/api/") && !path_lower.ends_with("route.ts") && !path_lower.ends_with("route.js") {
+                processed = ensure_react_and_next_hook_imports(&processed);
             }
         }
 
@@ -1946,4 +1950,172 @@ pub fn sanitize_ts_interfaces(content: &str) -> String {
     }
 
     output.join("\n")
+}
+
+pub fn insert_import_after_use_client(content: &str, import_line: &str) -> String {
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+    let mut insert_idx = 0;
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("//") {
+            continue;
+        }
+        if t.starts_with("\"use client\"") || t.starts_with("'use client'") {
+            insert_idx = i + 1;
+        }
+        break;
+    }
+    lines.insert(insert_idx, import_line.to_string());
+    lines.join("\n")
+}
+
+pub fn ensure_react_and_next_hook_imports(content: &str) -> String {
+    let code_body: String = content
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            !t.starts_with("import ") && !t.starts_with("//") && !t.starts_with('*')
+        })
+        .collect::<Vec<&str>>()
+        .join("\n");
+
+    let mut result = content.to_string();
+
+    // 1. Standard React hooks
+    let react_hooks = [
+        "useState",
+        "useEffect",
+        "useContext",
+        "useRef",
+        "useReducer",
+        "useMemo",
+        "useCallback",
+    ];
+    let mut missing_react_hooks: Vec<&str> = Vec::new();
+    for hook in &react_hooks {
+        let call_pattern = format!(r"(?m)(?:^|[^a-zA-Z0-9_.$]){}\s*(?:<[^>]*>)?\s*\(", hook);
+        let is_called = regex::Regex::new(&call_pattern)
+            .map(|re| re.is_match(&code_body))
+            .unwrap_or(false);
+        if !is_called {
+            continue;
+        }
+        let import_pattern = format!(
+            r#"(?s)import\s+[^;]*?\b{}\b[^;]*?from\s*['"]react['"]"#,
+            hook
+        );
+        let destructure_pattern = format!(r"\bconst\s*\{{[^}}]*\b{}\b[^}}]*\}}\s*=\s*React\b", hook);
+        let decl_pattern = format!(r"\b(?:function|const|let|var)\s+{}\b", hook);
+        let already_present = regex::Regex::new(&import_pattern)
+            .map(|re| re.is_match(&result))
+            .unwrap_or(false)
+            || regex::Regex::new(&destructure_pattern)
+                .map(|re| re.is_match(&result))
+                .unwrap_or(false)
+            || regex::Regex::new(&decl_pattern)
+                .map(|re| re.is_match(&result))
+                .unwrap_or(false);
+        if !already_present {
+            missing_react_hooks.push(hook);
+        }
+    }
+
+    if !missing_react_hooks.is_empty() {
+        let named_react_re = regex::Regex::new(
+            r#"(?m)^(\s*import\s+(?:[A-Za-z0-9_$]+\s*,\s*)?\{)([^}]*)(\}\s*from\s*['"]react['"]\s*;?)"#,
+        )
+        .ok();
+        let default_react_re = regex::Regex::new(
+            r#"(?m)^(\s*import\s+React)(\s+from\s*['"]react['"]\s*;?)"#,
+        )
+        .ok();
+
+        let mut handled = false;
+        if let Some(ref re) = named_react_re {
+            if let Some(cap) = re.captures(&result) {
+                let prefix = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+                let existing = cap.get(2).map(|m| m.as_str()).unwrap_or("").trim();
+                let suffix = cap.get(3).map(|m| m.as_str()).unwrap_or("");
+                if !prefix.contains("import type") {
+                    let combined = if existing.is_empty() {
+                        format!(" {} ", missing_react_hooks.join(", "))
+                    } else {
+                        format!(" {}, {} ", existing.trim_end_matches(','), missing_react_hooks.join(", "))
+                    };
+                    let replacement = format!("{}{}{}", prefix, combined, suffix);
+                    result = re.replace(&result, replacement.as_str()).to_string();
+                    handled = true;
+                }
+            }
+        }
+        if !handled {
+            if let Some(ref re) = default_react_re {
+                if re.is_match(&result) {
+                    let replacement = format!("$1, {{ {} }}$2", missing_react_hooks.join(", "));
+                    result = re.replace(&result, replacement.as_str()).to_string();
+                    handled = true;
+                }
+            }
+        }
+        if !handled {
+            let import_stmt = format!("import {{ {} }} from 'react';", missing_react_hooks.join(", "));
+            result = insert_import_after_use_client(&result, &import_stmt);
+        }
+    }
+
+    // 2. Next.js App Router navigation hooks
+    let next_hooks = ["usePathname", "useRouter", "useParams", "useSearchParams"];
+    let mut missing_next_hooks: Vec<&str> = Vec::new();
+    for hook in &next_hooks {
+        let call_pattern = format!(r"(?m)(?:^|[^a-zA-Z0-9_.$]){}\s*(?:<[^>]*>)?\s*\(", hook);
+        let is_called = regex::Regex::new(&call_pattern)
+            .map(|re| re.is_match(&code_body))
+            .unwrap_or(false);
+        if !is_called {
+            continue;
+        }
+        let import_pattern = format!(
+            r#"(?s)import\s+[^;]*?\b{}\b[^;]*?from\s*['"]next/(?:navigation|router)['"]"#,
+            hook
+        );
+        let decl_pattern = format!(r"\b(?:function|const|let|var)\s+{}\b", hook);
+        let already_present = regex::Regex::new(&import_pattern)
+            .map(|re| re.is_match(&result))
+            .unwrap_or(false)
+            || regex::Regex::new(&decl_pattern)
+                .map(|re| re.is_match(&result))
+                .unwrap_or(false);
+        if !already_present {
+            missing_next_hooks.push(hook);
+        }
+    }
+
+    if !missing_next_hooks.is_empty() {
+        let named_next_re = regex::Regex::new(
+            r#"(?m)^(\s*import\s+\{)([^}]*)(\}\s*from\s*['"]next/navigation['"]\s*;?)"#,
+        )
+        .ok();
+        let mut handled = false;
+        if let Some(ref re) = named_next_re {
+            if let Some(cap) = re.captures(&result) {
+                let prefix = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+                let existing = cap.get(2).map(|m| m.as_str()).unwrap_or("").trim();
+                let suffix = cap.get(3).map(|m| m.as_str()).unwrap_or("");
+                let combined = if existing.is_empty() {
+                    format!(" {} ", missing_next_hooks.join(", "))
+                } else {
+                    format!(" {}, {} ", existing.trim_end_matches(','), missing_next_hooks.join(", "))
+                };
+                let replacement = format!("{}{}{}", prefix, combined, suffix);
+                result = re.replace(&result, replacement.as_str()).to_string();
+                handled = true;
+            }
+        }
+        if !handled {
+            let import_stmt = format!("import {{ {} }} from 'next/navigation';", missing_next_hooks.join(", "));
+            result = insert_import_after_use_client(&result, &import_stmt);
+        }
+    }
+
+    result
 }

@@ -100,8 +100,9 @@ pub fn extract_file_path_from_line(line: &str) -> Option<String> {
                 if let Some(idx) = path_str.find("./") {
                     path_str = path_str[idx + 2..].to_string();
                 } else if path_str.starts_with("./") {
-                    path_str = path_str[idx + 2..].to_string();
+                    path_str = path_str[2..].to_string();
                 }
+
                 // Preskoči biblioteke treće strane, bild izlaz, keš i git foldere
                 if path_str.contains("node_modules") 
                     || path_str.contains(".next") 
@@ -141,6 +142,17 @@ pub fn extract_package_name_from_error(line: &str) -> Option<String> {
 }
 
 pub fn resolve_project_file_candidate(proj_dir: &Path, rel_path: &str) -> Option<String> {
+    let mut norm_rel = rel_path.replace('\\', "/");
+    let proj_dir_norm = proj_dir.to_string_lossy().replace('\\', "/");
+    if let Some(stripped) = norm_rel.strip_prefix(&format!("{}/", proj_dir_norm)) {
+        norm_rel = stripped.to_string();
+    } else if let Some(src_idx) = norm_rel.rfind("/src/") {
+        norm_rel = norm_rel[src_idx + 1..].to_string();
+    } else if let Some(prisma_idx) = norm_rel.rfind("/prisma/") {
+        norm_rel = norm_rel[prisma_idx + 1..].to_string();
+    }
+    let rel_path = norm_rel.as_str();
+
     if proj_dir.join(rel_path).is_file() {
         return Some(rel_path.to_string());
     }
@@ -243,7 +255,7 @@ impl CompileErrorDetector {
     }
 
     fn process_line(&mut self, line: &str, window: &tauri::Window, project_id: &str) {
-        let clean_line = strip_ansi_codes(line);
+        let clean_line = clean_cli_output_for_llm(line);
 
         if clean_line.contains("Cannot find module") || clean_line.contains("Module not found") {
             if let Some(pkg_name) = extract_package_name_from_error(&clean_line) {
@@ -255,23 +267,59 @@ impl CompileErrorDetector {
             }
         }
 
+        let trimmed = clean_line.trim();
+        let is_boundary = trimmed.starts_with("GET /")
+            || trimmed.starts_with("POST /")
+            || trimmed.starts_with("PUT /")
+            || trimmed.starts_with("DELETE /")
+            || trimmed.contains("✓ Compiled")
+            || trimmed.contains("○ Compiling")
+            || trimmed.contains("✓ Ready in");
+
+        if is_boundary {
+            if self.is_recording {
+                self.emit_current(window, project_id);
+            }
+            return;
+        }
+
         let has_error_marker = clean_line.contains('⨯') 
             || clean_line.contains("Failed to compile") 
             || clean_line.contains("Error:")
+            || clean_line.contains("ReferenceError:")
+            || clean_line.contains("TypeError:")
+            || clean_line.contains("SyntaxError:")
+            || clean_line.contains("Unhandled Runtime Error")
             || clean_line.contains("Attempted import error:")
             || (clean_line.contains('⚠') && (clean_line.contains(".tsx") || clean_line.contains(".ts") || clean_line.contains(".jsx") || clean_line.contains(".js")));
 
         if has_error_marker {
-            if self.is_recording && self.file_path.is_some() {
-                self.emit_current(window, project_id);
-            }
-            self.is_recording = true;
-            self.file_path = extract_file_path_from_line(&clean_line);
-            self.error_lines = vec![clean_line];
-            self.lines_since_start = 0;
-            
-            if self.file_path.is_some() {
-                self.emit_current(window, project_id);
+            let line_file = extract_file_path_from_line(&clean_line);
+            let is_same_error_continuation = self.is_recording
+                && self.lines_since_start <= 4
+                && (line_file.is_none() || self.file_path.is_none() || line_file == self.file_path);
+
+            if is_same_error_continuation {
+                self.error_lines.push(clean_line);
+                self.lines_since_start += 1;
+                if self.file_path.is_none() {
+                    self.file_path = line_file;
+                }
+                if self.file_path.is_some() {
+                    self.emit_snapshot(window, project_id);
+                }
+            } else {
+                if self.is_recording && self.file_path.is_some() {
+                    self.emit_current(window, project_id);
+                }
+                self.is_recording = true;
+                self.file_path = line_file;
+                self.error_lines = vec![clean_line];
+                self.lines_since_start = 0;
+                
+                if self.file_path.is_some() {
+                    self.emit_snapshot(window, project_id);
+                }
             }
         } else if self.is_recording {
             self.error_lines.push(clean_line.clone());
@@ -282,20 +330,21 @@ impl CompileErrorDetector {
             }
 
             if self.file_path.is_some() {
-                self.emit_current(window, project_id);
-            } else if self.lines_since_start >= 10 {
-                self.is_recording = false;
-                self.error_lines.clear();
-                self.lines_since_start = 0;
+                self.emit_snapshot(window, project_id);
+                if self.lines_since_start >= 16 {
+                    self.reset();
+                }
+            } else if self.lines_since_start >= 12 {
+                self.reset();
             }
         }
     }
 
-    fn emit_current(&mut self, window: &tauri::Window, project_id: &str) {
+    fn emit_snapshot(&self, window: &tauri::Window, project_id: &str) {
         if let Some(ref raw_path) = self.file_path {
             let proj_dir = get_project_path(project_id);
             let resolved_path = resolve_project_file_candidate(&proj_dir, raw_path)
-                .unwrap_or_else(|| raw_path.clone());
+                .unwrap_or_else(|| raw_path.replace('\\', "/"));
             let full_path = proj_dir.join(&resolved_path);
             if full_path.exists() && full_path.is_file() {
                 let error_message = self.error_lines.join("\n");
@@ -306,6 +355,24 @@ impl CompileErrorDetector {
                 }));
             }
         }
+    }
+
+    fn emit_current(&mut self, window: &tauri::Window, project_id: &str) {
+        if let Some(ref raw_path) = self.file_path {
+            let proj_dir = get_project_path(project_id);
+            let resolved_path = resolve_project_file_candidate(&proj_dir, raw_path)
+                .unwrap_or_else(|| raw_path.replace('\\', "/"));
+            let error_message = self.error_lines.join(" | ");
+            debug_log_to_file(format!(
+                "[Dev Server CompileError] project={} file={} details={}",
+                project_id, resolved_path, error_message
+            ));
+        }
+        self.emit_snapshot(window, project_id);
+        self.reset();
+    }
+
+    fn reset(&mut self) {
         self.is_recording = false;
         self.file_path = None;
         self.error_lines.clear();
@@ -512,42 +579,66 @@ pub async fn server_start(
         Ok(mut child) => {
             let stdout = child.stdout.take().unwrap();
             let stderr = child.stderr.take().unwrap();
+            let shared_detector = std::sync::Arc::new(std::sync::Mutex::new(CompileErrorDetector::new()));
             
             // Spawn task to read stdout and emit logs
             let window_stdout = window.clone();
             let p_id_stdout = options.project_id.clone();
+            let detector_stdout = shared_detector.clone();
             tokio::spawn(async move {
                 use tokio::io::{AsyncBufReadExt, BufReader};
                 let mut reader = BufReader::new(stdout).lines();
-                let mut detector = CompileErrorDetector::new();
                 while let Ok(Some(line)) = reader.next_line().await {
-                    detector.process_line(&line, &window_stdout, &p_id_stdout);
+                    if let Ok(mut det) = detector_stdout.lock() {
+                        det.process_line(&line, &window_stdout, &p_id_stdout);
+                    }
+                    let clean_text = clean_cli_output_for_llm(&line);
+                    let is_important = clean_text.contains('⨯')
+                        || clean_text.contains("Error")
+                        || clean_text.contains("Failed to compile")
+                        || clean_text.contains("Ready in")
+                        || clean_text.contains("Local:")
+                        || clean_text.contains(" 500 in ")
+                        || clean_text.contains("Cannot find module");
+                    if is_important {
+                        debug_log_to_file(format!("[Dev Server stdout] {}", clean_text.trim()));
+                    }
                     let _ = window_stdout.emit("server:log", serde_json::json!({
-                        "text": format!("{}\n", line),
+                        "text": format!("{}\n", clean_text),
                         "type": "info"
                     }));
                 }
-                if detector.is_recording {
-                    detector.emit_current(&window_stdout, &p_id_stdout);
+                if let Ok(mut det) = detector_stdout.lock() {
+                    if det.is_recording {
+                        det.emit_current(&window_stdout, &p_id_stdout);
+                    }
                 }
             });
 
             // Spawn task to read stderr and emit logs
             let window_stderr = window.clone();
             let p_id_stderr = options.project_id.clone();
+            let detector_stderr = shared_detector.clone();
             tokio::spawn(async move {
                 use tokio::io::{AsyncBufReadExt, BufReader};
                 let mut reader = BufReader::new(stderr).lines();
-                let mut detector = CompileErrorDetector::new();
                 while let Ok(Some(line)) = reader.next_line().await {
-                    detector.process_line(&line, &window_stderr, &p_id_stderr);
+                    if let Ok(mut det) = detector_stderr.lock() {
+                        det.process_line(&line, &window_stderr, &p_id_stderr);
+                    }
+                    let clean_text = clean_cli_output_for_llm(&line);
+                    if !clean_text.trim().is_empty() {
+                        debug_log_to_file(format!("[Dev Server stderr] {}", clean_text.trim()));
+                    }
                     let _ = window_stderr.emit("server:log", serde_json::json!({
-                        "text": format!("{}\n", line),
+                        "text": format!("{}\n", clean_text),
                         "type": "error"
                     }));
                 }
-                if detector.is_recording {
-                    detector.emit_current(&window_stderr, &p_id_stderr);
+                if let Ok(mut det) = detector_stderr.lock() {
+                    if det.is_recording {
+                        det.emit_current(&window_stderr, &p_id_stderr);
+                    }
                 }
             });
             

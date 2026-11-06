@@ -665,6 +665,8 @@ export default function EditorPage() {
   const editorRef = useRef(null);
   const webviewRef = useRef(null);
   const terminalEndRef = useRef(null);
+  const previewUiSnapshotRef = useRef(null);
+  const pendingAgentDomCmdRef = useRef(null);
 
   // Derived State
   const activeTab = openTabs.find(t => t.path === activeTabPath) || null;
@@ -754,11 +756,6 @@ export default function EditorPage() {
         setIsServerStarting(false);
       }
 
-      // Auto-clear stale compile error banner when compilation succeeds
-      if ((text.includes('Compiled in') || text.includes('compiled successfully') || (text.includes('Compiled') && text.includes('modules'))) && !text.includes('Failed') && !text.includes('Error:')) {
-        setCompileError(null);
-      }
-
       // Auto-detect preview URL from server output (e.g. Next.js or Vite logs)
       if (text) {
         const match = text.match(/https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|192\.\d+\.\d+\.\d+):(\d+)/i);
@@ -832,12 +829,14 @@ export default function EditorPage() {
         await window.electronAPI.server.stop(projectId);
         setCdpPort(null);
         setCdpConnected(false);
+        setCompileError(null);
       } finally {
         setIsServerStopping(false);
       }
     } else {
       setIsServerStarting(true);
       setIframeLoading(true);
+      setCompileError(null);
       setServerLogs([{ text: '> Starting server...', type: 'info', id: Date.now() }]);
       setShowTerminal(true);
       try {
@@ -882,6 +881,7 @@ export default function EditorPage() {
       if (res) {
         const healedFilePath = compileError.filePath;
         setCompileError(null);
+        setPreviewRuntimeError(null);
         // Reload healed file from disk into Monaco openTabs so editor state is not stale!
         try {
           const readRes = await window.electronAPI.project.readFile(projectId, healedFilePath);
@@ -892,6 +892,9 @@ export default function EditorPage() {
           }
         } catch (e) {
           console.warn('Could not reload healed tab:', e);
+        }
+        if (showPreview) {
+          setTimeout(() => handleReloadPreview(), 800);
         }
       }
     } catch (err) {
@@ -1127,19 +1130,47 @@ export default function EditorPage() {
     const handleWindowMessage = (event) => {
       const data = event.data;
       if (data && data.channel === 'axiom-preview-route') {
+        if (data.snapshot) {
+          previewUiSnapshotRef.current = data.snapshot;
+        }
         if (data.pathname) {
           setCurrentPreviewRoute(data.pathname);
-          setPreviewRuntimeError(null);
+          if (!data.snapshot?.nextjsOverlay?.hasError) {
+            setPreviewRuntimeError(null);
+          }
+        }
+      }
+
+      if (data && data.channel === 'axiom-ui-snapshot') {
+        if (data.snapshot) {
+          previewUiSnapshotRef.current = data.snapshot;
+        }
+        if (data.cmdId && pendingAgentDomCmdRef.current && pendingAgentDomCmdRef.current.cmdId === data.cmdId) {
+          pendingAgentDomCmdRef.current.resolve({
+            actionResult: data.actionResult || 'ok',
+            snapshot: data.snapshot || null
+          });
+          pendingAgentDomCmdRef.current = null;
         }
       }
 
       if (data && data.channel === 'axiom-preview-error') {
         console.log('[Editor] Preview runtime error caught:', data);
+        window.electronAPI?.debugLog?.(`[Preview RuntimeError] project=${projectId} route=${data.path || currentPreviewRoute} source=${data.sourceFile || 'none'} msg=${data.message}`);
         setPreviewRuntimeError({
           message: data.message || 'Nepoznata runtime greška',
           path: data.path || currentPreviewRoute,
           time: Date.now()
         });
+        if (data.sourceFile) {
+          const normSource = data.sourceFile.replace(/\\/g, '/').replace(/^\.\//, '');
+          setCompileError(prev => prev || {
+            projectId,
+            filePath: normSource,
+            errorMessage: data.details || data.message || 'Runtime error in preview'
+          });
+          setShowTerminal(true);
+        }
       }
 
       if (data && data.channel === 'axiom-inspect-click') {
@@ -1186,7 +1217,177 @@ export default function EditorPage() {
     return () => {
       window.removeEventListener('message', handleWindowMessage);
     };
-  }, [openFile, files]);
+  }, [openFile, files, projectId, currentPreviewRoute]);
+
+  // Lightweight Agent Bridge: sync live Editor & Preview state (<20KB JSON, debounced)
+  useEffect(() => {
+    if (!window.electronAPI?.agentBridge) return;
+    const timer = setTimeout(() => {
+      window.electronAPI.agentBridge.updateLiveState({
+        timestamp: new Date().toISOString(),
+        projectId,
+        projectName: project?.name || '',
+        viewMode: showPreview ? 'preview' : 'code',
+        activeTabPath,
+        serverRunning,
+        isServerStarting,
+        previewUrl,
+        currentPreviewRoute,
+        compileError,
+        previewRuntimeError,
+        missingPackage,
+        healingInProgress,
+        healStatus,
+        recentServerLogs: serverLogs.slice(-30).map(l => l.text.trim()),
+        previewUiSnapshot: previewUiSnapshotRef.current
+      });
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [
+    projectId,
+    project?.name,
+    showPreview,
+    activeTabPath,
+    serverRunning,
+    isServerStarting,
+    previewUrl,
+    currentPreviewRoute,
+    compileError,
+    previewRuntimeError,
+    missingPackage,
+    healingInProgress,
+    healStatus,
+    serverLogs.length
+  ]);
+
+  // Lightweight Agent Bridge: poll and execute remote commands (click, heal, inspect UI, navigate)
+  useEffect(() => {
+    if (!window.electronAPI?.agentBridge) return;
+
+    const sendPreviewDomCmd = (domPayload) => {
+      return new Promise((resolve) => {
+        if (!webviewRef.current || !webviewRef.current.contentWindow) {
+          resolve({ actionResult: 'preview_iframe_not_mounted', snapshot: previewUiSnapshotRef.current });
+          return;
+        }
+        const cmdId = `dom-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        const timeout = setTimeout(() => {
+          if (pendingAgentDomCmdRef.current?.cmdId === cmdId) {
+            pendingAgentDomCmdRef.current = null;
+          }
+          resolve({ actionResult: 'timeout_fallback', snapshot: previewUiSnapshotRef.current });
+        }, 2200);
+
+        pendingAgentDomCmdRef.current = {
+          cmdId,
+          resolve: (res) => {
+            clearTimeout(timeout);
+            resolve(res);
+          }
+        };
+
+        try {
+          webviewRef.current.contentWindow.postMessage({
+            channel: 'axiom-agent-dom-cmd',
+            cmdId,
+            ...domPayload
+          }, '*');
+        } catch (err) {
+          clearTimeout(timeout);
+          pendingAgentDomCmdRef.current = null;
+          resolve({ actionResult: 'postMessage_error: ' + String(err), snapshot: previewUiSnapshotRef.current });
+        }
+      });
+    };
+
+    const interval = setInterval(async () => {
+      const cmd = await window.electronAPI.agentBridge.pollCommand();
+      if (!cmd || !cmd.action) return;
+
+      const cmdId = cmd.id || `cmd-${Date.now()}`;
+      let success = true;
+      let details = '';
+      let domData = null;
+
+      try {
+        if (cmd.action === 'trigger_heal') {
+          if (compileError) {
+            await handleHealError();
+            details = `Healed compileError in ${compileError.filePath}`;
+          } else {
+            success = false;
+            details = 'No active compileError to heal';
+          }
+        } else if (cmd.action === 'trigger_ai_fix_page') {
+          await handleAIFixCurrentPage(cmd.prompt || '');
+          details = 'Triggered handleAIFixCurrentPage';
+        } else if (cmd.action === 'switch_view') {
+          const toPreview = cmd.view === 'preview';
+          setShowPreview(toPreview);
+          details = `Switched view to ${toPreview ? 'preview' : 'code'}`;
+        } else if (cmd.action === 'start_server') {
+          if (!serverRunning) await toggleServer();
+          details = 'Start server triggered';
+        } else if (cmd.action === 'stop_server') {
+          if (serverRunning) await toggleServer();
+          details = 'Stop server triggered';
+        } else if (cmd.action === 'reload_preview') {
+          handleReloadPreview();
+          details = 'Preview reloaded';
+        } else if (cmd.action === 'inspect_ui' || cmd.action === 'snapshot') {
+          domData = await sendPreviewDomCmd({ action: 'snapshot' });
+          details = domData.actionResult;
+        } else if (cmd.action === 'preview_click') {
+          domData = await sendPreviewDomCmd({ action: 'click', selector: cmd.selector, text: cmd.text });
+          details = domData.actionResult;
+        } else if (cmd.action === 'preview_type') {
+          domData = await sendPreviewDomCmd({ action: 'type', selector: cmd.selector, placeholder: cmd.placeholder, value: cmd.value });
+          details = domData.actionResult;
+        } else if (cmd.action === 'preview_navigate') {
+          if (webviewRef.current && cmd.route) {
+            const base = previewUrl.replace(/\/$/, '');
+            const route = cmd.route.startsWith('/') ? cmd.route : `/${cmd.route}`;
+            webviewRef.current.src = `${base}${route}`;
+            await new Promise(r => setTimeout(r, 1200));
+            domData = await sendPreviewDomCmd({ action: 'snapshot' });
+            details = `Navigated to ${route}`;
+          } else {
+            success = false;
+            details = 'Preview iframe not active or route missing';
+          }
+        } else {
+          success = false;
+          details = `Unknown command action: ${cmd.action}`;
+        }
+      } catch (err) {
+        success = false;
+        details = String(err);
+      }
+
+      await window.electronAPI.agentBridge.writeCommandResult({
+        id: cmdId,
+        action: cmd.action,
+        success,
+        details,
+        timestamp: new Date().toISOString(),
+        editorState: {
+          projectId,
+          viewMode: showPreview ? 'preview' : 'code',
+          serverRunning,
+          currentPreviewRoute,
+          compileError,
+          previewRuntimeError,
+          missingPackage,
+          healingInProgress,
+          healStatus,
+          recentServerLogs: serverLogs.slice(-25).map(l => l.text.trim())
+        },
+        previewUiSnapshot: domData?.snapshot || previewUiSnapshotRef.current
+      });
+    }, 1500);
+
+    return () => clearInterval(interval);
+  });
 
   console.log("[EditorPage] Render. pendingContent exists?", !!pendingContent);
   if (pendingContent) {

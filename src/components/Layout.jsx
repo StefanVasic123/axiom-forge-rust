@@ -281,7 +281,7 @@ function Layout() {
     if (!activeTask) return;
     setIsTaskActionLoading(true);
     try {
-      const id = activeTask.taskId || activeTask.projectId;
+      const id = activeTask.projectId || activeTask.taskId;
       await window.electronAPI.task.pause(id);
       setTaskProgress(activeTask.taskId, {
         ...activeTask,
@@ -300,28 +300,28 @@ function Layout() {
   const handleResumeTask = async () => {
     if (!activeTask) return;
     setIsTaskActionLoading(true);
+    const prevTaskState = { ...activeTask };
     try {
-      if (isStopped && activeTask.projectId) {
-        setTaskProgress(activeTask.taskId, {
-          ...activeTask,
-          phase: 'generate-files',
-          status: 'generating',
-          message: 'Nastavak generisanja sa sačuvanog checkpoint-a...'
-        });
+      setTaskProgress(activeTask.taskId, {
+        ...activeTask,
+        phase: 'generate-files',
+        status: 'generating',
+        message: 'Nastavak generisanja sa sačuvanog checkpoint-a...'
+      });
+      if (activeTask.projectId) {
         await window.electronAPI.task.resumeGeneration(activeTask.projectId);
-      } else {
-        const id = activeTask.taskId || activeTask.projectId;
-        await window.electronAPI.task.resume(id);
-        setTaskProgress(activeTask.taskId, {
-          ...activeTask,
-          phase: 'generate-files',
-          status: 'generating',
-          message: 'Generisanje se nastavlja...'
-        });
+      } else if (activeTask.taskId) {
+        await window.electronAPI.task.resume(activeTask.taskId);
       }
       await loadProjects();
     } catch (e) {
       console.error('Resume failed:', e);
+      setTaskProgress(prevTaskState.taskId, {
+        ...prevTaskState,
+        phase: 'stopped',
+        status: 'stopped',
+        message: `Greška pri nastavku: ${e?.message || e}`
+      });
     } finally {
       setIsTaskActionLoading(false);
     }
@@ -331,7 +331,7 @@ function Layout() {
     if (!activeTask) return;
     setIsTaskActionLoading(true);
     try {
-      const id = activeTask.taskId || activeTask.projectId;
+      const id = activeTask.projectId || activeTask.taskId;
       await window.electronAPI.task.stop(id);
       setTaskProgress(activeTask.taskId, {
         ...activeTask,

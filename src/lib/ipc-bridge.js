@@ -793,6 +793,30 @@ window.electronAPI = {
         throw e;
       }
     }
+  },
+  debugLog: (message) => {
+    try {
+      invoke('debug_log_to_file', { message: String(message) }).catch(() => {});
+    } catch {}
+  },
+  agentBridge: {
+    updateLiveState: async (stateJson) => {
+      try {
+        await invoke('agent_update_live_state', { stateJson });
+      } catch {}
+    },
+    pollCommand: async () => {
+      try {
+        return await invoke('agent_poll_command');
+      } catch {
+        return null;
+      }
+    },
+    writeCommandResult: async (resultJson) => {
+      try {
+        await invoke('agent_write_command_result', { resultJson });
+      } catch {}
+    }
   }
 };
 
