@@ -754,6 +754,11 @@ export default function EditorPage() {
         setIsServerStarting(false);
       }
 
+      // Auto-clear stale compile error banner when compilation succeeds
+      if ((text.includes('Compiled in') || text.includes('compiled successfully') || (text.includes('Compiled') && text.includes('modules'))) && !text.includes('Failed') && !text.includes('Error:')) {
+        setCompileError(null);
+      }
+
       // Auto-detect preview URL from server output (e.g. Next.js or Vite logs)
       if (text) {
         const match = text.match(/https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|192\.\d+\.\d+\.\d+):(\d+)/i);

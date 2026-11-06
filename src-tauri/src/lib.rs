@@ -979,4 +979,104 @@ export const version = "1.0.0";
         assert!(NEXTJS_REACT_RULEPACK.contains("useQuery({ queryKey: ['metrics'], queryFn: fetchMetrics })"));
     }
 
+
+    #[test]
+    fn test_sanitize_ts_interfaces() {
+        let input = r#"
+interface SkeletonProps {
+  className?: string;
+  data-axiom-component?: string;
+  data-axiom-file?: string;
+  aria-label?: string;
+}
+
+export type ButtonProps = {
+  variant?: 'default' | 'outline';
+  "data-axiom-component"?: string;
+  data-testid?: string;
+};
+"#;
+        let output = sanitize_ts_interfaces(input);
+        assert!(!output.contains("data-axiom-component?:"));
+        assert!(!output.contains("data-axiom-file?:"));
+        assert!(output.contains(r#""aria-label"?: string;"#));
+        assert!(output.contains(r#""data-testid"?: string;"#));
+    }
+
+    #[test]
+    fn test_dual_export_synchronization() {
+        // Case 1: Button with only default export gets named export { Button }
+        let button_input = r#"
+import React from 'react';
+const Button: React.FC<any> = ({ children }) => <button>{children}</button>;
+export default Button;
+"#;
+        let button_output = post_process_generated_file("src/components/ui/button.tsx", button_input, &serde_json::json!({}), false);
+        assert!(button_output.contains("export default Button;"));
+        assert!(button_output.contains("export { Button };"));
+
+        // Case 2: Card with named export gets export default Card;
+        let card_input = r#"
+import React from 'react';
+export const Card: React.FC<any> = ({ children }) => <div>{children}</div>;
+export const CardHeader: React.FC<any> = ({ children }) => <div>{children}</div>;
+"#;
+        let card_output = post_process_generated_file("src/components/ui/card.tsx", card_input, &serde_json::json!({}), false);
+        assert!(card_output.contains("export const Card:"));
+        assert!(card_output.contains("export default Card;"));
+
+        // Case 3: Kebab-case file alert-dialog.tsx gets PascalCase named/default export
+        let alert_input = r#"
+import React from 'react';
+export default function AlertDialog() { return <div />; }
+"#;
+        let alert_output = post_process_generated_file("src/components/ui/alert-dialog.tsx", alert_input, &serde_json::json!({}), false);
+        assert!(alert_output.contains("export default function AlertDialog"));
+        assert!(alert_output.contains("export { AlertDialog };"));
+    }
+
+    #[test]
+    fn test_extract_edits_ignores_explanation_and_supports_deletion() {
+        // 1. Explanation mentioning "export " must NEVER be extracted as code replacement
+        let payload = serde_json::json!({
+            "explanation": "The error indicates that the name `Skeleton` is defined multiple times in the file. This is likely due to an additional export of the `Skeleton` component without a default export.",
+            "edits": [
+                {
+                    "target": "export const Skeleton: React.FC<SkeletonProps> = ({ className = '' }) => {",
+                    "replacement": "const Skeleton: React.FC<SkeletonProps> = ({ className = '' }) => {"
+                }
+            ]
+        });
+        let edits = extract_edits_from_json(&payload, "src/components/ui/skeleton.tsx");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(
+            edits[0].get("target").and_then(|v| v.as_str()),
+            Some("export const Skeleton: React.FC<SkeletonProps> = ({ className = '' }) => {")
+        );
+        assert_eq!(
+            edits[0].get("replacement").and_then(|v| v.as_str()),
+            Some("const Skeleton: React.FC<SkeletonProps> = ({ className = '' }) => {")
+        );
+
+        // 2. Empty replacement ("") with a valid target must be preserved as a deletion edit
+        let deletion_payload = serde_json::json!({
+            "explanation": "The error indicates that the name 'Skeleton' is defined multiple times in the file. This is likely due to an additional export of the 'Skeleton' component without a default export.",
+            "edits": [
+                {
+                    "target": "export default Skeleton;",
+                    "replacement": ""
+                }
+            ]
+        });
+        let del_edits = extract_edits_from_json(&deletion_payload, "src/components/ui/skeleton.tsx");
+        assert_eq!(del_edits.len(), 1);
+        assert_eq!(del_edits[0].get("target").and_then(|v| v.as_str()), Some("export default Skeleton;"));
+        assert_eq!(del_edits[0].get("replacement").and_then(|v| v.as_str()), Some(""));
+
+        // 3. Natural language prose mentioning keywords is not classified as code
+        assert!(!looks_like_code_payload(
+            "The error indicates that the name `Skeleton` is defined multiple times in the file. This is likely due to an additional export of the `Skeleton` component without a default export."
+        ));
+    }
+
 }

@@ -560,19 +560,29 @@ pub fn looks_like_code_payload(s: &str) -> bool {
     if (trimmed.starts_with('{') && trimmed.ends_with('}')) || (trimmed.starts_with('[') && trimmed.ends_with(']')) {
         return false;
     }
+    // Single-line natural language prose (e.g. explanations ending with a period and lacking code syntax) is NOT code
+    if !trimmed.contains('\n')
+        && trimmed.ends_with('.')
+        && !trimmed.contains(';')
+        && !trimmed.contains('{')
+        && !trimmed.contains('}')
+        && !trimmed.contains('=')
+    {
+        return false;
+    }
     trimmed.contains('\n')
-        || trimmed.contains("import ")
-        || trimmed.contains("export ")
-        || trimmed.contains("const ")
-        || trimmed.contains("function ")
-        || trimmed.contains("class ")
-        || trimmed.contains("interface ")
-        || trimmed.contains("type ")
-        || trimmed.contains("return ")
+        || trimmed.starts_with("import ")
+        || trimmed.starts_with("export ")
+        || trimmed.starts_with("const ")
+        || trimmed.starts_with("let ")
+        || trimmed.starts_with("function ")
+        || trimmed.starts_with("class ")
+        || trimmed.starts_with("interface ")
+        || trimmed.starts_with("type ")
         || trimmed.contains("from '")
         || trimmed.contains("from \"")
-        || trimmed.contains("<")
         || trimmed.contains("=>")
+        || (trimmed.contains('<') && trimmed.contains('>'))
         || trimmed.contains("model ")
         || trimmed.contains("datasource ")
 }
@@ -623,6 +633,7 @@ pub fn recursively_find_edits(value: &Value, current_path: &str, edits: &mut Vec
             let mut detected_code = None;
             let mut detected_path = None;
             let mut detected_target = None;
+            let mut has_explicit_empty_replacement = false;
             let mut context_path = current_path.to_string();
 
             // First pass: check if there is an explicit valid file path in this object (e.g. "file": "src/components/Navbar.tsx")
@@ -635,6 +646,24 @@ pub fn recursively_find_edits(value: &Value, current_path: &str, edits: &mut Vec
                             detected_path = Some(s.to_string());
                         }
                     }
+                }
+            }
+
+            // If this object is a container envelope holding an array/object of edits, recurse directly into its children
+            // so container-level metadata like "explanation" is never mistaken for a code edit.
+            let is_container = map.keys().any(|k| {
+                let kl = k.to_lowercase();
+                matches!(kl.as_str(), "edits" | "fixes" | "changes" | "patches" | "files" | "operations")
+            });
+            if is_container {
+                for (k, v) in map {
+                    let kl = k.to_lowercase();
+                    if matches!(kl.as_str(), "edits" | "fixes" | "changes" | "patches" | "files" | "operations") {
+                        recursively_find_edits(v, &context_path, edits);
+                    }
+                }
+                if !edits.is_empty() {
+                    return;
                 }
             }
 
@@ -654,9 +683,18 @@ pub fn recursively_find_edits(value: &Value, current_path: &str, edits: &mut Vec
                 }
             }
 
-            // Second pass: extract code and target/search strings
+            // Second pass: extract code and target/search strings from leaf edit object
             for (k, v) in map {
                 let k_lower = k.to_lowercase();
+
+                // Explicitly skip descriptive metadata fields so prose explanations are never treated as code
+                if matches!(
+                    k_lower.as_str(),
+                    "explanation" | "reason" | "description" | "summary" | "analysis" | "message" | "note" | "thought" | "error" | "status" | "type" | "name" | "id"
+                ) {
+                    continue;
+                }
+
                 if let Some(s) = v.as_str() {
                     if is_valid_file_path(s) && detected_path.is_none() {
                         detected_path = Some(s.to_string());
@@ -670,11 +708,18 @@ pub fn recursively_find_edits(value: &Value, current_path: &str, edits: &mut Vec
                     } else if k_lower.contains("replacement") || k_lower.contains("replace") || k_lower.contains("code") || k_lower.contains("content") || k_lower.contains("solution") || k_lower.contains("fixed") || k_lower.contains("new") || k_lower == "with" || k_lower == "to" || k_lower == "insert" || k_lower == "val" || k_lower == "value" {
                         if !s.trim().is_empty() {
                             detected_code = Some(s.to_string());
+                        } else if k_lower == "replacement" || k_lower == "replace" || k_lower == "new" {
+                            has_explicit_empty_replacement = true;
                         }
                     } else if looks_like_code_payload(s) && detected_code.is_none() && detected_target.as_deref() != Some(s) {
                         detected_code = Some(s.to_string());
                     }
                 }
+            }
+
+            // Allow empty replacement ("") when a target is specified (deletion of duplicate/erroneous code)
+            if detected_code.is_none() && has_explicit_empty_replacement && detected_target.is_some() {
+                detected_code = Some(String::new());
             }
 
             if let Some(code) = detected_code {
@@ -688,8 +733,14 @@ pub fn recursively_find_edits(value: &Value, current_path: &str, edits: &mut Vec
                 return;
             }
 
-            for (_, v) in map {
-                recursively_find_edits(v, &context_path, edits);
+            for (k, v) in map {
+                let kl = k.to_lowercase();
+                if (v.is_object() || v.is_array()) && !matches!(
+                    kl.as_str(),
+                    "explanation" | "reason" | "description" | "summary" | "analysis" | "message" | "note" | "thought"
+                ) {
+                    recursively_find_edits(v, &context_path, edits);
+                }
             }
         },
         Value::Array(arr) => {
@@ -816,7 +867,7 @@ pub async fn project_heal_compile_error(
         3. Do NOT include placeholders in 'replacement'. The code must be complete and ready to run.\n\
         4. Focus only on resolving the reported error. Do not make unrelated changes.\n\
         5. DATABASE RESILIENCY: If a database query (like a Prisma call `findMany`) throws a database connection error, wrap the query in try-catch and fall back to returning a mock array containing 10 realistic mockup items so the application remains previewable even if the database server is offline.\n\
-        6. NEVER declare, use, or destructure 'data-axiom-component' or 'data-axiom-file' props in React components or TypeScript interfaces/types. These are automatically injected during compilation post-processing, and manual declaration will cause syntax errors.\n\
+        6. NEVER declare unquoted 'data-axiom-component' or 'data-axiom-file' inside TypeScript interfaces or type definitions. If 'data-axiom-component' or 'data-axiom-file' already exists as an HTML attribute on a JSX tag, it is valid and you MUST leave it untouched.\n\
         7. STRICT UI & DESIGN PRESERVATION: NEVER delete or strip UI components, hero sections, product grids, forms, tables, or buttons to bypass a compilation error. Fix the underlying TypeScript, import, export, or syntax error in place. The page richness and intent MUST remain 100% intact.\n\
         8. MANDATORY TAILWIND CSS: All JSX elements MUST continue to use comprehensive Tailwind CSS utility classes. NEVER degrade styled elements into raw, unstyled HTML.\n\
         \n\n\
@@ -1041,7 +1092,11 @@ pub async fn project_heal_compile_error(
                                 || trimmed.contains("\"replacement\":");
 
                             if !is_raw_json && !is_json_envelope {
-                                let looks_like_code = clean_content.contains("import ") 
+                                let existing_line_count = file_content.lines().count();
+                            let new_line_count = trimmed.lines().count();
+                            let is_tiny_snippet = new_line_count < 4 && existing_line_count > 6;
+
+                            let looks_like_code = clean_content.contains("import ") 
                                     || clean_content.contains("export ") 
                                     || clean_content.contains("const ") 
                                     || clean_content.contains("function ") 
@@ -1051,7 +1106,7 @@ pub async fn project_heal_compile_error(
                                     || clean_content.contains("return ") 
                                     || clean_content.contains("<");
 
-                                if looks_like_code && !trimmed.is_empty() {
+                                if looks_like_code && !trimmed.is_empty() && !is_tiny_snippet {
                                     debug_log_to_file(format!("[AI Auto-Healing] Whole-file code fallback activated for: {}", rel_file_path));
                                     let _ = window.emit("server:log", serde_json::json!({
                                         "text": format!("> [AI Auto-Healing] Prepoznat direktan kod celog fajla (Whole-File Fallback). Primenjujem na: {}\n", rel_file_path),
@@ -1063,6 +1118,13 @@ pub async fn project_heal_compile_error(
                                         "replacement": clean_content
                                     }));
                                     explanation = "Primenjen kompletan popravljen kod iz AI odgovora".to_string();
+                                } else if is_tiny_snippet && (trimmed.starts_with("import ") || trimmed.starts_with("export ")) {
+                                    resolved_edits.push(serde_json::json!({
+                                        "path": rel_file_path.clone(),
+                                        "target": "",
+                                        "replacement": trimmed
+                                    }));
+                                    explanation = "Primenjena dopuna koda u fajl".to_string();
                                 }
                             }
                         }
@@ -1140,6 +1202,15 @@ pub async fn project_heal_compile_error(
                                     && !repl_trimmed.contains("default ")
                                     && !repl_trimmed.contains("class ");
 
+                                let is_just_export = (repl_trimmed.starts_with("export ") || repl_trimmed.starts_with("export default"))
+                                    && !repl_trimmed.contains("function ")
+                                    && !repl_trimmed.contains("class ")
+                                    && !repl_trimmed.contains("const ")
+                                    && !repl_trimmed.contains("let ")
+                                    && !repl_trimmed.contains("var ")
+                                    && !repl_trimmed.contains("return ")
+                                    && !repl_trimmed.contains("<");
+
                                 let is_partial_helper_snippet = !file_content_mut.is_empty()
                                     && file_content_mut.contains("export default")
                                     && !repl_trimmed.contains("export default")
@@ -1148,6 +1219,10 @@ pub async fn project_heal_compile_error(
                                 if is_just_import && !file_content_mut.is_empty() {
                                     if !file_content_mut.contains(repl_trimmed) {
                                         *file_content_mut = format!("{}\n{}", repl_trimmed, file_content_mut);
+                                    }
+                                } else if is_just_export && !file_content_mut.is_empty() {
+                                    if !file_content_mut.contains(repl_trimmed) {
+                                        file_content_mut.push_str(&format!("\n{}\n", repl_trimmed));
                                     }
                                 } else if is_partial_helper_snippet {
                                     // Do not wipe out a full React page with a 1-10 line helper declaration

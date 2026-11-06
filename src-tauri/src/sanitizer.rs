@@ -1029,6 +1029,9 @@ pub fn post_process_generated_file(
 
     let is_js_ts_file = path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx") || path_lower.ends_with(".ts") || path_lower.ends_with(".js");
     if is_js_ts_file {
+        if path_lower.ends_with(".ts") || path_lower.ends_with(".tsx") {
+            processed = sanitize_ts_interfaces(&processed);
+        }
         // Ensure prisma singleton config exports default if it has a named export
         if path_lower.ends_with("lib/prisma.ts") || path_lower.ends_with("lib/prisma.js") {
             if processed.contains("export const prisma") && !processed.contains("export default") {
@@ -1471,26 +1474,57 @@ export const config = {
             }
         }
 
-        // Dual-export synchronization (both named and default export) for hooks and components
-        // Prevents: Attempted import error: 'useAuth' is not exported from '@/hooks/useAuth'
+        // Dual-export synchronization (both named and default export) for components, UI primitives, and hooks
+        // Prevents: Attempted import error: 'Button' is not exported from '@/components/ui/button'
         if !path_lower.contains("/api/") && !path_lower.ends_with("route.ts") && !path_lower.ends_with("route.js") && !path_lower.ends_with("middleware.ts") {
             if let Some(stem) = std::path::Path::new(&normalized_path).file_stem().and_then(|s| s.to_str()) {
-                let valid_ident = stem.chars().all(|c| c.is_alphanumeric() || c == '_')
-                    && stem.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_');
-                if valid_ident && stem != "page" && stem != "layout" && stem != "index" && stem != "loading" && stem != "error" {
-                    let has_ident_decl = processed.contains(&format!("function {}", stem))
-                        || processed.contains(&format!("const {} =", stem))
-                        || processed.contains(&format!("const {}:", stem));
-                    if has_ident_decl {
-                        let has_default_export = processed.contains("export default");
-                        let has_named_export = processed.contains(&format!("export function {}", stem))
-                            || processed.contains(&format!("export const {}", stem))
-                            || processed.contains(&format!("export {{ {}", stem))
-                            || processed.contains(&format!("export {{{}", stem));
-                        if has_default_export && !has_named_export {
-                            processed.push_str(&format!("\nexport {{ {} }};\n", stem));
-                        } else if has_named_export && !has_default_export {
-                            processed.push_str(&format!("\nexport default {};\n", stem));
+                if stem != "page" && stem != "layout" && stem != "index" && stem != "loading" && stem != "error" && stem != "not-found" {
+                    let mut pascal_name = String::new();
+                    let mut cap_next = true;
+                    for c in stem.chars() {
+                        if c == '-' || c == '_' || c == ' ' {
+                            cap_next = true;
+                        } else if cap_next {
+                            pascal_name.push(c.to_ascii_uppercase());
+                            cap_next = false;
+                        } else {
+                            pascal_name.push(c);
+                        }
+                    }
+
+                    // 1. If file has a default export of an identifier: "export default <Ident>;" or "export default function <Ident>"
+                    let default_ident_re = regex::Regex::new(r#"(?m)^export\s+default\s+(?:function\s+|class\s+)?([A-Za-z0-9_]+)\b"#).ok();
+                    let default_ident = default_ident_re.as_ref().and_then(|re| {
+                        re.captures(&processed).and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
+                    });
+
+                    if let Some(ref def_id) = default_ident {
+                        if def_id != "function" && def_id != "class" && def_id != "default" {
+                            let has_named_export = processed.contains(&format!("export {{ {}", def_id))
+                                || processed.contains(&format!("export {{{}", def_id))
+                                || processed.contains(&format!("export const {}", def_id))
+                                || processed.contains(&format!("export function {}", def_id))
+                                || processed.contains(&format!("export class {}", def_id));
+                            if !has_named_export {
+                                processed.push_str(&format!("\nexport {{ {} }};\n", def_id));
+                            }
+                        }
+                    }
+
+                    // 2. If file has a named export matching pascal_name or stem (e.g. "export const Button", "export const Skeleton"), but NO default export
+                    let target_names = vec![pascal_name.clone(), stem.to_string()];
+                    for name in &target_names {
+                        if !name.is_empty() {
+                            let has_named = processed.contains(&format!("export function {}", name))
+                                || processed.contains(&format!("export const {}", name))
+                                || processed.contains(&format!("export class {}", name))
+                                || processed.contains(&format!("export {{ {}", name))
+                                || processed.contains(&format!("export {{{}", name));
+                            let has_default = processed.contains("export default");
+                            if has_named && !has_default {
+                                processed.push_str(&format!("\nexport default {};\n", name));
+                                break;
+                            }
                         }
                     }
                 }
@@ -1820,4 +1854,54 @@ pub fn ensure_prisma_opposite_relations(schema: &str) -> String {
     }
 
     result
+}
+
+pub fn sanitize_ts_interfaces(content: &str) -> String {
+    let mut output = Vec::new();
+    let mut in_interface_or_type = false;
+    let mut brace_depth: i32 = 0;
+    let kebab_prop_re = regex::Regex::new(r#"^(\s*)([a-zA-Z0-9_]+-[a-zA-Z0-9_-]+)(\s*\??:)"#).ok();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        if (trimmed.starts_with("interface ") || trimmed.starts_with("export interface ")
+            || (trimmed.starts_with("type ") && (trimmed.contains('=') || trimmed.contains('{')))
+            || (trimmed.starts_with("export type ") && (trimmed.contains('=') || trimmed.contains('{'))))
+            && trimmed.contains('{')
+        {
+            in_interface_or_type = true;
+        }
+
+        if in_interface_or_type {
+            for c in trimmed.chars() {
+                if c == '{' {
+                    brace_depth += 1;
+                } else if c == '}' {
+                    brace_depth -= 1;
+                    if brace_depth <= 0 {
+                        in_interface_or_type = false;
+                        brace_depth = 0;
+                    }
+                }
+            }
+
+            // Strip internal axiom data props if mistakenly typed in component interfaces
+            if trimmed.contains("data-axiom-component") || trimmed.contains("data-axiom-file") {
+                continue;
+            }
+
+            // Quote any unquoted kebab-case prop name in interface/type (e.g. data-testid?: string -> "data-testid"?: string)
+            if let Some(ref re) = kebab_prop_re {
+                if re.is_match(line) {
+                    output.push(re.replace(line, r#"$1"$2"$3"#).to_string());
+                    continue;
+                }
+            }
+        }
+
+        output.push(line.to_string());
+    }
+
+    output.join("\n")
 }
