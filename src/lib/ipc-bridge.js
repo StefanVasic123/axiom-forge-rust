@@ -657,26 +657,19 @@ window.electronAPI = {
       if (!id) return;
       try {
         window.dispatchEvent(new CustomEvent('axiom:show-progress', { detail: { projectId: id } }));
-      } catch (e) {}
-      try {
-        await invoke('show_floating_window', { projectId: id });
       } catch (e) {
-        console.error('Failed to show floating window:', e);
+        console.error('Failed to dispatch show-progress event:', e);
       }
     },
     closeFloating: async () => {
       try {
-        await invoke('close_floating_window');
-      } catch (e) {
-        console.error('Failed to close floating window:', e);
-      }
+        window.dispatchEvent(new CustomEvent('axiom:hide-progress'));
+      } catch (e) {}
     },
     hideFloating: async () => {
       try {
-        await invoke('close_floating_window');
-      } catch (e) {
-        console.error('Failed to hide floating window:', e);
-      }
+        window.dispatchEvent(new CustomEvent('axiom:hide-progress'));
+      } catch (e) {}
     }
   },
   app: {

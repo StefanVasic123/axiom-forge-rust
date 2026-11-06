@@ -45,6 +45,12 @@ fn debug_log_to_file(message: String) {
     let _ = std::fs::create_dir_all(&projects_dir);
     let log_path = projects_dir.join("deeplink_debug.txt");
     println!("[JS/Rust Debug Log] {}", message);
+    if let Ok(meta) = std::fs::metadata(&log_path) {
+        if meta.len() > 5 * 1024 * 1024 {
+            let backup_path = projects_dir.join("deeplink_debug.old.txt");
+            let _ = std::fs::rename(&log_path, &backup_path);
+        }
+    }
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -74,30 +80,21 @@ fn clear_pending_deep_link(state: tauri::State<'_, PendingDeepLink>) {
 }
 
 #[tauri::command]
-fn show_floating_window(app: tauri::AppHandle, project_id: String) -> Result<(), String> {
+async fn show_floating_window(app: tauri::AppHandle, project_id: String) -> Result<(), String> {
     let label = format!("floating-{}", project_id);
     if let Some(existing_win) = app.get_webview_window(&label) {
-        let _ = existing_win.show();
-        let _ = existing_win.unminimize();
-        let _ = existing_win.set_focus();
-        return Ok(());
+        let _ = existing_win.close();
     }
-
-    let url = format!("index.html?projectId={}#/floating?id={}", project_id, project_id);
-    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(url.into()))
-        .title("Axiom Forge - Generation Progress")
-        .inner_size(460.0, 440.0)
-        .resizable(true)
-        .always_on_top(true)
-        .center()
-        .build()
-        .map_err(|e| e.to_string())?;
-
+    if let Some(main_win) = app.get_webview_window("main") {
+        let _ = main_win.show();
+        let _ = main_win.unminimize();
+        let _ = main_win.set_focus();
+    }
     Ok(())
 }
 
 #[tauri::command]
-fn close_floating_window(window: tauri::Window) -> Result<(), String> {
+async fn close_floating_window(window: tauri::Window) -> Result<(), String> {
     if window.label().starts_with("floating-") {
         let _ = window.close();
     }

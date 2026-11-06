@@ -286,11 +286,11 @@ function ProjectDetail() {
               onClick={async () => {
                 const activeInfo = await window.electronAPI.task.getActiveTaskByProject(projectId);
                 const realStatus = activeInfo?.task?.status || project.status;
-                await window.electronAPI.window.showFloating({ id: projectId });
                 if (realStatus === 'stopped' || realStatus === 'paused') {
                   await window.electronAPI.task.resumeGeneration(projectId);
-                  loadProjects();
                 }
+                await window.electronAPI.window.showFloating({ id: projectId });
+                await loadProjects();
               }}
               className="btn-primary"
             >
@@ -413,11 +413,11 @@ function ProjectDetail() {
             onClick={async () => {
               const activeInfo = await window.electronAPI.task.getActiveTaskByProject(projectId);
               const realStatus = activeInfo?.task?.status || project.status;
-              await window.electronAPI.window.showFloating({ id: projectId });
               if (realStatus === 'stopped' || realStatus === 'paused') {
                 await window.electronAPI.task.resumeGeneration(projectId);
-                loadProjects();
               }
+              await window.electronAPI.window.showFloating({ id: projectId });
+              await loadProjects();
             }}
             className="btn-primary py-1.5 px-3 text-xs"
           >

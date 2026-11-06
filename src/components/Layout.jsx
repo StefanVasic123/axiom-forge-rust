@@ -19,6 +19,9 @@ import {
   AlertCircle,
   Pause,
   Play,
+  Terminal,
+  ChevronDown,
+  ChevronUp,
   X
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
@@ -170,6 +173,8 @@ function Layout() {
   const [dismissedTaskId, setDismissedTaskId] = React.useState(null);
   const [focusedProjectId, setFocusedProjectId] = React.useState(null);
   const [isTaskActionLoading, setIsTaskActionLoading] = React.useState(false);
+  const [showLogs, setShowLogs] = React.useState(true);
+  const logsEndRef = React.useRef(null);
   const navigate = useNavigate();
 
   React.useEffect(() => {
@@ -188,9 +193,20 @@ function Layout() {
         }
       }
     };
+    const handleHideProgress = () => {
+      const tasks = Object.values(taskProgress);
+      const current = tasks.find(tk => tk.projectId === focusedProjectId) || tasks[0];
+      if (current) {
+        setDismissedTaskId(current.taskId);
+      }
+    };
     window.addEventListener('axiom:show-progress', handleShowProgress);
-    return () => window.removeEventListener('axiom:show-progress', handleShowProgress);
-  }, [setTaskProgress]);
+    window.addEventListener('axiom:hide-progress', handleHideProgress);
+    return () => {
+      window.removeEventListener('axiom:show-progress', handleShowProgress);
+      window.removeEventListener('axiom:hide-progress', handleHideProgress);
+    };
+  }, [setTaskProgress, taskProgress, focusedProjectId]);
 
   // Find the task matching focusedProjectId first, or the first non-dismissed task
   const activeTask = React.useMemo(() => {
@@ -201,6 +217,12 @@ function Layout() {
     }
     return tasks.find(tk => tk.taskId !== dismissedTaskId);
   }, [taskProgress, focusedProjectId, dismissedTaskId]);
+
+  React.useEffect(() => {
+    if (showLogs && logsEndRef.current) {
+      logsEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [activeTask?.logs?.length, showLogs]);
 
   const handleDismiss = () => {
     if (activeTask) {
@@ -367,6 +389,42 @@ function Layout() {
               <div className="mt-3 flex items-center justify-between text-[10px] text-slate-500">
                 <span>{isPaused ? 'Pauzirano' : isStopped ? 'Sačuvani napredak' : t('taskOverlay.progress')}</span>
                 <span className="font-medium text-slate-300">{Math.round(activeTask.progress || 0)}%</span>
+              </div>
+            )}
+
+            {/* Expandable Engine Logs inside Main Window Overlay */}
+            {Array.isArray(activeTask.logs) && activeTask.logs.length > 0 && (
+              <div className="mt-2.5 border-t border-slate-800/80 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowLogs(!showLogs)}
+                  className="w-full flex items-center justify-between text-[10px] uppercase tracking-wider font-semibold text-slate-500 hover:text-slate-300 transition-colors"
+                >
+                  <span className="flex items-center gap-1.5">
+                    <Terminal className="w-3 h-3 text-indigo-400" />
+                    Engine Logs ({activeTask.logs.length})
+                  </span>
+                  {showLogs ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronUp className="w-3.5 h-3.5" />}
+                </button>
+                {showLogs && (
+                  <div className="mt-2 max-h-32 overflow-y-auto rounded-lg bg-slate-950/90 border border-slate-800/80 p-2 font-mono text-[10px] space-y-1">
+                    {activeTask.logs.map((log, idx) => {
+                      const isLast = idx === activeTask.logs.length - 1;
+                      return (
+                        <div
+                          key={log.id || idx}
+                          className={`flex items-start gap-1.5 leading-relaxed ${
+                            isLast ? 'text-indigo-300 font-medium' : 'text-slate-500'
+                          }`}
+                        >
+                          <span className="text-slate-600 shrink-0">&gt;</span>
+                          <span className="break-all">{log.message}</span>
+                        </div>
+                      );
+                    })}
+                    <div ref={logsEndRef} />
+                  </div>
+                )}
               </div>
             )}
 

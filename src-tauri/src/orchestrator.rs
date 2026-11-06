@@ -1478,7 +1478,8 @@ pub async fn run_orchestrator(
     let axiom_dir = proj_dir.join(".axiom");
     let _ = fs::create_dir_all(&axiom_dir);
 
-    let task_control = register_task_control(&task_id, &project_id);
+    let task_control = find_task_control(&task_id)
+        .unwrap_or_else(|| register_task_control(&task_id, &project_id));
 
     let existing_checkpoint = load_generation_checkpoint(&proj_dir);
     let mut completed_files: Vec<String> = Vec::new();
@@ -1502,7 +1503,23 @@ pub async fn run_orchestrator(
         }
     }
 
-    emit_progress("fetch-manifest", "Initializing generation pipeline...", 1.0);
+    let resume_base_pct: Option<f64> = files_to_generate_from_cp.as_ref().and_then(|ftg| {
+        if !completed_files.is_empty() && !ftg.is_empty() {
+            Some((25.0 + (completed_files.len() as f64 / ftg.len() as f64) * 55.0).min(99.0))
+        } else {
+            None
+        }
+    });
+
+    emit_progress(
+        if resume_base_pct.is_some() { "generate-files" } else { "fetch-manifest" },
+        if files_to_generate_from_cp.is_some() {
+            "Nastavljam generisanje sa sačuvanog checkpoint-a..."
+        } else {
+            "Initializing generation pipeline..."
+        },
+        resume_base_pct.unwrap_or(1.0),
+    );
 
     // 1. Fetch Manifest
     let client = reqwest::Client::builder()
@@ -2271,7 +2288,9 @@ export default function RootLayout({
         }
     }
 
-    emit_progress("fetch-manifest", "Manifest secured and ready.", 10.0);
+    if resume_base_pct.is_none() {
+        emit_progress("fetch-manifest", "Manifest secured and ready.", 10.0);
+    }
 
     // Load tech version overrides from settings
     let settings_path = get_base_dir().join("axiom-settings.json");
@@ -2301,7 +2320,9 @@ export default function RootLayout({
     let _ = ollama_start_server().await;
 
     // Manifest Expansion Phase
-    emit_progress("manifest-expansion", "Expanding manifest structure with local AI...", 12.0);
+    if resume_base_pct.is_none() {
+        emit_progress("manifest-expansion", "Expanding manifest structure with local AI...", 12.0);
+    }
     
     let resolved_stack = manifest.get("resolvedStack").and_then(|s| s.as_str()).unwrap_or("Next.js");
     let platform = manifest.get("platform").and_then(|p| p.as_str()).unwrap_or("web");
@@ -2345,7 +2366,11 @@ export default function RootLayout({
 
     let mut files_to_generate = if let Some(ref saved_files) = files_to_generate_from_cp {
         debug_log_to_file(format!("[Orchestrator] Reusing {} expanded files from checkpoint.", saved_files.len()));
-        emit_progress("manifest-expansion", &format!("Resumed manifest structure with {} files.", saved_files.len()), 14.0);
+        emit_progress(
+            "generate-files",
+            &format!("Učitan checkpoint: {}/{} fajlova već sačuvano.", completed_files.len(), saved_files.len()),
+            resume_base_pct.unwrap_or(14.0),
+        );
         saved_files.clone()
     } else {
         files.clone()
@@ -2633,7 +2658,15 @@ export default function RootLayout({
         get_generation_phase(file_path, &project_type)
     });
 
-    emit_progress("generate-files", "Checking local AI engine...", 15.0);
+    if let Some(pct) = resume_base_pct {
+        emit_progress(
+            "generate-files",
+            &format!("Nastavljam generisanje od fajla {}/{}...", completed_files.len() + 1, files_to_generate.len()),
+            pct,
+        );
+    } else {
+        emit_progress("generate-files", "Checking local AI engine...", 15.0);
+    }
 
     // 2. Generation Loop
     let total_files = files_to_generate.len() as f64;
@@ -2744,8 +2777,6 @@ export default function RootLayout({
             && fs::metadata(&full_disk_path).map(|m| m.len() > 0).unwrap_or(false);
 
         if already_on_disk {
-            let msg = format!("Verified existing file {}/{} - {}", i + 1, files_to_generate.len(), file_path);
-            emit_progress("generate-files", &msg, current_progress);
             continue;
         }
 
@@ -3120,8 +3151,48 @@ pub async fn task_start_generation(
     host: Option<String>,
 ) -> Result<String, String> {
     let p_id = project_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let task_id = format!("task-{}", uuid::Uuid::new_v4());
+    let proj_dir = get_project_path(&p_id);
+    let existing_cp = load_generation_checkpoint(&proj_dir);
+
+    let task_id = existing_cp
+        .as_ref()
+        .and_then(|cp| {
+            let status = cp.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            if status != "completed" {
+                cp.get("taskId").and_then(|v| v.as_str()).map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| format!("task-{}", uuid::Uuid::new_v4()));
+
     let model = model_id.clone().unwrap_or_else(|| "qwen2.5-coder:7b".to_string());
+
+    // Register task control synchronously BEFORE spawning the worker so any immediate status/checkpoint queries see an active worker
+    let _ = register_task_control(&task_id, &p_id);
+
+    if let Some(mut cp) = existing_cp {
+        let status = cp.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if status != "completed" {
+            let completed_len = cp.get("completedFiles").and_then(|a| a.as_array()).map(|a| a.len()).unwrap_or(0);
+            let total_len = cp.get("totalFiles").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
+            let pct = (25.0 + (completed_len as f64 / total_len as f64) * 55.0).min(99.0);
+            cp["taskId"] = serde_json::json!(task_id);
+            cp["status"] = serde_json::json!("generating");
+            cp["phase"] = serde_json::json!("generate-files");
+            cp["updatedAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+            save_generation_checkpoint(&proj_dir, &cp);
+            let _ = project_update_status(p_id.clone(), "generating".to_string(), serde_json::json!({}));
+            let _ = window.app_handle().emit("task:progress", serde_json::json!({
+                "taskId": task_id,
+                "projectId": p_id,
+                "phase": "generate-files",
+                "status": "generating",
+                "message": format!("Nastavljam generisanje ({}/{} fajlova)...", completed_len, total_len),
+                "progress": pct
+            }));
+        }
+    }
     
     debug_log_to_file(format!(
         "[IPC Rust Command] task_start_generation called. manifest_id: {}, project_id: {:?}, model_id: {:?}, host: {:?}",
@@ -3136,6 +3207,7 @@ pub async fn task_start_generation(
         let err_proj_id = p_id_clone.clone();
         if let Err(e) = run_orchestrator(window.clone(), t_id.clone(), manifest_id, p_id_clone, token, model, host_clone).await {
             debug_log_to_file(format!("[IPC Rust Command] run_orchestrator failed for task_id {}: {}", t_id, e));
+            unregister_task_control(&t_id, &err_proj_id);
             let _ = window.app_handle().emit("task:progress", serde_json::json!({
                 "taskId": t_id,
                 "projectId": err_proj_id,

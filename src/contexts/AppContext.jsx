@@ -104,14 +104,52 @@ function appReducer(state, action) {
     case ACTIONS.SET_CURRENT_PROJECT:
       return { ...state, currentProject: action.payload };
       
-    case ACTIONS.SET_TASK_PROGRESS:
+    case ACTIONS.SET_TASK_PROGRESS: {
+      const { taskId, progress } = action.payload;
+      const incomingProjectId = progress?.projectId;
+      const nextTaskProgress = {};
+      let existingLogs = [];
+
+      for (const [k, v] of Object.entries(state.taskProgress)) {
+        if (k === taskId || (incomingProjectId && v?.projectId === incomingProjectId)) {
+          if (Array.isArray(v?.logs) && v.logs.length > existingLogs.length) {
+            existingLogs = v.logs;
+          }
+          // Deduplicate by projectId so resumed tasks replace stale checkpoint entries
+          continue;
+        }
+        nextTaskProgress[k] = v;
+      }
+
+      const newMsg = progress?.message;
+      let mergedLogs = Array.isArray(progress?.logs) ? progress.logs : existingLogs;
+      if (newMsg) {
+        const lastLog = mergedLogs[mergedLogs.length - 1];
+        if (!lastLog || lastLog.message !== newMsg) {
+          mergedLogs = [
+            ...mergedLogs.slice(-39),
+            {
+              id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+              message: newMsg,
+              phase: progress?.phase || progress?.status || 'generate-files',
+              progress: progress?.progress,
+              time: new Date().toLocaleTimeString()
+            }
+          ];
+        }
+      }
+
+      nextTaskProgress[taskId] = {
+        ...progress,
+        taskId,
+        logs: mergedLogs
+      };
+
       return {
         ...state,
-        taskProgress: {
-          ...state.taskProgress,
-          [action.payload.taskId]: action.payload.progress
-        }
+        taskProgress: nextTaskProgress
       };
+    }
       
     case ACTIONS.UPDATE_SETTINGS:
       return {
