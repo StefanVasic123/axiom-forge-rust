@@ -23,10 +23,8 @@ function registerGlobalListener(eventName, callback) {
     listenerInfo.promise = listen(eventName, (event) => {
       const payload = event.payload;
       
-      // Centralized debug logging for specific event types to match old behavior
-      if (eventName === 'task:progress') {
-        invoke('debug_log_to_file', { message: `[IPC Bridge] task:progress event received in JS bridge: ${JSON.stringify(payload)}` });
-      } else if (eventName === 'deep-link:build') {
+      // Centralized debug logging for deep-link event types
+      if (eventName === 'deep-link:build') {
         invoke('debug_log_to_file', { message: `[IPC Bridge] Live deep-link:build event received in JS listener: ${JSON.stringify(payload)}` });
       } else if (eventName === 'deep-link:config') {
         invoke('debug_log_to_file', { message: `[IPC Bridge] Live deep-link:config event received: ${JSON.stringify(payload)}` });
@@ -477,19 +475,44 @@ window.electronAPI = {
       try {
         const checkpoint = await invoke('task_get_project_checkpoint', { projectId });
         if (checkpoint) {
-          const completedCount = checkpoint.completedFiles ? checkpoint.completedFiles.length : 0;
+          const completedFiles = Array.isArray(checkpoint.completedFiles) ? checkpoint.completedFiles : [];
+          const completedCount = completedFiles.length;
           const totalCount = checkpoint.totalFiles || 1;
           const isDone = checkpoint.status === 'completed' || checkpoint.phase === 'complete';
           const calcProgress = isDone
             ? 100
             : Math.min(Math.round(25 + (completedCount / totalCount) * 55), 99);
+          const lastFile = checkpoint.currentFilePath || (completedFiles.length > 0 ? completedFiles[completedFiles.length - 1] : '');
+          let fileDesc = '';
+          if (lastFile && Array.isArray(checkpoint.filesToGenerate)) {
+            const matchedSpec = checkpoint.filesToGenerate.find(f => f.path === lastFile);
+            if (matchedSpec && matchedSpec.description) {
+              fileDesc = matchedSpec.description;
+            }
+          }
+          let savedCodePreview = '';
+          if (lastFile) {
+            try {
+              const rawContent = await invoke('project_read_file', { projectId, filePath: lastFile });
+              if (rawContent && typeof rawContent === 'string') {
+                const lines = rawContent.split('\n');
+                savedCodePreview = lines.slice(-20).join('\n');
+              }
+            } catch {}
+          }
           return { 
             success: true, 
             task: {
               taskId: checkpoint.taskId || `task-${projectId}`,
               projectId: checkpoint.projectId || projectId,
+              projectName: checkpoint.name || '',
               phase: checkpoint.phase || checkpoint.status,
               status: checkpoint.status,
+              currentFile: lastFile,
+              fileDescription: fileDesc,
+              fileIndex: completedCount,
+              totalFiles: totalCount,
+              liveCode: savedCodePreview,
               message: checkpoint.status === 'paused' ? `Generisanje pauzirano (${completedCount}/${totalCount} fajlova)` : 
                        checkpoint.status === 'stopped' ? `Generisanje prekinuto (${completedCount}/${totalCount} fajlova sačuvano)` : 
                        `Checkpoint: ${completedCount}/${totalCount} fajlova generisano`,

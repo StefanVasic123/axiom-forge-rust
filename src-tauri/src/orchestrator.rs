@@ -1446,6 +1446,33 @@ pub fn get_expert_system_prompt(
     prompt
 }
 
+fn extract_live_code_preview(raw: &str) -> String {
+    let trimmed = raw.trim_start();
+    let without_fence = if trimmed.starts_with("```") {
+        if let Some(newline_pos) = trimmed.find('\n') {
+            &trimmed[newline_pos + 1..]
+        } else {
+            ""
+        }
+    } else {
+        trimmed
+    };
+    let without_closing = without_fence.trim_end().strip_suffix("```").unwrap_or(without_fence);
+    let lines: Vec<&str> = without_closing.lines().collect();
+    let tail_lines = if lines.len() > 22 {
+        &lines[lines.len() - 22..]
+    } else {
+        &lines[..]
+    };
+    let joined = tail_lines.join("\n");
+    if joined.chars().count() > 1400 {
+        let count = joined.chars().count();
+        joined.chars().skip(count - 1400).collect()
+    } else {
+        joined
+    }
+}
+
 pub async fn run_orchestrator(
     window: tauri::Window,
     task_id: String,
@@ -1470,6 +1497,21 @@ pub async fn run_orchestrator(
             "phase": phase,
             "message": msg,
             "progress": progress
+        }));
+    };
+    let emit_live_code = |phase: &str, msg: &str, progress: f64, current_file: &str, file_desc: &str, file_idx: usize, total_files: usize, token_count: usize, live_code: &str| {
+        let _ = window.app_handle().emit("task:progress", serde_json::json!({
+            "taskId": task_id,
+            "projectId": project_id,
+            "phase": phase,
+            "message": msg,
+            "progress": progress,
+            "currentFile": current_file,
+            "fileDescription": file_desc,
+            "fileIndex": file_idx,
+            "totalFiles": total_files,
+            "tokenCount": token_count,
+            "liveCode": live_code
         }));
     };
 
@@ -2420,6 +2462,7 @@ export default function RootLayout({
                 if resp.status().is_success() {
                     let mut accumulated_response = String::new();
                     let mut chars_received = 0;
+                    let mut manifest_token_count = 0usize;
                     let mut byte_buf = Vec::new();
                     let stream_start = std::time::Instant::now();
                     #[allow(unused_assignments)]
@@ -2446,6 +2489,21 @@ export default function RootLayout({
                                                 if let Some(content) = val.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
                                                     accumulated_response.push_str(content);
                                                     chars_received += content.len();
+                                                    manifest_token_count += 1;
+                                                    if manifest_token_count == 1 || manifest_token_count % 10 == 0 {
+                                                        let preview = extract_live_code_preview(&accumulated_response);
+                                                        emit_live_code(
+                                                            "manifest-expansion",
+                                                            &format!("AI projektuje arhitekturu manifesta... ({} tokena)", manifest_token_count),
+                                                            13.0,
+                                                            ".axiom/manifest.json",
+                                                            "Proširivanje arhitekture projekta, ruta, modela baze i UI komponenti",
+                                                            0,
+                                                            0,
+                                                            manifest_token_count,
+                                                            &preview,
+                                                        );
+                                                    }
                                                 }
                                                 if let Some(done) = val.get("done").and_then(|d| d.as_bool()) {
                                                     if done {
@@ -2782,6 +2840,17 @@ export default function RootLayout({
 
         let msg = format!("Generating {}/{} - {}", i + 1, files_to_generate.len(), file_path);
         emit_progress("generate-files", &msg, current_progress);
+        emit_live_code(
+            "generate-files",
+            &msg,
+            current_progress,
+            file_path,
+            desc,
+            i + 1,
+            files_to_generate.len(),
+            0,
+            "// AI analizira kontekst i započinje pisanje koda...",
+        );
 
         let overrides_desc_str = if !overrides_desc.trim().is_empty() {
             format!("\nUse the following version/stack preferences if applicable:\n{}", overrides_desc)
@@ -2910,8 +2979,26 @@ export default function RootLayout({
                                 full_content.push_str(content);
                                 token_count += 1;
 
-                                if token_count % 50 == 0 {
-                                    emit_progress("generate-files", &format!("AI typing {}... ({} tokens)", file_path, token_count), current_progress);
+                                if token_count == 1 || token_count % 8 == 0 {
+                                    let preview = extract_live_code_preview(&full_content);
+                                    let sub_progress = current_progress + ((token_count as f64 / 600.0).min(0.9) * (55.0 / total_files.max(1.0)));
+                                    emit_live_code(
+                                        "generate-files",
+                                        &format!("AI typing {}... ({} tokens)", file_path, token_count),
+                                        sub_progress,
+                                        file_path,
+                                        desc,
+                                        i + 1,
+                                        files_to_generate.len(),
+                                        token_count,
+                                        &preview,
+                                    );
+                                }
+                                if token_count % 100 == 0 {
+                                    debug_log_to_file(format!(
+                                        "[Orchestrator Progress] AI typing {} ({}/{}): {} tokens",
+                                        file_path, i + 1, files_to_generate.len(), token_count
+                                    ));
                                 }
 
                                 // Detect repetition loop only after 100 tokens every 30 tokens to avoid early false positives

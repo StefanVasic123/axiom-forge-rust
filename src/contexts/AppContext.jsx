@@ -108,24 +108,41 @@ function appReducer(state, action) {
       const { taskId, progress } = action.payload;
       const incomingProjectId = progress?.projectId;
       const nextTaskProgress = {};
-      let existingLogs = [];
+      let prevTask = null;
 
       for (const [k, v] of Object.entries(state.taskProgress)) {
         if (k === taskId || (incomingProjectId && v?.projectId === incomingProjectId)) {
-          if (Array.isArray(v?.logs) && v.logs.length > existingLogs.length) {
-            existingLogs = v.logs;
-          }
+          prevTask = v;
           // Deduplicate by projectId so resumed tasks replace stale checkpoint entries
           continue;
         }
         nextTaskProgress[k] = v;
       }
 
+      const existingLogs = Array.isArray(prevTask?.logs) ? prevTask.logs : [];
       const newMsg = progress?.message;
       let mergedLogs = Array.isArray(progress?.logs) ? progress.logs : existingLogs;
+
       if (newMsg) {
         const lastLog = mergedLogs[mergedLogs.length - 1];
-        if (!lastLog || lastLog.message !== newMsg) {
+        const isTypingUpdate = newMsg.startsWith('AI typing ') || newMsg.startsWith('AI projektuje ');
+        const lastWasSameTyping =
+          isTypingUpdate &&
+          lastLog &&
+          typeof lastLog.message === 'string' &&
+          lastLog.message.split('...')[0] === newMsg.split('...')[0];
+
+        if (lastWasSameTyping) {
+          mergedLogs = [
+            ...mergedLogs.slice(0, -1),
+            {
+              ...lastLog,
+              message: newMsg,
+              progress: progress?.progress,
+              time: new Date().toLocaleTimeString()
+            }
+          ];
+        } else if (!lastLog || lastLog.message !== newMsg) {
           mergedLogs = [
             ...mergedLogs.slice(-39),
             {
@@ -140,8 +157,15 @@ function appReducer(state, action) {
       }
 
       nextTaskProgress[taskId] = {
+        ...prevTask,
         ...progress,
         taskId,
+        currentFile: progress?.currentFile ?? prevTask?.currentFile ?? '',
+        fileDescription: progress?.fileDescription ?? prevTask?.fileDescription ?? '',
+        fileIndex: progress?.fileIndex ?? prevTask?.fileIndex ?? 0,
+        totalFiles: progress?.totalFiles ?? prevTask?.totalFiles ?? 0,
+        tokenCount: progress?.tokenCount ?? prevTask?.tokenCount ?? 0,
+        liveCode: progress?.liveCode !== undefined ? progress.liveCode : (prevTask?.liveCode ?? ''),
         logs: mergedLogs
       };
 

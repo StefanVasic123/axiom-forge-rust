@@ -20,6 +20,7 @@ import {
   Pause,
   Play,
   Terminal,
+  FileCode,
   ChevronDown,
   ChevronUp,
   X
@@ -168,19 +169,46 @@ function Header() {
 }
 
 function Layout() {
-  const { taskProgress, setTaskProgress, loadProjects } = useAppStore();
+  const { projects, taskProgress, setTaskProgress, loadProjects } = useAppStore();
   const { t } = useI18n();
   const [dismissedTaskId, setDismissedTaskId] = React.useState(null);
   const [focusedProjectId, setFocusedProjectId] = React.useState(null);
   const [isTaskActionLoading, setIsTaskActionLoading] = React.useState(false);
-  const [showLogs, setShowLogs] = React.useState(true);
+  const [isDropdownOpen, setIsDropdownOpen] = React.useState(true);
+  const [showLogs, setShowLogs] = React.useState(false);
   const logsEndRef = React.useRef(null);
+  const liveCodeContainerRef = React.useRef(null);
+  const hydratedRef = React.useRef(false);
   const navigate = useNavigate();
+
+  // Auto-hydrate interrupted/paused/generating task into bottom-right widget on startup
+  React.useEffect(() => {
+    if (hydratedRef.current || !Array.isArray(projects) || projects.length === 0) return;
+    if (Object.keys(taskProgress).length > 0) {
+      hydratedRef.current = true;
+      return;
+    }
+    const candidate = projects.find(
+      p => p.status === 'generating' || p.status === 'paused' || p.status === 'stopped'
+    );
+    if (candidate) {
+      hydratedRef.current = true;
+      window.electronAPI.task
+        .getActiveTaskByProject(candidate.id)
+        .then(res => {
+          if (res?.success && res.task) {
+            setTaskProgress(res.task.taskId, res.task);
+          }
+        })
+        .catch(() => {});
+    }
+  }, [projects, taskProgress, setTaskProgress]);
 
   React.useEffect(() => {
     const handleShowProgress = async (e) => {
       const projectId = e?.detail?.projectId;
       setDismissedTaskId(null);
+      setIsDropdownOpen(true);
       if (projectId) {
         setFocusedProjectId(projectId);
         try {
@@ -223,6 +251,12 @@ function Layout() {
       logsEndRef.current.scrollIntoView({ behavior: 'smooth' });
     }
   }, [activeTask?.logs?.length, showLogs]);
+
+  React.useEffect(() => {
+    if (isDropdownOpen && liveCodeContainerRef.current) {
+      liveCodeContainerRef.current.scrollTop = liveCodeContainerRef.current.scrollHeight;
+    }
+  }, [activeTask?.liveCode, isDropdownOpen]);
 
   const handleDismiss = () => {
     if (activeTask) {
@@ -323,51 +357,103 @@ function Layout() {
         </main>
       </div>
 
-      {/* Background Task Progress Overlay */}
+      {/* Background Task Progress Dropdown & Real-Time Live Code Widget */}
       {activeTask && (
-        <div className="fixed bottom-6 right-6 z-50 w-96 bg-slate-900/95 backdrop-blur-xl border border-indigo-500/20 rounded-xl shadow-2xl overflow-hidden animate-fade-in transition-all duration-300">
-          <div className={`h-1 bg-gradient-to-r ${
-            isComplete ? 'from-emerald-500 to-teal-500' :
-            isError || isStopped ? 'from-rose-500 to-red-500' :
-            isPaused ? 'from-amber-500 to-orange-500' :
-            'from-indigo-500 to-violet-500'
-          }`} style={{ width: `${activeTask.progress || 0}%` }} />
-          
-          <div className="p-4">
-            <div className="flex items-start justify-between gap-3">
-              <div className="flex items-center gap-3">
-                <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
+        <div
+          className={`fixed bottom-5 right-5 z-50 ${
+            isDropdownOpen ? 'w-[440px]' : 'w-96'
+          } bg-slate-900/95 backdrop-blur-xl border border-indigo-500/25 rounded-2xl shadow-2xl overflow-hidden animate-fade-in transition-all duration-200`}
+        >
+          {/* Top Progress Bar */}
+          <div className="w-full bg-slate-950 h-1.5 overflow-hidden">
+            <div
+              className={`h-full transition-all duration-300 bg-gradient-to-r ${
+                isComplete ? 'from-emerald-500 to-teal-500' :
+                isError || isStopped ? 'from-rose-500 to-red-500' :
+                isPaused ? 'from-amber-500 to-orange-500' :
+                'from-indigo-500 via-violet-500 to-blue-500'
+              }`}
+              style={{ width: `${Math.min(Math.max(activeTask.progress || 0, 2), 100)}%` }}
+            />
+          </div>
+
+          {/* Clickable Pill / Dropdown Header */}
+          <div
+            onClick={() => setIsDropdownOpen(!isDropdownOpen)}
+            className="px-4 py-3 flex items-center justify-between gap-3 cursor-pointer hover:bg-slate-800/40 transition-colors select-none"
+          >
+            <div className="flex items-center gap-3 min-w-0">
+              <div
+                className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${
                   isComplete ? 'bg-emerald-500/10 text-emerald-400' :
                   isError || isStopped ? 'bg-rose-500/10 text-rose-400' :
                   isPaused ? 'bg-amber-500/10 text-amber-400' :
-                  'bg-indigo-500/10 text-indigo-400'
-                }`}>
-                  {isComplete ? (
-                    <CheckCircle2 className="w-4 h-4" />
-                  ) : isError || isStopped ? (
-                    <AlertCircle className="w-4 h-4" />
-                  ) : isPaused ? (
-                    <Pause className="w-4 h-4" />
-                  ) : (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  )}
-                </div>
-                <div>
-                  <h3 className="font-semibold text-sm text-white">
+                  'bg-indigo-500/15 text-indigo-400'
+                }`}
+              >
+                {isComplete ? (
+                  <CheckCircle2 className="w-4 h-4" />
+                ) : isError || isStopped ? (
+                  <AlertCircle className="w-4 h-4" />
+                ) : isPaused ? (
+                  <Pause className="w-4 h-4" />
+                ) : (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                )}
+              </div>
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <h3 className="font-semibold text-sm text-white truncate">
                     {isComplete ? t('taskOverlay.complete') :
                      isError ? t('taskOverlay.failed') :
                      isPaused ? 'Generisanje pauzirano' :
                      isStopped ? 'Generisanje prekinuto' :
                      t('taskOverlay.forging')}
                   </h3>
-                  <p className="text-[10px] text-slate-500">
-                    Task ID: {String(activeTask.taskId || '').substring(0, 13)}
-                  </p>
+                  {activeTask.totalFiles > 0 && (
+                    <span className="px-1.5 py-0.5 rounded bg-slate-800 text-[10px] font-mono text-slate-300 shrink-0">
+                      {activeTask.fileIndex || 0}/{activeTask.totalFiles}
+                    </span>
+                  )}
                 </div>
+                <p className="text-[11px] text-slate-400 truncate font-mono">
+                  {activeTask.currentFile
+                    ? activeTask.currentFile
+                    : activeTask.message || `Task ID: ${String(activeTask.taskId || '').substring(0, 13)}`}
+                </p>
               </div>
-              
-              <div className="relative group/dismiss">
-                <button 
+            </div>
+
+            <div className="flex items-center gap-1.5 shrink-0">
+              <span
+                className={`px-2 py-0.5 rounded-md text-xs font-bold border ${
+                  isComplete
+                    ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-300'
+                    : isError || isStopped
+                    ? 'bg-rose-500/15 border-rose-500/30 text-rose-300'
+                    : isPaused
+                    ? 'bg-amber-500/15 border-amber-500/30 text-amber-300'
+                    : 'bg-indigo-500/15 border-indigo-500/30 text-indigo-300'
+                }`}
+              >
+                {Math.round(activeTask.progress || 0)}%
+              </span>
+
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setIsDropdownOpen(!isDropdownOpen);
+                }}
+                className="p-1 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white transition-colors"
+                title={isDropdownOpen ? 'Skupi prikaz' : 'Prikaži detalje i kod uživo'}
+              >
+                {isDropdownOpen ? <ChevronDown className="w-4 h-4" /> : <ChevronUp className="w-4 h-4" />}
+              </button>
+
+              <div className="relative group/dismiss" onClick={(e) => e.stopPropagation()}>
+                <button
+                  type="button"
                   onClick={handleDismiss}
                   className="p-1 rounded-lg hover:bg-slate-800 text-slate-500 hover:text-slate-300 transition-colors"
                 >
@@ -378,103 +464,158 @@ function Layout() {
                 </div>
               </div>
             </div>
-            
-            <div className="mt-3">
-              <p className="text-xs text-slate-300 line-clamp-2 italic">
-                {activeTask.message || 'Initializing generation sequence...'}
-              </p>
-            </div>
-            
-            {(isRunning || isPaused || isStopped) && (
-              <div className="mt-3 flex items-center justify-between text-[10px] text-slate-500">
-                <span>{isPaused ? 'Pauzirano' : isStopped ? 'Sačuvani napredak' : t('taskOverlay.progress')}</span>
-                <span className="font-medium text-slate-300">{Math.round(activeTask.progress || 0)}%</span>
-              </div>
-            )}
-
-            {/* Expandable Engine Logs inside Main Window Overlay */}
-            {Array.isArray(activeTask.logs) && activeTask.logs.length > 0 && (
-              <div className="mt-2.5 border-t border-slate-800/80 pt-2">
-                <button
-                  type="button"
-                  onClick={() => setShowLogs(!showLogs)}
-                  className="w-full flex items-center justify-between text-[10px] uppercase tracking-wider font-semibold text-slate-500 hover:text-slate-300 transition-colors"
-                >
-                  <span className="flex items-center gap-1.5">
-                    <Terminal className="w-3 h-3 text-indigo-400" />
-                    Engine Logs ({activeTask.logs.length})
-                  </span>
-                  {showLogs ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronUp className="w-3.5 h-3.5" />}
-                </button>
-                {showLogs && (
-                  <div className="mt-2 max-h-32 overflow-y-auto rounded-lg bg-slate-950/90 border border-slate-800/80 p-2 font-mono text-[10px] space-y-1">
-                    {activeTask.logs.map((log, idx) => {
-                      const isLast = idx === activeTask.logs.length - 1;
-                      return (
-                        <div
-                          key={log.id || idx}
-                          className={`flex items-start gap-1.5 leading-relaxed ${
-                            isLast ? 'text-indigo-300 font-medium' : 'text-slate-500'
-                          }`}
-                        >
-                          <span className="text-slate-600 shrink-0">&gt;</span>
-                          <span className="break-all">{log.message}</span>
-                        </div>
-                      );
-                    })}
-                    <div ref={logsEndRef} />
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Interactive Controls inside Main Window Overlay */}
-            {(isRunning || isPaused || isStopped) && (
-              <div className="mt-3 pt-3 border-t border-slate-800 flex items-center gap-2">
-                {isRunning && !isPaused && (
-                  <>
-                    <button
-                      onClick={handlePauseTask}
-                      disabled={isTaskActionLoading}
-                      className="flex-1 flex items-center justify-center gap-1.5 py-1.5 px-2.5 rounded-lg bg-amber-500/10 text-amber-400 hover:bg-amber-500/20 text-xs font-medium transition-colors"
-                    >
-                      <Pause className="w-3.5 h-3.5" />
-                      {t('common.pause') || 'Pause'}
-                    </button>
-                    <button
-                      onClick={handleStopTask}
-                      disabled={isTaskActionLoading}
-                      className="flex-1 flex items-center justify-center gap-1.5 py-1.5 px-2.5 rounded-lg bg-rose-500/10 text-rose-400 hover:bg-rose-500/20 text-xs font-medium transition-colors"
-                    >
-                      <X className="w-3.5 h-3.5" />
-                      {t('common.stop') || 'Stop'}
-                    </button>
-                  </>
-                )}
-                {(isPaused || isStopped) && (
-                  <button
-                    onClick={handleResumeTask}
-                    disabled={isTaskActionLoading}
-                    className="w-full flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold shadow-lg shadow-indigo-600/20 transition-all"
-                  >
-                    <Play className="w-3.5 h-3.5" />
-                    {isStopped ? 'Nastavi tamo gde je stao' : (t('common.resume') || 'Resume')}
-                  </button>
-                )}
-              </div>
-            )}
-            
-            {isComplete && activeTask.projectId && (
-              <div className="mt-4 flex gap-2">
-                <button
-                  onClick={handleViewProject}
-                  className="w-full py-2 px-3 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold shadow-lg shadow-emerald-600/20 transition-all text-center"
-                >
-                  {t('taskOverlay.viewProject')}
-                </button>
-              </div>
-            )}
           </div>
+
+          {/* Expanded Dropdown Body */}
+          {isDropdownOpen && (
+            <div className="px-4 pb-4 pt-2 border-t border-slate-800/80 space-y-3">
+              {/* Current AI Activity Card */}
+              <div className="rounded-xl bg-slate-950/70 border border-slate-800/80 p-2.5 space-y-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    <FileCode className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                    <span className="text-xs font-mono font-semibold text-indigo-200 truncate">
+                      {activeTask.currentFile || 'Priprema pipeline-a...'}
+                    </span>
+                  </div>
+                  {activeTask.tokenCount > 0 && (
+                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-indigo-500/10 text-indigo-300 border border-indigo-500/20 shrink-0">
+                      {activeTask.tokenCount} tok
+                    </span>
+                  )}
+                </div>
+                {activeTask.fileDescription && (
+                  <p className="text-[11px] text-slate-400 line-clamp-2 leading-relaxed">
+                    {activeTask.fileDescription}
+                  </p>
+                )}
+                <p className="text-[11px] text-slate-300 italic truncate">
+                  {activeTask.message || 'Initializing generation sequence...'}
+                </p>
+              </div>
+
+              {/* Real-Time Code Streaming Preview */}
+              {activeTask.liveCode && (
+                <div className="rounded-xl bg-slate-950 border border-slate-800/90 overflow-hidden shadow-inner">
+                  <div className="px-3 py-1.5 bg-slate-900/90 border-b border-slate-800/80 flex items-center justify-between">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span
+                        className={`w-2 h-2 rounded-full ${
+                          isRunning && !isPaused
+                            ? 'bg-emerald-400 animate-pulse'
+                            : isPaused
+                            ? 'bg-amber-400'
+                            : 'bg-slate-500'
+                        }`}
+                      />
+                      <span className="text-[10px] font-mono uppercase tracking-wider font-semibold text-slate-300 truncate">
+                        {isRunning && !isPaused ? 'Uživo pisanje koda' : 'Poslednji generisani kod'}
+                      </span>
+                    </div>
+                    {activeTask.currentFile && (
+                      <span className="text-[10px] font-mono text-slate-500 truncate max-w-[180px]">
+                        {activeTask.currentFile.split('/').pop()}
+                      </span>
+                    )}
+                  </div>
+                  <div
+                    ref={liveCodeContainerRef}
+                    className="p-2.5 max-h-40 overflow-y-auto overflow-x-auto font-mono text-[10.5px] leading-relaxed text-emerald-300/90 select-text"
+                  >
+                    <pre className="whitespace-pre-wrap break-words m-0">
+                      {activeTask.liveCode}
+                      {isRunning && !isPaused && (
+                        <span className="inline-block w-1.5 h-3.5 ml-0.5 align-middle bg-emerald-400 animate-pulse" />
+                      )}
+                    </pre>
+                  </div>
+                </div>
+              )}
+
+              {/* Expandable Engine Logs */}
+              {Array.isArray(activeTask.logs) && activeTask.logs.length > 0 && (
+                <div className="border-t border-slate-800/70 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowLogs(!showLogs)}
+                    className="w-full flex items-center justify-between text-[10px] uppercase tracking-wider font-semibold text-slate-500 hover:text-slate-300 transition-colors"
+                  >
+                    <span className="flex items-center gap-1.5">
+                      <Terminal className="w-3 h-3 text-indigo-400" />
+                      Istorija koraka ({activeTask.logs.length})
+                    </span>
+                    {showLogs ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronUp className="w-3.5 h-3.5" />}
+                  </button>
+                  {showLogs && (
+                    <div className="mt-2 max-h-28 overflow-y-auto rounded-lg bg-slate-950/90 border border-slate-800/80 p-2 font-mono text-[10px] space-y-1">
+                      {activeTask.logs.map((log, idx) => {
+                        const isLast = idx === activeTask.logs.length - 1;
+                        return (
+                          <div
+                            key={log.id || idx}
+                            className={`flex items-start gap-1.5 leading-relaxed ${
+                              isLast ? 'text-indigo-300 font-medium' : 'text-slate-500'
+                            }`}
+                          >
+                            <span className="text-slate-600 shrink-0">&gt;</span>
+                            <span className="break-all">{log.message}</span>
+                          </div>
+                        );
+                      })}
+                      <div ref={logsEndRef} />
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Interactive Controls */}
+              {(isRunning || isPaused || isStopped) && (
+                <div className="pt-2 border-t border-slate-800/80 flex items-center gap-2">
+                  {isRunning && !isPaused && (
+                    <>
+                      <button
+                        onClick={handlePauseTask}
+                        disabled={isTaskActionLoading}
+                        className="flex-1 flex items-center justify-center gap-1.5 py-1.5 px-2.5 rounded-lg bg-amber-500/10 text-amber-400 hover:bg-amber-500/20 text-xs font-medium transition-colors"
+                      >
+                        <Pause className="w-3.5 h-3.5" />
+                        {t('common.pause') || 'Pause'}
+                      </button>
+                      <button
+                        onClick={handleStopTask}
+                        disabled={isTaskActionLoading}
+                        className="flex-1 flex items-center justify-center gap-1.5 py-1.5 px-2.5 rounded-lg bg-rose-500/10 text-rose-400 hover:bg-rose-500/20 text-xs font-medium transition-colors"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                        {t('common.stop') || 'Stop'}
+                      </button>
+                    </>
+                  )}
+                  {(isPaused || isStopped) && (
+                    <button
+                      onClick={handleResumeTask}
+                      disabled={isTaskActionLoading}
+                      className="w-full flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold shadow-lg shadow-indigo-600/20 transition-all"
+                    >
+                      <Play className="w-3.5 h-3.5" />
+                      {isStopped ? 'Nastavi tamo gde je stao' : (t('common.resume') || 'Resume')}
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {isComplete && activeTask.projectId && (
+                <div className="pt-2 flex gap-2">
+                  <button
+                    onClick={handleViewProject}
+                    className="w-full py-2 px-3 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold shadow-lg shadow-emerald-600/20 transition-all text-center"
+                  >
+                    {t('taskOverlay.viewProject')}
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>
