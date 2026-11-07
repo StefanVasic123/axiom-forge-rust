@@ -665,21 +665,6 @@ pub fn repair_package_json_dependencies(proj_dir: &std::path::Path) {
                                 changed = true;
                             }
                         }
-                        // Synchronize eslint-config-next & eslint with Next.js 14.2.35 if present
-                        if dev_deps_obj.contains_key("eslint-config-next") {
-                            let target = serde_json::json!("14.2.35");
-                            if dev_deps_obj.get("eslint-config-next") != Some(&target) {
-                                dev_deps_obj.insert("eslint-config-next".to_string(), target);
-                                changed = true;
-                            }
-                        }
-                        if dev_deps_obj.contains_key("eslint") {
-                            let target = serde_json::json!("^8.57.0");
-                            if dev_deps_obj.get("eslint") != Some(&target) {
-                                dev_deps_obj.insert("eslint".to_string(), target);
-                                changed = true;
-                            }
-                        }
                     }
                 }
 
@@ -842,6 +827,11 @@ pub fn repair_package_json_dependencies(proj_dir: &std::path::Path) {
                     }
                 }
                 
+                let _ = pkg_obj;
+                if sanitize_package_json_value_for_offline(&mut pkg_json) {
+                    changed = true;
+                }
+
                 if changed {
                     if let Ok(pretty) = serde_json::to_string_pretty(&pkg_json) {
                         let _ = std::fs::write(&pkg_path, pretty);
@@ -990,6 +980,136 @@ pub fn analyze_npm_install_failure(err_log: &str) -> Option<NpmFailureAction> {
     None
 }
 
+pub fn sanitize_package_json_value_for_offline(json_val: &mut Value) -> bool {
+    let mut changed = false;
+    let bogus_subpaths = [
+        "fi", "hi", "hi2", "bi", "fa", "fa6", "md", "io", "io5", "bs", "ai", "ri", "tb", "lu",
+        "si", "gi", "ti", "wi", "cg", "vsc", "go", "gr", "rx", "pi", "im", "sl", "tfi", "lia",
+    ];
+    let banned_offline_pkgs = [
+        "@typescript-eslint/eslint-plugin",
+        "@typescript-eslint/parser",
+        "@typescript-eslint/project-service",
+        "@typescript-eslint/types",
+        "@typescript-eslint/visitor-keys",
+        "@typescript-eslint/scope-manager",
+        "eslint-config-next",
+        "eslint",
+        "prettier",
+        "babel-loader",
+        "webpack",
+        "webpack-cli",
+        "jest",
+        "ts-jest",
+        "@types/jest",
+        "react-testing-library",
+        "@testing-library/react",
+        "@testing-library/jest-dom",
+        "@testing-library/user-event",
+    ];
+
+    if let Some(obj) = json_val.as_object_mut() {
+        let mut had_react_icons_subpath = false;
+
+        for key in &["dependencies", "devDependencies"] {
+            if let Some(deps) = obj.get_mut(*key).and_then(|d| d.as_object_mut()) {
+                for sub in &bogus_subpaths {
+                    if deps.remove(*sub).is_some() {
+                        had_react_icons_subpath = true;
+                        changed = true;
+                    }
+                }
+                for banned in &banned_offline_pkgs {
+                    if deps.remove(*banned).is_some() {
+                        changed = true;
+                    }
+                }
+                let scoped_to_remove: Vec<String> = deps
+                    .keys()
+                    .filter(|k| {
+                        k.starts_with("@typescript-eslint/")
+                            || k.starts_with("@babel/")
+                            || k.starts_with("@testing-library/")
+                            || k.starts_with("eslint-plugin-")
+                            || k.starts_with("eslint-config-")
+                    })
+                    .cloned()
+                    .collect();
+                for k in scoped_to_remove {
+                    deps.remove(&k);
+                    changed = true;
+                }
+            }
+        }
+
+        if had_react_icons_subpath {
+            if let Some(deps) = obj.get_mut("dependencies").and_then(|d| d.as_object_mut()) {
+                if !deps.contains_key("react-icons") {
+                    deps.insert("react-icons".to_string(), serde_json::json!("^5.0.1"));
+                    changed = true;
+                }
+            }
+        }
+
+        // Deduplicate packages present in both dependencies and devDependencies
+        let dev_keys: Vec<String> = obj
+            .get("devDependencies")
+            .and_then(|d| d.as_object())
+            .map(|d| d.keys().cloned().collect())
+            .unwrap_or_default();
+
+        if !dev_keys.is_empty() {
+            let dev_only_tools = [
+                "typescript",
+                "tailwindcss",
+                "postcss",
+                "autoprefixer",
+                "prisma",
+                "@types/node",
+                "@types/react",
+                "@types/react-dom",
+            ];
+            for dk in dev_keys {
+                if dev_only_tools.contains(&dk.as_str()) || dk.starts_with("@types/") {
+                    if let Some(deps) = obj.get_mut("dependencies").and_then(|d| d.as_object_mut()) {
+                        if deps.remove(&dk).is_some() {
+                            changed = true;
+                        }
+                    }
+                } else {
+                    let in_deps = obj
+                        .get("dependencies")
+                        .and_then(|d| d.as_object())
+                        .map_or(false, |d| d.contains_key(&dk));
+                    if in_deps {
+                        if let Some(dev_deps) = obj.get_mut("devDependencies").and_then(|d| d.as_object_mut()) {
+                            if dev_deps.remove(&dk).is_some() {
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    changed
+}
+
+pub fn sanitize_package_json_for_offline(pkg_path: &std::path::Path) -> bool {
+    if let Ok(content) = std::fs::read_to_string(pkg_path) {
+        if let Ok(mut json_val) = serde_json::from_str::<Value>(&content) {
+            if sanitize_package_json_value_for_offline(&mut json_val) {
+                if let Ok(pretty) = serde_json::to_string_pretty(&json_val) {
+                    let _ = std::fs::write(pkg_path, pretty);
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 pub fn set_package_version_to_wildcard(pkg_path: &std::path::Path, pkg_name: &str) -> bool {
     if let Ok(content) = std::fs::read_to_string(pkg_path) {
         if let Ok(mut json_val) = serde_json::from_str::<Value>(&content) {
@@ -1005,6 +1125,42 @@ pub fn set_package_version_to_wildcard(pkg_path: &std::path::Path, pkg_name: &st
                     if dev_deps.contains_key(pkg_name) {
                         dev_deps.insert(pkg_name.to_string(), serde_json::json!("*"));
                         changed = true;
+                    }
+                }
+
+                // If pkg_name is a transitive dependency not directly listed in package.json
+                // (e.g. @typescript-eslint/project-service pulled by @typescript-eslint/parser or eslint-config-next),
+                // remove conflicting parent packages in the same @scope/ or eslint family so offline retry succeeds.
+                if !changed {
+                    let scope_prefix = if pkg_name.starts_with('@') {
+                        pkg_name.split('/').next().map(|s| format!("{}/", s))
+                    } else {
+                        None
+                    };
+                    let is_eslint_related = pkg_name.contains("eslint") || pkg_name.starts_with("@typescript-eslint/");
+
+                    for key in &["dependencies", "devDependencies"] {
+                        if let Some(deps) = obj.get_mut(*key).and_then(|d| d.as_object_mut()) {
+                            let keys_to_remove: Vec<String> = deps
+                                .keys()
+                                .filter(|k| {
+                                    if let Some(ref sp) = scope_prefix {
+                                        if k.starts_with(sp) {
+                                            return true;
+                                        }
+                                    }
+                                    if is_eslint_related && (k.contains("eslint") || k.starts_with("@typescript-eslint/")) {
+                                        return true;
+                                    }
+                                    false
+                                })
+                                .cloned()
+                                .collect();
+                            for k in keys_to_remove {
+                                deps.remove(&k);
+                                changed = true;
+                            }
+                        }
                     }
                 }
             }
@@ -1119,7 +1275,7 @@ pub async fn ensure_node_toolchain_ready(window: Option<&tauri::Window>, log_eve
         }
 
         // 3. Node.js is missing! Automatically download & extract Portable Node.js v20.18.1 LTS
-        emit_msg("> [Auto-Setup] Node.js nije pronađen na sistemu. Automatski preuzimam i instaliram Node.js v20.18.1 LTS...\n", false);
+        emit_msg("> [Auto-Setup] Node.js nije pronaÄ‘en na sistemu. Automatski preuzimam i instaliram Node.js v20.18.1 LTS...\n", false);
 
         let base_toolchain = get_base_dir().join("toolchain").join("node");
         let _ = std::fs::create_dir_all(&base_toolchain);
@@ -1155,7 +1311,7 @@ pub async fn ensure_node_toolchain_ready(window: Option<&tauri::Window>, log_eve
         }
 
         if download_ok {
-            emit_msg("> [Auto-Setup] Raspakujem Node.js v20.18.1 LTS okruženje...\n", false);
+            emit_msg("> [Auto-Setup] Raspakujem Node.js v20.18.1 LTS okruÅ¾enje...\n", false);
             let mut tar_cmd = tokio::process::Command::new("tar.exe");
             tar_cmd
                 .arg("-xf")
@@ -1190,7 +1346,7 @@ pub async fn ensure_node_toolchain_ready(window: Option<&tauri::Window>, log_eve
 
             let new_path = format!("{};{}", node_bin_str, current_path);
             std::env::set_var("PATH", &new_path);
-            emit_msg("> [Auto-Setup] Node.js v20.18.1 LTS (node, npm, npx) je uspešno instaliran i spreman!\n", false);
+            emit_msg("> [Auto-Setup] Node.js v20.18.1 LTS (node, npm, npx) je uspeÅ¡no instaliran i spreman!\n", false);
             return new_path;
         } else {
             emit_msg("> [Auto-Setup Error] Automatsko preuzimanje Node.js-a nije uspelo. Proverite internet konekciju.\n", true);
@@ -1229,7 +1385,7 @@ pub async fn run_npm_install_with_auto_healing(
         if let Some(mut child) = child_opt {
             if !log_event.is_empty() {
                 let _ = window.emit(log_event, serde_json::json!({
-                    "text": format!("> [Self-Healing] Zaustavljanje aktivnog dev servera za projekat '{}' radi sprečavanja EPERM file lock-a...\n", project_id),
+                    "text": format!("> [Self-Healing] Zaustavljanje aktivnog dev servera za projekat '{}' radi spreÄavanja EPERM file lock-a...\n", project_id),
                     "type": "info"
                 }));
             }
@@ -1272,6 +1428,10 @@ pub async fn run_npm_install_with_auto_healing(
 
     emit_progress("Finalizing dependencies...", 75.0);
     emit_log("> Starting dependency installation check...\n", false);
+
+    if sanitize_package_json_for_offline(&pkg_path) {
+        emit_log("> [Offline Sanitizer] Uklonjeni konfliktni linter/test paketi i duplikati iz package.json pre offline instalacije.\n", false);
+    }
 
     for attempt in 1..=4 {
         emit_progress(&format!("Installing dependencies (attempt {}/4)...", attempt), 75.0 + (attempt as f64 - 1.0) * 0.7);

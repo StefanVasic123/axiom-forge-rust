@@ -521,8 +521,11 @@ pub async fn heal_prisma_schema_loop(
 
         match ai_content {
             Some(cleaned) => {
+                // Guard against partial LLM responses (e.g. returning only a single `model Payment { ... }` block
+                // instead of the full schema.prisma, which would wipe out `datasource db`, `generator client`, and other models).
+                let merged_candidate = merge_prisma_ai_response(&schema_content, &cleaned);
                 // (1) Never write raw LLM output: run it through the deterministic sanitizer first
-                let sanitized = post_process_generated_file("prisma/schema.prisma", &cleaned, &serde_json::json!({}), false);
+                let sanitized = post_process_generated_file("prisma/schema.prisma", &merged_candidate, &serde_json::json!({}), false);
                 let unchanged = sanitized.replace("\r\n", "\n").trim() == schema_content.replace("\r\n", "\n").trim();
                 if unchanged {
                     previous_ai_unchanged = true;
@@ -549,6 +552,57 @@ pub async fn heal_prisma_schema_loop(
     }
 
     Err(format!("Failed to validate and auto-heal Prisma schema after {} AI attempts.", MAX_AI_HEALS))
+}
+
+pub fn merge_prisma_ai_response(original_schema: &str, ai_response: &str) -> String {
+    let model_re = match regex::Regex::new(r"(?ms)^model\s+(\w+)\s*\{[^}]*\}") {
+        Ok(r) => r,
+        Err(_) => return ai_response.to_string(),
+    };
+
+    let orig_models_count = model_re.find_iter(original_schema).count();
+    let ai_models_count = model_re.find_iter(ai_response).count();
+
+    let ai_has_datasource = ai_response.contains("datasource ");
+    let ai_has_generator = ai_response.contains("generator ");
+
+    // If the AI returned a partial snippet (missing datasource/generator, or dropped existing models),
+    // merge its updated/new model blocks into the original schema without deleting existing models or headers.
+    if !ai_has_datasource || !ai_has_generator || (orig_models_count > 1 && ai_models_count < orig_models_count) {
+        if ai_models_count == 0 {
+            return original_schema.to_string();
+        }
+        let mut merged = original_schema.to_string();
+        for cap in model_re.captures_iter(ai_response) {
+            if let (Some(full_match), Some(name_match)) = (cap.get(0), cap.get(1)) {
+                let model_name = name_match.as_str();
+                let new_block = full_match.as_str();
+                let target_pattern = format!(r"(?ms)^model\s+{}\s*\{{[^}}]*\}}", regex::escape(model_name));
+                if let Ok(target_re) = regex::Regex::new(&target_pattern) {
+                    if target_re.is_match(&merged) {
+                        merged = target_re.replace(&merged, new_block).to_string();
+                    } else {
+                        merged = format!("{}\n\n{}", merged.trim_end(), new_block);
+                    }
+                }
+            }
+        }
+        if !merged.contains("datasource ") {
+            merged = format!(
+                "datasource db {{\n  provider = \"sqlite\"\n  url      = env(\"DATABASE_URL\")\n}}\n\n{}",
+                merged
+            );
+        }
+        if !merged.contains("generator ") {
+            merged = format!(
+                "generator client {{\n  provider = \"prisma-client-js\"\n}}\n\n{}",
+                merged
+            );
+        }
+        return merged;
+    }
+
+    ai_response.to_string()
 }
 
 pub fn looks_like_code_payload(s: &str) -> bool {

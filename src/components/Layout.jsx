@@ -271,6 +271,37 @@ function Layout() {
     }
   };
 
+  // Global Agent Bridge listener when user is outside Editor.jsx (e.g. on Dashboard or ProjectDetail)
+  React.useEffect(() => {
+    if (location.pathname.includes('/editor')) return;
+    if (!window.electronAPI?.agentBridge?.pollCommand) return;
+
+    const interval = setInterval(async () => {
+      const cmd = await window.electronAPI.agentBridge.pollCommand();
+      if (!cmd || !cmd.action) return;
+      const cmdId = cmd.id || `cmd-${Date.now()}`;
+      if (cmd.action === 'open_project_editor' && cmd.projectId) {
+        navigate(`/projects/${cmd.projectId}/editor`);
+        await window.electronAPI.agentBridge.writeCommandResult({
+          id: cmdId,
+          action: cmd.action,
+          success: true,
+          details: `Opened editor for project ${cmd.projectId}`,
+          timestamp: new Date().toISOString()
+        });
+      } else {
+        await window.electronAPI.agentBridge.writeCommandResult({
+          id: cmdId,
+          action: cmd.action,
+          success: false,
+          details: `Currently on ${location.pathname} (not in Editor). Use open_project_editor first.`,
+          timestamp: new Date().toISOString()
+        });
+      }
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [location.pathname, navigate]);
+
   const isComplete = activeTask && (activeTask.phase === 'complete' || activeTask.phase === 'success');
   const isError = activeTask && activeTask.phase === 'error';
   const isPaused = activeTask && (activeTask.phase === 'paused' || activeTask.status === 'paused');

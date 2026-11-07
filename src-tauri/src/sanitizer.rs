@@ -798,10 +798,11 @@ pub fn post_process_generated_file(
                 dev_deps.remove("node-base64");
                 dev_deps.remove("base64");
             }
+        }
 
-            if let Ok(pretty) = serde_json::to_string_pretty(&pkg_val) {
-                return pretty;
-            }
+        let _ = sanitize_package_json_value_for_offline(&mut pkg_val);
+        if let Ok(pretty) = serde_json::to_string_pretty(&pkg_val) {
+            return pretty;
         }
     }
 
@@ -1048,6 +1049,9 @@ pub fn post_process_generated_file(
 
         // 5. Enforce the canonical NextAuth Prisma Adapter models (Account / Session)
         processed = apply_nextauth_prisma_template(&processed);
+
+        // 5b. Deterministically inject any missing foreign key scalar fields referenced in @relation(fields: [...])
+        processed = ensure_prisma_foreign_key_scalars(&processed);
 
         // 6. Ensure all @relation definitions have their opposite relation on the target model
         processed = ensure_prisma_opposite_relations(&processed);
@@ -1715,6 +1719,115 @@ export default function Home() {
     processed
 }
 
+
+/// Automatically detects `@relation(fields: [fk1, fk2], references: [ref1, ref2])` where
+/// the scalar foreign key field `fk1` is not declared in the model, and injects it
+/// deterministically (matching the referenced model's `@id` or target field scalar type,
+/// defaulting to `String` or `String?` if the relation field is optional).
+pub fn ensure_prisma_foreign_key_scalars(schema: &str) -> String {
+    let model_re = match regex::Regex::new(r"(?ms)^model\s+(\w+)\s*\{([^}]+)\}") {
+        Ok(r) => r,
+        Err(_) => return schema.to_string(),
+    };
+
+    let mut model_bodies: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for cap in model_re.captures_iter(schema) {
+        if let (Some(m_name), Some(m_body)) = (cap.get(1), cap.get(2)) {
+            model_bodies.insert(m_name.as_str().to_string(), m_body.as_str().to_string());
+        }
+    }
+
+    if model_bodies.is_empty() {
+        return schema.to_string();
+    }
+
+    let fields_re = match regex::Regex::new(r"fields:\s*\[([^\]]+)\]") {
+        Ok(r) => r,
+        Err(_) => return schema.to_string(),
+    };
+    let refs_re = regex::Regex::new(r"references:\s*\[([^\]]+)\]").ok();
+
+    let mut result = schema.to_string();
+
+    for (model_name, body) in &model_bodies {
+        // Collect all declared field names in this model
+        let mut declared_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for line in body.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("@@") {
+                continue;
+            }
+            if let Some(first_token) = trimmed.split_whitespace().next() {
+                declared_fields.insert(first_token.to_string());
+            }
+        }
+
+        let mut new_lines: Vec<String> = Vec::new();
+        let mut modified = false;
+
+        for line in body.lines() {
+            let trimmed = line.trim();
+            if trimmed.contains("@relation") && trimmed.contains("fields:") {
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    let raw_target_type = parts[1];
+                    let is_optional = raw_target_type.ends_with('?');
+                    let clean_target_model = raw_target_type.replace(['?', '[', ']'], "");
+
+                    if let Some(f_cap) = fields_re.captures(trimmed) {
+                        let fk_list: Vec<&str> = f_cap[1].split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                        let ref_list: Vec<String> = refs_re
+                            .as_ref()
+                            .and_then(|r| r.captures(trimmed))
+                            .map(|c| c[1].split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+                            .unwrap_or_default();
+
+                        for (idx, fk_name) in fk_list.iter().enumerate() {
+                            if !declared_fields.contains(*fk_name) {
+                                let ref_field = ref_list.get(idx).map(|s| s.as_str()).unwrap_or("id");
+                                let mut scalar_type = "String".to_string();
+                                if let Some(target_body) = model_bodies.get(&clean_target_model) {
+                                    for t_line in target_body.lines() {
+                                        let t_trim = t_line.trim();
+                                        let t_parts: Vec<&str> = t_trim.split_whitespace().collect();
+                                        if t_parts.len() >= 2 && t_parts[0] == ref_field {
+                                            let candidate = t_parts[1].replace(['?', '[', ']'], "");
+                                            if ["String", "Int", "BigInt", "Float", "Decimal"].contains(&candidate.as_str()) {
+                                                scalar_type = candidate;
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                                if is_optional {
+                                    scalar_type.push('?');
+                                }
+                                new_lines.push(format!("  {:14} {}", fk_name, scalar_type));
+                                declared_fields.insert((*fk_name).to_string());
+                                modified = true;
+                            }
+                        }
+                    }
+                }
+            }
+            new_lines.push(line.to_string());
+        }
+
+        if modified {
+            let pattern = format!(r"(?ms)(^model\s+{}\s*\{{)([\s\S]*?)(\n*\}})", model_name);
+            if let Ok(block_re) = regex::Regex::new(&pattern) {
+                let updated_body = new_lines.join("\n");
+                result = block_re
+                    .replace(&result, |caps: &regex::Captures| {
+                        format!("{}{}\n{}", &caps[1], updated_body.trim_end(), caps[3].trim_start())
+                    })
+                    .to_string();
+            }
+        }
+    }
+
+    result
+}
 
 /// Automatically identifies any @relation(fields: [...], references: [...]) that lacks
 /// an opposite relation field on the referenced model and deterministically injects it.

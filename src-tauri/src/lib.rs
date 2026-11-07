@@ -1327,4 +1327,68 @@ export default Navbar;
         assert!(processed.contains("import React, { useState } from 'react';"));
     }
 
+    #[test]
+    fn test_offline_package_sanitizer_and_prisma_fk_healer() {
+        let mut pkg_json = serde_json::json!({
+            "name": "skillmatch",
+            "dependencies": {
+                "next": "14.2.35",
+                "fi": "*",
+                "typescript": "^4.5.2"
+            },
+            "devDependencies": {
+                "typescript": "^5.3.3",
+                "@typescript-eslint/parser": "^4.29.2",
+                "@typescript-eslint/eslint-plugin": "^4.29.2",
+                "eslint-config-next": "14.2.35",
+                "eslint": "^8.57.0"
+            }
+        });
+        assert!(sanitize_package_json_value_for_offline(&mut pkg_json));
+        let deps = pkg_json["dependencies"].as_object().unwrap();
+        let dev_deps = pkg_json["devDependencies"].as_object().unwrap();
+        assert!(!deps.contains_key("fi"));
+        assert!(deps.contains_key("react-icons"));
+        assert!(!deps.contains_key("typescript"));
+        assert!(dev_deps.contains_key("typescript"));
+        assert!(!dev_deps.contains_key("@typescript-eslint/parser"));
+        assert!(!dev_deps.contains_key("eslint-config-next"));
+
+        let broken_prisma = r#"datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model UserProfile {
+  id   String @id @default(cuid())
+  name String
+}
+
+model Payment {
+  id          String      @id @default(cuid())
+  amount      Float
+  userProfile UserProfile @relation(fields: [userProfileId], references: [id])
+}
+"#;
+        let fixed_prisma = post_process_generated_file("prisma/schema.prisma", broken_prisma, &serde_json::json!({}), false);
+        assert!(fixed_prisma.contains("userProfileId"));
+        assert!(fixed_prisma.contains("payments"));
+
+        let partial_ai_snippet = r#"model Payment {
+  id            String      @id @default(cuid())
+  amount        Float
+  userProfileId String
+  userProfile   UserProfile @relation(fields: [userProfileId], references: [id])
+}"#;
+        let merged = merge_prisma_ai_response(&fixed_prisma, partial_ai_snippet);
+        assert!(merged.contains("datasource db"));
+        assert!(merged.contains("generator client"));
+        assert!(merged.contains("model UserProfile"));
+        assert!(merged.contains("model Payment"));
+    }
+
 }

@@ -743,6 +743,10 @@ export default function EditorPage() {
 
     const unsubStatus = window.electronAPI.server.onStatus(({ status }) => {
       setServerRunning(status === 'running');
+      if (status === 'stopped' || status === 'error') {
+        setIsServerStarting(false);
+        setIframeLoading(false);
+      }
     });
 
     let logBuffer = [];
@@ -1338,16 +1342,49 @@ export default function EditorPage() {
         } else if (cmd.action === 'trigger_ai_fix_page') {
           await handleAIFixCurrentPage(cmd.prompt || '');
           details = 'Triggered handleAIFixCurrentPage';
+        } else if (cmd.action === 'ai_edit_and_apply') {
+          if (cmd.filePath && cmd.prompt) {
+            const readRes = await window.electronAPI.project.readFile(projectId, cmd.filePath);
+            const currentContent = readRes?.success ? readRes.content : '';
+            const aiRes = await window.electronAPI.editor.aiEdit(
+              cmd.filePath,
+              currentContent,
+              cmd.prompt,
+              projectId,
+              null
+            );
+            if (aiRes && aiRes.success && aiRes.newContent) {
+              await window.electronAPI.editor.writeFile(projectId, cmd.filePath, aiRes.newContent);
+              setOpenTabs(tabs => tabs.map(t =>
+                t.path === cmd.filePath ? { ...t, content: aiRes.newContent, isDirty: false } : t
+              ));
+              details = `AI edited and saved ${cmd.filePath}`;
+            } else {
+              success = false;
+              details = `AI edit failed: ${aiRes?.error || 'empty response'}`;
+            }
+          } else {
+            success = false;
+            details = 'filePath and prompt required for ai_edit_and_apply';
+          }
         } else if (cmd.action === 'switch_view') {
           const toPreview = cmd.view === 'preview';
           setShowPreview(toPreview);
           details = `Switched view to ${toPreview ? 'preview' : 'code'}`;
         } else if (cmd.action === 'start_server') {
-          if (!serverRunning) await toggleServer();
-          details = 'Start server triggered';
+          if (!serverRunning && !isServerStarting) await toggleServer();
+          details = isServerStarting ? 'Server is already starting' : 'Start server triggered';
         } else if (cmd.action === 'stop_server') {
-          if (serverRunning) await toggleServer();
+          if (serverRunning || isServerStarting) await toggleServer();
           details = 'Stop server triggered';
+        } else if (cmd.action === 'open_project_editor') {
+          if (cmd.projectId) {
+            navigate(`/projects/${cmd.projectId}/editor`);
+            details = `Navigated to project editor ${cmd.projectId}`;
+          } else {
+            success = false;
+            details = 'projectId missing';
+          }
         } else if (cmd.action === 'reload_preview') {
           handleReloadPreview();
           details = 'Preview reloaded';
