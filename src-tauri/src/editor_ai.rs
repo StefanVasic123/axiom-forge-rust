@@ -418,15 +418,19 @@ pub async fn editor_ai_edit(
                         let mut final_content = content.clone();
                         let mut fail_reason = String::new();
                         
-                        let is_json_response = clean_content.trim().starts_with('{') 
-                            && (clean_content.contains("\"edits\"")
+                        let is_json_response = (clean_content.trim().starts_with('{') 
+                                || clean_content.contains("\"edits\"")
                                 || clean_content.contains("\"edit\"")
                                 || clean_content.contains("\"changes\"")
                                 || clean_content.contains("\"fixes\"")
                                 || clean_content.contains("\"fix\"")
                                 || clean_content.contains("\"target\"")
                                 || clean_content.contains("\"replacement\"")
-                                || clean_content.contains("\"explanation\""));
+                                || clean_content.contains("\"explanation\""))
+                            && (clean_content.contains("\"target\"") 
+                                || clean_content.contains("\"replacement\"") 
+                                || clean_content.contains("\"edits\"") 
+                                || clean_content.contains("\"edit\""));
 
                         let maybe_parsed_json = serde_json::from_str::<Value>(&clean_content)
                             .ok()

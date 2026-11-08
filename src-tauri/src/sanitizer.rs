@@ -385,25 +385,36 @@ pub fn ensure_directory_barrel_files(proj_dir: &std::path::Path) {
                                     continue;
                                 };
 
-                                // Only trigger if `target_dir` is an existing directory AND has no file/index counterpart
+                                // Only trigger if `target_dir` has no file counterpart (e.g. `src/hooks.ts`)
                                 let has_file_counterpart = target_dir.with_extension("ts").is_file()
                                     || target_dir.with_extension("tsx").is_file()
                                     || target_dir.with_extension("js").is_file()
                                     || target_dir.with_extension("jsx").is_file();
 
-                                if target_dir.is_dir() && !has_file_counterpart {
-                                    let entry_set = demanded.entry(target_dir).or_default();
-                                    if let Some(named_list) = cap.get(1) {
-                                        for item in named_list.as_str().split(',') {
-                                            let clean = item
-                                                .trim()
-                                                .trim_start_matches("type ")
-                                                .split_whitespace()
-                                                .next()
-                                                .unwrap_or("")
-                                                .trim();
-                                            if !clean.is_empty() {
-                                                entry_set.insert(clean.to_string());
+                                let is_standard_barrel_dir = matches!(
+                                    spec,
+                                    "@/hooks" | "@/types" | "@/utils" | "@/lib" | "@/components" | "@/context" | "@/contexts" | "@/services" | "@/constants"
+                                );
+
+                                if !has_file_counterpart {
+                                    if !target_dir.is_dir() && is_standard_barrel_dir {
+                                        let _ = std::fs::create_dir_all(&target_dir);
+                                    }
+
+                                    if target_dir.is_dir() {
+                                        let entry_set = demanded.entry(target_dir).or_default();
+                                        if let Some(named_list) = cap.get(1) {
+                                            for item in named_list.as_str().split(',') {
+                                                let clean = item
+                                                    .trim()
+                                                    .trim_start_matches("type ")
+                                                    .split_whitespace()
+                                                    .next()
+                                                    .unwrap_or("")
+                                                    .trim();
+                                                if !clean.is_empty() {
+                                                    entry_set.insert(clean.to_string());
+                                                }
                                             }
                                         }
                                     }
@@ -474,25 +485,34 @@ pub fn ensure_directory_barrel_files(proj_dir: &std::path::Path) {
             lines.push(format!("export * from './{}';", stem));
         }
 
-        // For any PascalCase symbol (type/interface) demanded from this barrel directory that is not exported in any of its files, provide a safe type alias
+        // For any demanded symbol not exported in any of its files:
+        // PascalCase -> safe type alias (`export type Foo = any;`)
+        // camelCase / other -> safe stub hook or function (`export const useFoo: any = () => ({} as any);`)
         for sym in demanded_symbols {
-            if sym.chars().next().map_or(false, |c| c.is_ascii_uppercase()) && !stems.contains(&sym) {
-                let is_defined = combined_existing_content.contains(&format!("interface {}", sym))
-                    || combined_existing_content.contains(&format!("type {} =", sym))
-                    || combined_existing_content.contains(&format!("type {}=", sym))
-                    || combined_existing_content.contains(&format!("enum {}", sym))
-                    || combined_existing_content.contains(&format!("const {}", sym))
-                    || combined_existing_content.contains(&format!("function {}", sym))
-                    || combined_existing_content.contains(&format!("class {}", sym));
-                if !is_defined {
+            if stems.contains(&sym) {
+                continue;
+            }
+            let is_defined = combined_existing_content.contains(&format!("interface {}", sym))
+                || combined_existing_content.contains(&format!("type {} =", sym))
+                || combined_existing_content.contains(&format!("type {}=", sym))
+                || combined_existing_content.contains(&format!("enum {}", sym))
+                || combined_existing_content.contains(&format!("const {}", sym))
+                || combined_existing_content.contains(&format!("function {}", sym))
+                || combined_existing_content.contains(&format!("class {}", sym));
+            if !is_defined {
+                if sym.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
                     lines.push(format!("export type {} = any;", sym));
+                } else {
+                    lines.push(format!("export const {}: any = () => ({{}} as any);", sym));
                 }
             }
         }
 
-        if !lines.is_empty() {
-            let _ = std::fs::write(&index_ts, format!("{}\n", lines.join("\n")));
+        if lines.is_empty() {
+            lines.push("export {};".to_string());
         }
+
+        let _ = std::fs::write(&index_ts, format!("{}\n", lines.join("\n")));
     }
 }
 
@@ -1237,10 +1257,22 @@ pub fn post_process_generated_file(
 
         // 6. Ensure all @relation definitions have their opposite relation on the target model
         processed = ensure_prisma_opposite_relations(&processed);
+
+        // 7. Enforce Prisma relational integrity (1-to-1 @unique, prune ghost duplicate/self relations)
+        processed = sanitize_prisma_relations(&processed);
     }
 
     let is_js_ts_file = path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx") || path_lower.ends_with(".ts") || path_lower.ends_with(".js");
     if is_js_ts_file {
+        // Strip trailing AI edit JSON artifacts (e.g. `const _unused = { "edit": ... }`)
+        if let Some(pos) = processed.rfind("const _unused =") {
+            let after = &processed[pos..];
+            if after.contains("\"edit\"") || after.contains("\"target\"") {
+                processed.truncate(pos);
+                processed = processed.trim_end().to_string();
+            }
+        }
+
         if path_lower.ends_with(".ts") || path_lower.ends_with(".tsx") {
             processed = sanitize_ts_interfaces(&processed);
         }
@@ -2271,6 +2303,14 @@ pub fn ensure_prisma_opposite_relations(schema: &str) -> String {
 
                 // Check collisions with existing fields or pending inserts
                 let existing_inserts = pending_inserts.get(&clean_target).cloned().unwrap_or_default();
+                let has_existing_field_of_type = target_body.lines().any(|l| {
+                    let parts: Vec<&str> = l.trim().split_whitespace().collect();
+                    parts.len() >= 2 && parts[1].replace(['?', '[', ']'], "") == *source_model
+                });
+                if has_existing_field_of_type {
+                    continue;
+                }
+
                 let has_collision = target_body.lines().any(|l| l.trim().starts_with(&field_name))
                     || existing_inserts.iter().any(|i| i.trim().starts_with(&field_name));
                 if has_collision {
@@ -2305,6 +2345,244 @@ pub fn ensure_prisma_opposite_relations(schema: &str) -> String {
                 let p2 = &caps[2];
                 let p3 = &caps[3];
                 format!("{}{}\n{}\n{}", p1, p2.trim_end(), insert_str, p3.trim_start())
+            }).to_string();
+        }
+    }
+
+    result
+}
+
+/// Enforces Prisma relational integrity:
+/// 1. Prunes ghost self-relations (e.g. `model Subscription { userSubscriptions Subscription[] @relation("UserSubscriptionsSecondary") }`).
+/// 2. Prunes orphaned duplicate back-relations (e.g. `userSubscriptions Subscription[] @relation("UserSubscriptionsSecondary")` when Subscription only defines `user User @relation("UserSubscriptions")`).
+/// 3. Synchronizes unmatched back-relation field relation names if only 1 defining relation exists.
+/// 4. Enforces 1-to-1 foreign key `@unique` attribute on defining side (e.g. `projectId String @unique` for `Analytics.project`).
+pub fn sanitize_prisma_relations(schema: &str) -> String {
+    let model_re = match regex::Regex::new(r"(?ms)^model\s+(\w+)\s*\{([^}]+)\}") {
+        Ok(r) => r,
+        Err(_) => return schema.to_string(),
+    };
+
+    let mut model_names: Vec<String> = Vec::new();
+    let mut model_bodies: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+
+    for cap in model_re.captures_iter(schema) {
+        if let (Some(m_name), Some(m_body)) = (cap.get(1), cap.get(2)) {
+            let name = m_name.as_str().to_string();
+            let lines: Vec<String> = m_body.as_str().lines().map(|s| s.to_string()).collect();
+            model_names.push(name.clone());
+            model_bodies.insert(name, lines);
+        }
+    }
+
+    if model_names.is_empty() {
+        return schema.to_string();
+    }
+
+    let rel_name_re = match regex::Regex::new(r#"@relation\([^)]*(?:name:\s*["']([^"']+)["']|["']([^"']+)["'])"#) {
+        Ok(r) => r,
+        Err(_) => return schema.to_string(),
+    };
+    let fields_re = match regex::Regex::new(r"fields:\s*\[([^\]]+)\]") {
+        Ok(r) => r,
+        Err(_) => return schema.to_string(),
+    };
+
+    // 1. Prune ghost self-relations
+    for m in &model_names {
+        if let Some(lines) = model_bodies.get_mut(m) {
+            let mut self_rel_indices: Vec<(usize, Option<String>)> = Vec::new();
+            for (idx, line) in lines.iter().enumerate() {
+                let trimmed = line.trim();
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    let field_type = parts[1].replace(['?', '[', ']'], "");
+                    if field_type == *m && trimmed.contains("@relation") && !trimmed.contains("fields:") {
+                        let rel_name = rel_name_re.captures(trimmed).and_then(|c| c.get(1).or_else(|| c.get(2)).map(|m| m.as_str().to_string()));
+                        self_rel_indices.push((idx, rel_name));
+                    }
+                }
+            }
+
+            let mut to_remove = std::collections::HashSet::new();
+            for (idx, rel_name) in &self_rel_indices {
+                if let Some(rname) = rel_name {
+                    let references_other_model = model_names.iter().any(|other| other != m && rname.contains(other.as_str()));
+                    let matches_count = self_rel_indices.iter().filter(|(_, r)| r.as_deref() == Some(rname.as_str())).count();
+                    if references_other_model || matches_count == 1 {
+                        to_remove.insert(*idx);
+                    }
+                }
+            }
+
+            if !to_remove.is_empty() {
+                let mut filtered = Vec::new();
+                for (idx, line) in lines.iter().enumerate() {
+                    if !to_remove.contains(&idx) {
+                        filtered.push(line.clone());
+                    }
+                }
+                *lines = filtered;
+            }
+        }
+    }
+
+    // 2. Prune ghost duplicate relations & sync relation names
+    for m1 in &model_names {
+        let mut target_defining_map: std::collections::HashMap<String, Vec<(Option<String>, Vec<String>)>> = std::collections::HashMap::new();
+        for m2 in &model_names {
+            if m2 == m1 { continue; }
+            if let Some(m2_lines) = model_bodies.get(m2) {
+                for line in m2_lines {
+                    let trimmed = line.trim();
+                    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        let t_type = parts[1].replace(['?', '[', ']'], "");
+                        if t_type == *m1 && trimmed.contains("fields:") {
+                            let r_name = rel_name_re.captures(trimmed).and_then(|c| c.get(1).or_else(|| c.get(2)).map(|m| m.as_str().to_string()));
+                            let fks: Vec<String> = fields_re.captures(trimmed)
+                                .map(|c| c[1].split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+                                .unwrap_or_default();
+                            target_defining_map.entry(m2.clone()).or_default().push((r_name, fks));
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(lines) = model_bodies.get_mut(m1) {
+            let mut to_remove = std::collections::HashSet::new();
+            let mut line_updates: Vec<(usize, String)> = Vec::new();
+            let mut matched_defining_rels: std::collections::HashSet<(String, Option<String>)> = std::collections::HashSet::new();
+
+            for (idx, line) in lines.iter().enumerate() {
+                let trimmed = line.trim();
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    let t_type = parts[1].replace(['?', '[', ']'], "");
+                    if model_names.contains(&t_type) && t_type != *m1 {
+                        let r_name = rel_name_re.captures(trimmed).and_then(|c| c.get(1).or_else(|| c.get(2)).map(|m| m.as_str().to_string()));
+                        let is_defining = trimmed.contains("fields:") && trimmed.contains("references:");
+
+                        if !is_defining {
+                            if let Some(defining_list) = target_defining_map.get(&t_type) {
+                                let matched = defining_list.iter().find(|(dr_name, _)| {
+                                    match (dr_name, &r_name) {
+                                        (Some(d), Some(r)) => d == r,
+                                        (None, None) => true,
+                                        _ => false,
+                                    }
+                                });
+
+                                if let Some((matched_name, _)) = matched {
+                                    matched_defining_rels.insert((t_type.clone(), matched_name.clone()));
+                                } else {
+                                    if defining_list.len() == 1 && r_name.is_none() {
+                                        if let Some(ref d_name) = defining_list[0].0 {
+                                            line_updates.push((idx, format!("{} @relation(\"{}\")", line.trim_end(), d_name)));
+                                            matched_defining_rels.insert((t_type.clone(), Some(d_name.clone())));
+                                        }
+                                    } else {
+                                        to_remove.insert(idx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (idx, updated) in line_updates {
+                lines[idx] = updated;
+            }
+
+            if !to_remove.is_empty() {
+                let mut filtered = Vec::new();
+                for (idx, line) in lines.iter().enumerate() {
+                    if !to_remove.contains(&idx) {
+                        filtered.push(line.clone());
+                    }
+                }
+                *lines = filtered;
+            }
+        }
+    }
+
+    // 3. 1-to-1 foreign key `@unique` enforcement
+    for m1 in &model_names {
+        let m1_lines = model_bodies.get(m1).cloned().unwrap_or_default();
+        for line in &m1_lines {
+            let trimmed = line.trim();
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let raw_type = parts[1];
+                let is_singular = !raw_type.contains('[');
+                let target_model = raw_type.replace(['?', '[', ']'], "");
+
+                if is_singular && model_names.contains(&target_model) && target_model != *m1 && !trimmed.contains("fields:") {
+                    let r_name = rel_name_re.captures(trimmed).and_then(|c| c.get(1).or_else(|| c.get(2)).map(|m| m.as_str().to_string()));
+
+                    if let Some(b_lines) = model_bodies.get_mut(&target_model) {
+                        let mut fk_to_mark_unique: Option<String> = None;
+                        for b_line in b_lines.iter() {
+                            let bt = b_line.trim();
+                            let bparts: Vec<&str> = bt.split_whitespace().collect();
+                            if bparts.len() >= 2 {
+                                let bt_type = bparts[1].replace(['?', '[', ']'], "");
+                                if bt_type == *m1 && bt.contains("fields:") {
+                                    let b_rname = rel_name_re.captures(bt).and_then(|c| c.get(1).or_else(|| c.get(2)).map(|m| m.as_str().to_string()));
+                                    let matches = match (&r_name, &b_rname) {
+                                        (Some(r1), Some(r2)) => r1 == r2,
+                                        (None, None) => true,
+                                        _ => false,
+                                    };
+                                    if matches {
+                                        if let Some(f_cap) = fields_re.captures(bt) {
+                                            let fks: Vec<&str> = f_cap[1].split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                                            if let Some(first_fk) = fks.first() {
+                                                fk_to_mark_unique = Some((*first_fk).to_string());
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(fk) = fk_to_mark_unique {
+                            let already_unique = b_lines.iter().any(|l| {
+                                let lt = l.trim();
+                                (lt.starts_with(&fk) && lt.contains("@unique"))
+                                    || (lt.starts_with("@@unique") && lt.contains(&fk))
+                            });
+
+                            if !already_unique {
+                                for b_line in b_lines.iter_mut() {
+                                    let lt = b_line.trim();
+                                    if lt.starts_with(&fk) {
+                                        let l_parts: Vec<&str> = lt.split_whitespace().collect();
+                                        if !l_parts.is_empty() && l_parts[0] == fk {
+                                            b_line.push_str(" @unique");
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Reconstruct schema
+    let mut result = schema.to_string();
+    for (m_name, lines) in &model_bodies {
+        let pattern = format!(r"(?ms)(^model\s+{}\s*\{{)([\s\S]*?)(\n*\}})", m_name);
+        if let Ok(block_re) = regex::Regex::new(&pattern) {
+            let body_str = lines.join("\n");
+            result = block_re.replace(&result, |caps: &regex::Captures| {
+                format!("{}{}\n{}", &caps[1], body_str.trim_end(), &caps[3].trim_start())
             }).to_string();
         }
     }

@@ -138,6 +138,8 @@ pub fn extract_package_name_from_error(line: &str) -> Option<String> {
             || trimmed.starts_with('\\')
             || trimmed.starts_with("@/")
             || trimmed.starts_with("~/")
+            || trimmed == "@"
+            || trimmed == "~"
             || trimmed.contains(":\\")
             || trimmed.contains(":/")
         {

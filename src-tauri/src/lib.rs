@@ -1391,4 +1391,140 @@ model Payment {
         assert!(merged.contains("model Payment"));
     }
 
+    #[test]
+    fn test_sanitize_prisma_relations_removes_ghosts_and_enforces_unique() {
+        let input_schema = r#"datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                String         @id @default(cuid())
+  subscriptions     Subscription[] @relation("UserSubscriptions")
+  userSubscriptions Subscription[] @relation("UserSubscriptionsSecondary")
+}
+
+model Project {
+  id                        String      @id @default(cuid())
+  projectAnalytics          Analytics?  @relation("ProjectAnalytics")
+  projectAnalyticsSecondary Analytics[] @relation("ProjectAnalyticsSecondary")
+}
+
+model Subscription {
+  id                String         @id @default(cuid())
+  userId            String
+  user              User           @relation("UserSubscriptions", fields: [userId], references: [id])
+  userSubscriptions Subscription[] @relation("UserSubscriptionsSecondary")
+}
+
+model Analytics {
+  id                        String      @id @default(cuid())
+  projectId                 String
+  project                   Project     @relation("ProjectAnalytics", fields: [projectId], references: [id])
+  projectAnalyticsSecondary Analytics[] @relation("ProjectAnalyticsSecondary")
+}
+"#;
+        let sanitized = sanitize_prisma_relations(input_schema);
+        
+        // 1. Ghost duplicate relation on User is pruned
+        assert!(!sanitized.contains("UserSubscriptionsSecondary"));
+        assert!(!sanitized.contains("userSubscriptions"));
+        assert!(sanitized.contains("subscriptions     Subscription[] @relation(\"UserSubscriptions\")"));
+
+        // 2. Ghost self-relation on Subscription is pruned
+        assert!(!sanitized.contains("Subscription[] @relation(\"UserSubscriptionsSecondary\")"));
+
+        // 3. Ghost duplicate and self relations on Project & Analytics are pruned
+        assert!(!sanitized.contains("ProjectAnalyticsSecondary"));
+        assert!(!sanitized.contains("projectAnalyticsSecondary"));
+
+        // 4. 1-to-1 relation foreign key on Analytics gets @unique
+        assert!(sanitized.contains("projectId                 String @unique"));
+    }
+
+    #[test]
+    fn test_ensure_directory_barrel_files_demanded_barrels() {
+        let temp_dir = std::env::temp_dir().join(format!("axiom_barrel_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let src_dir = temp_dir.join("src");
+        let app_dir = src_dir.join("app");
+        let hooks_dir = src_dir.join("hooks");
+        let types_dir = src_dir.join("types");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::create_dir_all(&types_dir).unwrap();
+
+        // Actual hook file in src/hooks
+        std::fs::write(hooks_dir.join("useProjects.ts"), "export function useProjects() { return []; }").unwrap();
+
+        // Write a page that imports from @/hooks and @/types and @/utils (which does not exist yet)
+        let page_tsx = app_dir.join("page.tsx");
+        std::fs::write(&page_tsx, r#"
+import React from 'react';
+import { useProjects, useAuth } from '@/hooks';
+import { UserProfile, DashboardStats } from '@/types';
+import { formatCurrency } from '@/utils';
+
+export default function Page() {
+    return <div>Test</div>;
+}
+"#).unwrap();
+
+        ensure_directory_barrel_files(&temp_dir);
+
+        let hooks_index = hooks_dir.join("index.ts");
+        let types_index = types_dir.join("index.ts");
+        let utils_index = src_dir.join("utils").join("index.ts");
+
+        assert!(hooks_index.exists(), "src/hooks/index.ts should have been created for existing hooks folder");
+        assert!(types_index.exists(), "src/types/index.ts should have been created for existing types folder");
+        assert!(utils_index.exists(), "src/utils/index.ts should have been created on demand for @/utils");
+
+        let hooks_content = std::fs::read_to_string(&hooks_index).unwrap();
+        assert!(hooks_content.contains("export * from './useProjects';"));
+        assert!(hooks_content.contains("export const useAuth: any = () => ({} as any);"));
+
+        let types_content = std::fs::read_to_string(&types_index).unwrap();
+        assert!(types_content.contains("export type UserProfile = any;"));
+        assert!(types_content.contains("export type DashboardStats = any;"));
+
+        let utils_content = std::fs::read_to_string(&utils_index).unwrap();
+        assert!(utils_content.contains("export const formatCurrency: any = () => ({} as any);"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_generate_project_metadata_resolves_alias_dependencies() {
+        let temp_dir = std::env::temp_dir().join(format!("axiom_meta_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let src_dir = temp_dir.join("src");
+        let app_dir = src_dir.join("app");
+        let components_dir = src_dir.join("components");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::create_dir_all(&components_dir).unwrap();
+
+        let navbar_file = components_dir.join("Navbar.tsx");
+        std::fs::write(&navbar_file, "export default function Navbar() { return <nav>Navbar</nav>; }").unwrap();
+
+        let page_file = app_dir.join("page.tsx");
+        std::fs::write(&page_file, "import Navbar from '@/components/Navbar';\nexport default function Page() { return <Navbar />; }").unwrap();
+
+        let files_list = vec![
+            serde_json::json!({ "path": "src/app/page.tsx" }),
+            serde_json::json!({ "path": "src/components/Navbar.tsx" }),
+        ];
+
+        generate_project_metadata(&temp_dir, "test-proj", &files_list);
+
+        let meta_file = temp_dir.join(".axiom").join("metadata.json");
+        assert!(meta_file.exists());
+        let meta_str = std::fs::read_to_string(&meta_file).unwrap();
+        let meta_val: serde_json::Value = serde_json::from_str(&meta_str).unwrap();
+
+        let page_deps = meta_val.get("dependencies").and_then(|d| d.get("src/app/page.tsx")).and_then(|v| v.as_array()).unwrap();
+        assert_eq!(page_deps.len(), 1);
+        assert_eq!(page_deps[0].as_str(), Some("src/components/Navbar.tsx"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
 }

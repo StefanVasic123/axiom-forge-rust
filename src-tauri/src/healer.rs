@@ -1592,7 +1592,11 @@ pub fn generate_project_metadata(proj_dir: &std::path::Path, project_id: &str, f
                     }
                     
                     if let Some(import_path) = found_path {
-                        if let Some(parent_dir) = std::path::Path::new(file_path).parent() {
+                        let candidate_path = if let Some(stripped) = import_path.strip_prefix("@/") {
+                            format!("src/{}", stripped)
+                        } else if let Some(stripped) = import_path.strip_prefix("~/") {
+                            format!("src/{}", stripped)
+                        } else if let Some(parent_dir) = std::path::Path::new(file_path).parent() {
                             let resolved = parent_dir.join(&import_path);
                             let mut normalized_parts = Vec::new();
                             for component in resolved.components() {
@@ -1608,15 +1612,26 @@ pub fn generate_project_metadata(proj_dir: &std::path::Path, project_id: &str, f
                                     _ => {}
                                 }
                             }
-                            let normalized_path_str = normalized_parts.join("/");
-                            
-                            for pf in &project_files {
-                                let pf_no_ext = std::path::Path::new(pf).with_extension("");
-                                let pf_no_ext_str = pf_no_ext.to_str().unwrap_or("").replace('\\', "/");
-                                if pf_no_ext_str == normalized_path_str {
-                                    file_deps.push(pf.clone());
-                                    break;
+                            normalized_parts.join("/")
+                        } else {
+                            continue;
+                        };
+
+                        for pf in &project_files {
+                            let pf_norm = pf.replace('\\', "/");
+                            let pf_no_ext = std::path::Path::new(&pf_norm).with_extension("");
+                            let pf_no_ext_str = pf_no_ext.to_str().unwrap_or("");
+                            if pf_no_ext_str == candidate_path
+                                || pf_norm == candidate_path
+                                || pf_norm == format!("{}.tsx", candidate_path)
+                                || pf_norm == format!("{}.ts", candidate_path)
+                                || pf_norm == format!("{}/index.ts", candidate_path)
+                                || pf_norm == format!("{}/index.tsx", candidate_path)
+                            {
+                                if !file_deps.contains(&pf_norm) {
+                                    file_deps.push(pf_norm);
                                 }
+                                break;
                             }
                         }
                     }

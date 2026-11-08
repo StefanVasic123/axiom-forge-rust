@@ -739,7 +739,7 @@ pub const DESKTOP_RULEPACK: &str = r#"DESKTOP (ELECTRON & TAURI) RULES:
 pub const PRISMA_DATABASE_RULEPACK: &str = r#"PRISMA ORM & DATABASE RULES:
 1. SERVER-ONLY BOUNDARY: Prisma Client (`@prisma/client`) must NEVER be imported or instantiated in client components or files marked with `'use client'`. Database operations belong strictly in Server Components, Route Handlers (`app/api/**/route.ts`), or Server Actions (`'use server'`).
 2. CONNECTION POOLING SINGLETON: In development and serverless environments, always cache the PrismaClient instance on `globalThis` to prevent connection pool exhaustion during hot reload: `const globalForPrisma = globalThis as unknown as { prisma: PrismaClient }; export const prisma = globalForPrisma.prisma ?? new PrismaClient(); if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = prisma;`.
-3. RELATION FOREIGN-KEY PLACEMENT: In `schema.prisma`, the scalar foreign key (`authorId String`) and the `@relation(fields: [authorId], references: [id])` attribute MUST be defined on the model that stores the foreign key (the child/many side). The parent model defines only the back-relation array (`posts Post[]`).
+3. RELATION FOREIGN-KEY PLACEMENT: In `schema.prisma`, the scalar foreign key (`authorId String`) and the `@relation(fields: [authorId], references: [id])` attribute MUST be defined on the model that stores the foreign key. For one-to-many relations, the parent defines only the back-relation array (`posts Post[]`). For one-to-one relations (where parent defines singular `profile Profile?`), the foreign key on the child MUST be marked `@unique` (`userId String @unique`). Between any two models, define exactly one clean relation pair unless multiple distinct foreign keys exist. Never define self-relations unless building an explicit hierarchical tree (`parent Model?` and `children Model[]`).
 4. CASCADING DELETE BEHAVIOR: Always specify referential action on relations when child records should not outlive the parent: `@relation(fields: [authorId], references: [id], onDelete: Cascade)`.
 5. OFFLINE & PREVIEW DEV RESILIENCE: Wrap database calls in Route Handlers in try/catch. In catch blocks, return realistic deterministic mock data matching the TypeScript interface so the application remains fully interactive in preview mode even if the database is offline or unmigrated.
 6. SCHEMA SYNTAX VS TYPESCRIPT SYNTAX: In `schema.prisma`, optional fields use `name String?` (type first, `?` suffix). In TypeScript interfaces, optional fields use `name?: string` (`?` before colon, lowercase primitive). Never mix the two syntaxes.
@@ -928,6 +928,102 @@ pub fn get_project_design_archetype_from_dir(proj_dir: &std::path::Path) -> Stri
     }
 
     resolve_design_archetype_prompt(&proj_name, &proj_desc, &category)
+}
+
+pub fn resolve_database_archetype_prompt(project_name: &str, project_description: &str, category: &str) -> String {
+    let combined = format!("{} {} {}", project_name, project_description, category).to_lowercase();
+
+    let (archetype_name, domain_entities, relational_guidance, architectural_hints) = if combined.contains("crypto")
+        || combined.contains("blockchain")
+        || combined.contains("cyber")
+        || combined.contains("security")
+        || combined.contains("trading")
+        || combined.contains("terminal")
+        || combined.contains("wallet")
+    {
+        (
+            "FinTech / Trading & Ledger Domain",
+            "User, Wallet, Account, Transaction, LedgerEntry, AuditLog",
+            "Wallets link 1-to-1 or 1-to-many to User. Transactions link to source/destination Wallets. Use high-precision Decimals (`@db.Decimal(18, 4)`) for currency amounts.",
+            "Enforce strict audit timestamps (`createdAt`, `updatedAt`). Use enums for TransactionStatus (PENDING, COMPLETED, FAILED) and TransactionType (DEPOSIT, WITHDRAWAL, TRANSFER)."
+        )
+    } else if combined.contains("ecommerce")
+        || combined.contains("e-commerce")
+        || combined.contains("marketplace")
+        || combined.contains("shop")
+        || combined.contains("store")
+        || combined.contains("booking")
+        || combined.contains("hotel")
+        || combined.contains("restaurant")
+    {
+        (
+            "E-Commerce & Digital Marketplace Domain",
+            "User, Product, Category, Order, OrderItem, Cart, CartItem, Review",
+            "User has many Orders. Order has many OrderItems. Product links to OrderItems and Categories. Use Float or Decimal for prices.",
+            "Use enums for OrderStatus (PENDING, PAID, SHIPPED, DELIVERED, CANCELLED) and PaymentStatus. Include inventory count (`stock Int @default(0)`)."
+        )
+    } else if combined.contains("health")
+        || combined.contains("medical")
+        || combined.contains("clinic")
+        || combined.contains("patient")
+        || combined.contains("wellness")
+        || combined.contains("edtech")
+        || combined.contains("education")
+        || combined.contains("learning")
+        || combined.contains("course")
+        || combined.contains("school")
+    {
+        (
+            "EdTech / HealthTech Care & Progression Domain",
+            "User, Course, Module, Lesson, Enrollment, Progress, Certificate (or Patient, Appointment, Record)",
+            "Course has many Modules. Module has many Lessons. User has many Enrollments. Progress tracks Lesson completion per User.",
+            "Use enums for UserRole (STUDENT, INSTRUCTOR, ADMIN), ProgressStatus, and Priority. Include completion percentage or score fields."
+        )
+    } else {
+        (
+            "Executive B2B SaaS & Work Management Domain",
+            "User, Team, Project, Task, Subscription, Analytics, ActivityLog",
+            "User has many Projects and belongs to Teams. Project has many Tasks. Subscription links to User (or Team). Analytics links 1-to-1 to Project (with @unique on projectId).",
+            "Use enums for Role (ADMIN, MEMBER, GUEST), Status (PENDING, IN_PROGRESS, COMPLETED), and Priority (LOW, MEDIUM, HIGH, URGENT). Include start/due dates and activity metrics."
+        )
+    };
+
+    format!(
+        "APPLICATION DATABASE DOMAIN ARCHETYPE ({}):\n\
+         - Recommended Core Entities: {}\n\
+         - Relational Topography Guidance: {}\n\
+         - Production Architectural Hints: {}\n\n",
+        archetype_name, domain_entities, relational_guidance, architectural_hints
+    )
+}
+
+pub fn get_project_database_archetype_from_dir(proj_dir: &std::path::Path) -> String {
+    let mut proj_name = String::new();
+    let mut proj_desc = String::new();
+    let mut category = String::new();
+
+    let cp_path = proj_dir.join(".axiom").join("generation_state.json");
+    if cp_path.exists() {
+        if let Ok(content) = fs::read_to_string(&cp_path) {
+            if let Ok(val) = serde_json::from_str::<Value>(&content) {
+                proj_name = val.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                proj_desc = val.get("projectDescription").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            }
+        }
+    }
+
+    let lbg_path = proj_dir.join(".axiom").join("live_builder_guide.json");
+    if lbg_path.exists() {
+        if let Ok(content) = fs::read_to_string(&lbg_path) {
+            if let Ok(val) = serde_json::from_str::<Value>(&content) {
+                if let Some(cat) = val.get("projectSpecification").and_then(|s| s.get("category")).and_then(|c| c.as_str()) {
+                    category = cat.to_string();
+                }
+            }
+        }
+    }
+
+    resolve_database_archetype_prompt(&proj_name, &proj_desc, &category)
 }
 
 pub fn get_scoped_ui_rules(file_path: &str) -> String {
@@ -1251,19 +1347,11 @@ pub fn get_expert_system_prompt(
 
     // 6. FILE-SCOPED PROMPT: Database & Prisma Schema
     if path_lower.contains("schema.prisma") {
-        let mut prompt = "You are a Senior Database Architect. Write only the complete, valid schema.prisma code wrapped in markdown code blocks. No explanations.\n\n\
-             DATABASE DESIGN RULES:\n\
-             - Focus on relational integrity, clean schema definitions, and proper Prisma model annotations.\n\
-             - When writing tables, ensure IDs use `@id @default(cuid())` or similar suitable auto-generators.\n\
-             - Make sure passwords or security token fields (e.g. `hashedPassword`) are defined as optional `String?` so that OAuth/Magic Link users can be saved without password errors.\n\
-             - Always include necessary relation annotations cleanly and explicitly.\n\
-             - PRISMA RELATION RULES:\n\
-               1. In a one-to-many relation, the `@relation` attribute (specifying `fields` and `references`) MUST ONLY be defined on the model that contains the actual foreign key column (the \"many\" side). The parent model (the \"one\" side, returning an array `Model[]`) MUST NOT specify any `fields` or `references` in its `@relation` attribute.\n\
-                2. Every relation must have an opposite relation field defined on both models. For example, if model `Message` has `sender User @relation(fields: [senderId], references: [id])`, then model `User` MUST have `messages Message[]`. If `@relation` has a name (e.g. `name: \"TeamMember\"`), the opposite field MUST specify the same name: `@relation(\"TeamMember\")`.\n\
-               3. For implicit many-to-many relations, do NOT specify any `fields` or `references` arguments.\n\
-               4. The `@relation` attribute MUST ONLY be placed on relational object fields, never on scalar fields.\n\
-               5. For NextAuth schema, the VerificationToken model does not have a direct relation back to the User model.\n\
-                6. CONSTANTS & ENUMS: Fixed sets of values (such as roles, statuses, priorities, tiers) MUST be defined using Prisma `enum Name { VAL1 VAL2 }`, NEVER as a relational `model`. Never place `@default(...)` on a relation field pointing to another model.\n".to_string();
+        let db_archetype = get_project_database_archetype_from_dir(proj_dir);
+        let mut prompt = format!(
+            "You are a Senior Database Architect. Write only the complete, valid schema.prisma code wrapped in markdown code blocks. No explanations.\n\n             {}             DATABASE GENERATION CHAIN-OF-THOUGHT (Execute in strict sequence):\n             Step 1 [Domain Enums]: Define all domain enums (Role, Status, Priority, Tier) at the very top of the schema.\n             Step 2 [Core Entities & Attributes]: Define models with IDs (@id @default(cuid())), scalar columns, and timestamps (createdAt, updatedAt). Make password fields optional (hashedPassword String?).\n             Step 3 [Relational Topography & Foreign Keys]:\n                    - One-to-Many: Put scalar foreign key (e.g. `ownerId String`) and `@relation(fields: [ownerId], references: [id])` on the child model. Put array (`projects Project[]`) on the parent model.\n                    - One-to-One: Put scalar foreign key WITH `@unique` on the child model (e.g. `projectId String @unique` and `@relation(fields: [projectId], references: [id])`). Put singular optional (`projectAnalytics Analytics?`) on parent model.\n                    - Implicit Many-to-Many: Define array fields on both sides without `@relation(fields: ...)`.\n             Step 4 [Verification Gate]: Verify that:\n                    1. Every relation has exactly ONE matching opposite field with matching relation name.\n                    2. Zero duplicate relation fields exist between the same two models.\n                    3. Zero self-relations exist unless explicitly building a hierarchical tree (parent Model?, children Model[]).\n                    4. All foreign key scalars in 1-to-1 relations have `@unique`.\n\n             PRISMA SCHEMA RULES:\n             - The `@relation` attribute MUST ONLY be placed on relational object fields, never on scalar fields.\n             - For NextAuth schema, the VerificationToken model does not have a direct relation back to the User model.\n             - Fixed sets of values MUST be defined using Prisma `enum Name {{ VAL1 VAL2 }}`, NEVER as a relational `model`.\n",
+            db_archetype
+        );
 
         if let Some(ref lbg) = lbg_val {
             if let Some(db_models) = lbg.get("sharedContracts").and_then(|c| c.get("database")).and_then(|d| d.get("models")) {
