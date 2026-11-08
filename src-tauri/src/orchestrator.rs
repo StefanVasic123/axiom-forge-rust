@@ -1026,6 +1026,81 @@ pub fn get_project_database_archetype_from_dir(proj_dir: &std::path::Path) -> St
     resolve_database_archetype_prompt(&proj_name, &proj_desc, &category)
 }
 
+pub fn resolve_api_domain_archetype(category: &str) -> &'static str {
+    let cat_lower = category.to_lowercase();
+    if cat_lower.contains("fintech") || cat_lower.contains("trading") || cat_lower.contains("crypto") || cat_lower.contains("banking") || cat_lower.contains("finance") {
+        "API DOMAIN ARCHETYPE: FinTech, Ledger & Transaction Management\n\
+         - Primary models: Wallets, Accounts, Transactions, Ledgers, Invoices.\n\
+         - Handlers deal with balances, currency codes (USD, EUR), status (PENDING, COMPLETED, FAILED), and audit trails.\n\
+         - In GET handlers, return realistic financial records with decimal amounts and ISO timestamps.\n\
+         - In POST mutations, validate amount > 0 and update wallet balances atomically."
+    } else if cat_lower.contains("ecommerce") || cat_lower.contains("marketplace") || cat_lower.contains("store") || cat_lower.contains("retail") || cat_lower.contains("shop") {
+        "API DOMAIN ARCHETYPE: E-Commerce, Product Catalog & Order Management\n\
+         - Primary models: Products, Categories, Orders, OrderItems, Cart.\n\
+         - Handlers deal with product SKUs, prices, stock levels, and order fulfillment status.\n\
+         - In GET handlers, return rich product catalogs with category badges and inventory status.\n\
+         - In POST orders, create order records and line items linked to user."
+    } else if cat_lower.contains("edtech") || cat_lower.contains("education") || cat_lower.contains("course") || cat_lower.contains("health") || cat_lower.contains("care") || cat_lower.contains("learning") {
+        "API DOMAIN ARCHETYPE: EdTech, HealthCare & Progression Tracking\n\
+         - Primary models: Courses/Programs, Modules, Lessons, Enrollments, Progress, Certifications.\n\
+         - Handlers deal with completion percentages (0-100), active enrollment, and content progression.\n\
+         - In GET handlers, return courses with module counts, instructor metadata, and student progress.\n\
+         - In POST progress, record completion timestamps and update total progress percentage."
+    } else {
+        "API DOMAIN ARCHETYPE: Executive B2B SaaS, Projects & Collaborative Workspaces\n\
+         - Primary models: Workspaces, Projects, Tasks, TeamMembers, Subscriptions, Activities.\n\
+         - Handlers deal with project statuses (PLANNING, ACTIVE, COMPLETED), task priorities (LOW, MEDIUM, HIGH, URGENT), and team assignments.\n\
+         - In GET handlers, return projects with task counts, team avatars, and activity logs.\n\
+         - In POST tasks/projects, assign creator ownerId and default to status ACTIVE/TODO."
+    }
+}
+
+pub const API_ROUTE_CHAIN_OF_THOUGHT: &str = r#"BACKEND API GENERATION CHAIN-OF-THOUGHT (Execute in strict sequence):
+Step 1 [Imports & Core Bindings]:
+       - Import { NextResponse, NextRequest } from 'next/server'.
+       - Import { prisma } from '@/lib/prisma'.
+       - If validating request bodies, ALWAYS import { z } from 'zod'.
+Step 2 [Schema Validation & Safe Defaults]:
+       - Define Zod schema matching the target model's scalar fields.
+       - Make optional and secondary fields (description, status, priority, tags, dates) .optional().default(...) so quick-create requests from the UI succeed without throwing 400 validation errors.
+Step 3 [Typed Relational Queries]:
+       - Target ONLY models declared in ACTIVE DATABASE MODELS.
+       - In GET handlers, call `prisma.<model>.findMany({ include: { ... } })` matching the exact relation names from the contract.
+       - In POST handlers, extract validated body and call `prisma.<model>.create({ data: { ... } })`.
+Step 4 [Local Resilience & Status Gate]:
+       - Always wrap Prisma queries in try/catch blocks.
+       - In GET catch (or if findMany returns [] in local preview), return a fallback array of 4-6 realistic domain mockup items with status 200 so the UI immediately renders with data.
+       - In POST/PUT catch, return a 201/200 fallback response with { id: 'mock-' + Date.now(), ...body } so UI creation flows always succeed in preview mode."#;
+
+pub const HOOK_CHAIN_OF_THOUGHT: &str = r#"CUSTOM REACT HOOK GENERATION CHAIN-OF-THOUGHT (Execute in strict sequence):
+Step 1 [Signature & Parameter Safety]:
+       - Accept an optional options object parameter with a safe default: `({ ...options }: HookOptions = {} as any)`.
+       - NEVER require mandatory destructured parameters without defaults, to prevent fatal runtime TypeError crashes.
+Step 2 [State Management]:
+       - Declare state for data, loading, and error: `const [data, setData] = useState<T>(fallbackData);`, `const [isLoading, setIsLoading] = useState<boolean>(false);`, `const [error, setError] = useState<string | null>(null);`.
+Step 3 [Data Fetching & Resilience]:
+       - Fetch data from verified API endpoints using async/await inside useCallback or useEffect.
+       - Wrap fetch in try/catch/finally: in finally, ALWAYS set `setIsLoading(false);`.
+       - In catch, log error and maintain realistic fallback mock data so preview UI is never broken or trapped in endless loading.
+Step 4 [Dual Export Compatibility]:
+       - Export the hook as BOTH named export (`export { useHookName }`) and default export (`export default useHookName`).
+       - Do NOT render JSX markup or HTML tags inside hook files."#;
+
+pub const UI_GENERATION_CHAIN_OF_THOUGHT: &str = r#"FRONTEND UI GENERATION CHAIN-OF-THOUGHT (Execute in strict sequence):
+Step 1 [Client Boundary & Imports]:
+       - Place 'use client'; at line 1 if the component uses hooks or interactivity.
+       - Import icons ONLY from subpaths ('react-icons/hi', 'react-icons/fa', 'lucide-react'), NEVER from bare 'react-icons'.
+       - Import verified hooks from '@/hooks' and UI primitives from '@/components/ui/*'.
+Step 2 [Domain Mock State]:
+       - Pre-populate state with 4-6 realistic domain mockup items matching the project archetype so the page renders rich visual content immediately.
+Step 3 [Visual Hierarchy & Layout]:
+       - Header: Prominent page title, descriptive subtitle, and primary CTA action button.
+       - Metric Cards: Responsive grid (grid-cols-1 sm:grid-cols-2 lg:grid-cols-4) with KPI numbers, labels, trend badges.
+       - Work Surface: Main interactive area with search input, status filter tabs, and responsive data cards or table.
+Step 4 [Navigation & Dual Export]:
+       - Every <Link> MUST point to a verified route from VERIFIED APPLICATION ROUTES.
+       - Export component as BOTH named (`export { ComponentName }`) and default (`export default ComponentName`)."#;
+
 pub fn get_scoped_ui_rules(file_path: &str) -> String {
     let path_lower = file_path.to_lowercase().replace('\\', "/");
     let mut ui_rules = Vec::new();
@@ -1230,6 +1305,279 @@ pub fn get_stack_rulepacks(file_path: &str, file_content: &str, error_msg: Optio
     }
 }
 
+/// Extracts domain contracts (models, fields, relations, enums) from `schema.prisma` content.
+pub fn extract_prisma_schema_contract(content: &str) -> Value {
+    let mut models = serde_json::Map::new();
+    let mut enums = serde_json::Map::new();
+
+    // 1. Extract domain enums
+    if let Ok(enum_re) = regex::Regex::new(r"(?ms)^enum\s+(\w+)\s*\{([^}]+)\}") {
+        for cap in enum_re.captures_iter(content) {
+            if let (Some(name_match), Some(body_match)) = (cap.get(1), cap.get(2)) {
+                let enum_name = name_match.as_str().trim();
+                let values: Vec<String> = body_match
+                    .as_str()
+                    .lines()
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty() && !l.starts_with("//"))
+                    .map(|s| s.to_string())
+                    .collect();
+                if !values.is_empty() {
+                    enums.insert(enum_name.to_string(), serde_json::json!(values));
+                }
+            }
+        }
+    }
+
+    // 2. Extract model names first to distinguish relations from scalar columns
+    let mut model_names = Vec::new();
+    if let Ok(model_re) = regex::Regex::new(r"(?ms)^model\s+(\w+)\s*\{([^}]+)\}") {
+        for cap in model_re.captures_iter(content) {
+            if let Some(name_match) = cap.get(1) {
+                model_names.push(name_match.as_str().trim().to_string());
+            }
+        }
+    }
+
+    // 3. Extract models with scalar fields and relation fields
+    if let Ok(model_re) = regex::Regex::new(r"(?ms)^model\s+(\w+)\s*\{([^}]+)\}") {
+        for cap in model_re.captures_iter(content) {
+            if let (Some(name_match), Some(body_match)) = (cap.get(1), cap.get(2)) {
+                let model_name = name_match.as_str().trim().to_string();
+                let mut scalar_fields = Vec::new();
+                let mut relation_fields = Vec::new();
+
+                for line in body_match.as_str().lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("@@") {
+                        continue;
+                    }
+                    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        let field_name = parts[0];
+                        let field_type = parts[1];
+                        let clean_type = field_type.replace(['?', '[', ']'], "");
+
+                        if model_names.contains(&clean_type) || trimmed.contains("@relation") {
+                            relation_fields.push(format!("{}: {}", field_name, field_type));
+                        } else {
+                            scalar_fields.push(field_name.to_string());
+                        }
+                    }
+                }
+
+                models.insert(model_name, serde_json::json!({
+                    "fields": scalar_fields,
+                    "relations": relation_fields
+                }));
+            }
+        }
+    }
+
+    serde_json::json!({
+        "models": models,
+        "enums": enums
+    })
+}
+
+/// Extracts API endpoint path and exported HTTP methods from route handler content.
+pub fn extract_api_route_contract(file_path: &str, content: &str) -> Option<(String, Vec<String>)> {
+    let norm_path = file_path.replace('\\', "/");
+    let api_idx = norm_path.find("/api/")?;
+    let without_file = norm_path[api_idx..].trim_end_matches("/route.ts").trim_end_matches("/route.js");
+    let endpoint = if without_file.is_empty() { "/api".to_string() } else { without_file.to_string() };
+
+    let mut methods = Vec::new();
+    let method_candidates = ["GET", "POST", "PUT", "DELETE", "PATCH"];
+    for method in &method_candidates {
+        let pattern_func = format!(r"\bexport\s+(?:async\s+)?function\s+{}\b", method);
+        let pattern_const = format!(r"\bexport\s+const\s+{}\b", method);
+        let pattern_export = format!(r"\bhandler\s+as\s+{}\b", method);
+
+        let matches = regex::Regex::new(&pattern_func).map(|r| r.is_match(content)).unwrap_or(false)
+            || regex::Regex::new(&pattern_const).map(|r| r.is_match(content)).unwrap_or(false)
+            || regex::Regex::new(&pattern_export).map(|r| r.is_match(content)).unwrap_or(false);
+
+        if matches {
+            methods.push(method.to_string());
+        }
+    }
+
+    if methods.is_empty() {
+        methods.push("GET".to_string());
+    }
+
+    Some((endpoint, methods))
+}
+
+/// Extracts custom hook names from a hook file.
+pub fn extract_hook_contract(file_path: &str, content: &str) -> Vec<String> {
+    let norm_path = file_path.replace('\\', "/");
+    let mut hooks = Vec::new();
+
+    if let Ok(hook_re) = regex::Regex::new(r"\bexport\s+(?:(?:async\s+)?function|const)\s+(use[A-Za-z0-9_]+)\b") {
+        for cap in hook_re.captures_iter(content) {
+            if let Some(m) = cap.get(1) {
+                let name = m.as_str().to_string();
+                if !hooks.contains(&name) {
+                    hooks.push(name);
+                }
+            }
+        }
+    }
+
+    if hooks.is_empty() {
+        let path = std::path::Path::new(&norm_path);
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            if stem.starts_with("use") && stem.len() > 3 {
+                hooks.push(stem.to_string());
+            }
+        }
+    }
+
+    hooks
+}
+
+/// Harvests metadata from newly generated files into `.axiom/live_builder_guide.json`.
+pub fn harvest_file_contract_to_lbg(proj_dir: &std::path::Path, file_path: &str, content: &str) {
+    let lbg_path = proj_dir.join(".axiom").join("live_builder_guide.json");
+    let mut lbg: Value = if lbg_path.exists() {
+        if let Ok(c) = std::fs::read_to_string(&lbg_path) {
+            serde_json::from_str(&c).unwrap_or_else(|_| serde_json::json!({}))
+        } else {
+            serde_json::json!({})
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    if !lbg.is_object() {
+        lbg = serde_json::json!({});
+    }
+
+    if lbg.get("sharedContracts").is_none() {
+        lbg["sharedContracts"] = serde_json::json!({
+            "database": { "models": {}, "enums": {} },
+            "api": { "endpoints": {} },
+            "hooks": {}
+        });
+    }
+
+    let path_lower = file_path.to_lowercase().replace('\\', "/");
+
+    // 1. Prisma schema
+    if path_lower.ends_with("schema.prisma") {
+        let db_contract = extract_prisma_schema_contract(content);
+        if let Some(shared) = lbg.get_mut("sharedContracts") {
+            shared["database"] = db_contract;
+        }
+    }
+    // 2. API Route
+    else if (path_lower.contains("/api/") || path_lower.starts_with("api/")) && (path_lower.ends_with("route.ts") || path_lower.ends_with("route.js")) {
+        if let Some((endpoint, methods)) = extract_api_route_contract(file_path, content) {
+            if let Some(shared) = lbg.get_mut("sharedContracts") {
+                if let Some(api) = shared.get_mut("api") {
+                    if let Some(endpoints) = api.get_mut("endpoints") {
+                        if let Some(map) = endpoints.as_object_mut() {
+                            map.insert(endpoint, serde_json::json!(methods));
+                        }
+                    } else {
+                        api["endpoints"] = serde_json::json!({ endpoint: methods });
+                    }
+                }
+            }
+        }
+    }
+    // 3. Custom Hooks
+    else if path_lower.contains("hooks/") && (path_lower.ends_with(".ts") || path_lower.ends_with(".tsx")) && !path_lower.ends_with("index.ts") {
+        let hooks = extract_hook_contract(file_path, content);
+        if let Some(shared) = lbg.get_mut("sharedContracts") {
+            if let Some(hooks_obj) = shared.get_mut("hooks") {
+                if let Some(map) = hooks_obj.as_object_mut() {
+                    for h in hooks {
+                        map.insert(h.clone(), serde_json::json!(format!("@/hooks/{}", h)));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(pretty) = serde_json::to_string_pretty(&lbg) {
+        if let Some(parent) = lbg_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&lbg_path, pretty);
+    }
+}
+
+/// Formats database contract JSON into a compact, high-signal prompt block.
+pub fn format_database_contract_prompt(db_val: &Value) -> String {
+    let mut out = String::new();
+    if let Some(models) = db_val.get("models").and_then(|m| m.as_object()) {
+        if !models.is_empty() {
+            out.push_str("ACTIVE DATABASE MODELS:\n");
+            for (m_name, m_data) in models {
+                let fields = m_data.get("fields")
+                    .and_then(|f| f.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<&str>>().join(", "))
+                    .unwrap_or_default();
+                let relations = m_data.get("relations")
+                    .and_then(|r| r.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<&str>>().join(", "))
+                    .unwrap_or_default();
+
+                out.push_str(&format!("- model {} {{\n    scalars: [{}]\n    relations: [{}]\n  }}\n", m_name, fields, relations));
+            }
+        }
+    }
+
+    if let Some(enums) = db_val.get("enums").and_then(|e| e.as_object()) {
+        if !enums.is_empty() {
+            out.push_str("DATABASE ENUMS:\n");
+            for (e_name, e_vals) in enums {
+                let vals = e_vals.as_array()
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<&str>>().join(", "))
+                    .unwrap_or_default();
+                out.push_str(&format!("- enum {} {{ {} }}\n", e_name, vals));
+            }
+        }
+    }
+
+    out
+}
+
+/// Formats API endpoints contract JSON into a compact prompt block.
+pub fn format_api_endpoints_prompt(api_val: &Value) -> String {
+    let mut out = String::new();
+    let endpoints = api_val.get("endpoints").and_then(|e| e.as_object()).or_else(|| api_val.as_object());
+    if let Some(eps) = endpoints {
+        if !eps.is_empty() {
+            out.push_str("VERIFIED API ENDPOINTS TO CALL:\n");
+            for (ep_path, methods_val) in eps {
+                let methods = methods_val.as_array()
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<&str>>().join(", "))
+                    .unwrap_or_else(|| "GET".to_string());
+                out.push_str(&format!("- [{}] {}\n", methods, ep_path));
+            }
+        }
+    }
+    out
+}
+
+/// Formats custom hooks contract JSON into a compact prompt block.
+pub fn format_hooks_prompt(hooks_val: &Value) -> String {
+    let mut out = String::new();
+    if let Some(hooks) = hooks_val.as_object() {
+        if !hooks.is_empty() {
+            out.push_str("VERIFIED CUSTOM HOOKS (Import from '@/hooks'):\n");
+            for (h_name, _) in hooks {
+                out.push_str(&format!("- {}\n", h_name));
+            }
+        }
+    }
+    out
+}
+
 pub fn get_expert_system_prompt(
     file_path: &str,
     project_type: &str,
@@ -1361,15 +1709,48 @@ pub fn get_expert_system_prompt(
         return prompt;
     }
 
+    // 6b. FILE-SCOPED PROMPT: Prisma Client Singleton (src/lib/prisma.ts)
+    if path_lower.ends_with("lib/prisma.ts") || path_lower.ends_with("lib/prisma.js") {
+        return "You are an expert Prisma and Next.js Database Architect. Output only the complete, valid production-ready src/lib/prisma.ts singleton file wrapped in markdown code blocks. No explanations.\n\n\
+                PRISMA SINGLETON RULES:\n\
+                - Export a cached PrismaClient on globalThis to prevent connection pool exhaustion during Next.js App Router hot reloading.\n\
+                - Export BOTH named (`export const prisma`) and default (`export default prisma`) exports.\n\n\
+                ```typescript\n\
+                import { PrismaClient } from '@prisma/client';\n\n\
+                const globalForPrisma = globalThis as unknown as {\n\
+                  prisma: PrismaClient | undefined;\n\
+                };\n\n\
+                export const prisma =\n\
+                  globalForPrisma.prisma ??\n\
+                  new PrismaClient({\n\
+                    log: process.env.NODE_ENV === 'development' ? ['query', 'error', 'warn'] : ['error'],\n\
+                  });\n\n\
+                if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = prisma;\n\n\
+                export default prisma;\n\
+                ```\n".to_string();
+    }
+
     // 7. FILE-SCOPED PROMPT: Backend API Routes & NextAuth
     let is_api_route = path_lower.contains("/api/") || path_lower.contains("route.ts") || path_lower.contains("route.js");
     if is_api_route {
-        let mut prompt = "You are a Senior Backend Developer. Write only clean, production-ready Next.js Route Handler code wrapped in markdown code blocks. No explanations.\n\n\
+        let mut category = "saas".to_string();
+        if let Some(ref lbg) = lbg_val {
+            if let Some(cat) = lbg.get("projectSpecification").and_then(|s| s.get("category")).and_then(|c| c.as_str()) {
+                category = cat.to_string();
+            }
+        }
+        let api_archetype = resolve_api_domain_archetype(&category);
+
+        let mut prompt = format!(
+            "You are a Senior Backend Developer. Write only clean, production-ready Next.js Route Handler code wrapped in markdown code blocks. No explanations.\n\n\
+             {}\n\n\
+             {}\n\n\
              BACKEND API DEVELOPMENT RULES:\n\
              - Implement clean Next.js App Router Route Handlers (exporting GET, POST, PUT, DELETE functions).\n\
-             - Wrap database calls in robust try-catch blocks. In GET handlers, if the database query returns an empty array `[]` or throws an error in catch, return a rich fallback array of 4-6 realistic domain mockup objects so the frontend preview is immediately populated with realistic data.\n\
-             - GRACEFUL POST/PUT VALIDATION & DEFAULTS: If using Zod (`z.object`), ALWAYS include `import { z } from 'zod';` at the top of the file! Make optional or secondary fields (such as `timeline`, `status`, `startDate`, `endDate`, `description`) `.optional().default(...)` so quick-create requests from the UI succeed without throwing 500/400 validation errors. In catch blocks of POST/PUT handlers, return a 201/200 fallback response with `{ id: 'mock-' + Date.now(), ...body }` so UI creation flows always work in local preview mode.\n\
-             - STRICT IMPORT RESOLUTION: Every external dependency ('zod', 'bcryptjs', '@/lib/prisma', 'next/server') MUST be explicitly imported at the top.\n".to_string();
+             - STRICT IMPORT RESOLUTION: Every external dependency ('zod', 'bcryptjs', '@/lib/prisma', 'next/server') MUST be explicitly imported at the top.\n",
+            api_archetype,
+            API_ROUTE_CHAIN_OF_THOUGHT
+        );
 
         if path_lower.contains("/api/auth/") || path_lower.contains("nextauth") {
             prompt.push_str(
@@ -1391,11 +1772,17 @@ pub fn get_expert_system_prompt(
         }
 
         if let Some(ref lbg) = lbg_val {
-            if let Some(api_contracts) = lbg.get("sharedContracts").and_then(|c| c.get("api")) {
-                prompt.push_str(&format!("\nAPI ENDPOINTS CONTRACT:\n{}\n", api_contracts));
-            }
             if let Some(db_contracts) = lbg.get("sharedContracts").and_then(|c| c.get("database")) {
-                prompt.push_str(&format!("\nDATABASE MODELS REFERENCE:\n{}\n", db_contracts));
+                let fmt_db = format_database_contract_prompt(db_contracts);
+                if !fmt_db.is_empty() {
+                    prompt.push_str(&format!("\n{}\n", fmt_db));
+                }
+            }
+            if let Some(api_contracts) = lbg.get("sharedContracts").and_then(|c| c.get("api")) {
+                let fmt_api = format_api_endpoints_prompt(api_contracts);
+                if !fmt_api.is_empty() {
+                    prompt.push_str(&format!("\n{}\n", fmt_api));
+                }
             }
         }
         if !context_ref.is_empty() {
@@ -1414,11 +1801,42 @@ pub fn get_expert_system_prompt(
         );
     }
 
+    // 7c. FILE-SCOPED PROMPT: Custom React Hooks (src/hooks/**)
+    let is_custom_hook = path_lower.contains("hooks/") && (path_lower.ends_with(".ts") || path_lower.ends_with(".tsx"));
+    if is_custom_hook {
+        let mut prompt = format!(
+            "You are a Senior React Hooks & State Management Architect. Write only clean, production-ready React hook TypeScript code wrapped in markdown code blocks. No explanations.\n\n\
+             {}\n\n\
+             HOOK ARCHITECTURE RULES:\n\
+             - This is a headless React hook. Do NOT output JSX elements (no <div>, <button>, etc.).\n\
+             - Hook name MUST start with 'use' (camelCase: useProjects, useAuth, useMetrics).\n\
+             - Provide clear TypeScript interfaces for state and hook return values.\n",
+            HOOK_CHAIN_OF_THOUGHT
+        );
+
+        if let Some(ref lbg) = lbg_val {
+            if let Some(api_contracts) = lbg.get("sharedContracts").and_then(|c| c.get("api")) {
+                let fmt_api = format_api_endpoints_prompt(api_contracts);
+                if !fmt_api.is_empty() {
+                    prompt.push_str(&format!("\n{}\n", fmt_api));
+                }
+            }
+        }
+        if !context_ref.is_empty() {
+            prompt.push_str(context_ref);
+        }
+        return prompt;
+    }
+
     // 8. FILE-SCOPED PROMPT: Web Client UI Components, Pages & Layouts (.tsx, .jsx)
     // Strictly isolated from backend Prisma schemas and NextAuth server internals!
-    let is_react_frontend = path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx");
+    let is_react_frontend = (path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx")) && !is_custom_hook;
     if is_react_frontend {
-        let mut prompt = "You are a Principal React & Tailwind CSS Product Designer and Frontend Engineer. Write only clean, complete, production-ready React code wrapped in markdown code blocks. No explanations.\n\n".to_string();
+        let mut prompt = format!(
+            "You are a Principal React & Tailwind CSS Product Designer and Frontend Engineer. Write only clean, complete, production-ready React code wrapped in markdown code blocks. No explanations.\n\n\
+             {}\n\n",
+            UI_GENERATION_CHAIN_OF_THOUGHT
+        );
 
         // Inject tailored Design Archetype tokens based on the project's domain & category
         let design_archetype = get_project_design_archetype_from_dir(proj_dir);
@@ -1500,8 +1918,17 @@ pub fn get_expert_system_prompt(
                     }
                 }
             }
-            if let Some(api_contracts) = lbg.get("sharedContracts").and_then(|c| c.get("api")).and_then(|a| a.get("endpoints")) {
-                prompt.push_str(&format!("- Available API Endpoints to Fetch:\n{}\n", api_contracts));
+            if let Some(api_contracts) = lbg.get("sharedContracts").and_then(|c| c.get("api")) {
+                let fmt_api = format_api_endpoints_prompt(api_contracts);
+                if !fmt_api.is_empty() {
+                    prompt.push_str(&format!("\n{}\n", fmt_api));
+                }
+            }
+            if let Some(hooks_contracts) = lbg.get("sharedContracts").and_then(|c| c.get("hooks")) {
+                let fmt_hooks = format_hooks_prompt(hooks_contracts);
+                if !fmt_hooks.is_empty() {
+                    prompt.push_str(&format!("\n{}\n", fmt_hooks));
+                }
             }
         }
 
@@ -2943,6 +3370,9 @@ export default function RootLayout({
             && fs::metadata(&full_disk_path).map(|m| m.len() > 0).unwrap_or(false);
 
         if already_on_disk {
+            if let Ok(c) = fs::read_to_string(&full_disk_path) {
+                harvest_file_contract_to_lbg(&proj_dir, file_path, &c);
+            }
             continue;
         }
 
@@ -3216,6 +3646,7 @@ export default function RootLayout({
             let _ = fs::create_dir_all(parent);
         }
         let _ = fs::write(&full_disk_path, &processed_content);
+        harvest_file_contract_to_lbg(&proj_dir, file_path, &processed_content);
 
         // Update completed files and persist checkpoint immediately
         if !completed_files.contains(&file_path.to_string()) {

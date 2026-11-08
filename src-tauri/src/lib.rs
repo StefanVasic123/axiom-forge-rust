@@ -1527,4 +1527,208 @@ export default function Page() {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    #[test]
+    fn test_harvester_extracts_and_updates_live_builder_guide() {
+        let temp_dir = std::env::temp_dir().join(format!("axiom_harvester_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let prisma_sample = r#"
+datasource db {
+  provider = "sqlite"
+  url = "file:./dev.db"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum Status {
+  ACTIVE
+  ARCHIVED
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  role      Role     @default(USER)
+  projects  Project[]
+  createdAt DateTime @default(now())
+}
+
+model Project {
+  id        String   @id @default(cuid())
+  name      String
+  status    Status   @default(ACTIVE)
+  ownerId   String
+  owner     User     @relation(fields: [ownerId], references: [id])
+}
+"#;
+
+        // 1. Harvest schema.prisma
+        harvest_file_contract_to_lbg(&temp_dir, "prisma/schema.prisma", prisma_sample);
+
+        // 2. Harvest API route
+        let route_sample = r#"
+import { NextResponse, NextRequest } from 'next/server';
+
+export async function GET(request: NextRequest) {
+    return NextResponse.json([]);
+}
+
+export async function POST(request: NextRequest) {
+    return NextResponse.json({ id: '1' });
+}
+"#;
+        harvest_file_contract_to_lbg(&temp_dir, "src/app/api/projects/route.ts", route_sample);
+
+        // 3. Harvest Hook
+        let hook_sample = r#"
+import { useState, useEffect } from 'react';
+
+export function useProjects() {
+    const [projects, setProjects] = useState([]);
+    return { projects };
+}
+"#;
+        harvest_file_contract_to_lbg(&temp_dir, "src/hooks/useProjects.ts", hook_sample);
+
+        // Verify live_builder_guide.json
+        let lbg_path = temp_dir.join(".axiom").join("live_builder_guide.json");
+        assert!(lbg_path.exists());
+        let lbg_str = std::fs::read_to_string(&lbg_path).unwrap();
+        let lbg: serde_json::Value = serde_json::from_str(&lbg_str).unwrap();
+
+        let shared = lbg.get("sharedContracts").unwrap();
+        let db = shared.get("database").unwrap();
+        assert!(db.get("models").and_then(|m| m.get("User")).is_some());
+        assert!(db.get("models").and_then(|m| m.get("Project")).is_some());
+        assert!(db.get("enums").and_then(|e| e.get("Role")).is_some());
+
+        let api = shared.get("api").and_then(|a| a.get("endpoints")).unwrap();
+        assert!(api.get("/api/projects").is_some());
+        let methods = api.get("/api/projects").and_then(|m| m.as_array()).unwrap();
+        assert!(methods.iter().any(|v| v.as_str() == Some("GET")));
+        assert!(methods.iter().any(|v| v.as_str() == Some("POST")));
+
+        let hooks = shared.get("hooks").unwrap();
+        assert!(hooks.get("useProjects").is_some());
+
+        // Verify prompt formatters
+        let db_prompt = format_database_contract_prompt(db);
+        assert!(db_prompt.contains("ACTIVE DATABASE MODELS:"));
+        assert!(db_prompt.contains("model Project"));
+        assert!(db_prompt.contains("model User"));
+        assert!(db_prompt.contains("enum Role { USER, ADMIN }"));
+
+        let api_prompt = format_api_endpoints_prompt(api);
+        assert!(api_prompt.contains("VERIFIED API ENDPOINTS TO CALL:"));
+        assert!(api_prompt.contains("/api/projects"));
+
+        let hooks_prompt = format_hooks_prompt(hooks);
+        assert!(hooks_prompt.contains("VERIFIED CUSTOM HOOKS (Import from '@/hooks'):"));
+        assert!(hooks_prompt.contains("useProjects"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_api_route_cot_and_prisma_singleton_scope() {
+        let temp_dir = std::env::temp_dir().join(format!("axiom_api_cot_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _ = std::fs::create_dir_all(temp_dir.join(".axiom"));
+
+        // 1. Verify src/lib/prisma.ts gets singleton scope
+        let prisma_lib_prompt = get_expert_system_prompt("src/lib/prisma.ts", "nextjs", "", "", "", "", &temp_dir);
+        assert!(prisma_lib_prompt.contains("PRISMA SINGLETON RULES:"));
+        assert!(prisma_lib_prompt.contains("globalForPrisma.prisma ??"));
+        assert!(prisma_lib_prompt.contains("export default prisma;"));
+
+        // 2. Populate live_builder_guide with harvested database models
+        let lbg = serde_json::json!({
+            "projectSpecification": { "category": "edtech" },
+            "sharedContracts": {
+                "database": {
+                    "models": {
+                        "Course": {
+                            "fields": ["id", "title", "price"],
+                            "relations": ["lessons: Lesson[]"]
+                        }
+                    },
+                    "enums": {
+                        "CourseStatus": ["DRAFT", "PUBLISHED"]
+                    }
+                },
+                "api": { "endpoints": {} },
+                "hooks": {}
+            }
+        });
+        std::fs::write(temp_dir.join(".axiom/live_builder_guide.json"), serde_json::to_string_pretty(&lbg).unwrap()).unwrap();
+
+        // 3. Verify API route prompt gets CoT, domain archetype, and active models
+        let api_prompt = get_expert_system_prompt("src/app/api/courses/route.ts", "nextjs", "", "", "", "", &temp_dir);
+        assert!(api_prompt.contains("API DOMAIN ARCHETYPE: EdTech, HealthCare & Progression Tracking"));
+        assert!(api_prompt.contains("BACKEND API GENERATION CHAIN-OF-THOUGHT"));
+        assert!(api_prompt.contains("Step 1 [Imports & Core Bindings]"));
+        assert!(api_prompt.contains("Step 2 [Schema Validation & Safe Defaults]"));
+        assert!(api_prompt.contains("Step 3 [Typed Relational Queries]"));
+        assert!(api_prompt.contains("Step 4 [Local Resilience & Status Gate]"));
+        assert!(api_prompt.contains("ACTIVE DATABASE MODELS:"));
+        assert!(api_prompt.contains("model Course"));
+        assert!(api_prompt.contains("scalars: [id, title, price]"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_custom_hook_and_ui_cot_scopes() {
+        let temp_dir = std::env::temp_dir().join(format!("axiom_hook_ui_cot_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _ = std::fs::create_dir_all(temp_dir.join(".axiom"));
+
+        // Setup live builder guide with endpoints and hooks
+        let lbg = serde_json::json!({
+            "projectSpecification": { "category": "saas" },
+            "sharedContracts": {
+                "database": {},
+                "api": {
+                    "endpoints": {
+                        "/api/projects": ["GET", "POST"]
+                    }
+                },
+                "hooks": {
+                    "useProjects": "@/hooks/useProjects"
+                }
+            }
+        });
+        std::fs::write(temp_dir.join(".axiom/live_builder_guide.json"), serde_json::to_string_pretty(&lbg).unwrap()).unwrap();
+
+        // 1. Verify custom hook scope
+        let hook_prompt = get_expert_system_prompt("src/hooks/useProjects.ts", "nextjs", "", "", "", "", &temp_dir);
+        assert!(hook_prompt.contains("Senior React Hooks & State Management Architect"));
+        assert!(hook_prompt.contains("CUSTOM REACT HOOK GENERATION CHAIN-OF-THOUGHT"));
+        assert!(hook_prompt.contains("Step 1 [Signature & Parameter Safety]"));
+        assert!(hook_prompt.contains("Step 4 [Dual Export Compatibility]"));
+        assert!(hook_prompt.contains("VERIFIED API ENDPOINTS TO CALL:"));
+        assert!(hook_prompt.contains("/api/projects"));
+        assert!(!hook_prompt.contains("ROOT LAYOUT ARCHITECTURE RULES"));
+
+        // 2. Verify UI Page scope
+        let ui_prompt = get_expert_system_prompt("src/app/dashboard/projects/page.tsx", "nextjs", "", "", "", "", &temp_dir);
+        assert!(ui_prompt.contains("FRONTEND UI GENERATION CHAIN-OF-THOUGHT"));
+        assert!(ui_prompt.contains("Step 1 [Client Boundary & Imports]"));
+        assert!(ui_prompt.contains("Step 2 [Domain Mock State]"));
+        assert!(ui_prompt.contains("Step 3 [Visual Hierarchy & Layout]"));
+        assert!(ui_prompt.contains("Step 4 [Navigation & Dual Export]"));
+        assert!(ui_prompt.contains("VERIFIED API ENDPOINTS TO CALL:"));
+        assert!(ui_prompt.contains("/api/projects"));
+        assert!(ui_prompt.contains("VERIFIED CUSTOM HOOKS (Import from '@/hooks'):"));
+        assert!(ui_prompt.contains("useProjects"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
 }
