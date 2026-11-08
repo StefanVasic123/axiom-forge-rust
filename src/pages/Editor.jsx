@@ -569,7 +569,7 @@ export default function EditorPage() {
   const [showPreview, setShowPreview] = useState(false);
   const [symbolsExpanded, setSymbolsExpanded] = useState(false);
   const [functions, setFunctions] = useState([]);
-  const [previewUrl, setPreviewUrl] = useState('http://localhost:5173');
+  const [previewUrl, setPreviewUrl] = useState('http://localhost:3000');
   // Dev Server State
   const [serverRunning, setServerRunning] = useState(false);
   const [isServerStarting, setIsServerStarting] = useState(false);
@@ -770,9 +770,10 @@ export default function EditorPage() {
         }, 100);
       }
 
-      // If server logs indicate ready or compiling progress, update starting state
-      if (text.includes('Ready in') || text.includes('Local:') || text.includes('ready on') || text.includes('compiled successfully') || text.includes('Compiled /')) {
+      // If server logs indicate ready or compiling progress, update starting state and clear stale compileError
+      if (text.includes('Ready in') || text.includes('Local:') || text.includes('ready on') || text.includes('compiled successfully') || text.includes('Compiled /') || text.includes('✓ Compiled')) {
         setIsServerStarting(false);
+        setCompileError(null);
       }
 
       // Auto-detect preview URL from server output (e.g. Next.js or Vite logs)
@@ -799,9 +800,14 @@ export default function EditorPage() {
     });
 
     const unsubCompileError = window.electronAPI.server.onCompileError((errorData) => {
-      console.log('[Editor] Received compilation error:', errorData);
-      setCompileError(errorData);
-      setShowTerminal(true);
+      setCompileError(prev => {
+        if (prev && prev.filePath === errorData?.filePath && prev.errorMessage === errorData?.errorMessage) {
+          return prev;
+        }
+        console.log('[Editor] Received compilation error:', errorData);
+        return errorData;
+      });
+      setShowTerminal(prev => prev ? prev : true);
     });
 
     const unsubHealStatus = window.electronAPI.server.onHealStatus((statusData) => {
@@ -866,11 +872,17 @@ export default function EditorPage() {
           platform: project?.manifest?.platform || 'web',
           techStack: project?.manifest?.techStack?.framework || 'nextjs'
         });
-        if (res.success && res.cdpPort) {
-          setCdpPort(res.cdpPort);
+        if (res && res.success) {
+          if (res.cdpPort) {
+            setCdpPort(res.cdpPort);
+          }
+        } else {
+          setIsServerStarting(false);
+          setIframeLoading(false);
         }
       } catch (err) {
         setIsServerStarting(false);
+        setIframeLoading(false);
       }
     }
   };
@@ -1240,34 +1252,14 @@ export default function EditorPage() {
     };
   }, [openFile, files, projectId, currentPreviewRoute]);
 
-  // Lightweight Agent Bridge: sync live Editor & Preview state (<20KB JSON, debounced)
-  useEffect(() => {
-    if (!window.electronAPI?.agentBridge) return;
-    const timer = setTimeout(() => {
-      window.electronAPI.agentBridge.updateLiveState({
-        timestamp: new Date().toISOString(),
-        projectId,
-        projectName: project?.name || '',
-        viewMode: showPreview ? 'preview' : 'code',
-        activeTabPath,
-        serverRunning,
-        isServerStarting,
-        previewUrl,
-        currentPreviewRoute,
-        compileError,
-        previewRuntimeError,
-        missingPackage,
-        healingInProgress,
-        healStatus,
-        recentServerLogs: serverLogs.slice(-30).map(l => l.text.trim()),
-        previewUiSnapshot: previewUiSnapshotRef.current
-      });
-    }, 600);
-    return () => clearTimeout(timer);
-  }, [
+  // Lightweight Agent Bridge: sync live Editor & Preview state (<20KB JSON, throttle-safe)
+  const liveStateRef = useRef(null);
+  const lastLiveStateSigRef = useRef('');
+  liveStateRef.current = {
+    timestamp: new Date().toISOString(),
     projectId,
-    project?.name,
-    showPreview,
+    projectName: project?.name || '',
+    viewMode: showPreview ? 'preview' : 'code',
     activeTabPath,
     serverRunning,
     isServerStarting,
@@ -1278,12 +1270,38 @@ export default function EditorPage() {
     missingPackage,
     healingInProgress,
     healStatus,
-    serverLogs.length
-  ]);
+    recentServerLogs: serverLogs.slice(-30).map(l => l.text.trim()),
+    previewUiSnapshot: previewUiSnapshotRef.current
+  };
 
-  // Lightweight Agent Bridge: poll and execute remote commands (click, heal, inspect UI, navigate)
   useEffect(() => {
     if (!window.electronAPI?.agentBridge) return;
+    const interval = setInterval(() => {
+      if (!liveStateRef.current) return;
+      const latestPayload = {
+        ...liveStateRef.current,
+        previewUiSnapshot: previewUiSnapshotRef.current,
+        timestamp: ''
+      };
+      const sig = JSON.stringify(latestPayload);
+      if (sig !== lastLiveStateSigRef.current) {
+        lastLiveStateSigRef.current = sig;
+        window.electronAPI.agentBridge.updateLiveState({
+          ...latestPayload,
+          timestamp: new Date().toISOString()
+        });
+      }
+    }, 800);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Lightweight Agent Bridge: poll and execute remote commands (never reset by re-renders)
+  const bridgePollHandlerRef = useRef(null);
+  const bridgePollBusyRef = useRef(false);
+
+  bridgePollHandlerRef.current = async () => {
+    if (!window.electronAPI?.agentBridge || bridgePollBusyRef.current) return;
+    bridgePollBusyRef.current = true;
 
     const sendPreviewDomCmd = (domPayload) => {
       return new Promise((resolve) => {
@@ -1321,7 +1339,7 @@ export default function EditorPage() {
       });
     };
 
-    const interval = setInterval(async () => {
+    try {
       const cmd = await window.electronAPI.agentBridge.pollCommand();
       if (!cmd || !cmd.action) return;
 
@@ -1332,9 +1350,18 @@ export default function EditorPage() {
 
       try {
         if (cmd.action === 'trigger_heal') {
-          if (compileError) {
-            await handleHealError();
-            details = `Healed compileError in ${compileError.filePath}`;
+          const targetFile = cmd.filePath || compileError?.filePath;
+          const targetMsg = cmd.errorMessage || compileError?.errorMessage || 'ReferenceError or syntax error in file';
+          if (targetFile) {
+            setHealingInProgress(true);
+            setHealStatus(`Popravljam ${targetFile}...`);
+            try {
+              await window.electronAPI.server.healCompileError(projectId, targetFile, targetMsg);
+              setCompileError(null);
+              details = `Healed compileError in ${targetFile}`;
+            } finally {
+              setHealingInProgress(false);
+            }
           } else {
             success = false;
             details = 'No active compileError to heal';
@@ -1438,10 +1465,17 @@ export default function EditorPage() {
         },
         previewUiSnapshot: domData?.snapshot || previewUiSnapshotRef.current
       });
-    }, 1500);
+    } finally {
+      bridgePollBusyRef.current = false;
+    }
+  };
 
+  useEffect(() => {
+    const interval = setInterval(() => {
+      bridgePollHandlerRef.current?.();
+    }, 1000);
     return () => clearInterval(interval);
-  });
+  }, []);
 
   console.log("[EditorPage] Render. pendingContent exists?", !!pendingContent);
   if (pendingContent) {
@@ -2211,7 +2245,7 @@ export default function EditorPage() {
 
                       <iframe
                         ref={webviewRef}
-                        src={previewUrl}
+                        src={serverRunning ? previewUrl : 'about:blank'}
                         className="flex-1 w-full border-none bg-white"
                         title="Project Preview"
                         sandbox="allow-same-origin allow-scripts allow-popups allow-forms"

@@ -761,8 +761,8 @@ pub const UI_DESIGN_FOUNDATION_RULEPACK: &str = r#"MOBILE-FIRST & RESPONSIVE UI 
 
 pub const UI_NAVBAR_RULEPACK: &str = r#"SCOPED NAVBAR, BRAND LOGO & HAMBURGER MENU RULES:
 1. STICKY GLASSMORPHISM HEADER: Structure the navbar as `<header className="sticky top-0 z-50 w-full backdrop-blur-md bg-white/90 border-b border-slate-200/80 shadow-sm">` with an inner container `<div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">`.
-2. INLINE SVG BRAND LOGO LOCKUP (NO BROKEN IMAGE FILES):
-   - NEVER use `<img src="/logo.png" />` or `<Image src="/logo.svg" />` (which cause 404 broken image icons), and NEVER render plain unstyled text alone.
+2. INLINE SVG BRAND LOGO LOCKUP (NO BROKEN IMAGE FILES & NO HAMBURGER ICON IN BRAND BADGE):
+   - NEVER use `<img src="/logo.png" />` or `<Image src="/logo.svg" />` (which cause 404 broken image icons), NEVER render plain unstyled text alone, and NEVER place a hamburger menu icon (`<HiMenu />`, `<FiMenu />`, `<HiOutlineMenu />`) inside the Brand Logo Mark Badge!
    - Always build a modern Brand Lockup inside `<Link href="/" prefetch={false} className="flex items-center gap-2.5 group shrink-0">`:
      a) Logo Mark Badge: `<div className="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-600 to-blue-600 flex items-center justify-center text-white shadow-md shadow-indigo-500/20">` containing a crisp inline `<svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2"><path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>`.
      b) Brand Wordmark: `<span className="text-lg font-extrabold tracking-tight text-slate-900">AppName</span>`.
@@ -775,12 +775,12 @@ pub const UI_NAVBAR_RULEPACK: &str = r#"SCOPED NAVBAR, BRAND LOGO & HAMBURGER ME
 6. OPTIONAL PROPS FOR STANDALONE MOUNTING: `Navbar` is mounted in `RootLayout` as `<Navbar />` with no arguments. All props in `NavbarProps` MUST be optional (`user?: ... | null`) with safe default parameters (`const Navbar: React.FC<NavbarProps> = ({ user = null } = {}) =>`)."#;
 
 pub const UI_FOOTER_RULEPACK: &str = r#"SCOPED FOOTER LAYOUT & COMPACTNESS RULES:
-1. BAN TALL VERTICAL LINK STACKS: NEVER stack all footer links vertically in a single centered column (`flex-col items-center space-y-4` is STRICTLY FORBIDDEN because it creates a giant dark block occupying half the viewport!).
+1. BAN TALL VERTICAL LINK STACKS & BAN BUTTON-STYLED LINKS: NEVER stack all footer links vertically in a single centered column (`flex-col items-center space-y-4` is STRICTLY FORBIDDEN), and NEVER style footer `<Link>` items as solid primary buttons (`bg-indigo-600`, `bg-teal-600`, `px-4 py-2.5`, `rounded-xl` are STRICTLY FORBIDDEN on footer links!).
 2. COMPACT HORIZONTAL / MULTI-COLUMN FOOTER:
    - Use `<footer className="mt-auto w-full bg-slate-900 text-slate-400 border-t border-slate-800 py-8">`.
    - Inside `<div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col md:flex-row items-center justify-between gap-6">`:
      a) Left side: Compact Brand Lockup (small gradient rounded-lg icon + bold white brand name) and `<p className="text-xs text-slate-500 mt-1">&copy; {new Date().getFullYear()} Brand. All rights reserved.</p>`.
-     b) Right side: `<nav className="flex flex-wrap items-center justify-center gap-x-6 gap-y-2 text-sm">` so all footer links sit horizontally in a single clean, compact row (`text-slate-400 hover:text-white transition-colors`)."#;
+     b) Right side: `<nav className="flex flex-wrap items-center justify-center gap-x-6 gap-y-2 text-sm">` so all footer links sit horizontally in a single clean, compact row (`className="text-sm text-slate-400 hover:text-white transition-colors"`)."#;
 
 pub const UI_PRIMITIVES_RULEPACK: &str = r#"SCOPED UI PRIMITIVES RULES (src/components/ui/*):
 1. EXTEND NATIVE HTML ATTRIBUTES: Always extend standard React HTML interfaces (`export interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement>`, `export interface CardProps extends React.HTMLAttributes<HTMLDivElement>`, `export interface InputProps extends React.InputHTMLAttributes<HTMLInputElement>`) and spread `{...props}` onto the underlying DOM element.
@@ -792,14 +792,14 @@ pub const UI_PRIMITIVES_RULEPACK: &str = r#"SCOPED UI PRIMITIVES RULES (src/comp
 4. MANDATORY DUAL EXPORTS: Export BOTH named and default exports (`export { Button }; export default Button;`)."#;
 
 pub const UI_PAGE_AND_DASHBOARD_RULEPACK: &str = r#"SCOPED PAGE & DASHBOARD PREVIEW RESILIENCE RULES:
-1. ZERO AUTH-WALL / ZERO INFINITE LOADING IN PREVIEW (CRITICAL):
-   - NEVER block page rendering with `if (!session) return <div>Loading...</div>;` or `if (status === 'unauthenticated') return <Link href="/login">Log in</Link>;` or `if (loading) return <div>Loading...</div>;`!
-   - Users inspect and test all pages in Live Preview mode before logging in. Every page (`/dashboard`, `/dashboard/projects`, `/dashboard/analytics`, `/dashboard/integrations`, `/dashboard/pricing`, `/dashboard/subscription`, etc.) MUST immediately render its complete, interactive UI with rich domain data even when `session` is null or unauthenticated!
-2. MANDATORY RICH INITIAL MOCK STATE (`INITIAL_MOCK_DATA`):
-   - NEVER initialize domain lists, metrics, or cards with an empty array `useState([])` or `useState(null)`!
-   - Always define a module-level constant (e.g. `const INITIAL_MOCK_PROJECTS: Project[] = [...]`) containing 4 to 6 realistic, domain-specific items (with realistic titles, descriptions, status badges, dates, and metrics tailored to the project's business domain) and initialize state with it: `const [projects, setProjects] = useState<Project[]>(INITIAL_MOCK_PROJECTS);`.
+1. ZERO AUTH-WALL / ZERO INFINITE LOADING / ZERO LOGIN REDIRECT IN PREVIEW (CRITICAL):
+   - NEVER block page rendering with `if (!session) return <div>Loading...</div>;` or `if (status === 'unauthenticated') return <Link href="/login">Log in</Link>;` or `if (loading) return <div>Loading...</div>;`, and NEVER redirect unauthenticated users away in `useEffect` (`if (!user) router.push('/login')` is STRICTLY FORBIDDEN)!
+   - Users inspect and test all pages in Live Preview mode before logging in. Every page (`/dashboard`, `/courses`, `/mentorship`, `/employer`, `/pricing`, `/subscription`, etc.) MUST immediately render its complete, interactive UI with rich domain data even when `session` or `user` is null!
+2. MANDATORY RICH INITIAL MOCK STATE (`INITIAL_MOCK_DATA`) IN PAGES AND HOOKS:
+   - NEVER initialize domain lists, metrics, or cards with an empty array `useState([])` or `useState(null)` in either pages (`page.tsx`) or custom hooks (`src/hooks/use*.ts`)!
+   - Always define a module-level constant (e.g. `const INITIAL_MOCK_ITEMS = [...]`) containing 4 to 6 realistic, domain-specific items (with realistic titles, descriptions, status badges, dates, and metrics tailored to the project's business domain) and initialize state with it: `const [items, setItems] = useState(INITIAL_MOCK_ITEMS);`.
 3. UNCONDITIONAL FETCH WITH NON-EMPTY GUARD:
-   - Inside `useEffect`, do NOT wrap `fetch('/api/...')` inside `if (session)`! Fetch unconditionally on mount, and only overwrite the initial mock state if the API returns a non-empty array or valid object:
+   - Inside `useEffect`, do NOT wrap `fetch('/api/...')` inside `if (session)`! Fetch unconditionally on mount with an empty dependency array `[]` (NEVER pass a non-memoized function or object into the `useEffect` dependency array, which causes an infinite re-render loop!), and only overwrite the initial mock state if `res.ok` and the API returns a non-empty array or valid object:
      ```tsx
      useEffect(() => {
        fetch('/api/projects')
@@ -810,8 +810,11 @@ pub const UI_PAGE_AND_DASHBOARD_RULEPACK: &str = r#"SCOPED PAGE & DASHBOARD PREV
          .catch(() => {});
      }, []);
      ```
-4. INTERACTIVE OPTIMISTIC CRUD WORKFLOWS:
-   - When the user clicks "New / Add / Create" or "Delete" or toggles a status on the page, provide an interactive modal/form or optimistic state update (`setItems((prev) => [newItem, ...prev])` and `setItems((prev) => prev.filter((i) => i.id !== id))`) alongside the `fetch` call so the UI responds instantaneously in Live Preview!"#;
+4. INTERACTIVE OPTIMISTIC CRUD WORKFLOWS & BOOLEAN MODAL TOGGLES:
+   - When the user clicks "New / Add / Create / Request", toggle a dedicated boolean state (`const [isFormOpen, setIsFormOpen] = useState(false);`) to open the modal/form (NEVER guard form visibility on non-empty input fields like `{newRequest.mentorId && (...)}` which prevents the form from ever opening!).
+   - On form submit, perform an optimistic state update (`setItems((prev) => [newItem, ...prev])`) alongside the `fetch` call so the UI responds instantaneously in Live Preview!
+5. DIRECT HOOK IMPORTS:
+   - Import custom hooks directly from their module file (e.g. `import { useCourse } from '@/hooks/useCourse';`), NOT from a barrel `'@/hooks'`."#;
 
 pub const UI_ANALYTICS_AND_CHARTS_RULEPACK: &str = r#"SCOPED ANALYTICS, KPI & DATA VISUALIZATION RULES:
 1. PRE-POPULATED CHART STATE (NEVER EMPTY):
@@ -947,6 +950,7 @@ pub fn get_scoped_ui_rules(file_path: &str) -> String {
 
     let is_page_or_domain_view = path_lower.ends_with("page.tsx")
         || path_lower.ends_with("page.jsx")
+        || path_lower.contains("hooks/")
         || path_lower.contains("dashboard")
         || path_lower.contains("project")
         || path_lower.contains("task")
@@ -3231,6 +3235,9 @@ export default function RootLayout({
             let _ = child.wait();
         }
     }
+
+    // Ensure barrel index.ts files exist in src/hooks, src/types, src/utils, src/config
+    ensure_directory_barrel_files(&proj_dir);
 
     // Run self-healing compiler loop to automatically correct any compilation or syntax errors
     perform_self_healing_loop(&proj_dir, &model_id, &files_to_generate).await;

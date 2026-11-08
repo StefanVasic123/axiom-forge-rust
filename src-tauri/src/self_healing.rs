@@ -182,7 +182,7 @@ pub fn scan_and_fix_imports(dir: &std::path::Path, src_root: &std::path::Path, i
                                     ];
                                     
                                     for var_path in variations {
-                                        if var_path.exists() {
+                                        if var_path.is_file() {
                                             exists = true;
                                             break;
                                         }
@@ -300,14 +300,14 @@ pub fn collect_missing_imports(
                                     ];
                                     
                                     for var_path in variations {
-                                        if var_path.exists() {
+                                        if var_path.is_file() {
                                             exists = true;
                                             break;
                                         }
                                     }
                                     
                                     if !exists {
-                                        let target_file_path = if target_abs.extension().is_some() {
+                                        let target_file_path = if target_abs.is_dir() { target_abs.join("index.ts") } else if target_abs.extension().is_some() {
                                             target_abs.clone()
                                         } else {
                                             let ext_str = path.extension().and_then(|e| e.to_str()).unwrap_or("tsx");

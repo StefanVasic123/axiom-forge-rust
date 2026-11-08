@@ -285,7 +285,20 @@ pub fn normalize_project_structure(files: &mut Vec<Value>, metamanifest: &Value,
 }
 
 pub fn get_axiom_inspector_script() -> &'static str {
-    "      <script dangerouslySetInnerHTML={{ __html: `\n        if (!window.__axiom_inspect_injected) {\n          window.__axiom_inspect_injected = true;\n          let isInspectActive = false;\n          let lastReportedOverlaySig = '';\n          function extractNextjsOverlay() {\n            try {\n              const portal = document.querySelector('nextjs-portal');\n              const root = (portal && portal.shadowRoot) ? portal.shadowRoot : document;\n              const dialog = root.querySelector('[data-nextjs-dialog], [role=\"dialog\"], #nextjs__container_errors_label');\n              const rawText = (root !== document && root.textContent) ? root.textContent.trim() : (dialog ? dialog.textContent.trim() : '');\n              if (!rawText || (!rawText.includes('Error') && !rawText.includes('Failed to compile'))) return null;\n              const fileMatch = rawText.match(/(?:\\.\\/|src[\\/\\\\]|app[\\/\\\\]|pages[\\/\\\\]|components[\\/\\\\])[A-Za-z0-9_\\-\\/\\\\.]+\\.(?:tsx|ts|jsx|js)/);\n              const sourceFile = fileMatch ? fileMatch[0].replace(/\\\\/g, '/').replace(/^\\.\\//, '') : null;\n              const errMatch = rawText.match(/(?:ReferenceError|TypeError|SyntaxError|Error):\\s*[^\\n]+/);\n              const message = errMatch ? errMatch[0].trim() : rawText.substring(0, 220).replace(/\\s+/g, ' ');\n              return { hasError: true, message, sourceFile, rawText: rawText.substring(0, 1200) };\n            } catch (e) { return null; }\n          }\n          function collectAxiomUiSnapshot() {\n            try {\n              const isVis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };\n              const headings = Array.from(document.querySelectorAll('h1, h2, h3')).slice(0, 20).map(h => ({ tag: h.tagName.toLowerCase(), text: (h.innerText || '').trim().substring(0, 120) })).filter(h => h.text);\n              const buttons = Array.from(document.querySelectorAll('button, [role=\"button\"]')).slice(0, 35).map(b => ({ text: (b.innerText || '').trim().substring(0, 80), ariaLabel: b.getAttribute('aria-label') || '', disabled: !!b.disabled, visible: isVis(b) }));\n              const links = Array.from(document.querySelectorAll('a')).slice(0, 35).map(a => ({ text: (a.innerText || '').trim().substring(0, 80), href: a.getAttribute('href') || '', visible: isVis(a) }));\n              const inputs = Array.from(document.querySelectorAll('input, select, textarea')).slice(0, 25).map(i => ({ tag: i.tagName.toLowerCase(), type: i.getAttribute('type') || '', name: i.getAttribute('name') || '', placeholder: i.getAttribute('placeholder') || '', value: (i.value || '').substring(0, 80) }));\n              const overlay = extractNextjsOverlay();\n              const bodyText = (document.body ? document.body.innerText : '').trim();\n              return {\n                url: window.location.href,\n                pathname: window.location.pathname,\n                title: document.title || '',\n                nextjsOverlay: overlay,\n                headings,\n                buttons,\n                links,\n                inputs,\n                layout: {\n                  viewportWidth: window.innerWidth,\n                  viewportHeight: window.innerHeight,\n                  scrollWidth: document.documentElement ? document.documentElement.scrollWidth : 0,\n                  scrollHeight: document.documentElement ? document.documentElement.scrollHeight : 0,\n                  hasHorizontalOverflow: (document.documentElement ? document.documentElement.scrollWidth : 0) > window.innerWidth + 4,\n                  hasNavbar: !!document.querySelector('nav, header'),\n                  hasFooter: !!document.querySelector('footer'),\n                  visibleTextPreview: bodyText.substring(0, 600)\n                }\n              };\n            } catch (e) { return { error: String(e) }; }\n          }\n          function reportAxiomRoute() {\n            try {\n              const overlay = extractNextjsOverlay();\n              if (overlay && overlay.hasError) {\n                const sig = (overlay.sourceFile || '') + '::' + overlay.message;\n                if (sig !== lastReportedOverlaySig) {\n                  lastReportedOverlaySig = sig;\n                  window.parent.postMessage({ channel: 'axiom-preview-error', message: overlay.message, sourceFile: overlay.sourceFile, details: overlay.rawText, path: window.location.pathname }, '*');\n                }\n              }\n              window.parent.postMessage({ channel: 'axiom-preview-route', pathname: window.location.pathname, url: window.location.href, snapshot: collectAxiomUiSnapshot() }, '*');\n            } catch(e) {}\n          }\n          setTimeout(reportAxiomRoute, 400);\n          window.addEventListener('popstate', reportAxiomRoute);\n          setInterval(reportAxiomRoute, 2000);\n          window.addEventListener('error', function(e) { try { window.parent.postMessage({ channel: 'axiom-preview-error', message: e.message || 'Unknown runtime error', sourceFile: e.filename || null, path: window.location.pathname }, '*'); } catch(err) {} });\n          window.addEventListener('unhandledrejection', function(e) { try { window.parent.postMessage({ channel: 'axiom-preview-error', message: e.reason?.message || String(e.reason || 'Unhandled promise rejection'), path: window.location.pathname }, '*'); } catch(err) {} });\n          window.addEventListener('message', (e) => {\n            if (e.data && e.data.channel === 'axiom-toggle-inspect') {\n              isInspectActive = !!e.data.enabled;\n              if (!isInspectActive && highlightedElement) {\n                highlightedElement.classList.remove('axiom-inspect-highlight');\n                highlightedElement = null;\n              }\n            }\n            if (e.data && e.data.channel === 'axiom-agent-dom-cmd') {\n              const cmd = e.data;\n              try {\n                if (cmd.action === 'snapshot') {\n                  window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'ok', snapshot: collectAxiomUiSnapshot() }, '*');\n                } else if (cmd.action === 'click') {\n                  let el = cmd.selector ? document.querySelector(cmd.selector) : null;\n                  if (!el && cmd.text) {\n                    const needle = cmd.text.toLowerCase();\n                    const candidates = Array.from(document.querySelectorAll('button, a, [role=\"button\"], li, span'));\n                    el = candidates.find(c => ((c.innerText || '').trim().toLowerCase().includes(needle)) || ((c.getAttribute('aria-label') || '').toLowerCase().includes(needle)));\n                  }\n                  if (el) {\n                    el.click();\n                    setTimeout(() => {\n                      window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'clicked: ' + (el.innerText || el.tagName).trim().substring(0, 50), snapshot: collectAxiomUiSnapshot() }, '*');\n                    }, 600);\n                  } else {\n                    window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'element_not_found', snapshot: collectAxiomUiSnapshot() }, '*');\n                  }\n                } else if (cmd.action === 'type') {\n                  let el = cmd.selector ? document.querySelector(cmd.selector) : null;\n                  if (!el && cmd.placeholder) {\n                    const needle = cmd.placeholder.toLowerCase();\n                    el = Array.from(document.querySelectorAll('input, textarea')).find(i => (i.getAttribute('placeholder') || '').toLowerCase().includes(needle) || (i.getAttribute('name') || '').toLowerCase().includes(needle));\n                  }\n                  if (el) {\n                    const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;\n                    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;\n                    if (setter) setter.call(el, cmd.value || ''); else el.value = cmd.value || '';\n                    el.dispatchEvent(new Event('input', { bubbles: true }));\n                    el.dispatchEvent(new Event('change', { bubbles: true }));\n                    setTimeout(() => {\n                      window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'typed', snapshot: collectAxiomUiSnapshot() }, '*');\n                    }, 300);\n                  } else {\n                    window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'input_not_found', snapshot: collectAxiomUiSnapshot() }, '*');\n                  }\n                } else if (cmd.action === 'navigate' && cmd.route) {\n                  window.location.href = cmd.route;\n                }\n              } catch (err) {\n                window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'error: ' + String(err), snapshot: collectAxiomUiSnapshot() }, '*');\n              }\n            }\n          });\n          const styleEl = document.createElement('style');\n          styleEl.textContent = \\`\n            .axiom-inspect-highlight {\n              outline: 2px solid #6366f1 !important;\n              outline-offset: -2px !important;\n              cursor: crosshair !important;\n              background-color: rgba(99, 102, 241, 0.12) !important;\n              transition: all 0.1s ease;\n            }\n          \\`;\n          document.head.appendChild(styleEl);\n          let highlightedElement = null;\n          function findAxiomTarget(el) {\n            if (!el || el === document.body || el === document.documentElement) return null;\n            let cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              if (cur.dataset && (cur.dataset.axiomFile || cur.dataset.axiomComponent)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            const validTags = ['h1','h2','h3','h4','h5','h6','p','button','a','input','textarea','select','header','footer','nav','section','article','aside','li'];\n            cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              const tag = cur.tagName.toLowerCase();\n              if (validTags.includes(tag) || (cur.innerText && cur.innerText.trim().length > 0 && cur.children.length === 0)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            return el !== document.body && el !== document.documentElement ? el : null;\n          }\n          document.addEventListener('mouseover', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (highlightedElement && highlightedElement !== target) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n            }\n            if (target) {\n              target.classList.add('axiom-inspect-highlight');\n              highlightedElement = target;\n            }\n          }, true);\n          document.addEventListener('mouseout', (e) => {\n            if (highlightedElement) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n              highlightedElement = null;\n            }\n          }, true);\n          document.addEventListener('click', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (target) {\n              e.preventDefault();\n              e.stopPropagation();\n              const payload = {\n                file: target.dataset?.axiomFile || null,\n                component: target.dataset?.axiomComponent || null,\n                tagName: target.tagName.toLowerCase(),\n                text: (target.innerText || target.value || '').trim().substring(0, 80),\n                path: window.location.pathname\n              };\n              window.parent.postMessage({ channel: 'axiom-inspect-click', payload }, '*');\n            }\n          }, true);\n        }\n      ` }} />"
+    "      <script dangerouslySetInnerHTML={{ __html: `\n        if (!window.__axiom_inspect_injected) {\n          window.__axiom_inspect_injected = true;\n          let isInspectActive = false;\n          let lastReportedOverlaySig = '';\n          function extractNextjsOverlay() {\n            try {\n              const portal = document.querySelector('nextjs-portal');\n              const root = (portal && portal.shadowRoot) ? portal.shadowRoot : document;\n              const dialog = root.querySelector('[data-nextjs-dialog], [role=\"dialog\"], #nextjs__container_errors_label');\n              let rawText = dialog ? (dialog.innerText || dialog.textContent || '').trim() : '';\n              if (!rawText && root !== document) {\n                rawText = Array.from(root.children || []).filter(el => el.tagName !== 'STYLE' && el.tagName !== 'SCRIPT').map(el => el.innerText || el.textContent || '').join(String.fromCharCode(10)).trim();\n              }\n              if (!rawText || (!rawText.includes('Error') && !rawText.includes('Failed to compile') && !rawText.includes('Module not found'))) return null;\n              const normText = rawText.split(String.fromCharCode(92)).join('/');\n              const fileMatch = normText.match(new RegExp('(?:src/|app/|pages/|components/)[A-Za-z0-9_/.+-]+[.](?:tsx|ts|jsx|js)'));\n              const sourceFile = fileMatch ? fileMatch[0] : null;\n              const lines = normText.split(String.fromCharCode(10)).map(l => l.trim()).filter(l => l && !l.startsWith(':host') && !l.startsWith('/*!'));\n              const errLine = lines.find(l => l.includes('Module not found:') || l.includes('Error:') || l.includes('Failed to compile')) || lines[0] || '';\n              const message = errLine.substring(0, 220);\n              return { hasError: true, message, sourceFile, rawText: rawText.substring(0, 1200) };\n            } catch (e) { return null; }\n          }\n          function collectAxiomUiSnapshot() {\n            try {\n              const isVis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };\n              const headings = Array.from(document.querySelectorAll('h1, h2, h3')).slice(0, 20).map(h => ({ tag: h.tagName.toLowerCase(), text: (h.innerText || '').trim().substring(0, 120) })).filter(h => h.text);\n              const buttons = Array.from(document.querySelectorAll('button, [role=\"button\"]')).slice(0, 35).map(b => ({ text: (b.innerText || '').trim().substring(0, 80), ariaLabel: b.getAttribute('aria-label') || '', disabled: !!b.disabled, visible: isVis(b) }));\n              const links = Array.from(document.querySelectorAll('a')).slice(0, 35).map(a => ({ text: (a.innerText || '').trim().substring(0, 80), href: a.getAttribute('href') || '', visible: isVis(a) }));\n              const inputs = Array.from(document.querySelectorAll('input, select, textarea')).slice(0, 25).map(i => ({ tag: i.tagName.toLowerCase(), type: i.getAttribute('type') || '', name: i.getAttribute('name') || '', placeholder: i.getAttribute('placeholder') || '', value: (i.value || '').substring(0, 80) }));\n              const overlay = extractNextjsOverlay();\n              const bodyText = (document.body ? document.body.innerText : '').trim();\n              return {\n                url: window.location.href,\n                pathname: window.location.pathname,\n                title: document.title || '',\n                nextjsOverlay: overlay,\n                headings,\n                buttons,\n                links,\n                inputs,\n                layout: {\n                  viewportWidth: window.innerWidth,\n                  viewportHeight: window.innerHeight,\n                  scrollWidth: document.documentElement ? document.documentElement.scrollWidth : 0,\n                  scrollHeight: document.documentElement ? document.documentElement.scrollHeight : 0,\n                  hasHorizontalOverflow: (document.documentElement ? document.documentElement.scrollWidth : 0) > window.innerWidth + 4,\n                  hasNavbar: !!document.querySelector('nav, header'),\n                  hasFooter: !!document.querySelector('footer'),\n                  visibleTextPreview: bodyText.substring(0, 600)\n                }\n              };\n            } catch (e) { return { error: String(e) }; }\n          }\n          function reportAxiomRoute() {\n            try {\n              const overlay = extractNextjsOverlay();\n              if (overlay && overlay.hasError) {\n                const sig = (overlay.sourceFile || '') + '::' + overlay.message;\n                if (sig !== lastReportedOverlaySig) {\n                  lastReportedOverlaySig = sig;\n                  window.parent.postMessage({ channel: 'axiom-preview-error', message: overlay.message, sourceFile: overlay.sourceFile, details: overlay.rawText, path: window.location.pathname }, '*');\n                }\n              }\n              window.parent.postMessage({ channel: 'axiom-preview-route', pathname: window.location.pathname, url: window.location.href, snapshot: collectAxiomUiSnapshot() }, '*');\n            } catch(e) {}\n          }\n          setTimeout(reportAxiomRoute, 400);\n          window.addEventListener('popstate', reportAxiomRoute);\n          setInterval(reportAxiomRoute, 2000);\n          window.addEventListener('error', function(e) { try { window.parent.postMessage({ channel: 'axiom-preview-error', message: e.message || 'Unknown runtime error', sourceFile: e.filename || null, path: window.location.pathname }, '*'); } catch(err) {} });\n          window.addEventListener('unhandledrejection', function(e) { try { window.parent.postMessage({ channel: 'axiom-preview-error', message: e.reason?.message || String(e.reason || 'Unhandled promise rejection'), path: window.location.pathname }, '*'); } catch(err) {} });\n          window.addEventListener('message', (e) => {\n            if (e.data && e.data.channel === 'axiom-toggle-inspect') {\n              isInspectActive = !!e.data.enabled;\n              if (!isInspectActive && highlightedElement) {\n                highlightedElement.classList.remove('axiom-inspect-highlight');\n                highlightedElement = null;\n              }\n            }\n            if (e.data && e.data.channel === 'axiom-agent-dom-cmd') {\n              const cmd = e.data;\n              try {\n                if (cmd.action === 'snapshot') {\n                  window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'ok', snapshot: collectAxiomUiSnapshot() }, '*');\n                } else if (cmd.action === 'click') {\n                  let el = cmd.selector ? document.querySelector(cmd.selector) : null;\n                  if (!el && cmd.text) {\n                    const needle = cmd.text.toLowerCase();\n                    const candidates = Array.from(document.querySelectorAll('button, a, [role=\"button\"], li, span'));\n                    el = candidates.find(c => ((c.innerText || '').trim().toLowerCase().includes(needle)) || ((c.getAttribute('aria-label') || '').toLowerCase().includes(needle)));\n                  }\n                  if (el) {\n                    el.click();\n                    setTimeout(() => {\n                      window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'clicked: ' + (el.innerText || el.tagName).trim().substring(0, 50), snapshot: collectAxiomUiSnapshot() }, '*');\n                    }, 600);\n                  } else {\n                    window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'element_not_found', snapshot: collectAxiomUiSnapshot() }, '*');\n                  }\n                } else if (cmd.action === 'type') {\n                  let el = cmd.selector ? document.querySelector(cmd.selector) : null;\n                  if (!el && cmd.placeholder) {\n                    const needle = cmd.placeholder.toLowerCase();\n                    el = Array.from(document.querySelectorAll('input, textarea')).find(i => (i.getAttribute('placeholder') || '').toLowerCase().includes(needle) || (i.getAttribute('name') || '').toLowerCase().includes(needle));\n                  }\n                  if (el) {\n                    const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;\n                    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;\n                    if (setter) setter.call(el, cmd.value || ''); else el.value = cmd.value || '';\n                    el.dispatchEvent(new Event('input', { bubbles: true }));\n                    el.dispatchEvent(new Event('change', { bubbles: true }));\n                    setTimeout(() => {\n                      window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'typed', snapshot: collectAxiomUiSnapshot() }, '*');\n                    }, 300);\n                  } else {\n                    window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'input_not_found', snapshot: collectAxiomUiSnapshot() }, '*');\n                  }\n                } else if (cmd.action === 'navigate' && cmd.route) {\n                  window.location.href = cmd.route;\n                }\n              } catch (err) {\n                window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'error: ' + String(err), snapshot: collectAxiomUiSnapshot() }, '*');\n              }\n            }\n          });\n          const styleEl = document.createElement('style');\n          styleEl.textContent = '.axiom-inspect-highlight { outline: 2px solid #6366f1 !important; outline-offset: -2px !important; cursor: crosshair !important; background-color: rgba(99, 102, 241, 0.12) !important; transition: all 0.1s ease; }';\n          document.head.appendChild(styleEl);\n          let highlightedElement = null;\n          function findAxiomTarget(el) {\n            if (!el || el === document.body || el === document.documentElement) return null;\n            let cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              if (cur.dataset && (cur.dataset.axiomFile || cur.dataset.axiomComponent)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            const validTags = ['h1','h2','h3','h4','h5','h6','p','button','a','input','textarea','select','header','footer','nav','section','article','aside','li'];\n            cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              const tag = cur.tagName.toLowerCase();\n              if (validTags.includes(tag) || (cur.innerText && cur.innerText.trim().length > 0 && cur.children.length === 0)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            return el !== document.body && el !== document.documentElement ? el : null;\n          }\n          document.addEventListener('mouseover', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (highlightedElement && highlightedElement !== target) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n            }\n            if (target) {\n              target.classList.add('axiom-inspect-highlight');\n              highlightedElement = target;\n            }\n          }, true);\n          document.addEventListener('mouseout', (e) => {\n            if (highlightedElement) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n              highlightedElement = null;\n            }\n          }, true);\n          document.addEventListener('click', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (target) {\n              e.preventDefault();\n              e.stopPropagation();\n              const payload = {\n                file: target.dataset?.axiomFile || null,\n                component: target.dataset?.axiomComponent || null,\n                tagName: target.tagName.toLowerCase(),\n                text: (target.innerText || target.value || '').trim().substring(0, 80),\n                path: window.location.pathname\n              };\n              window.parent.postMessage({ channel: 'axiom-inspect-click', payload }, '*');\n            }\n          }, true);\n        }\n      ` }} />"
+}
+
+pub fn strip_axiom_inspector_script(content: &str) -> String {
+    let mut cleaned = content.to_string();
+    let start_marker = "<script dangerouslySetInnerHTML={{ __html: `";
+    while let Some(s_idx) = cleaned.find(start_marker) {
+        if let Some(end_rel) = cleaned[s_idx..].find("` }} />") {
+            cleaned.replace_range(s_idx..s_idx + end_rel + 7, "");
+        } else {
+            break;
+        }
+    }
+    cleaned
 }
 
 pub fn ensure_axiom_inspector_injected(proj_dir: &std::path::Path) {
@@ -308,23 +321,12 @@ pub fn ensure_axiom_inspector_injected(proj_dir: &std::path::Path) {
         let full_path = proj_dir.join(rel_path);
         if full_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&full_path) {
-                if !content.contains("axiom-agent-dom-cmd") {
-                    let cleaned = if content.contains("axiom-inspect-click") || content.contains("axiom-toggle-inspect") || content.contains("axiom-preview-error") {
-                        let start_marker = "<script dangerouslySetInnerHTML={{ __html: `";
-                        if let Some(s_idx) = content.find(start_marker) {
-                            if let Some(end_rel) = content[s_idx..].find("` }} />") {
-                                let mut c = content.clone();
-                                c.replace_range(s_idx..s_idx + end_rel + 7, "");
-                                c
-                            } else {
-                                content.clone()
-                            }
-                        } else {
-                            content.clone()
-                        }
-                    } else {
-                        content.clone()
-                    };
+                let needs_upgrade = !content.contains("axiom-agent-dom-cmd")
+                    || content.contains("rawText.match(/(?:")
+                    || content.contains("styleEl.textContent = \\`")
+                    || content.contains("const rawText = (root !== document && root.textContent)");
+                if needs_upgrade {
+                    let cleaned = strip_axiom_inspector_script(&content);
 
                     let new_content = if cleaned.contains("</body>") {
                         cleaned.replace("</body>", &format!("{}\n      </body>", script))
@@ -337,6 +339,159 @@ pub fn ensure_axiom_inspector_injected(proj_dir: &std::path::Path) {
                 }
             }
             break;
+        }
+    }
+}
+
+pub fn ensure_directory_barrel_files(proj_dir: &std::path::Path) {
+    let src_dir = proj_dir.join("src");
+    if !src_dir.exists() {
+        return;
+    }
+
+    // Demand-driven scan: find any local import specifier (`@/...` or `./...` or `../...`) that resolves to an existing directory lacking an index file
+    let import_re = match regex::Regex::new(r#"(?m)import\s+(?:type\s+)?(?:\{([^}]+)\}|[A-Za-z0-9_$*,\s]+)\s+from\s+['"](@/[^'"]+|\.\.?/[^'"]+)['"]"#) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+
+    let mut demanded_dirs: std::collections::BTreeMap<std::path::PathBuf, std::collections::BTreeSet<String>> = std::collections::BTreeMap::new();
+
+    fn scan_demanded_barrels(
+        dir: &std::path::Path,
+        src_root: &std::path::Path,
+        re: &regex::Regex,
+        demanded: &mut std::collections::BTreeMap<std::path::PathBuf, std::collections::BTreeSet<String>>,
+    ) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if name != "node_modules" && name != ".next" && name != ".git" {
+                        scan_demanded_barrels(&p, src_root, re, demanded);
+                    }
+                } else if p.is_file() {
+                    let s = p.to_string_lossy();
+                    if s.ends_with(".ts") || s.ends_with(".tsx") || s.ends_with(".js") || s.ends_with(".jsx") {
+                        if let Ok(content) = std::fs::read_to_string(&p) {
+                            for cap in re.captures_iter(&content) {
+                                let spec = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+                                let target_dir = if let Some(sub) = spec.strip_prefix("@/") {
+                                    src_root.join(sub)
+                                } else if let Some(parent) = p.parent() {
+                                    parent.join(spec)
+                                } else {
+                                    continue;
+                                };
+
+                                // Only trigger if `target_dir` is an existing directory AND has no file/index counterpart
+                                let has_file_counterpart = target_dir.with_extension("ts").is_file()
+                                    || target_dir.with_extension("tsx").is_file()
+                                    || target_dir.with_extension("js").is_file()
+                                    || target_dir.with_extension("jsx").is_file();
+
+                                if target_dir.is_dir() && !has_file_counterpart {
+                                    let entry_set = demanded.entry(target_dir).or_default();
+                                    if let Some(named_list) = cap.get(1) {
+                                        for item in named_list.as_str().split(',') {
+                                            let clean = item
+                                                .trim()
+                                                .trim_start_matches("type ")
+                                                .split_whitespace()
+                                                .next()
+                                                .unwrap_or("")
+                                                .trim();
+                                            if !clean.is_empty() {
+                                                entry_set.insert(clean.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    scan_demanded_barrels(&src_dir, &src_dir, &import_re, &mut demanded_dirs);
+
+    for (dir_path, demanded_symbols) in demanded_dirs {
+        let index_ts = dir_path.join("index.ts");
+        let index_tsx = dir_path.join("index.tsx");
+        let index_js = dir_path.join("index.js");
+        if index_ts.is_file() || index_tsx.is_file() || index_js.is_file() {
+            continue;
+        }
+
+        let mut stems: Vec<String> = Vec::new();
+        let mut combined_existing_content = String::new();
+        if let Ok(entries) = std::fs::read_dir(&dir_path) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_file() {
+                    if let Some(fname) = p.file_name().and_then(|n| n.to_str()) {
+                        if (fname.ends_with(".ts") || fname.ends_with(".tsx"))
+                            && !fname.starts_with("index.")
+                            && !fname.ends_with(".d.ts")
+                        {
+                            if let Ok(c) = std::fs::read_to_string(&p) {
+                                combined_existing_content.push_str(&c);
+                                combined_existing_content.push('\n');
+                            }
+                            let stem = fname
+                                .trim_end_matches(".tsx")
+                                .trim_end_matches(".ts")
+                                .to_string();
+                            if !stem.is_empty() {
+                                stems.push(stem);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stems.sort();
+
+        let mut lines = Vec::new();
+        for stem in &stems {
+            let ts_file = dir_path.join(format!("{}.ts", stem));
+            let tsx_file = dir_path.join(format!("{}.tsx", stem));
+            let target_file = if ts_file.exists() { ts_file } else { tsx_file };
+            if let Ok(file_content) = std::fs::read_to_string(&target_file) {
+                let has_named = file_content.contains(&format!("export const {}", stem))
+                    || file_content.contains(&format!("export function {}", stem))
+                    || file_content.contains(&format!("export {{ {}", stem))
+                    || file_content.contains(&format!("export {{{}", stem))
+                    || file_content.contains("export interface ")
+                    || file_content.contains("export type ");
+                if !has_named && file_content.contains("export default") {
+                    lines.push(format!("export {{ default as {} }} from './{}';", stem, stem));
+                }
+            }
+            lines.push(format!("export * from './{}';", stem));
+        }
+
+        // For any PascalCase symbol (type/interface) demanded from this barrel directory that is not exported in any of its files, provide a safe type alias
+        for sym in demanded_symbols {
+            if sym.chars().next().map_or(false, |c| c.is_ascii_uppercase()) && !stems.contains(&sym) {
+                let is_defined = combined_existing_content.contains(&format!("interface {}", sym))
+                    || combined_existing_content.contains(&format!("type {} =", sym))
+                    || combined_existing_content.contains(&format!("type {}=", sym))
+                    || combined_existing_content.contains(&format!("enum {}", sym))
+                    || combined_existing_content.contains(&format!("const {}", sym))
+                    || combined_existing_content.contains(&format!("function {}", sym))
+                    || combined_existing_content.contains(&format!("class {}", sym));
+                if !is_defined {
+                    lines.push(format!("export type {} = any;", sym));
+                }
+            }
+        }
+
+        if !lines.is_empty() {
+            let _ = std::fs::write(&index_ts, format!("{}\n", lines.join("\n")));
         }
     }
 }
@@ -387,16 +542,24 @@ pub fn ensure_valid_tsconfig(proj_dir: &std::path::Path) {
 }
 
 pub fn sanitize_react_icons_imports(content: &str) -> String {
+    let normalized = content
+        .replace("HiOutlineDollarSign", "HiOutlineCurrencyDollar")
+        .replace("HiDollarSign", "HiCurrencyDollar");
     let mut result = Vec::new();
-    let lines: Vec<&str> = content.lines().collect();
+    let lines: Vec<&str> = normalized.lines().collect();
     
     for line in lines {
         let trimmed = line.trim();
+        let is_mismatched_io = (trimmed.contains("from 'react-icons/io5'") || trimmed.contains("from \"react-icons/io5\""))
+            && (trimmed.contains("IoIos") || trimmed.contains("IoMd"));
         let is_bare_react_icons = (trimmed.starts_with("import ") || trimmed.starts_with("import{"))
             && (trimmed.ends_with("from 'react-icons';") 
                 || trimmed.ends_with(r#"from "react-icons";"#)
                 || trimmed.ends_with("from 'react-icons'")
-                || trimmed.ends_with(r#"from "react-icons""#));
+                || trimmed.ends_with(r#"from "react-icons""#)
+                || trimmed.contains("-icons-react'")
+                || trimmed.contains("-icons-react\"")
+                || is_mismatched_io);
 
         if is_bare_react_icons {
             if let Some(open_brace) = line.find('{') {
@@ -424,7 +587,9 @@ pub fn sanitize_react_icons_imports(content: &str) -> String {
                             "react-icons/fi"
                         } else if ident.starts_with("Md") {
                             "react-icons/md"
-                        } else if ident.starts_with("Io5") || ident.starts_with("IoMd") || ident.starts_with("IoIos") || ident.starts_with("Io") {
+                        } else if ident.starts_with("IoMd") || ident.starts_with("IoIos") {
+                            "react-icons/io"
+                        } else if ident.starts_with("Io5") || ident.starts_with("Io") {
                             "react-icons/io5"
                         } else if ident.starts_with("Ai") {
                             "react-icons/ai"
@@ -547,11 +712,25 @@ pub fn sanitize_app_router_links_with_routes(content: &str, valid_routes: &[Stri
 }
 
 pub fn sanitize_unhandled_session_loading(content: &str) -> String {
-    if !content.contains("useSession") {
-        return content.to_string();
+    let mut modified = content.to_string();
+
+    // Neutralize client-side preview redirect traps (`if (!user) { router.push('/login'); }` or `if (!session) { router.push('/login'); }`)
+    if modified.contains("router.push") && (modified.contains("'/login'") || modified.contains("\"/login\"")) {
+        if let Ok(re_redirect_block) = regex::Regex::new(
+            r#"(?m)^[ \t]*if\s*\(\s*!(?:user|session)\s*\)\s*\{\s*router\.push\s*\(\s*['"]/login['"]\s*\)\s*;?\s*(?:return\s*;?\s*)?\}[ \t]*\r?\n?"#
+        ) {
+            modified = re_redirect_block.replace_all(&modified, "").to_string();
+        }
+        if let Ok(re_redirect_line) = regex::Regex::new(
+            r#"(?m)^[ \t]*if\s*\(\s*!(?:user|session)\s*\)\s*router\.push\s*\(\s*['"]/login['"]\s*\)\s*;?[ \t]*\r?\n?"#
+        ) {
+            modified = re_redirect_line.replace_all(&modified, "").to_string();
+        }
     }
 
-    let mut modified = content.to_string();
+    if !modified.contains("useSession") {
+        return modified;
+    }
 
     // 1. Ensure setLoading(false) is reached when session is null in `if (session) { ... }`
     if modified.contains("setLoading") {
@@ -827,7 +1006,10 @@ pub fn post_process_generated_file(
     }
 
     let pre_sanitized_content = if (path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx"))
-        && (content.contains("useSession") || content.contains("!session") || content.contains("status ==="))
+        && (content.contains("useSession")
+            || content.contains("!session")
+            || content.contains("!user")
+            || content.contains("status ==="))
     {
         sanitize_unhandled_session_loading(content)
     } else {
@@ -1652,8 +1834,8 @@ export const config = {
                     .replace("NavLink", "Link");
             }
 
-            // react-icons root import normalization (converts bare 'react-icons' imports into specific subpaths)
-            if processed.contains("from 'react-icons'") || processed.contains("from \"react-icons\"") {
+            // react-icons root import normalization (converts bare 'react-icons' or '*-icons-react' imports into specific subpaths)
+            if processed.contains("from 'react-icons'") || processed.contains("from \"react-icons\"") || processed.contains("-icons-react'") || processed.contains("-icons-react\"") {
                 processed = sanitize_react_icons_imports(&processed);
             }
 
@@ -1713,6 +1895,131 @@ export default function Home() {
                 .replace("new Resend(process.env.RESEND_API_KEY!)", "new Resend(process.env.RESEND_API_KEY || 're_dummy_key_for_dev_preview')")
                 .replace("new Resend(process.env.RESEND_API_KEY || \"\")", "new Resend(process.env.RESEND_API_KEY || 're_dummy_key_for_dev_preview')")
                 .replace("new Resend(process.env.RESEND_API_KEY || '')", "new Resend(process.env.RESEND_API_KEY || 're_dummy_key_for_dev_preview')");
+        }
+
+        // Apply across all TS/TSX/JS/JSX files (hooks, components, pages, API routes):
+        if processed.contains("react-icons") || processed.contains("-icons-react") {
+            processed = sanitize_react_icons_imports(&processed);
+        }
+
+        // Expand barrel hook imports `import { useA, useB } from '@/hooks'` into individual `import { useA } from '@/hooks/useA'`
+        if processed.contains("from '@/hooks'") || processed.contains("from \"@/hooks\"") {
+            let mut rewritten_lines = Vec::new();
+            for line in processed.lines() {
+                let t = line.trim();
+                let is_hooks_barrel = (t.starts_with("import ") || t.starts_with("import{"))
+                    && (t.ends_with("from '@/hooks';")
+                        || t.ends_with("from \"@/hooks\";")
+                        || t.ends_with("from '@/hooks'")
+                        || t.ends_with("from \"@/hooks\""));
+                if is_hooks_barrel {
+                    if let (Some(ob), Some(cb)) = (line.find('{'), line.find('}')) {
+                        let inner = &line[ob + 1..cb];
+                        let symbols: Vec<&str> = inner.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                        let all_hooks = !symbols.is_empty() && symbols.iter().all(|s| {
+                            let ident = s.split_whitespace().next().unwrap_or(s);
+                            ident.starts_with("use") && ident.chars().nth(3).map_or(false, |c| c.is_ascii_uppercase())
+                        });
+                        if all_hooks {
+                            for sym in symbols {
+                                let ident = sym.split_whitespace().next().unwrap_or(sym);
+                                rewritten_lines.push(format!("import {{ {} }} from '@/hooks/{}';", sym, ident));
+                            }
+                            continue;
+                        }
+                    }
+                }
+                rewritten_lines.push(line.to_string());
+            }
+            processed = rewritten_lines.join("\n");
+        }
+
+        // Guard common array/object property accesses against undefined in generated UI/hooks
+        if processed.contains(".skills.join(") {
+            processed = processed.replace(".skills.join(", ".skills?.join(");
+        }
+        if processed.contains(".tags.join(") {
+            processed = processed.replace(".tags.join(", ".tags?.join(");
+        }
+        if processed.contains("${user.id}") {
+            processed = processed.replace("${user.id}", "${user?.id || 'preview-user'}");
+        }
+
+        // Aesthetic sanitizer for Footer.tsx: replace solid primary button classes on footer <Link> items with clean footer text link styling
+        if path_lower.ends_with("footer.tsx") || path_lower.ends_with("footer.jsx") {
+            if let Ok(re_footer_btn) = regex::Regex::new(
+                r#"(<Link\b[^>]*?\bclassName=["'])([^"']*?\b(?:bg-(?:teal|indigo|blue|emerald|violet|purple|rose|amber|cyan|sky)-600)\b[^"']*?\brounded-(?:xl|lg)\b[^"']*?)(["'])"#
+            ) {
+                processed = re_footer_btn
+                    .replace_all(&processed, "${1}text-sm text-slate-400 hover:text-white transition-colors mr-6 last:mr-0${3}")
+                    .to_string();
+            }
+        }
+
+        // Aesthetic sanitizer for Navbar.tsx: replace hamburger menu icon (<HiMenu / <FiMenu) accidentally placed inside the Brand Logo Mark badge
+        if path_lower.ends_with("navbar.tsx") || path_lower.ends_with("navbar.jsx") {
+            if let Ok(re_brand_menu) = regex::Regex::new(
+                r#"(<div\s+className=["'][^"']*?\bw-9\s+h-9\s+rounded-xl\s+bg-gradient-to-br\b[^"']*?["']\s*>\s*)<(?:HiMenu|FiMenu|HiOutlineMenu)\b[^>]*/?>"#
+            ) {
+                processed = re_brand_menu
+                    .replace_all(
+                        &processed,
+                        r#"${1}<svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>"#,
+                    )
+                    .to_string();
+            }
+        }
+
+        // Fix LLM `finally { setIsLoading(true); }` / `finally { setLoading(true); }` forever-loading trap
+        if processed.contains("finally") && (processed.contains("setIsLoading(true)") || processed.contains("setLoading(true)")) {
+            if let Ok(re) = regex::Regex::new(r"finally\s*\{\s*(set(?:Is)?Loading)\s*\(\s*true\s*\)\s*;?\s*\}") {
+                processed = re.replace_all(&processed, "finally {\n        $1(false);\n      }").to_string();
+            }
+        }
+
+        // Auto-inject `import { z } from 'zod';` when `z.object(` / `z.string(` / `z.enum(` / `z.array(` is used without importing zod
+        if (processed.contains("z.object(") || processed.contains("z.string(") || processed.contains("z.enum(") || processed.contains("z.array("))
+            && !processed.contains("from 'zod'")
+            && !processed.contains("from \"zod\"")
+        {
+            if processed.trim_start().starts_with("\"use client\"") || processed.trim_start().starts_with("'use client'") {
+                if let Some(newline_pos) = processed.find('\n') {
+                    let (first, rest) = processed.split_at(newline_pos + 1);
+                    processed = format!("{}import {{ z }} from 'zod';\n{}", first, rest);
+                }
+            } else {
+                processed = format!("import {{ z }} from 'zod';\n{}", processed);
+            }
+        }
+
+        // Auto-inject `import Link from 'next/link';` when `<Link ` or `<Link>` is used in JSX without importing Link
+        if (path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx"))
+            && (processed.contains("<Link ") || processed.contains("<Link>"))
+            && !processed.contains("import Link")
+            && !processed.contains("Link } from")
+            && !processed.contains("Link} from")
+            && !processed.contains("function Link")
+            && !processed.contains("const Link ")
+        {
+            if processed.trim_start().starts_with("\"use client\"") || processed.trim_start().starts_with("'use client'") {
+                if let Some(newline_pos) = processed.find('\n') {
+                    let (first, rest) = processed.split_at(newline_pos + 1);
+                    processed = format!("{}import Link from 'next/link';\n{}", first, rest);
+                }
+            } else {
+                processed = format!("import Link from 'next/link';\n{}", processed);
+            }
+        }
+
+        // Safe default parameter for custom hooks with destructured object props:
+        // `const useTasks = ({ boardId }: UseTasksProps)` -> `const useTasks = ({ boardId }: UseTasksProps = {} as any)`
+        if normalized_path.contains("hooks/") && processed.contains("({") {
+            if let Ok(re) = regex::Regex::new(r"(const\s+use\w+\s*=\s*\(\s*\{[^}]+\}\s*:\s*\w+)(\s*\))") {
+                processed = re.replace_all(&processed, "$1 = {} as any$2").to_string();
+            }
+            if let Ok(re) = regex::Regex::new(r"(function\s+use\w+\s*\(\s*\{[^}]+\}\s*:\s*\w+)(\s*\))") {
+                processed = re.replace_all(&processed, "$1 = {} as any$2").to_string();
+            }
         }
     }
 

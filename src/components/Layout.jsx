@@ -273,6 +273,7 @@ function Layout() {
 
   // Global Agent Bridge listener when user is outside Editor.jsx (e.g. on Dashboard or ProjectDetail)
   React.useEffect(() => {
+    if (window.self !== window.top) return;
     if (location.pathname.includes('/editor')) return;
     if (!window.electronAPI?.agentBridge?.pollCommand) return;
 

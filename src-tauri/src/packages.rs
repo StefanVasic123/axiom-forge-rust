@@ -1032,10 +1032,15 @@ pub fn sanitize_package_json_value_for_offline(json_val: &mut Value) -> bool {
                             || k.starts_with("@testing-library/")
                             || k.starts_with("eslint-plugin-")
                             || k.starts_with("eslint-config-")
+                            || k.ends_with("-icons-react")
+                            || k.starts_with("react-icons/")
                     })
                     .cloned()
                     .collect();
                 for k in scoped_to_remove {
+                    if k.ends_with("-icons-react") || k.starts_with("react-icons/") {
+                        had_react_icons_subpath = true;
+                    }
                     deps.remove(&k);
                     changed = true;
                 }

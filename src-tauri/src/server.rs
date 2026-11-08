@@ -132,8 +132,15 @@ pub fn extract_package_name_from_error(line: &str) -> Option<String> {
 
     if let Some(p) = pkg {
         let trimmed = p.trim();
-        // Filtriraj lokalne relativne i apsolutne putanje
-        if trimmed.starts_with('.') || trimmed.starts_with('/') || trimmed.starts_with('\\') || trimmed.contains(":\\") || trimmed.contains(":/") {
+        // Filtriraj lokalne relativne, apsolutne i TypeScript alias putanje (@/..., ~/...)
+        if trimmed.starts_with('.')
+            || trimmed.starts_with('/')
+            || trimmed.starts_with('\\')
+            || trimmed.starts_with("@/")
+            || trimmed.starts_with("~/")
+            || trimmed.contains(":\\")
+            || trimmed.contains(":/")
+        {
             return None;
         }
         return Some(trimmed.to_string());
@@ -464,7 +471,7 @@ pub fn ensure_react_icons_sanitized(proj_dir: &std::path::Path) {
                     let path_str = path.to_string_lossy();
                     if path_str.ends_with(".tsx") || path_str.ends_with(".jsx") || path_str.ends_with(".ts") || path_str.ends_with(".js") {
                         if let Ok(content) = std::fs::read_to_string(&path) {
-                            if content.contains("from 'react-icons'") || content.contains("from \"react-icons\"") {
+                            if content.contains("react-icons") || content.contains("-icons-react") {
                                 let fixed = sanitize_react_icons_imports(&content);
                                 if fixed != content {
                                     let _ = std::fs::write(&path, fixed);
@@ -526,6 +533,9 @@ pub async fn server_start(
 
     // Pre-flight: Auto-sanitize any bare 'react-icons' imports into specific subpaths (e.g. react-icons/hi)
     ensure_react_icons_sanitized(&proj_dir);
+
+    // Pre-flight: Ensure barrel index.ts files exist in src/hooks, src/types, src/utils, src/config
+    ensure_directory_barrel_files(&proj_dir);
 
     // Pre-flight: Normalize any App Router route links across the project
     let project_routes = get_project_routes_from_dir(&proj_dir);

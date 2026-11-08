@@ -303,7 +303,7 @@ pub async fn editor_ai_edit(
          {}\n\
          ```\n\n\
          User Prompt / Instructed Edit: {}\n",
-         file_path, content, prompt
+         file_path, strip_axiom_inspector_script(&content), prompt
     );
     
     if let Some(ctx) = visual_context {
@@ -419,9 +419,23 @@ pub async fn editor_ai_edit(
                         let mut fail_reason = String::new();
                         
                         let is_json_response = clean_content.trim().starts_with('{') 
-                            && (clean_content.contains("\"edits\"") || clean_content.contains("\"changes\"") || clean_content.contains("\"explanation\""));
+                            && (clean_content.contains("\"edits\"")
+                                || clean_content.contains("\"edit\"")
+                                || clean_content.contains("\"changes\"")
+                                || clean_content.contains("\"fixes\"")
+                                || clean_content.contains("\"fix\"")
+                                || clean_content.contains("\"target\"")
+                                || clean_content.contains("\"replacement\"")
+                                || clean_content.contains("\"explanation\""));
 
-                        if let Ok(parsed_json) = serde_json::from_str::<Value>(&clean_content) {
+                        let maybe_parsed_json = serde_json::from_str::<Value>(&clean_content)
+                            .ok()
+                            .or_else(|| {
+                                let sanitized_json = clean_content.find('{').and_then(|s| clean_content.rfind('}').map(|e| &clean_content[s..=e])).unwrap_or(&clean_content);
+                                serde_json::from_str::<Value>(&sanitized_json).ok()
+                            });
+
+                        if let Some(parsed_json) = maybe_parsed_json {
                             let extracted_edits = extract_edits_from_json(&parsed_json, &rel_file_path);
                             if !extracted_edits.is_empty() {
                                 let mut temp_content = content.clone();

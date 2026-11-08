@@ -705,14 +705,20 @@ pub fn recursively_find_edits(value: &Value, current_path: &str, edits: &mut Vec
 
             // If this object is a container envelope holding an array/object of edits, recurse directly into its children
             // so container-level metadata like "explanation" is never mistaken for a code edit.
-            let is_container = map.keys().any(|k| {
-                let kl = k.to_lowercase();
-                matches!(kl.as_str(), "edits" | "fixes" | "changes" | "patches" | "files" | "operations")
-            });
+            let is_container_key = |kl: &str, val: &Value| -> bool {
+                (val.is_array() || val.is_object())
+                    && (matches!(
+                        kl,
+                        "edits" | "edit" | "fixes" | "fix" | "changes" | "change" | "patches" | "patch" | "files" | "operations"
+                    ) || kl.starts_with("edit")
+                        || kl.starts_with("fix")
+                        || kl.starts_with("patch"))
+            };
+            let is_container = map.iter().any(|(k, v)| is_container_key(&k.to_lowercase(), v));
             if is_container {
                 for (k, v) in map {
                     let kl = k.to_lowercase();
-                    if matches!(kl.as_str(), "edits" | "fixes" | "changes" | "patches" | "files" | "operations") {
+                    if is_container_key(&kl, v) {
                         recursively_find_edits(v, &context_path, edits);
                     }
                 }
@@ -887,6 +893,7 @@ pub async fn project_heal_compile_error(
     }));
 
     let proj_dir = get_project_path(&project_id);
+    ensure_directory_barrel_files(&proj_dir);
     let file_path = resolve_project_file_candidate(&proj_dir, &file_path)
         .unwrap_or_else(|| file_path.replace('\\', "/"));
     let full_path = proj_dir.join(&file_path);
@@ -895,11 +902,32 @@ pub async fn project_heal_compile_error(
         return Err(format!("Fajl {} ne postoji.", file_path));
     }
 
-    let file_content = std::fs::read_to_string(&full_path)
+    let raw_file_content = std::fs::read_to_string(&full_path)
         .map_err(|e| {
             let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Greška pri čitanju" }));
             format!("Greška pri čitanju fajla: {}", e)
         })?;
+
+    // Fast deterministic pre-heal pass (rewrites barrel imports, missing react-icons subpaths, etc.)
+    let pre_sanitized = post_process_generated_file(&file_path, &raw_file_content, &serde_json::json!({}), true);
+    if pre_sanitized != raw_file_content {
+        let _ = std::fs::write(&full_path, &pre_sanitized);
+        ensure_axiom_inspector_injected(&proj_dir);
+        if error_msg.contains("Can't resolve '@/hooks'")
+            || error_msg.contains("Can't resolve '@/types'")
+            || error_msg.contains("Can't resolve '@/utils'")
+            || error_msg.contains("Can't resolve '@/config'")
+        {
+            let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Uspešno popravljeno!" }));
+            let _ = window.emit("server:log", serde_json::json!({
+                "text": format!("> [AI Auto-Healing] Deterministički razrešeni barrel importi u: {}\n", file_path),
+                "type": "info"
+            }));
+            return Ok(true);
+        }
+    }
+
+    let file_content = strip_axiom_inspector_script(&pre_sanitized);
 
     let settings = get_axiom_settings();
     let model = settings.get("modelId")
@@ -1025,9 +1053,10 @@ pub async fn project_heal_compile_error(
             if layout_full_path.exists() {
                 if let Ok(layout_content) = std::fs::read_to_string(&layout_full_path) {
                     if !project_context.contains(layout_name) {
+                        let clean_layout = strip_axiom_inspector_script(&layout_content);
                         project_context.push_str(&format!(
                             "\n--- Project Layout File: {} ---\n{}\n-------------------------------------\n",
-                            layout_name, layout_content
+                            layout_name, clean_layout
                         ));
                     }
                 }
@@ -1379,6 +1408,8 @@ pub async fn project_heal_compile_error(
                             }));
                             debug_log_to_file(format!("[AI Auto-Healing] Successfully healed file: {}", edit_path));
                         }
+
+                        ensure_axiom_inspector_injected(&proj_dir);
 
                         let _ = window.emit("server:heal-status", serde_json::json!({
                             "status": "Završeno!"
