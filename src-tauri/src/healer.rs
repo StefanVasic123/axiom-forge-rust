@@ -922,23 +922,17 @@ pub async fn project_heal_compile_error(
             format!("Greška pri čitanju fajla: {}", e)
         })?;
 
-    // Fast deterministic pre-heal pass (rewrites barrel imports, missing react-icons subpaths, etc.)
+    // Fast deterministic pre-heal pass (rewrites barrel imports, missing react-icons subpaths, useEffect deps, etc.)
     let pre_sanitized = post_process_generated_file(&file_path, &raw_file_content, &serde_json::json!({}), true);
     if pre_sanitized != raw_file_content {
         let _ = std::fs::write(&full_path, &pre_sanitized);
         ensure_axiom_inspector_injected(&proj_dir);
-        if error_msg.contains("Can't resolve '@/hooks'")
-            || error_msg.contains("Can't resolve '@/types'")
-            || error_msg.contains("Can't resolve '@/utils'")
-            || error_msg.contains("Can't resolve '@/config'")
-        {
-            let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Uspešno popravljeno!" }));
-            let _ = window.emit("server:log", serde_json::json!({
-                "text": format!("> [AI Auto-Healing] Deterministički razrešeni barrel importi u: {}\n", file_path),
-                "type": "info"
-            }));
-            return Ok(true);
-        }
+        let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Uspešno popravljeno!" }));
+        let _ = window.emit("server:log", serde_json::json!({
+            "text": format!("> [AI Auto-Healing] Deterministički saniran kod i zavisnosti u: {}\n", file_path),
+            "type": "info"
+        }));
+        return Ok(true);
     }
 
     let file_content = strip_axiom_inspector_script(&pre_sanitized);

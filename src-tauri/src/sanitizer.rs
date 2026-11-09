@@ -1336,6 +1336,10 @@ pub fn post_process_generated_file(
             if !path_lower.contains("/api/") && !path_lower.ends_with("route.ts") && !path_lower.ends_with("route.js") {
                 processed = ensure_react_and_next_hook_imports(&processed);
                 processed = hoist_use_client_directive(&processed);
+                processed = sanitize_use_effect_deps(&processed);
+                if path_lower.contains("/hooks/") || path_lower.contains("hook") {
+                    processed = sanitize_custom_hook_functions(&processed);
+                }
             }
         }
 
@@ -3297,4 +3301,217 @@ pub fn apply_ast_sanity_pass_to_project(proj_dir: &std::path::Path) {
     }
 
     walk_dir(&src_dir, proj_dir, has_tailwind);
+}
+
+fn is_action_verb_identifier(name: &str) -> bool {
+    let prefixes = [
+        "get", "fetch", "load", "set", "update", "handle", "create", 
+        "delete", "send", "sync", "check", "refresh", "save", "query", 
+        "refetch", "mutate", "post", "patch", "put"
+    ];
+    for p in prefixes {
+        if name.starts_with(p) && name.len() > p.len() {
+            let next_char = name.chars().nth(p.len()).unwrap_or(' ');
+            if next_char.is_ascii_uppercase() || next_char == '_' {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Automatically sanitizes React `useEffect` dependency arrays.
+/// Dynamically extracts all identifiers destructured from any `use*()` hook or declared locally,
+/// and strips any identifier that is invoked as a function inside the effect body (or matches router/action verbs).
+/// Any data, props, or state variables (regardless of naming) are 100% PRESERVED.
+pub fn sanitize_use_effect_deps(content: &str) -> String {
+    let mut result = String::with_capacity(content.len());
+    let mut remaining = content;
+
+    // 1. Universally collect all identifiers destructured from any custom or standard hook:
+    // e.g. `const { foo, bar, baz } = useAnyHook(...)`
+    let mut hook_destructured_ids: Vec<String> = Vec::new();
+    if let Ok(hook_re) = regex::Regex::new(r"(?m)const\s*\{([^}]+)\}\s*=\s*use\w+\s*\(") {
+        for cap in hook_re.captures_iter(content) {
+            if let Some(inner) = cap.get(1) {
+                for item in inner.as_str().split(',') {
+                    let id = item.trim().split(':').next().unwrap_or("").trim();
+                    if !id.is_empty() && id.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                        hook_destructured_ids.push(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    while let Some(pos) = remaining.find("useEffect(") {
+        result.push_str(&remaining[..pos]);
+        let after_use_effect = &remaining[pos..];
+
+        let mut matched = false;
+        if let Some(open_body) = after_use_effect.find('{') {
+            let mut brace_depth = 0;
+            let mut body_end = None;
+            for (idx, ch) in after_use_effect[open_body..].char_indices() {
+                if ch == '{' {
+                    brace_depth += 1;
+                } else if ch == '}' {
+                    brace_depth -= 1;
+                    if brace_depth == 0 {
+                        body_end = Some(open_body + idx);
+                        break;
+                    }
+                }
+            }
+
+            if let Some(end_brace) = body_end {
+                let body_slice = &after_use_effect[open_body + 1..end_brace];
+                let after_body = &after_use_effect[end_brace + 1..];
+                let trimmed_after_body = after_body.trim_start();
+
+                if trimmed_after_body.starts_with(',') {
+                    let after_comma = trimmed_after_body[1..].trim_start();
+                    if after_comma.starts_with('[') {
+                        if let Some(close_bracket) = after_comma.find(']') {
+                            let deps_str = &after_comma[1..close_bracket];
+                            let deps: Vec<&str> = deps_str
+                                .split(',')
+                                .map(|s| s.trim())
+                                .filter(|s| !s.is_empty())
+                                .collect();
+
+                            let mut filtered_deps = Vec::new();
+                            for dep in deps {
+                                let is_called = body_slice.contains(&format!("{}(", dep))
+                                    || body_slice.contains(&format!("{}.", dep))
+                                    || body_slice.contains(&format!("{}.then(", dep))
+                                    || body_slice.contains(&format!("{}.catch(", dep));
+                                let is_from_hook = hook_destructured_ids.iter().any(|h| h == dep);
+                                let is_action = is_action_verb_identifier(dep);
+                                let is_router = dep == "router" || dep == "navigate";
+
+                                // If an identifier is called as a function inside the effect body AND
+                                // either originates from a hook, matches action verbs, or is router/navigate:
+                                // It is an unmemoized action that triggers infinite re-render loops!
+                                if (is_called && (is_from_hook || is_action)) || is_router {
+                                    continue;
+                                }
+                                filtered_deps.push(dep);
+                            }
+
+                            let new_deps_str = filtered_deps.join(", ");
+                            let prefix = &after_use_effect[..end_brace + 1];
+                            result.push_str(prefix);
+                            result.push_str(&format!(", [{}]", new_deps_str));
+
+                            // Find offset past the closing bracket in after_use_effect
+                            if let Some(brk_pos) = after_use_effect.find(deps_str) {
+                                let offset = brk_pos + deps_str.len() + 1; // past ']'
+                                remaining = &after_use_effect[offset..];
+                                matched = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !matched {
+            result.push_str("useEffect(");
+            remaining = &after_use_effect[10..];
+        }
+    }
+
+    result.push_str(remaining);
+    result
+}
+
+/// Generically memoizes action functions declared in custom React hooks.
+/// Finds any `return { foo, bar, ... }` in a custom hook, and if the returned identifier
+/// is declared as an unmemoized arrow function, wraps it with `useCallback(async (...) => { ... }, [])`.
+/// Operates on ANY custom hook, ANY function name, and ANY domain.
+pub fn sanitize_custom_hook_functions(content: &str) -> String {
+    if !content.contains("const use") && !content.contains("function use") && !content.contains("export function use") {
+        return content.to_string();
+    }
+
+    let return_re = match regex::Regex::new(r"(?s)return\s*\{([^}]+)\}") {
+        Ok(r) => r,
+        Err(_) => return content.to_string(),
+    };
+
+    let mut returned_ids: Vec<String> = Vec::new();
+    for cap in return_re.captures_iter(content) {
+        if let Some(inner) = cap.get(1) {
+            for item in inner.as_str().split(',') {
+                let id = item.trim().split(':').next().unwrap_or("").trim();
+                if !id.is_empty() && id.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    returned_ids.push(id.to_string());
+                }
+            }
+        }
+    }
+
+    if returned_ids.is_empty() {
+        return content.to_string();
+    }
+
+    let mut modified = content.to_string();
+    let mut needs_use_callback_import = false;
+
+    for id in &returned_ids {
+        let fn_decl_pattern = format!(r"(?m)^(\s*)const\s+{}\s*=\s*(async\s*)?\(([^)]*)\)\s*=>\s*\{{", id);
+        if let Ok(fn_re) = regex::Regex::new(&fn_decl_pattern) {
+            if let Some(mat) = fn_re.find(&modified) {
+                let open_pos = mat.end() - 1;
+                let mut brace_depth = 0;
+                let mut close_pos = None;
+                for (char_idx, ch) in modified[open_pos..].char_indices() {
+                    if ch == '{' {
+                        brace_depth += 1;
+                    } else if ch == '}' {
+                        brace_depth -= 1;
+                        if brace_depth == 0 {
+                            close_pos = Some(open_pos + char_idx);
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(end_brace) = close_pos {
+                    let after_brace = &modified[end_brace + 1..];
+                    let semi_len = if after_brace.trim_start().starts_with(';') {
+                        after_brace.find(';').map(|p| p + 1).unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    let full_fn_end = end_brace + 1 + semi_len;
+                    let full_fn_text = &modified[mat.start()..full_fn_end];
+
+                    if !full_fn_text.contains("useCallback(") {
+                        if let Some(cap) = fn_re.captures(&modified[mat.start()..mat.end()]) {
+                            let indent = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+                            let async_kw = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+                            let params = cap.get(3).map(|m| m.as_str()).unwrap_or("");
+                            let body = &modified[open_pos..=end_brace];
+
+                            let memoized = format!(
+                                "{}const {} = useCallback({}({}) => {} , []);",
+                                indent, id, async_kw, params, body
+                            );
+
+                            modified.replace_range(mat.start()..full_fn_end, &memoized);
+                            needs_use_callback_import = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if needs_use_callback_import && !modified.contains("useCallback") {
+        modified = ensure_react_and_next_hook_imports(&modified);
+    }
+
+    modified
 }

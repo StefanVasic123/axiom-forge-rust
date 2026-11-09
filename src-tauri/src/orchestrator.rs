@@ -3700,8 +3700,14 @@ export default function RootLayout({
                     emit_progress("install-deps", "Local PostgreSQL database configured successfully.", 74.8);
                 }
                 Err(err) => {
-                    emit_progress("install-deps", &format!("PostgreSQL setup failed: {}. Falling back to SQLite...", err), 74.5);
-                    let _ = fallback_to_sqlite(&proj_dir);
+                    match fallback_to_sqlite(&proj_dir) {
+                        Ok(()) => {
+                            emit_progress("install-deps", &format!("PostgreSQL setup failed: {}. Falling back to SQLite...", err), 74.5);
+                        }
+                        Err(fb_err) => {
+                            emit_progress("install-deps", &format!("PostgreSQL setup warning: {}. SQLite fallback skipped ({})", err, fb_err), 74.5);
+                        }
+                    }
                 }
             }
         }
@@ -3777,6 +3783,9 @@ export default function RootLayout({
 
     // Run self-healing compiler loop to automatically correct any compilation or syntax errors
     perform_self_healing_loop(&proj_dir, &model_id, &files_to_generate).await;
+
+    // Run automated post-generation manual/API test suite and route crawler
+    crate::self_healing::run_generation_auto_test_suite(&proj_dir, &window, &model_id).await;
 
     // Generate Axiom Map (axiom-map.json)
     if let Err(e) = generate_axiom_map(&proj_dir) {

@@ -588,12 +588,56 @@ pub async fn server_start(
         .to_string();
 
     // Auto-run, validate and heal prisma generate if Prisma schema exists in the project
-    if let Err(e) = heal_prisma_schema_loop(&proj_dir, &window, &model_id, "server:log").await {
+    let has_prisma = proj_dir.join("prisma/schema.prisma").exists() || proj_dir.join("schema.prisma").exists();
+    if has_prisma {
+        if let Err(e) = heal_prisma_schema_loop(&proj_dir, &window, &model_id, "server:log").await {
+            let _ = window.emit("server:log", serde_json::json!({
+                "text": format!("> [Prisma Critical Error] Pokretanje servera otkazano: {}\n", e),
+                "type": "error"
+            }));
+            return Err(e);
+        }
+
+        // Obavezan prisma db push pre starta dev servera
         let _ = window.emit("server:log", serde_json::json!({
-            "text": format!("> [Prisma Critical Error] Pokretanje servera otkazano: {}\n", e),
-            "type": "error"
+            "text": "> [Prisma Sync] Sinhronizujem bazu podataka sa semom (db push)...\n",
+            "type": "info"
         }));
-        return Err(e);
+        let local_prisma_js = proj_dir.join("node_modules").join("prisma").join("build").join("index.js");
+        let mut push_cmd = if local_prisma_js.exists() {
+            let mut c = tokio::process::Command::new("node");
+            c.arg(&local_prisma_js).arg("db").arg("push").arg("--accept-data-loss").current_dir(&proj_dir);
+            c
+        } else {
+            #[cfg(target_os = "windows")]
+            let mut c = tokio::process::Command::new("cmd");
+            #[cfg(target_os = "windows")]
+            c.arg("/C").arg("npx").arg("-y").arg("prisma@5.22.0").arg("db").arg("push").arg("--accept-data-loss").current_dir(&proj_dir);
+            #[cfg(not(target_os = "windows"))]
+            let mut c = tokio::process::Command::new("npx");
+            #[cfg(not(target_os = "windows"))]
+            c.arg("-y").arg("prisma@5.22.0").arg("db").arg("push").arg("--accept-data-loss").current_dir(&proj_dir);
+            c
+        };
+        #[cfg(target_os = "windows")]
+        {
+            push_cmd.creation_flags(0x08000000);
+        }
+        if let Ok(po) = push_cmd.output().await {
+            if po.status.success() {
+                let _ = window.emit("server:log", serde_json::json!({
+                    "text": "> [Prisma Sync] Baza podataka uspesno sinhronizovana!\n",
+                    "type": "info"
+                }));
+            } else {
+                let err_text = crate::healer::clean_cli_output_for_llm(&String::from_utf8_lossy(&po.stderr));
+                let first_err = err_text.lines().find(|l| !l.trim().is_empty()).unwrap_or("db push upozorenje");
+                let _ = window.emit("server:log", serde_json::json!({
+                    "text": format!("> [Prisma Sync Warning] {}\n", first_err),
+                    "type": "warning"
+                }));
+            }
+        }
     }
     
     // Dynamically select the npm script based on platform and package.json scripts
@@ -761,13 +805,16 @@ pub async fn server_stop(
             }
         }
         let _ = child.kill().await;
-        let _ = window.emit("server:status", serde_json::json!({
-            "status": "stopped"
-        }));
-        Ok(true)
-    } else {
-        Ok(false)
     }
+
+    // Always aggressively liberate port 3000 to prevent any lingering/zombie processes
+    kill_process_on_port(3000);
+
+    let _ = window.emit("server:status", serde_json::json!({
+        "status": "stopped"
+    }));
+    debug_log_to_file(format!("[Server] Development server stopped for project: {}", project_id));
+    Ok(true)
 }
 
 #[tauri::command]

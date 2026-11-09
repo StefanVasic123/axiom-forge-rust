@@ -857,6 +857,8 @@ export default function EditorPage() {
         setCdpPort(null);
         setCdpConnected(false);
         setCompileError(null);
+        setServerRunning(false);
+        setIsServerStarting(false);
       } finally {
         setIsServerStopping(false);
       }
@@ -2201,13 +2203,23 @@ export default function EditorPage() {
                               Runtime greška na ruti <code className="bg-rose-900/60 px-1 py-0.5 rounded text-rose-300 font-mono">{previewRuntimeError.path || currentPreviewRoute}</code>: {previewRuntimeError.message}
                             </span>
                           </div>
-                          <button
-                            onClick={() => handleAIFixCurrentPage(`Ispravi runtime grešku na ovoj stranici: "${previewRuntimeError.message}". Osiguraj ispravan rad sa React hook/query pozivima.`)}
-                            className="flex items-center gap-1.5 px-3 py-1 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded text-[11px] shadow transition-colors shrink-0 ml-3"
-                          >
-                            <Sparkles className="w-3.5 h-3.5" />
-                            <span>AI Popravi grešku</span>
-                          </button>
+                          <div className="flex items-center gap-2 shrink-0 ml-3">
+                            <button
+                              onClick={() => handleAIFixCurrentPage(`Ispravi runtime grešku na ovoj stranici: "${previewRuntimeError.message}". Osiguraj ispravan rad sa React hook/query pozivima.`)}
+                              className="flex items-center gap-1.5 px-3 py-1 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded text-[11px] shadow transition-colors"
+                            >
+                              <Sparkles className="w-3.5 h-3.5" />
+                              <span>AI Popravi grešku</span>
+                            </button>
+                            <button
+                              onClick={toggleServer}
+                              className="flex items-center gap-1.5 px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-rose-300 border border-rose-800/80 font-semibold rounded text-[11px] shadow transition-colors"
+                              title="Zaustavi dev server"
+                            >
+                              <div className="w-2 h-2 rounded-sm bg-rose-400" />
+                              <span>Zaustavi Server</span>
+                            </button>
+                          </div>
                         </div>
                       )}
                       {/* Server Not Running Placeholder */}
@@ -2350,9 +2362,21 @@ export default function EditorPage() {
                 <span className="text-[10px] uppercase font-bold text-slate-400 flex items-center gap-2">
                   <Terminal className="w-3.5 h-3.5" /> Dev Server Logs
                 </span>
-                <button onClick={() => setShowTerminal(false)} className="text-slate-400 hover:text-white">
-                  <X className="w-3.5 h-3.5" />
-                </button>
+                <div className="flex items-center gap-2">
+                  {serverRunning && (
+                    <button
+                      onClick={toggleServer}
+                      className="flex items-center gap-1 px-2 py-0.5 bg-red-500/20 hover:bg-red-500/30 text-red-400 border border-red-500/30 rounded text-[10px] font-bold transition-colors"
+                      title="Zaustavi Dev Server"
+                    >
+                      <div className="w-1.5 h-1.5 rounded-sm bg-red-400" />
+                      Zaustavi Server
+                    </button>
+                  )}
+                  <button onClick={() => setShowTerminal(false)} className="text-slate-400 hover:text-white">
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
               </div>
               
               {compileError && (
