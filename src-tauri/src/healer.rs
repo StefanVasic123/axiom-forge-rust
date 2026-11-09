@@ -448,6 +448,19 @@ pub async fn heal_prisma_schema_loop(
             Err(_) => break,
         };
 
+        // Deterministic auto-healing for ambiguous relations (P1012)
+        if error_log.contains("Ambiguous relation detected") || error_log.contains("P1012") {
+            let disambiguated = disambiguate_prisma_relations(&schema_content);
+            if disambiguated.replace("\r\n", "\n").trim() != schema_content.replace("\r\n", "\n").trim() {
+                let _ = std::fs::write(&schema_path, &disambiguated);
+                let _ = window.emit(log_channel, serde_json::json!({
+                    "text": "> [Prisma Validator] Deterministički razrešavam dvosmislene relacije (dodeljujem @relation imena). Ponovo testiram...\n",
+                    "type": "info"
+                }));
+                continue;
+            }
+        }
+
         let _ = window.emit(log_channel, serde_json::json!({
             "text": format!("> [Prisma Validator] Započinjem AI auto-healing za schema.prisma (pokušaj {}/{})...\n", attempt + 1, MAX_AI_HEALS),
             "type": "info"
@@ -466,6 +479,7 @@ pub async fn heal_prisma_schema_loop(
             5. For NextAuth schema, the VerificationToken model does not have a direct relation back to the User model; do not define a verificationTokens relation field on the User model. \
             6. Every relation needs an opposite field on the other model (e.g. `user User @relation(...)` on the child and `dashboards Dashboard[]` on User). If the relation uses a name (e.g. `name: \"TeamMember\"`), the opposite relation array MUST use the exact same name (e.g. `teams Team[] @relation(\"TeamMember\")`). CRITICAL: NEVER delete foreign key scalar fields (like `userId String` or `projectId String`). Always ADD the opposite relation field instead! \
             7. Fields pointing to another model (relations) CANNOT have a `@default()` attribute. For default values, use an `enum` or a scalar type (e.g. `String @default(\"USER\")`). \
+            8. Ambiguous Relations (P1012): If a model defines two or more relations pointing to the same target model (e.g. `sourceWallet` and `destinationWallet` both pointing to `Wallet`), Prisma strictly requires unique relation names on BOTH models: `@relation(\"SourceWallet\", fields: ...)` and `@relation(\"DestinationWallet\", fields: ...)`. On the target model (Wallet), define matching opposite named relations: `sourceTransactions Transaction[] @relation(\"SourceWallet\")` and `destinationTransactions Transaction[] @relation(\"DestinationWallet\")`. Remove duplicate un-named arrays like `transactions` and `transactionsTransaction`. \
             First, in exactly 1 concise sentence, identify the compiler rule that was violated on the failing line. \
             Then, provide the complete corrected schema.prisma code wrapped in a ```prisma code block.";
 

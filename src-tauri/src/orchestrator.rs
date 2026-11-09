@@ -1697,7 +1697,7 @@ pub fn get_expert_system_prompt(
     if path_lower.contains("schema.prisma") {
         let db_archetype = get_project_database_archetype_from_dir(proj_dir);
         let mut prompt = format!(
-            "You are a Senior Database Architect. Write only the complete, valid schema.prisma code wrapped in markdown code blocks. No explanations.\n\n             {}             DATABASE GENERATION CHAIN-OF-THOUGHT (Execute in strict sequence):\n             Step 1 [Domain Enums]: Define all domain enums (Role, Status, Priority, Tier) at the very top of the schema.\n             Step 2 [Core Entities & Attributes]: Define models with IDs (@id @default(cuid())), scalar columns, and timestamps (createdAt, updatedAt). Make password fields optional (hashedPassword String?).\n             Step 3 [Relational Topography & Foreign Keys]:\n                    - One-to-Many: Put scalar foreign key (e.g. `ownerId String`) and `@relation(fields: [ownerId], references: [id])` on the child model. Put array (`projects Project[]`) on the parent model.\n                    - One-to-One: Put scalar foreign key WITH `@unique` on the child model (e.g. `projectId String @unique` and `@relation(fields: [projectId], references: [id])`). Put singular optional (`projectAnalytics Analytics?`) on parent model.\n                    - Implicit Many-to-Many: Define array fields on both sides without `@relation(fields: ...)`.\n             Step 4 [Verification Gate]: Verify that:\n                    1. Every relation has exactly ONE matching opposite field with matching relation name.\n                    2. Zero duplicate relation fields exist between the same two models.\n                    3. Zero self-relations exist unless explicitly building a hierarchical tree (parent Model?, children Model[]).\n                    4. All foreign key scalars in 1-to-1 relations have `@unique`.\n\n             PRISMA SCHEMA RULES:\n             - The `@relation` attribute MUST ONLY be placed on relational object fields, never on scalar fields.\n             - For NextAuth schema, the VerificationToken model does not have a direct relation back to the User model.\n             - Fixed sets of values MUST be defined using Prisma `enum Name {{ VAL1 VAL2 }}`, NEVER as a relational `model`.\n",
+            "You are a Senior Database Architect. Write only the complete, valid schema.prisma code wrapped in markdown code blocks. No explanations.\n\n             {}             DATABASE GENERATION CHAIN-OF-THOUGHT (Execute in strict sequence):\n             Step 1 [Domain Enums]: Define all domain enums (Role, Status, Priority, Tier) at the very top of the schema.\n             Step 2 [Core Entities & Attributes]: Define models with IDs (@id @default(cuid())), scalar columns, and timestamps (createdAt, updatedAt). Make password fields optional (hashedPassword String?).\n             Step 3 [Relational Topography & Foreign Keys]:\n                    - One-to-Many: Put scalar foreign key (e.g. `ownerId String`) and `@relation(fields: [ownerId], references: [id])` on the child model. Put array (`projects Project[]`) on the parent model.\n                    - One-to-One: Put scalar foreign key WITH `@unique` on the child model (e.g. `projectId String @unique` and `@relation(fields: [projectId], references: [id])`). Put singular optional (`projectAnalytics Analytics?`) on parent model.\n                    - Multiple Relations Between Same Models: If a model defines two or more relations pointing to the SAME target model (e.g. `sourceWallet Wallet` and `destinationWallet Wallet?` in `Transaction`), you MUST assign unique relation names on BOTH models: `@relation(\"SourceWallet\", fields: [sourceWalletId], references: [id])` and on the target model `@relation(\"SourceWallet\")`.\n                    - Implicit Many-to-Many: Define array fields on both sides without `@relation(fields: ...)`.\n             Step 4 [Verification Gate]: Verify that:\n                    1. Every relation has exactly ONE matching opposite field with matching relation name.\n                    2. Zero duplicate relation fields exist between the same two models.\n                    3. If multiple relations exist between the same two models, each pair MUST have a distinct `@relation(\"Name\")`.\n                    4. Zero self-relations exist unless explicitly building a hierarchical tree (parent Model?, children Model[]).\n                    5. All foreign key scalars in 1-to-1 relations have `@unique`.\n\n             PRISMA SCHEMA RULES:\n             - The `@relation` attribute MUST ONLY be placed on relational object fields, never on scalar fields.\n             - For NextAuth schema, the VerificationToken model does not have a direct relation back to the User model.\n             - Fixed sets of values MUST be defined using Prisma `enum Name {{ VAL1 VAL2 }}`, NEVER as a relational `model`.\n",
             db_archetype
         );
 
@@ -3648,6 +3648,20 @@ export default function RootLayout({
         let _ = fs::write(&full_disk_path, &processed_content);
         harvest_file_contract_to_lbg(&proj_dir, file_path, &processed_content);
 
+        // Emit final live code preview with completed, fully processed code
+        let preview = extract_live_code_preview(&processed_content);
+        emit_live_code(
+            "generate-files",
+            &format!("Completed {}/{} - {}", i + 1, files_to_generate.len(), file_path),
+            current_progress,
+            file_path,
+            desc,
+            i + 1,
+            files_to_generate.len(),
+            processed_content.len() / 4,
+            &preview,
+        );
+
         // Update completed files and persist checkpoint immediately
         if !completed_files.contains(&file_path.to_string()) {
             completed_files.push(file_path.to_string());
@@ -3716,6 +3730,9 @@ export default function RootLayout({
 
     // Run npm install with automatic self-healing and version locking
     run_npm_install_with_auto_healing(&proj_dir, &window, "", Some(&task_id)).await;
+
+    // AST Sanity Pass: Clean invalid React imports (e.g. useRouter in 'react'), hoist client directives across src/
+    apply_ast_sanity_pass_to_project(&proj_dir);
 
     // Auto-run prisma generate & db push if Prisma schema exists in the project
     let has_prisma = proj_dir.join("prisma/schema.prisma").exists() || proj_dir.join("schema.prisma").exists();

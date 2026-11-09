@@ -1731,4 +1731,111 @@ export function useProjects() {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    #[test]
+    fn test_disambiguate_prisma_ambiguous_relations() {
+        let broken_schema = r#"
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Transaction {
+  id                  String   @id @default(cuid())
+  amount              Float
+  sourceWalletId      String
+  sourceWallet        Wallet   @relation(fields: [sourceWalletId], references: [id])
+  destinationWalletId String?
+  destinationWallet   Wallet?  @relation(fields: [destinationWalletId], references: [id])
+}
+
+model Wallet {
+  id        String   @id @default(cuid())
+  balance   Float
+}
+"#;
+
+        let sanitized = post_process_generated_file("prisma/schema.prisma", broken_schema, &serde_json::json!({}), false);
+        // Verify both sides received explicit relation names
+        assert!(sanitized.contains("@relation(\"TransactionSourceWallet\""));
+        assert!(sanitized.contains("@relation(\"TransactionDestinationWallet\""));
+        // Verify Wallet received named back-relations
+        assert!(sanitized.contains("sourceWalletTransactions"));
+        assert!(sanitized.contains("destinationWalletTransactions"));
+        // Verify ambiguous collision field `transactionsTransaction` was NEVER generated
+        assert!(!sanitized.contains("transactionsTransaction"));
+    }
+
+    #[test]
+    fn test_clean_react_navigation_hooks_from_react_imports() {
+        // Case 1: Mixed import from react
+        let input1 = "import { useRouter, useState, useEffect } from 'react';\nimport { useRouter } from 'next/navigation';";
+        let cleaned1 = clean_react_navigation_hooks_from_react_imports(input1);
+        assert!(cleaned1.contains("import { useState, useEffect } from 'react';"));
+        assert!(cleaned1.contains("import { useRouter } from 'next/navigation';"));
+        assert!(!cleaned1.contains("useRouter, useState"));
+
+        // Case 2: Solo useRouter from react
+        let input2 = "import { useRouter } from 'react';\nexport default function Page() { return <div />; }";
+        let cleaned2 = clean_react_navigation_hooks_from_react_imports(input2);
+        assert!(!cleaned2.contains("from 'react'"));
+
+        // Case 3: Default React with useRouter
+        let input3 = "import React, { useRouter, useState } from 'react';";
+        let cleaned3 = clean_react_navigation_hooks_from_react_imports(input3);
+        assert_eq!(cleaned3.trim(), "import React, { useState } from 'react';");
+
+        // Case 4: Full page post-processing
+        let page_code = r#"import { useRouter } from 'next/navigation';
+import { useRouter, useState, useEffect } from 'react';
+
+export default function AnalyticsPage() {
+  const router = useRouter();
+  const [data, setData] = useState([]);
+  return <div>{data.length}</div>;
+}
+"#;
+        let processed = post_process_generated_file("src/app/real-time-analytics/page.tsx", page_code, &serde_json::json!({}), false);
+        // Ensure useRouter is only imported once from next/navigation, and NOT from react
+        assert!(processed.contains("import { useRouter } from 'next/navigation';"));
+        assert!(processed.contains("import { useState, useEffect } from 'react';"));
+        assert!(!processed.contains("useRouter, useState"));
+    }
+
+    #[test]
+    fn test_disambiguate_prisma_self_relations_and_mutual_relations() {
+        let self_rel_schema = r#"
+model Category {
+  id        String     @id @default(cuid())
+  parentId  String?
+  parent    Category?  @relation(fields: [parentId], references: [id])
+  children  Category[]
+}
+"#;
+        let sanitized = post_process_generated_file("prisma/schema.prisma", self_rel_schema, &serde_json::json!({}), false);
+        // Verify self-relation hierarchy receives relation name
+        assert!(sanitized.contains("@relation(\"CategoryHierarchy\""));
+
+        // Mutual relations test
+        let mutual_schema = r#"
+model User {
+  id          String   @id @default(cuid())
+  companyId   String
+  company     Company  @relation(fields: [companyId], references: [id])
+}
+
+model Company {
+  id          String   @id @default(cuid())
+  ownerId     String
+  owner       User     @relation(fields: [ownerId], references: [id])
+}
+"#;
+        let sanitized_mutual = post_process_generated_file("prisma/schema.prisma", mutual_schema, &serde_json::json!({}), false);
+        assert!(sanitized_mutual.contains("@relation(\"UserCompany\""));
+        assert!(sanitized_mutual.contains("@relation(\"CompanyOwner\""));
+    }
+
 }

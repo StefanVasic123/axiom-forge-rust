@@ -759,25 +759,37 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
 
     debug_log_to_file("[Self-Healing] Starting compilation check loop...".to_string());
     
+    let enriched_path = ensure_node_toolchain_ready(None, "self-heal").await;
+    let local_next_js = proj_dir.join("node_modules").join("next").join("dist").join("bin").join("next");
+    let has_local_next = local_next_js.exists();
+
     // Run build and self-heal up to 3 times
     for attempt in 1..=3 {
         debug_log_to_file(format!("[Self-Healing] Build check attempt {}/3...", attempt));
         
-        #[cfg(target_os = "windows")]
-        let mut cmd = std::process::Command::new("cmd");
-        #[cfg(target_os = "windows")]
-        cmd.arg("/C").arg("npx").arg("--no-install").arg("next").arg("build").current_dir(proj_dir);
-        
-        #[cfg(not(target_os = "windows"))]
-        let mut cmd = std::process::Command::new("npx");
-        #[cfg(not(target_os = "windows"))]
-        cmd.arg("--no-install").arg("next").arg("build").current_dir(proj_dir);
+        let mut cmd = if has_local_next {
+            let mut c = std::process::Command::new("node");
+            c.arg(&local_next_js).arg("build").current_dir(proj_dir);
+            c
+        } else {
+            #[cfg(target_os = "windows")]
+            let mut c = std::process::Command::new("cmd");
+            #[cfg(target_os = "windows")]
+            c.arg("/C").arg("npx").arg("--no-install").arg("next").arg("build").current_dir(proj_dir);
+            
+            #[cfg(not(target_os = "windows"))]
+            let mut c = std::process::Command::new("npx");
+            #[cfg(not(target_os = "windows"))]
+            c.arg("--no-install").arg("next").arg("build").current_dir(proj_dir);
+            c
+        };
         
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         }
+        cmd.env("PATH", &enriched_path).env("NO_COLOR", "1");
 
         let output_res = cmd.output();
         let output = match output_res {

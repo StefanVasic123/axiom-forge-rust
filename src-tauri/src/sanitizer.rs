@@ -1255,11 +1255,17 @@ pub fn post_process_generated_file(
         // 5b. Deterministically inject any missing foreign key scalar fields referenced in @relation(fields: [...])
         processed = ensure_prisma_foreign_key_scalars(&processed);
 
+        // 5c. Disambiguate multiple relations between the same models (assign explicit @relation("...") names)
+        processed = disambiguate_prisma_relations(&processed);
+
         // 6. Ensure all @relation definitions have their opposite relation on the target model
         processed = ensure_prisma_opposite_relations(&processed);
 
         // 7. Enforce Prisma relational integrity (1-to-1 @unique, prune ghost duplicate/self relations)
         processed = sanitize_prisma_relations(&processed);
+
+        // 7b. Disambiguate relations again to guarantee no un-named or ambiguous collisions remain
+        processed = disambiguate_prisma_relations(&processed);
     }
 
     let is_js_ts_file = path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx") || path_lower.ends_with(".ts") || path_lower.ends_with(".js");
@@ -2306,15 +2312,37 @@ pub fn ensure_prisma_opposite_relations(schema: &str) -> String {
                 let has_existing_field_of_type = target_body.lines().any(|l| {
                     let parts: Vec<&str> = l.trim().split_whitespace().collect();
                     parts.len() >= 2 && parts[1].replace(['?', '[', ']'], "") == *source_model
+                }) || existing_inserts.iter().any(|l| {
+                    let parts: Vec<&str> = l.trim().split_whitespace().collect();
+                    parts.len() >= 2 && parts[1].replace(['?', '[', ']'], "") == *source_model
                 });
-                if has_existing_field_of_type {
+
+                if rel_name.is_none() && has_existing_field_of_type {
+                    // Do not inject multiple un-named back relations of the same type (would cause Prisma P1012 ambiguous relation)
                     continue;
+                }
+
+                if let Some(ref r_name) = rel_name {
+                    let already_has_this_named_rel = target_body.lines().any(|l| {
+                        let t = l.trim();
+                        t.contains(&format!("\"{}\"", r_name)) || t.contains(&format!("'{}'", r_name))
+                    }) || existing_inserts.iter().any(|l| {
+                        let t = l.trim();
+                        t.contains(&format!("\"{}\"", r_name)) || t.contains(&format!("'{}'", r_name))
+                    });
+                    if already_has_this_named_rel {
+                        continue;
+                    }
                 }
 
                 let has_collision = target_body.lines().any(|l| l.trim().starts_with(&field_name))
                     || existing_inserts.iter().any(|i| i.trim().starts_with(&field_name));
                 if has_collision {
-                    field_name = format!("{}{}", field_name, source_model);
+                    if rel_name.is_some() {
+                        field_name = format!("{}{}", field_name, source_model);
+                    } else {
+                        continue;
+                    }
                 }
 
                 let insert_line = match rel_name {
@@ -2346,6 +2374,260 @@ pub fn ensure_prisma_opposite_relations(schema: &str) -> String {
                 let p3 = &caps[3];
                 format!("{}{}\n{}\n{}", p1, p2.trim_end(), insert_str, p3.trim_start())
             }).to_string();
+        }
+    }
+
+    result
+}
+
+fn capitalize_first_letter(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
+/// Disambiguates multiple relations between the same pair of models in Prisma schema.
+/// When a model defines two or more relations pointing to the same target model (e.g. `sourceWallet` and `destinationWallet` in `Transaction`),
+/// Prisma requires unique relation names on both sides.
+/// This function:
+/// 1. Finds models that have 2+ defining relations pointing to the same target model.
+/// 2. If any of those relations lack explicit relation names or share duplicate names, assigns unique relation names based on the model and field name.
+/// 3. In the target model, prunes any ambiguous un-named back-relations pointing to that model, and injects matching named back-relation fields.
+pub fn disambiguate_prisma_relations(schema: &str) -> String {
+    let model_re = match regex::Regex::new(r"(?ms)^model\s+(\w+)\s*\{([^}]+)\}") {
+        Ok(r) => r,
+        Err(_) => return schema.to_string(),
+    };
+
+    let mut model_names: Vec<String> = Vec::new();
+    let mut model_bodies: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+
+    for cap in model_re.captures_iter(schema) {
+        if let (Some(m_name), Some(m_body)) = (cap.get(1), cap.get(2)) {
+            let name = m_name.as_str().to_string();
+            let lines: Vec<String> = m_body.as_str().lines().map(|s| s.to_string()).collect();
+            model_names.push(name.clone());
+            model_bodies.insert(name, lines);
+        }
+    }
+
+    if model_names.is_empty() {
+        return schema.to_string();
+    }
+
+    let rel_name_re = match regex::Regex::new(r#"@relation\([^)]*(?:name:\s*["']([^"']+)["']|["']([^"']+)["'])"#) {
+        Ok(r) => r,
+        Err(_) => return schema.to_string(),
+    };
+
+    struct DefiningRel {
+        source_model: String,
+        target_model: String,
+        line_idx: usize,
+        field_name: String,
+        rel_name: Option<String>,
+        is_one_to_one: bool,
+    }
+
+    let mut defining_by_pair: std::collections::HashMap<(String, String), Vec<DefiningRel>> = std::collections::HashMap::new();
+
+    for source_model in &model_names {
+        if let Some(lines) = model_bodies.get(source_model) {
+            for (line_idx, line) in lines.iter().enumerate() {
+                let trimmed = line.trim();
+                if !trimmed.contains("@relation") || !trimmed.contains("fields:") || !trimmed.contains("references:") {
+                    continue;
+                }
+
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() < 2 {
+                    continue;
+                }
+
+                let field_name = parts[0].to_string();
+                let clean_target = parts[1].replace(['?', '[', ']'], "");
+                if !model_names.contains(&clean_target) {
+                    continue;
+                }
+
+                let rel_name = rel_name_re.captures(trimmed).and_then(|c| {
+                    c.get(1).or_else(|| c.get(2)).map(|m| m.as_str().to_string())
+                });
+
+                let is_one_to_one = if let Some(open_f) = trimmed.find("fields: [") {
+                    let fk_slice = &trimmed[open_f + 9..];
+                    if let Some(close_f) = fk_slice.find(']') {
+                        let fk_name = fk_slice[..close_f].trim();
+                        lines.iter().any(|l| {
+                            let lt = l.trim();
+                            (lt.starts_with(fk_name) && lt.contains("@unique"))
+                                || (lt.starts_with("@@unique") && lt.contains(fk_name))
+                        })
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                let pair_key = if source_model <= &clean_target {
+                    (source_model.clone(), clean_target.clone())
+                } else {
+                    (clean_target.clone(), source_model.clone())
+                };
+
+                defining_by_pair.entry(pair_key).or_default().push(DefiningRel {
+                    source_model: source_model.clone(),
+                    target_model: clean_target,
+                    line_idx,
+                    field_name,
+                    rel_name,
+                    is_one_to_one,
+                });
+            }
+        }
+    }
+
+    // Process pairs where disambiguation is needed:
+    // 1. Multiple relations between models (rels.len() >= 2)
+    // 2. Self-relations (m1 == m2) lacking explicit relation names
+    for ((m1, m2), rels) in defining_by_pair {
+        let is_self_relation = m1 == m2;
+        if rels.len() < 2 && !is_self_relation {
+            continue;
+        }
+
+        // Check if any lacks relation name or if any share relation names
+        let mut rel_names_used = std::collections::HashSet::new();
+        let mut needs_disambiguation = false;
+        for r in &rels {
+            if let Some(ref name) = r.rel_name {
+                if !rel_names_used.insert(name.clone()) {
+                    needs_disambiguation = true;
+                }
+            } else {
+                needs_disambiguation = true;
+            }
+        }
+
+        if !needs_disambiguation {
+            continue;
+        }
+
+        // Assign distinct relation names to all relations in this pair
+        for r in &rels {
+            let cap_field = capitalize_first_letter(&r.field_name);
+            let rel_name = if is_self_relation && rels.len() == 1 {
+                format!("{}Hierarchy", r.source_model)
+            } else {
+                format!("{}{}", r.source_model, cap_field)
+            };
+
+            if let Some(src_lines) = model_bodies.get_mut(&r.source_model) {
+                let original_line = &src_lines[r.line_idx];
+                let updated_line = if let Some(ref existing) = r.rel_name {
+                    original_line.replace(&format!("\"{}\"", existing), &format!("\"{}\"", rel_name))
+                } else if original_line.contains("@relation(") {
+                    original_line.replace("@relation(", &format!("@relation(\"{}\", ", rel_name))
+                } else {
+                    original_line.clone()
+                };
+                src_lines[r.line_idx] = updated_line;
+            }
+
+            // In target_model: prune un-named back relations and inject/update named opposite
+            if let Some(target_lines) = model_bodies.get_mut(&r.target_model) {
+                if !is_self_relation {
+                    target_lines.retain(|l| {
+                        let trimmed = l.trim();
+                        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            let field_type = parts[1].replace(['?', '[', ']'], "");
+                            if field_type == r.source_model && !trimmed.contains("fields:") {
+                                let r_name = rel_name_re.captures(trimmed).and_then(|c| c.get(1).or_else(|| c.get(2)).map(|m| m.as_str().to_string()));
+                                if r_name.is_none() {
+                                    return false;
+                                }
+                            }
+                        }
+                        true
+                    });
+                }
+
+                let mut plural_source = r.source_model.clone();
+                if let Some(first_char) = plural_source.chars().next() {
+                    plural_source = format!("{}{}", first_char.to_lowercase(), &plural_source[first_char.len_utf8()..]);
+                }
+                if plural_source.ends_with('y') && !plural_source.ends_with("ey") && !plural_source.ends_with("ay") && !plural_source.ends_with("oy") {
+                    plural_source.pop();
+                    plural_source.push_str("ies");
+                } else if !plural_source.ends_with('s') {
+                    plural_source.push('s');
+                }
+
+                let already_has_named_opposite = target_lines.iter().any(|l| {
+                    let trimmed = l.trim();
+                    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        let field_type = parts[1].replace(['?', '[', ']'], "");
+                        field_type == r.source_model && (trimmed.contains(&format!("\"{}\"", rel_name)) || trimmed.contains(&format!("'{}'", rel_name)))
+                    } else {
+                        false
+                    }
+                });
+
+                if !already_has_named_opposite {
+                    // Check if there is an un-named back-relation array of source_model that we can name
+                    let mut updated_existing_back = false;
+                    for t_line in target_lines.iter_mut() {
+                        let trimmed = t_line.trim();
+                        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            let field_type = parts[1].replace(['?', '[', ']'], "");
+                            if field_type == r.source_model && !trimmed.contains("fields:") && !trimmed.contains("@relation") {
+                                *t_line = format!("{} @relation(\"{}\")", t_line.trim_end(), rel_name);
+                                updated_existing_back = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if !updated_existing_back {
+                        let opposite_field_name = if is_self_relation {
+                            if r.field_name == "parent" { "children".to_string() } else { format!("{}Children", r.field_name) }
+                        } else if r.is_one_to_one {
+                            format!("{}{}", r.field_name, r.source_model)
+                        } else {
+                            format!("{}{}", r.field_name, capitalize_first_letter(&plural_source))
+                        };
+
+                        let field_type = if r.is_one_to_one {
+                            format!("{}?", r.source_model)
+                        } else {
+                            format!("{}[]", r.source_model)
+                        };
+
+                        let new_line = format!("  {:14} {} @relation(\"{}\")", opposite_field_name, field_type, rel_name);
+                        target_lines.push(new_line);
+                    }
+                }
+            }
+        }
+    }
+
+    // Reconstruct schema
+    let mut result = schema.to_string();
+    for (m_name, lines) in model_bodies {
+        let pattern = format!(r"(?ms)(^model\s+{}\s*\{{)([\s\S]*?)(\n*\}})", m_name);
+        if let Ok(block_re) = regex::Regex::new(&pattern) {
+            let updated_body = lines.join("\n");
+            result = block_re
+                .replace(&result, |caps: &regex::Captures| {
+                    format!("{}{}\n{}", &caps[1], updated_body.trim_end(), caps[3].trim_start())
+                })
+                .to_string();
         }
     }
 
@@ -2755,8 +3037,82 @@ pub fn ensure_zod_imports(content: &str) -> String {
     insert_import_after_use_client(content, "import { z } from 'zod';")
 }
 
+/// Strips Next.js navigation hooks (`useRouter`, `usePathname`, `useParams`, `useSearchParams`)
+/// if the AI accidentally imported them from 'react' instead of 'next/navigation'.
+pub fn clean_react_navigation_hooks_from_react_imports(content: &str) -> String {
+    let next_nav_hooks = ["useRouter", "usePathname", "useParams", "useSearchParams"];
+    let react_import_re = match regex::Regex::new(r#"(?m)^(\s*import\s+)([^;]+?)(\s+from\s*['"]react['"]\s*;?)"#) {
+        Ok(r) => r,
+        Err(_) => return content.to_string(),
+    };
+
+    let mut result = content.to_string();
+    result = react_import_re.replace_all(&result, |caps: &regex::Captures| {
+        let prefix = &caps[1];
+        let import_clause = caps[2].trim();
+
+        if !import_clause.contains('{') {
+            return caps[0].to_string();
+        }
+
+        let has_nav_hook = next_nav_hooks.iter().any(|h| {
+            regex::Regex::new(&format!(r"\b{}\b", h)).map(|re| re.is_match(import_clause)).unwrap_or(false)
+        });
+
+        if !has_nav_hook {
+            return caps[0].to_string();
+        }
+
+        let open_brace = match import_clause.find('{') {
+            Some(idx) => idx,
+            None => return caps[0].to_string(),
+        };
+        let close_brace = match import_clause.find('}') {
+            Some(idx) => idx,
+            None => return caps[0].to_string(),
+        };
+
+        let default_part = import_clause[..open_brace].trim().trim_end_matches(',').trim();
+        let named_part = &import_clause[open_brace + 1..close_brace];
+
+        let filtered_named: Vec<String> = named_part
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .filter(|s| {
+                let name = s.split_whitespace().next().unwrap_or("");
+                !next_nav_hooks.contains(&name)
+            })
+            .map(|s| s.to_string())
+            .collect();
+
+        if filtered_named.is_empty() {
+            if !default_part.is_empty() {
+                format!("{}{} from 'react';", prefix, default_part)
+            } else {
+                String::new()
+            }
+        } else if !default_part.is_empty() {
+            format!("{}{}, {{ {} }} from 'react';", prefix, default_part, filtered_named.join(", "))
+        } else {
+            format!("{}{{ {} }} from 'react';", prefix, filtered_named.join(", "))
+        }
+    }).to_string();
+
+    let mut cleaned_lines = Vec::new();
+    for line in result.lines() {
+        if !line.trim().is_empty() || cleaned_lines.last().map(|l: &&str| !l.trim().is_empty()).unwrap_or(false) {
+            cleaned_lines.push(line);
+        }
+    }
+    cleaned_lines.join("\n")
+}
+
 pub fn ensure_react_and_next_hook_imports(content: &str) -> String {
-    let code_body: String = content
+    // 0. Clean any Next.js navigation hooks mistakenly imported from 'react'
+    let content_cleaned = clean_react_navigation_hooks_from_react_imports(content);
+
+    let code_body: String = content_cleaned
         .lines()
         .filter(|l| {
             let t = l.trim();
@@ -2765,7 +3121,7 @@ pub fn ensure_react_and_next_hook_imports(content: &str) -> String {
         .collect::<Vec<&str>>()
         .join("\n");
 
-    let mut result = content.to_string();
+    let mut result = content_cleaned;
 
     // 1. Standard React hooks
     let react_hooks = [
@@ -2904,4 +3260,41 @@ pub fn ensure_react_and_next_hook_imports(content: &str) -> String {
     }
 
     result
+}
+
+/// Traverses all source files in `src/` and runs AST import sanitization
+/// (removes invalid React navigation imports, verifies @/ alias imports, hoists 'use client').
+pub fn apply_ast_sanity_pass_to_project(proj_dir: &std::path::Path) {
+    let src_dir = proj_dir.join("src");
+    if !src_dir.exists() {
+        return;
+    }
+
+    let has_tailwind = proj_dir.join("tailwind.config.js").exists() || proj_dir.join("tailwind.config.ts").exists();
+
+    fn walk_dir(dir: &std::path::Path, proj_dir: &std::path::Path, has_tailwind: bool) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk_dir(&path, proj_dir, has_tailwind);
+                } else if path.is_file() {
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    if ext == "tsx" || ext == "ts" || ext == "jsx" || ext == "js" {
+                        if let Ok(rel) = path.strip_prefix(proj_dir) {
+                            let rel_str = rel.to_string_lossy().replace('\\', "/");
+                            if let Ok(content) = std::fs::read_to_string(&path) {
+                                let sanitized = post_process_generated_file(&rel_str, &content, &serde_json::json!({}), has_tailwind);
+                                if sanitized.replace("\r\n", "\n").trim() != content.replace("\r\n", "\n").trim() {
+                                    let _ = std::fs::write(&path, &sanitized);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    walk_dir(&src_dir, proj_dir, has_tailwind);
 }
