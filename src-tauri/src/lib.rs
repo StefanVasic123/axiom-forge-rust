@@ -9,6 +9,7 @@ pub mod editor_ai;
 pub mod hardware;
 pub mod server;
 pub mod healer;
+pub mod katastar;
 pub mod self_healing;
 pub mod orchestrator;
 
@@ -20,6 +21,7 @@ pub use editor_ai::*;
 pub use hardware::*;
 pub use server::*;
 pub use healer::*;
+pub use katastar::*;
 pub use self_healing::*;
 pub use orchestrator::*;
 
@@ -341,6 +343,7 @@ pub fn run() {
             project_heal_compile_error,
             project_install_package,
             project_run_prisma_generate,
+            get_error_katastar,
             task_start_generation,
             task_pause_generation,
             task_resume_generation,
@@ -1836,6 +1839,714 @@ model Company {
         let sanitized_mutual = post_process_generated_file("prisma/schema.prisma", mutual_schema, &serde_json::json!({}), false);
         assert!(sanitized_mutual.contains("@relation(\"UserCompany\""));
         assert!(sanitized_mutual.contains("@relation(\"CompanyOwner\""));
+    }
+
+    #[test]
+    fn test_prisma_referential_actions_and_carbonchain_assigned_to_healing() {
+        // 1. Referential action normalization inside @relation(...) without mutating enum/scalar names
+        let raw_actions = r#"
+enum ActionType {
+  NO_ACTION
+}
+
+model Item {
+  id       String  @id @default(cuid())
+  parentId String?
+  action   ActionType @default(NO_ACTION)
+  parent   Item?   @relation(fields: [parentId], references: [id], onDelete: SET_NULL, onUpdate: CASCADE)
+  otherId  String?
+  other    Other?  @relation(fields: [otherId], references: [id], onDelete: NO_ACTION, onUpdate: SET_DEFAULT)
+  // onDelete: SET_NULL comment must remain untouched
+}
+"#;
+        let normalized = normalize_prisma_referential_actions(raw_actions);
+        assert!(normalized.contains("onDelete: SetNull, onUpdate: Cascade"));
+        assert!(normalized.contains("onDelete: NoAction, onUpdate: SetDefault"));
+        assert!(normalized.contains("NO_ACTION\n"));
+        assert!(normalized.contains("@default(NO_ACTION)"));
+        assert!(normalized.contains("// onDelete: SET_NULL comment must remain untouched"));
+
+        // 2. extract_prisma_relation_name must ignore map: "..." and extract positional or name: "..."
+        assert_eq!(
+            extract_prisma_relation_name("  user User @relation(fields: [userId], references: [id], map: \"fk_user\")"),
+            None
+        );
+        assert_eq!(
+            extract_prisma_relation_name("  assignedTo User? @relation(fields: [assignedToId], references: [id], onDelete: SetNull, name: \"AssignedTo\")"),
+            Some("AssignedTo".to_string())
+        );
+
+        // 3. CarbonChain Check 3 scenario (SET_NULL + explicit name: "AssignedTo" + un-named User.tasks)
+        let check3_schema = r#"generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String        @id @default(cuid())
+  email        String        @unique
+  tasks        Task[]
+}
+
+model Task {
+  id           String   @id @default(cuid())
+  assignedToId String?
+  assignedTo   User?    @relation(fields: [assignedToId], references: [id], onDelete: SET_NULL, name: "AssignedTo")
+}
+"#;
+        let fixed_check3 = post_process_generated_file("prisma/schema.prisma", check3_schema, &serde_json::json!({}), false);
+        assert!(fixed_check3.contains("onDelete: SetNull"), "SET_NULL should become SetNull:\n{}", fixed_check3);
+        assert!(!fixed_check3.contains("SET_NULL"));
+        assert!(!fixed_check3.contains("tasksTask"), "must NOT synthesize duplicate tasksTask:\n{}", fixed_check3);
+        assert!(fixed_check3.contains("tasks        Task[] @relation(\"AssignedTo\")"), "User.tasks should receive @relation(\"AssignedTo\"):\n{}", fixed_check3);
+
+        // 4. CarbonChain Check 4 full corrupted schema (both `tasks` and `tasksTask` + dual Project/Analytics + TeamProjects M2M)
+        let check4_schema = r#"generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  projects      Project[]
+  teams         Team[]
+  tasks        Task[] @relation("AssignedTo")
+  subscriptions Subscription[]
+  tasksTask    Task[] @relation("AssignedTo")
+}
+
+model Team {
+  id        String   @id @default(cuid())
+  name      String
+  users     User[]
+  projects  Project[] @relation("TeamProjects")
+  subscriptions Subscription[]
+}
+
+model Project {
+  id          String   @id @default(cuid())
+  ownerId     String
+  owner       User     @relation(fields: [ownerId], references: [id])
+  tasks       Task[]
+  analytics   Analytics? @relation("ProjectAnalytics", fields: [analyticsId], references: [id])
+  analyticsId String?  @unique
+  projectAnalytics Analytics? @relation("AnalyticsProject")
+  teams       Team[] @relation("TeamProjects")
+}
+
+model Task {
+  id           String   @id @default(cuid())
+  projectId    String
+  project      Project  @relation(fields: [projectId], references: [id])
+  assignedTo   User?    @relation(fields: [assignedToId], references: [id], onDelete: SET_NULL, name: "AssignedTo")
+  assignedToId String?
+}
+
+model Subscription {
+  id     String  @id @default(cuid())
+  userId String?
+  teamId String?
+  user   User?   @relation(fields: [userId], references: [id])
+  team   Team?   @relation(fields: [teamId], references: [id])
+}
+
+model Analytics {
+  id               String   @id @default(cuid())
+  projectId        String   @unique
+  project          Project  @relation("AnalyticsProject", fields: [projectId], references: [id])
+  analyticsProject Project? @relation("ProjectAnalytics")
+}
+"#;
+        let healed_check4 = post_process_generated_file("prisma/schema.prisma", check4_schema, &serde_json::json!({}), false);
+        assert!(!healed_check4.contains("tasksTask"), "duplicate tasksTask must be pruned:\n{}", healed_check4);
+        assert!(healed_check4.contains("tasks        Task[] @relation(\"AssignedTo\")"));
+        assert!(!healed_check4.contains("SET_NULL"));
+        assert!(healed_check4.contains("onDelete: SetNull"));
+        assert!(healed_check4.contains("projects  Project[] @relation(\"TeamProjects\")"));
+        assert!(healed_check4.contains("teams       Team[] @relation(\"TeamProjects\")"));
+        assert!(healed_check4.contains("projectAnalytics Analytics? @relation(\"AnalyticsProject\")"));
+        assert!(healed_check4.contains("analyticsProject Project? @relation(\"ProjectAnalytics\")"));
+
+        // 4b. Even if `tasksTask` precedes `tasks` in User, natural `tasks` wins over synthetic `tasksTask`
+        let reversed_schema = check4_schema
+            .replace("  tasks        Task[] @relation(\"AssignedTo\")\n", "")
+            .replace("  tasksTask    Task[] @relation(\"AssignedTo\")", "  tasksTask    Task[] @relation(\"AssignedTo\")\n  tasks        Task[] @relation(\"AssignedTo\")");
+        let healed_reversed = post_process_generated_file("prisma/schema.prisma", &reversed_schema, &serde_json::json!({}), false);
+        assert!(!healed_reversed.contains("tasksTask"));
+        assert!(healed_reversed.contains("tasks        Task[] @relation(\"AssignedTo\")"));
+
+        // 5. Self-relation paired child field must survive sanitize_prisma_relations AND full pipeline
+        let self_rel_with_set_null = r#"
+model Category {
+  id       String     @id @default(cuid())
+  parentId String?
+  parent   Category?  @relation("CategoryHierarchy", fields: [parentId], references: [id], onDelete: SET_NULL)
+  children Category[] @relation("CategoryHierarchy")
+}
+"#;
+        let healed_self = post_process_generated_file("prisma/schema.prisma", self_rel_with_set_null, &serde_json::json!({}), false);
+        assert!(healed_self.contains("onDelete: SetNull"));
+        assert!(healed_self.contains("children Category[] @relation(\"CategoryHierarchy\")"), "paired children self-relation was wrongly deleted:\n{}", healed_self);
+    }
+
+    #[test]
+    fn test_npm_self_healing_shell_quote_and_webpack_dev_server() {
+        // 1. ETARGET parser extracts package name cleanly for transitive dependency `shell-quote@^1.10.0.`
+        let npm_log = "npm error code ETARGET\nnpm error notarget No matching version found for shell-quote@^1.10.0.\nnpm error notarget In most cases you or one of your dependencies...";
+        let parsed = analyze_npm_install_failure(npm_log);
+        assert!(matches!(parsed, Some(NpmFailureAction::SetWildcard(ref p)) if p == "shell-quote"));
+
+        // 2. Offline sanitizer strips hallucinated `webpack-dev-server` etc.
+        let mut pkg_json = serde_json::json!({
+            "name": "carbonchain-navigator",
+            "dependencies": {
+                "@auth/prisma-adapter": "^1.0.12",
+                "@prisma/client": "5.22.0",
+                "next": "14.2.35",
+                "webpack-dev-server": "^4.7.3",
+                "webpack-hot-middleware": "^2.25.4"
+            },
+            "devDependencies": {
+                "html-webpack-plugin": "^5.6.0",
+                "prisma": "5.22.0"
+            }
+        });
+        assert!(sanitize_package_json_value_for_offline(&mut pkg_json));
+        let deps = pkg_json["dependencies"].as_object().unwrap();
+        let dev_deps = pkg_json["devDependencies"].as_object().unwrap();
+        assert!(!deps.contains_key("webpack-dev-server"));
+        assert!(!deps.contains_key("webpack-hot-middleware"));
+        assert!(!dev_deps.contains_key("html-webpack-plugin"));
+        assert!(deps.contains_key("@auth/prisma-adapter"));
+        assert!(deps.contains_key("next"));
+
+        // 3. No global wildcard override without parent; parent-scoped override only when parent is known
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_pkg_heal_test_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let pkg_path = temp_dir.join("package.json");
+        std::fs::write(
+            &pkg_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "name": "test-app",
+                "dependencies": {
+                    "next": "14.2.35",
+                    "some-direct-pkg": "^1.2.3"
+                },
+                "devDependencies": {
+                    "webpack-dev-server": "^4.15.2"
+                }
+            })).unwrap(),
+        ).unwrap();
+
+        // Unknown parent -> refuses to pollute package.json with global overrides
+        assert!(!apply_npm_etarget_heal(&pkg_path, "shell-quote", Some(npm_log)));
+        let after_unknown: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&pkg_path).unwrap()).unwrap();
+        assert!(after_unknown.get("overrides").is_none());
+
+        // Known parent in log -> writes parent-scoped override once, second call is a no-op
+        let parented_npm_log = "npm error code ETARGET\nnpm error While resolving: test-app@0.1.0\nnpm error notarget No matching version found for shell-quote@^1.10.0.\nnpm error requested by webpack-dev-server@4.15.2";
+        assert!(apply_npm_etarget_heal(&pkg_path, "shell-quote", Some(parented_npm_log)));
+        assert!(!apply_npm_etarget_heal(&pkg_path, "shell-quote", Some(parented_npm_log)));
+        let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&pkg_path).unwrap()).unwrap();
+        assert!(saved["overrides"].get("shell-quote").is_none(), "Must NEVER emit global overrides['shell-quote']!");
+        assert_eq!(saved["overrides"]["webpack-dev-server"]["shell-quote"], serde_json::json!("*"));
+
+        // Direct non-core dependency: first call mutates "^1.2.3" -> "*" and returns true; second call returns false (no-op)
+        assert!(set_package_version_to_wildcard(&pkg_path, "some-direct-pkg"));
+        assert!(!set_package_version_to_wildcard(&pkg_path, "some-direct-pkg"));
+        let saved2: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&pkg_path).unwrap()).unwrap();
+        assert_eq!(saved2["dependencies"]["some-direct-pkg"], serde_json::json!("*"));
+
+        // Core framework lock: `next` can NEVER be downgraded to "*" or removed
+        assert!(!set_package_version_to_wildcard(&pkg_path, "next"));
+        assert!(!remove_package_from_json(&pkg_path, "next"));
+        let saved3: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&pkg_path).unwrap()).unwrap();
+        assert_eq!(saved3["dependencies"]["next"], serde_json::json!("14.2.35"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_axiom_contracts_harvester_refresh_and_prompt() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_contracts_test_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join(".axiom")).unwrap();
+        // Simulate corrupted/empty stub like v0.1.45 CarbonChain Navigator
+        std::fs::write(
+            temp_dir.join(".axiom").join("axiom-contracts.json"),
+            r#"{"lastUpdated":"2026-01-01T00:00:00Z","totalFilesTracked":0}"#,
+        ).unwrap();
+
+        let schema_code = "enum Role {\n  ADMIN\n  MEMBER\n}\nmodel Supplier {\n  id String @id @default(cuid())\n}\n";
+        let api_code = "import { NextResponse } from 'next/server';\nexport async function GET() { return NextResponse.json([]); }\n";
+        let hook_code = "import { useState, useEffect } from 'react';\nexport function useSuppliers() {\n  const [suppliers, setSuppliers] = useState([]);\n  useEffect(() => { fetch('/api/suppliers'); }, []);\n  return { suppliers };\n}\n";
+        let nav_code = "import Link from 'next/link';\nimport { useRouter } from 'next/navigation';\nexport default function Navbar() {\n  const router = useRouter();\n  const [isMenuOpen, setIsMenuOpen] = useState(false);\n  return <nav onClick={() => router.push('/dashboard')}><Link href=\"/suppliers\">Suppliers</Link></nav>;\n}\n";
+
+        std::fs::create_dir_all(temp_dir.join("prisma")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/app/api/suppliers")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/hooks")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/components")).unwrap();
+        std::fs::write(temp_dir.join("prisma/schema.prisma"), schema_code).unwrap();
+        std::fs::write(temp_dir.join("src/app/api/suppliers/route.ts"), api_code).unwrap();
+        std::fs::write(temp_dir.join("src/hooks/useSuppliers.tsx"), hook_code).unwrap();
+        std::fs::write(temp_dir.join("src/components/Navbar.tsx"), nav_code).unwrap();
+
+        let files_list = vec![
+            serde_json::json!({ "path": "prisma/schema.prisma" }),
+            serde_json::json!({ "path": "src/app/api/suppliers/route.ts" }),
+            serde_json::json!({ "path": "src/hooks/useSuppliers.tsx" }),
+            serde_json::json!({ "path": "src/components/Navbar.tsx" }),
+        ];
+
+        harvest_file_to_axiom_contracts(&temp_dir, "proj-1", "prisma/schema.prisma", schema_code, &files_list);
+        harvest_file_to_axiom_contracts(&temp_dir, "proj-1", "src/app/api/suppliers/route.ts", api_code, &files_list);
+        harvest_file_to_axiom_contracts(&temp_dir, "proj-1", "src/hooks/useSuppliers.tsx", hook_code, &files_list);
+        harvest_file_to_axiom_contracts(&temp_dir, "proj-1", "src/components/Navbar.tsx", nav_code, &files_list);
+
+        let root_contracts: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(temp_dir.join("axiom-contracts.json")).unwrap()
+        ).unwrap();
+        assert_eq!(root_contracts["version"], serde_json::json!("1.0"));
+        assert_eq!(root_contracts["projectId"], serde_json::json!("proj-1"));
+        assert_eq!(root_contracts["totalFilesTracked"], serde_json::json!(4));
+
+        let files_arr = root_contracts["files"].as_array().unwrap();
+        assert_eq!(files_arr.len(), 4);
+
+        let hook_entry = files_arr.iter().find(|f| f["path"] == "src/hooks/useSuppliers.tsx").unwrap();
+        assert_eq!(hook_entry["role"], serde_json::json!("client-hook"));
+        assert!(hook_entry["capabilities"]["states"].get("suppliers").is_some());
+        assert!(hook_entry["consumedContracts"]["apiCalls"].as_array().unwrap().iter().any(|v| v == "/api/suppliers"));
+
+        let nav_entry = files_arr.iter().find(|f| f["path"] == "src/components/Navbar.tsx").unwrap();
+        let nav_routes = nav_entry["connectedRoutes"].as_array().unwrap();
+        assert!(nav_routes.iter().any(|v| v == "/suppliers"));
+        assert!(nav_routes.iter().any(|v| v == "/dashboard"));
+        assert!(nav_entry["capabilities"]["exports"].as_array().unwrap().iter().any(|v| v == "Navbar"));
+
+        // Prompt injection skips configuration and current file
+        let prompt_ctx = format_axiom_contracts_prompt(&temp_dir, "src/app/dashboard/page.tsx");
+        assert!(prompt_ctx.contains("CROSS-FILE CONTRACTS REGISTRY"));
+        assert!(prompt_ctx.contains("src/hooks/useSuppliers.tsx"));
+        assert!(prompt_ctx.contains("/api/suppliers"));
+
+        // Refresh picks up files added later by Import Fixer
+        std::fs::write(
+            temp_dir.join("src/components/MissingWidget.tsx"),
+            "export const MissingWidget = () => <div />;\nexport default MissingWidget;\n",
+        ).unwrap();
+        refresh_axiom_contracts_for_project(&temp_dir, "proj-1", &files_list);
+        let refreshed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(temp_dir.join(".axiom").join("axiom-contracts.json")).unwrap()
+        ).unwrap();
+        assert_eq!(refreshed["totalFilesTracked"], serde_json::json!(5));
+        assert!(refreshed["files"].as_array().unwrap().iter().any(|f| f["path"] == "src/components/MissingWidget.tsx"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_hook_use_callback_client_directive_and_ui_metacognitive_prompt() {
+        let raw_hook = r#"import { useRouter, useState, useEffect } from 'react';
+
+export function useSuppliers() {
+  const router = useRouter();
+  const [suppliers, setSuppliers] = useState([]);
+
+  const fetchSuppliers = async () => {
+    const res = await fetch('/api/suppliers');
+    if (res.ok) setSuppliers(await res.json());
+  };
+
+  useEffect(() => {
+    fetchSuppliers();
+  }, [fetchSuppliers, router]);
+
+  return { suppliers, fetchSuppliers };
+}
+"#;
+        let processed = post_process_generated_file("src/hooks/useSuppliers.tsx", raw_hook, &serde_json::json!({}), false);
+        assert!(processed.starts_with("\"use client\";"), "Hook must get 'use client' directive:\n{}", processed);
+        assert!(processed.contains("useCallback"), "Action must be memoized with useCallback:\n{}", processed);
+        assert!(processed.contains("import { useRouter } from 'next/navigation';"), "useRouter must move to next/navigation:\n{}", processed);
+        // Must actually import useCallback alongside useState, useEffect in 'react'
+        let react_import_line = processed.lines().find(|l| l.contains("from 'react'")).unwrap();
+        assert!(react_import_line.contains("useCallback"), "useCallback MUST be imported from 'react':\n{}", processed);
+        assert!(!react_import_line.contains("useRouter"), "useRouter MUST NOT remain in 'react' import:\n{}", processed);
+
+        // Ensure UI generation prompt injects METACOGNITIVE_UI_STATE_RULEPACK for UI files, NOT hooks/API
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_ui_meta_prompt_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let ui_prompt = get_expert_system_prompt("src/components/Navbar.tsx", "nextjs", "", "", "", "", &temp_dir);
+        assert!(ui_prompt.contains("METACOGNITIVE UI COMPONENT STATE & INTERACTION PROTOCOL"));
+        let hook_prompt = get_expert_system_prompt("src/hooks/useSuppliers.tsx", "nextjs", "", "", "", "", &temp_dir);
+        assert!(!hook_prompt.contains("METACOGNITIVE UI COMPONENT STATE & INTERACTION PROTOCOL"));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_npm_offline_network_detection_and_scoped_override_safety() {
+        assert!(is_npm_network_error("npm error code ENOTFOUND\nnpm error syscall getaddrinfo"));
+        assert!(is_npm_network_error("npm error errno EAI_NODATA"));
+        assert!(is_npm_network_error("npm error network request failed: fetch failed"));
+        assert!(is_npm_network_error("npm error code ENOTCACHED\nnpm error request to https://registry.npmjs.org/next failed, reason: cache mode is 'only-if-cached'"));
+        assert!(!is_npm_network_error("npm warn deprecated offline-plugin@5.0.0"));
+        assert!(!is_npm_network_error("npm error code ETARGET\nnpm error notarget No matching version found for shell-quote@^1.10.0."));
+        assert!(!is_npm_network_error("npm error code E404\nnpm error 404 Not Found - GET https://registry.npmjs.org/nonexistent"));
+
+        // Non-Next.js Webpack/Express project keeps webpack-dev-server
+        let mut standalone_webpack = serde_json::json!({
+            "name": "legacy-spa",
+            "scripts": { "dev": "webpack serve --mode development" },
+            "dependencies": { "express": "^4.18.0" },
+            "devDependencies": { "webpack": "^5.0.0", "webpack-dev-server": "^4.7.3" }
+        });
+        assert!(!sanitize_package_json_value_for_offline(&mut standalone_webpack));
+        assert!(standalone_webpack["devDependencies"].get("webpack-dev-server").is_some());
+
+        // Scoped transitive dependency override must NEVER delete @auth/* core/direct deps or write global overrides
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_scoped_override_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let pkg_path = temp_dir.join("package.json");
+        std::fs::write(
+            &pkg_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "name": "auth-app",
+                "dependencies": {
+                    "next": "14.2.35",
+                    "next-auth": "^4.24.7",
+                    "@auth/prisma-adapter": "^1.0.12"
+                }
+            })).unwrap(),
+        ).unwrap();
+
+        // Without parent evidence, returns false and adds no global override
+        assert!(!set_package_version_to_wildcard(&pkg_path, "@auth/core"));
+        // With parent evidence in npm ERESOLVE/stderr log, writes strictly parent-scoped override
+        let auth_log = "npm error Could not resolve dependency:\nnpm error peer @auth/core@^0.18.0 from @auth/prisma-adapter@1.0.12";
+        assert!(apply_npm_etarget_heal(&pkg_path, "@auth/core", Some(auth_log)));
+        let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&pkg_path).unwrap()).unwrap();
+        assert!(saved["dependencies"].get("@auth/prisma-adapter").is_some(), "@auth/prisma-adapter must NOT be deleted!");
+        assert!(saved["overrides"].get("@auth/core").is_none(), "Global @auth/core override must NEVER be written!");
+        assert_eq!(saved["overrides"]["@auth/prisma-adapter"]["@auth/core"], serde_json::json!("*"));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_prisma_quoted_parens_utf8_and_inline_comment_unique() {
+        // Parentheses inside map: "..." must not truncate @relation(...) parsing
+        let rel_line = r#"  assignedTo User? @relation(map: "fk(assigned_1)", fields: [assignedToId], references: [id], onDelete: SET_NULL, name: "AssignedTo")"#;
+        assert_eq!(extract_prisma_relation_name(rel_line), Some("AssignedTo".to_string()));
+        let norm_line = normalize_prisma_referential_actions(rel_line);
+        assert!(norm_line.contains("onDelete: SetNull"), "Must normalize past quoted parens:\n{}", norm_line);
+
+        // Multi-byte UTF-8 inline comment + scalar @relation must not panic or corrupt bytes
+        let utf8_scalar = "model Audit {\n  članId String @relation(fields: [x], references: [id]) // čćžšđ komentar\n}\n";
+        let fixed_utf8 = post_process_generated_file("prisma/schema.prisma", utf8_scalar, &serde_json::json!({}), false);
+        assert!(!fixed_utf8.contains("@relation"));
+        assert!(fixed_utf8.contains("// čćžšđ komentar"));
+
+        // 1-to-1 @unique injection and back-relation @relation("...") attachment must preserve trailing inline comments
+        let one_to_one_comment = r#"
+model User {
+  id    String @id @default(cuid())
+  tasks Task[] // dodeljeni zadaci
+}
+
+model Task {
+  id           String  @id @default(cuid())
+  assignedToId String?
+  assignedTo   User?   @relation(name: "AssignedTo", fields: [assignedToId], references: [id])
+}
+
+model Project {
+  id        String     @id @default(cuid())
+  analytics Analytics? @relation("ProjectAnalytics")
+}
+
+model Analytics {
+  id        String  @id @default(cuid())
+  projectId String  // FK ka projektu
+  project   Project @relation("ProjectAnalytics", fields: [projectId], references: [id])
+}
+"#;
+        let fixed_unique = sanitize_prisma_relations(one_to_one_comment);
+        assert!(
+            fixed_unique.contains("projectId String @unique // FK ka projektu"),
+            "@unique must be inserted before inline comment:\n{}",
+            fixed_unique
+        );
+        assert!(
+            fixed_unique.contains("tasks Task[] @relation(\"AssignedTo\") // dodeljeni zadaci"),
+            "@relation must be inserted before inline comment:\n{}",
+            fixed_unique
+        );
+    }
+
+    #[test]
+    fn test_katastar_normalization_and_scrubbing() {
+        // 1. Prisma P1012 signature normalizes identifiers and line numbers
+        let prisma_err = "Error: Prisma schema validation - (get-dmmf wasm)\nError code: P1012\nerror: Error validating: You defined the enum `Role`. But the current connector does not support enums.\n  -->  prisma\\schema.prisma:10";
+        let prisma_sig = crate::katastar::normalize_error_signature("prisma", prisma_err, Some("prisma/schema.prisma"));
+        assert_eq!(prisma_sig.category, "prisma");
+        assert_eq!(prisma_sig.error_code.as_deref(), Some("P1012"));
+        assert!(prisma_sig.error_signature.starts_with("prisma:P1012:"));
+        assert!(prisma_sig.normalized_sample.contains("<IDENT>"));
+
+        // 2. npm ETARGET extracts error code + offending package
+        let npm_err = "npm error code ETARGET\nnpm error notarget No matching version found for shell-quote@^1.10.0.";
+        let npm_sig = crate::katastar::normalize_error_signature("npm", npm_err, Some("package.json"));
+        assert_eq!(npm_sig.category, "npm");
+        assert_eq!(npm_sig.error_code.as_deref(), Some("ETARGET"));
+        assert_eq!(npm_sig.error_signature, "npm:ETARGET:shell-quote");
+
+        // 3. Compile / runtime error normalization
+        let ts_local = "src/app/page.tsx(4,20): error TS2307: Cannot find module '@/components/Navbar' or its corresponding type declarations.";
+        let ts_sig = crate::katastar::normalize_error_signature("", ts_local, Some("src/app/page.tsx"));
+        assert_eq!(ts_sig.error_signature, "compile:TS2307:local-import");
+
+        let client_err = "You're importing a component that needs useState. It only works in a Client Component, mark the file with the 'use client' directive.";
+        let client_sig = crate::katastar::normalize_error_signature("", client_err, Some("src/components/Navbar.tsx"));
+        assert_eq!(client_sig.error_signature, "compile:NEXT_USE_CLIENT:missing-client-directive");
+
+        let ref_err = "Unhandled Runtime Error\nReferenceError: isMobileMenuOpen is not defined";
+        let ref_sig = crate::katastar::normalize_error_signature("", ref_err, Some("src/components/Navbar.tsx"));
+        assert_eq!(ref_sig.category, "runtime");
+        assert_eq!(ref_sig.error_signature, "runtime:ReferenceError:identifier-not-defined");
+
+        // 4. Sensitive path, ANSI, and credential scrubbing
+        let dirty = "\x1b[31mError\x1b[0m in C:\\Users\\Alice\\AppData\\Local\\axiom-forge\\projects\\123e4567-e89b-12d3-a456-426614174000\\src\\app.ts with postgresql://admin:supersecret@db.internal:5432/prod and sk_live_1234567890abcdef Bearer eyJhbGciOiJIUzI1NiJ9.payload";
+        let scrubbed = crate::katastar::scrub_sensitive_text(dirty);
+        assert!(!scrubbed.contains("Alice"));
+        assert!(!scrubbed.contains("supersecret"));
+        assert!(!scrubbed.contains("sk_live_"));
+        assert!(!scrubbed.contains("eyJhbGciOi"));
+        assert!(scrubbed.contains("<USER_DIR>"));
+        assert!(scrubbed.contains("postgresql://<REDACTED>"));
+        assert!(scrubbed.contains("<SECRET>"));
+    }
+
+    #[test]
+    fn test_katastar_safe_patch_extraction_and_guards() {
+        // Atomic import fix is accepted
+        let before_imp = "import { useState } from 'react';\nimport { Home } from 'react-icons';\nexport default function A() { return <div />; }\n";
+        let after_imp = "import { useState } from 'react';\nimport { FiHome as Home } from 'react-icons/fi';\nexport default function A() { return <div />; }\n";
+        let patch_imp = crate::katastar::extract_safe_atomic_patch("src/components/Header.tsx", before_imp, after_imp);
+        assert!(patch_imp.is_some());
+
+        // Atomic next.config fix is accepted
+        let before_cfg = "const nextConfig = {\n  webpack: (config) => {\n    config.resolve.fallback = { path: require.resolve('path-browserify') };\n    return config;\n  }\n};\n";
+        let after_cfg = "const nextConfig = {\n  webpack: (config) => {\n    config.resolve.fallback = { path: false };\n    return config;\n  }\n};\n";
+        assert!(crate::katastar::extract_safe_atomic_patch("next.config.js", before_cfg, after_cfg).is_some());
+
+        // Prisma universal referential fix accepted; provider & model edits rejected
+        let before_prisma = "model Item {\n  parent Item? @relation(fields: [p], references: [id], onDelete: SET_NULL)\n}\n";
+        let after_prisma = "model Item {\n  parent Item? @relation(fields: [p], references: [id], onDelete: SetNull)\n}\n";
+        assert!(crate::katastar::extract_safe_atomic_patch("prisma/schema.prisma", before_prisma, after_prisma).is_some());
+
+        let before_prov = "datasource db {\n  provider = \"sqlite\"\n  url = env(\"DATABASE_URL\")\n}\n";
+        let after_prov = "datasource db {\n  provider = \"postgresql\"\n  url = env(\"DATABASE_URL\")\n}\n";
+        assert!(crate::katastar::extract_safe_atomic_patch("prisma/schema.prisma", before_prov, after_prov).is_none());
+
+        // JSX component markup edits are NEVER auto-patched globally across projects
+        let before_jsx = "export default function Nav() {\n  return <div>{isOpen ? 'Open' : 'Closed'}</div>;\n}\n";
+        let after_jsx = "export default function Nav() {\n  return <div><span>Menu</span></div>;\n}\n";
+        assert!(crate::katastar::extract_safe_atomic_patch("src/components/Navbar.tsx", before_jsx, after_jsx).is_none());
+    }
+
+    #[test]
+    fn test_katastar_two_phase_verification_and_disable_lifecycle() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_katastar_lifecycle_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let store_path = temp_dir.join("axiom-error-katastar.json");
+
+        let before_code = "import { Home } from 'react-icons';\nexport default function Hero() { return <main />; }\n";
+        let after_code = "import { FiHome as Home } from 'react-icons/fi';\nexport default function Hero() { return <main />; }\n";
+        let patch = crate::katastar::extract_safe_atomic_patch("src/components/Hero.tsx", before_code, after_code).unwrap();
+        let err_msg = "src/components/Hero.tsx(1,22): error TS2307: Cannot find module 'react-icons' or its corresponding type declarations.";
+
+        // 1. Register as pending -> must NOT surface in verified lookup or blind sanitizer patches yet
+        let eid = crate::katastar::register_repair_attempt_at(
+            &store_path,
+            "compile",
+            err_msg,
+            "src/components/Hero.tsx",
+            "ai",
+            "search_replace",
+            Some(patch),
+            "Pending fix",
+            "qwen2.5-coder:7b",
+        );
+        let pre_lookup = crate::katastar::lookup_katastar_at(&store_path, "compile", err_msg, "src/components/Other.tsx", before_code, &[]);
+        assert!(pre_lookup.applicable_patches.is_empty());
+        assert!(pre_lookup.hints.is_empty());
+        assert!(crate::katastar::get_verified_sanitizer_patches_at(&store_path, "src/components/Other.tsx").is_empty());
+
+        // 2. Finalize passing build test -> promotes to "verified" and becomes usable
+        crate::katastar::finalize_katastar_outcome_at(
+            &store_path,
+            &eid,
+            true,
+            "ai",
+            "next_build",
+            None,
+            Some("Import react-icons icons from specific subpath like 'react-icons/fi'"),
+            "qwen2.5-coder:7b",
+        );
+        let post_lookup = crate::katastar::lookup_katastar_at(&store_path, "compile", err_msg, "src/components/Other.tsx", before_code, &[]);
+        assert_eq!(post_lookup.applicable_patches.len(), 1);
+        assert_eq!(post_lookup.applicable_patches[0].entry_id, eid);
+        assert_eq!(post_lookup.hints.len(), 1);
+        assert_eq!(crate::katastar::get_verified_sanitizer_patches_at(&store_path, "src/components/Other.tsx").len(), 1);
+
+        // 3. Two consecutive failures auto-disable the verified rule
+        crate::katastar::finalize_katastar_outcome_at(&store_path, &eid, false, "katastar", "tsc_noemit", None, None, "qwen2.5-coder:7b");
+        crate::katastar::finalize_katastar_outcome_at(&store_path, &eid, false, "katastar", "tsc_noemit", None, None, "qwen2.5-coder:7b");
+        let disabled_lookup = crate::katastar::lookup_katastar_at(&store_path, "compile", err_msg, "src/components/Other.tsx", before_code, &[]);
+        assert!(disabled_lookup.applicable_patches.is_empty());
+        assert!(crate::katastar::get_verified_sanitizer_patches_at(&store_path, "src/components/Other.tsx").is_empty());
+
+        let store = crate::katastar::load_katastar_store_at(&store_path);
+        assert_eq!(store.entries[0].status, "disabled");
+        assert_eq!(store.entries[0].history.len(), 3);
+
+        // 4. Interactive pending repair tracking & reoccurrence detection
+        let runtime_err = "ReferenceError: isMobileMenuOpen is not defined";
+        let sig_info = crate::katastar::normalize_error_signature("runtime", runtime_err, Some("src/components/Navbar.tsx"));
+        let eid2 = crate::katastar::register_repair_attempt_at(
+            &store_path,
+            &sig_info.category,
+            runtime_err,
+            "src/components/Navbar.tsx",
+            "ai",
+            "ai_edit",
+            None,
+            "Declare useState for mobile menu",
+            "qwen2.5-coder:7b",
+        );
+        crate::katastar::track_pending_project_repair_at(
+            &store_path,
+            "proj-demo",
+            "src/components/Navbar.tsx",
+            &sig_info.error_signature,
+            &eid2,
+            "ai",
+        );
+        let reoccurred = crate::katastar::resolve_reoccurred_pending_repair_at(
+            &store_path,
+            "proj-demo",
+            "src/components/Navbar.tsx",
+            &sig_info.error_signature,
+            "qwen2.5-coder:7b",
+        );
+        assert_eq!(reoccurred, vec![eid2.clone()]);
+        let store_after = crate::katastar::load_katastar_store_at(&store_path);
+        assert!(store_after.pending_repairs.is_empty());
+        let failed_entry = store_after.entries.iter().find(|e| e.id == eid2).unwrap();
+        assert_eq!(failed_entry.status, "failed");
+        assert_eq!(failed_entry.fail_count, 1);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_extract_offending_parent_from_debug_log_and_core_lock() {
+        // Core framework package lock verification
+        for core_pkg in &[
+            "next",
+            "react",
+            "react-dom",
+            "prisma",
+            "@prisma/client",
+            "next-auth",
+            "@auth/prisma-adapter",
+            "typescript",
+            "tailwindcss",
+        ] {
+            assert!(is_core_framework_package(core_pkg), "{} must be core-locked", core_pkg);
+        }
+        assert!(!is_core_framework_package("lucide-react"));
+        assert!(!is_core_framework_package("shell-quote"));
+        assert!(!is_core_framework_package("recharts"));
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_parent_log_test_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let pkg_path = temp_dir.join("package.json");
+        std::fs::write(
+            &pkg_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "name": "decentral-grid",
+                "dependencies": {
+                    "next": "14.2.35",
+                    "react": "^18.2.0",
+                    "@prisma/client": "5.22.0",
+                    "next-auth": "^4.24.7"
+                },
+                "devDependencies": {
+                    "prisma": "5.22.0",
+                    "some-legacy-tool": "^2.1.0"
+                }
+            })).unwrap(),
+        ).unwrap();
+
+        // Core framework packages cannot be modified or removed via self-healing
+        for protected in &["next", "react", "@prisma/client", "prisma", "next-auth"] {
+            assert!(!apply_npm_etarget_heal(&pkg_path, protected, None));
+            assert!(!remove_package_from_json(&pkg_path, protected));
+        }
+
+        // Mock npm _logs/debug-0.log referenced by stderr
+        let debug_log_path = temp_dir.join("2026-11-10T07_12_26_520Z-debug-0.log");
+        std::fs::write(
+            &debug_log_path,
+            "0 verbose cli node npm\n12 silly placeDep ROOT shell-quote@^1.10.0 KEEP for: some-legacy-tool@2.1.0 want: ^1.10.0\n13 error notarget No matching version found for shell-quote@^1.10.0.\n",
+        ).unwrap();
+
+        let stderr_only = format!(
+            "npm error code ETARGET\nnpm error While resolving: decentral-grid@0.1.0\nnpm error notarget No matching version found for shell-quote@^1.10.0.\nnpm error A complete log of this run can be found in: {}",
+            debug_log_path.display()
+        );
+        let direct = vec!["next".to_string(), "some-legacy-tool".to_string()];
+        let extracted = extract_offending_parent_from_npm_log(
+            &stderr_only,
+            "shell-quote",
+            &direct,
+            Some("decentral-grid"),
+        );
+        assert_eq!(extracted.as_deref(), Some("some-legacy-tool"));
+
+        assert!(apply_npm_etarget_heal(&pkg_path, "shell-quote", Some(&stderr_only)));
+        let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&pkg_path).unwrap()).unwrap();
+        assert_eq!(saved["overrides"]["some-legacy-tool"]["shell-quote"], serde_json::json!("*"));
+        assert!(saved["overrides"].get("decentral-grid").is_none());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
 }

@@ -3,11 +3,16 @@
  * Higher-level hook for common operations
  */
 
-import { useCallback, useEffect } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import { useAppContext } from '../contexts/AppContext';
+
+// Module-level guard so multiple useAppStore() hook instances never trigger duplicate offline auto-resumes
+const pendingOfflineAutoResumes = new Set();
 
 export function useAppStore() {
   const { state, actions } = useAppContext();
+  const latestStoreRef = useRef({ projects: state.projects, taskProgress: state.taskProgress });
+  latestStoreRef.current = { projects: state.projects, taskProgress: state.taskProgress };
 
   // ==================== FIRST RUN CHECK ====================
   const checkFirstRun = useCallback(async () => {
@@ -262,17 +267,19 @@ export function useAppStore() {
     }
   }, [actions]);
 
-
-
   // ==================== TASK PROGRESS ====================
   useEffect(() => {
     const unsubscribe = window.electronAPI.task.onProgress(async (data) => {
       if (data.taskId) {
         actions.setTaskProgress(data.taskId, data);
-        
+        if (data.projectId && data.offlineWaiting === true) {
+          // Allow another auto-resume if connection dropped again during install
+          pendingOfflineAutoResumes.delete(data.projectId);
+        }
+
         // JIT Memory Swapping: Unload builder model after completion to free VRAM/RAM
         const phase = data.phase || (data.status ? data.status.toLowerCase() : '');
-        if (phase === 'manifest-expansion' || phase === 'save-project') {
+        if (phase === 'manifest-expansion' || phase === 'save-project' || phase === 'paused') {
           try {
             await loadProjects();
           } catch (e) {
@@ -280,6 +287,9 @@ export function useAppStore() {
           }
         }
         if (phase === 'success' || phase === 'error' || phase === 'stopped' || phase === 'complete') {
+          if (data.projectId) {
+            pendingOfflineAutoResumes.delete(data.projectId);
+          }
           // Auto-reload projects so dashboard instantly reflects newly created codebases!
           try {
             console.log("[Task Progress] Task finished. Refreshing local projects list...");
@@ -301,6 +311,59 @@ export function useAppStore() {
 
     return () => unsubscribe();
   }, [actions, loadProjects]);
+
+  // ==================== AUTO-RESUME ON RECONNECT ====================
+  useEffect(() => {
+    const handleOnline = async () => {
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+
+      const { projects = [], taskProgress = {} } = latestStoreRef.current;
+      const candidateIds = new Set();
+
+      for (const task of Object.values(taskProgress)) {
+        if (
+          task?.projectId &&
+          task?.offlineWaiting === true &&
+          (task?.status === 'paused' || task?.phase === 'paused')
+        ) {
+          candidateIds.add(task.projectId);
+        }
+      }
+
+      for (const proj of projects) {
+        if (!proj?.id || proj.status !== 'paused') continue;
+        if (proj.metadata?.offlineWaiting === true) {
+          candidateIds.add(proj.id);
+        } else if (proj.metadata?.offlineWaiting !== false) {
+          try {
+            const cp = await getProjectCheckpoint(proj.id);
+            if (cp && cp.status === 'paused' && cp.offlineWaiting === true) {
+              candidateIds.add(proj.id);
+            }
+          } catch {
+            // ignore checkpoint lookup error
+          }
+        }
+      }
+
+      for (const projectId of candidateIds) {
+        if (pendingOfflineAutoResumes.has(projectId)) continue;
+        pendingOfflineAutoResumes.add(projectId);
+        setTimeout(() => pendingOfflineAutoResumes.delete(projectId), 15000);
+        try {
+          console.log(`[Offline Auto-Resume] Internet connection restored. Resuming project ${projectId}...`);
+          await resumeProjectGeneration(projectId);
+          await loadProjects();
+        } catch (err) {
+          pendingOfflineAutoResumes.delete(projectId);
+          console.warn(`[Offline Auto-Resume] Failed to resume project ${projectId}:`, err);
+        }
+      }
+    };
+
+    window.addEventListener('online', handleOnline);
+    return () => window.removeEventListener('online', handleOnline);
+  }, [getProjectCheckpoint, loadProjects, resumeProjectGeneration]);
 
   const importLocalFolder = useCallback(async (path) => {
     try {

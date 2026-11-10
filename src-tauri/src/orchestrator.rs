@@ -1127,6 +1127,7 @@ pub fn get_scoped_ui_rules(file_path: &str) -> String {
     let mut ui_rules = Vec::new();
 
     ui_rules.push(UI_DESIGN_FOUNDATION_RULEPACK);
+    ui_rules.push(METACOGNITIVE_UI_STATE_RULEPACK);
 
     if path_lower.contains("navbar") || path_lower.contains("header") || path_lower.contains("sidebar") || path_lower.contains("/nav") {
         ui_rules.push(UI_NAVBAR_RULEPACK);
@@ -1540,35 +1541,31 @@ pub fn harvest_file_contract_to_lbg(proj_dir: &std::path::Path, file_path: &str,
 /// 4. Declared UI states (useState hooks with inferred/declared types and default initializers).
 /// 5. Consumed capabilities (API routes fetched, custom hooks called, Prisma models queried).
 /// 6. Connected UI routes (<Link href="..."> or router.push(...)).
-pub fn harvest_file_to_axiom_contracts(
-    proj_dir: &std::path::Path,
+fn ensure_axiom_contracts_root(contracts_root: &mut Value, project_id: &str) {
+    if !contracts_root.is_object() {
+        *contracts_root = serde_json::json!({});
+    }
+    if let Some(root_obj) = contracts_root.as_object_mut() {
+        root_obj
+            .entry("version".to_string())
+            .or_insert_with(|| serde_json::json!("1.0"));
+        root_obj
+            .entry("projectId".to_string())
+            .or_insert_with(|| serde_json::json!(project_id));
+        if !root_obj.get("files").map_or(false, |f| f.is_array()) {
+            root_obj.insert("files".to_string(), serde_json::json!([]));
+        }
+    }
+}
+
+fn upsert_file_contract_into_root(
+    contracts_root: &mut Value,
     project_id: &str,
     file_path: &str,
     content: &str,
     files_list: &[Value],
 ) {
-    let axiom_dir = proj_dir.join(".axiom");
-    let _ = std::fs::create_dir_all(&axiom_dir);
-    let contracts_path = axiom_dir.join("axiom-contracts.json");
-
-    let mut contracts_root: Value = if contracts_path.exists() {
-        if let Ok(c) = std::fs::read_to_string(&contracts_path) {
-            serde_json::from_str(&c).unwrap_or_else(|_| serde_json::json!({}))
-        } else {
-            serde_json::json!({})
-        }
-    } else {
-        serde_json::json!({})
-    };
-
-    if !contracts_root.is_object() {
-        contracts_root = serde_json::json!({
-            "version": "1.0",
-            "projectId": project_id,
-            "lastUpdated": chrono::Utc::now().to_rfc3339(),
-            "files": []
-        });
-    }
+    ensure_axiom_contracts_root(contracts_root, project_id);
 
     let norm_path = file_path.replace('\\', "/");
     let path_lower = norm_path.to_lowercase();
@@ -1576,17 +1573,24 @@ pub fn harvest_file_to_axiom_contracts(
     // Determine role
     let role = if path_lower.ends_with("schema.prisma") {
         "database-schema"
-    } else if (path_lower.contains("/api/") || path_lower.starts_with("api/")) && (path_lower.ends_with("route.ts") || path_lower.ends_with("route.js")) {
+    } else if (path_lower.contains("/api/") || path_lower.starts_with("api/"))
+        && (path_lower.ends_with("route.ts") || path_lower.ends_with("route.js"))
+    {
         "api-route"
-    } else if path_lower.contains("/hooks/") || path_lower.contains("hook") {
+    } else if path_lower.contains("/hooks/") || path_lower.starts_with("hooks/") || path_lower.contains("hook") {
         "client-hook"
     } else if path_lower.ends_with("layout.tsx") || path_lower.ends_with("layout.jsx") {
         "layout"
     } else if path_lower.ends_with("page.tsx") || path_lower.ends_with("page.jsx") || path_lower.ends_with("page.js") {
         "page-route"
-    } else if path_lower.contains("/components/") {
+    } else if path_lower.contains("/components/") || path_lower.starts_with("components/") {
         "ui-component"
-    } else if path_lower.ends_with(".config.js") || path_lower.ends_with(".config.mjs") || path_lower.ends_with(".config.ts") || path_lower == "tsconfig.json" {
+    } else if path_lower.ends_with(".config.js")
+        || path_lower.ends_with(".config.mjs")
+        || path_lower.ends_with(".config.ts")
+        || path_lower == "tsconfig.json"
+        || path_lower == "package.json"
+    {
         "configuration"
     } else {
         "source-module"
@@ -1597,10 +1601,25 @@ pub fn harvest_file_to_axiom_contracts(
     let mut external_deps = Vec::new();
 
     let node_builtins = [
-        "fs", "path", "http", "https", "os", "crypto", "stream", "util", "events", "assert", "dns", "net", "tls", "querystring", "url", "zlib", "buffer"
+        "fs", "path", "http", "https", "os", "crypto", "stream", "util", "events", "assert",
+        "dns", "net", "tls", "querystring", "url", "zlib", "buffer",
     ];
 
-    if let Ok(import_re) = regex::Regex::new(r#"(?:import\s+(?:[^"';]+\s+from\s+)?|require\s*\(\s*|require\.resolve\s*\(\s*)['"]([^'"]+)['"]"#) {
+    if path_lower == "package.json" {
+        if let Ok(pkg_val) = serde_json::from_str::<Value>(content) {
+            for sec in ["dependencies", "devDependencies"] {
+                if let Some(deps_obj) = pkg_val.get(sec).and_then(|d| d.as_object()) {
+                    for dep_name in deps_obj.keys() {
+                        if !external_deps.contains(dep_name) {
+                            external_deps.push(dep_name.clone());
+                        }
+                    }
+                }
+            }
+        }
+    } else if let Ok(import_re) = regex::Regex::new(
+        r#"(?:import\s+(?:[^"';]+\s+from\s+)?|require\s*\(\s*|require\.resolve\s*\(\s*)['"]([^'"]+)['"]"#,
+    ) {
         for cap in import_re.captures_iter(content) {
             if let Some(m) = cap.get(1) {
                 let specifier = m.as_str().trim();
@@ -1615,9 +1634,13 @@ pub fn harvest_file_to_axiom_contracts(
                         for comp in res.components() {
                             match comp {
                                 std::path::Component::Normal(c) => {
-                                    if let Some(cs) = c.to_str() { normalized_parts.push(cs); }
+                                    if let Some(cs) = c.to_str() {
+                                        normalized_parts.push(cs);
+                                    }
                                 }
-                                std::path::Component::ParentDir => { normalized_parts.pop(); }
+                                std::path::Component::ParentDir => {
+                                    normalized_parts.pop();
+                                }
                                 _ => {}
                             }
                         }
@@ -1632,7 +1655,11 @@ pub fn harvest_file_to_axiom_contracts(
                             let p_norm = p.replace('\\', "/");
                             let p_no_ext = std::path::Path::new(&p_norm).with_extension("");
                             let p_no_ext_str = p_no_ext.to_str().unwrap_or("");
-                            if p_norm == resolved || p_no_ext_str == resolved || p_norm == format!("{}.tsx", resolved) || p_norm == format!("{}.ts", resolved) {
+                            if p_norm == resolved
+                                || p_no_ext_str == resolved
+                                || p_norm == format!("{}.tsx", resolved)
+                                || p_norm == format!("{}.ts", resolved)
+                            {
                                 matched_target = p_norm;
                                 break;
                             }
@@ -1645,7 +1672,11 @@ pub fn harvest_file_to_axiom_contracts(
                     let pkg_name = specifier.split('/').next().unwrap_or(specifier).to_string();
                     let full_pkg = if specifier.starts_with('@') {
                         let parts: Vec<&str> = specifier.split('/').collect();
-                        if parts.len() > 1 { format!("{}/{}", parts[0], parts[1]) } else { pkg_name }
+                        if parts.len() > 1 {
+                            format!("{}/{}", parts[0], parts[1])
+                        } else {
+                            pkg_name
+                        }
                     } else {
                         pkg_name
                     };
@@ -1657,10 +1688,12 @@ pub fn harvest_file_to_axiom_contracts(
         }
     }
 
-    // Extract UI states (useState hooks)
+    // Extract client/UI states (useState hooks)
     let mut state_contracts = serde_json::Map::new();
-    if role == "ui-component" || role == "page-route" || role == "layout" {
-        if let Ok(state_re) = regex::Regex::new(r#"const\s*\[\s*([a-zA-Z0-9_]+)\s*,\s*([a-zA-Z0-9_]+)\s*\]\s*=\s*useState(?:<([^>]+)>)?\s*\(([^)]*)\)"#) {
+    if role == "ui-component" || role == "page-route" || role == "layout" || role == "client-hook" {
+        if let Ok(state_re) = regex::Regex::new(
+            r#"const\s*\[\s*([a-zA-Z0-9_]+)\s*,\s*([a-zA-Z0-9_]+)\s*\]\s*=\s*useState(?:<([^>]+)>)?\s*\(([^)]*)\)"#,
+        ) {
             for cap in state_re.captures_iter(content) {
                 if let (Some(state_name), Some(setter_name)) = (cap.get(1), cap.get(2)) {
                     let s_name = state_name.as_str();
@@ -1684,11 +1717,14 @@ pub fn harvest_file_to_axiom_contracts(
                         "any".to_string()
                     };
 
-                    state_contracts.insert(s_name.to_string(), serde_json::json!({
-                        "setter": set_name,
-                        "type": inferred_type,
-                        "defaultValue": default_val
-                    }));
+                    state_contracts.insert(
+                        s_name.to_string(),
+                        serde_json::json!({
+                            "setter": set_name,
+                            "type": inferred_type,
+                            "defaultValue": default_val
+                        }),
+                    );
                 }
             }
         }
@@ -1697,11 +1733,8 @@ pub fn harvest_file_to_axiom_contracts(
     // Extract API endpoints (for api-route)
     let mut endpoints = Vec::new();
     if role == "api-route" {
-        let methods = ["GET", "POST", "PUT", "DELETE", "PATCH"];
-        for m in methods {
-            if content.contains(&format!("export async function {}", m)) || content.contains(&format!("export function {}", m)) {
-                endpoints.push(m.to_string());
-            }
+        if let Some((_, detected_methods)) = extract_api_route_contract(&norm_path, content) {
+            endpoints = detected_methods;
         }
     }
 
@@ -1711,23 +1744,29 @@ pub fn harvest_file_to_axiom_contracts(
     if role == "database-schema" {
         if let Ok(model_re) = regex::Regex::new(r"(?m)^model\s+([a-zA-Z0-9_]+)\s*\{") {
             for cap in model_re.captures_iter(content) {
-                if let Some(m) = cap.get(1) { prisma_models.push(m.as_str().to_string()); }
+                if let Some(m) = cap.get(1) {
+                    prisma_models.push(m.as_str().to_string());
+                }
             }
         }
         if let Ok(enum_re) = regex::Regex::new(r"(?m)^enum\s+([a-zA-Z0-9_]+)\s*\{") {
             for cap in enum_re.captures_iter(content) {
-                if let Some(e) = cap.get(1) { prisma_enums.push(e.as_str().to_string()); }
+                if let Some(e) = cap.get(1) {
+                    prisma_enums.push(e.as_str().to_string());
+                }
             }
         }
     }
 
     // Extract exported symbols
     let mut exports = Vec::new();
-    if let Ok(export_re) = regex::Regex::new(r#"(?:export\s+(?:default\s+)?(?:function|const|class|type|interface)\s+([a-zA-Z0-9_]+)|export\s*\{\s*([^}]+)\s*\})"#) {
+    if let Ok(export_re) = regex::Regex::new(
+        r#"(?:export\s+(?:default\s+)?(?:async\s+)?(?:function|const|class|type|interface)\s+([a-zA-Z0-9_]+)|export\s*\{\s*([^}]+)\s*\}|export\s+default\s+([A-Za-z0-9_]+)\s*;)"#,
+    ) {
         for cap in export_re.captures_iter(content) {
-            if let Some(name) = cap.get(1) {
+            if let Some(name) = cap.get(1).or_else(|| cap.get(3)) {
                 let n = name.as_str().trim();
-                if !n.is_empty() && !exports.contains(&n.to_string()) {
+                if !n.is_empty() && n != "default" && n != "function" && n != "class" && !exports.contains(&n.to_string()) {
                     exports.push(n.to_string());
                 }
             } else if let Some(list) = cap.get(2) {
@@ -1743,19 +1782,31 @@ pub fn harvest_file_to_axiom_contracts(
 
     // Extract consumed API routes via fetch
     let mut api_calls = Vec::new();
-    if let Ok(fetch_re) = regex::Regex::new(r#"fetch\s*\(\s*['"](/api/[^'"]+)['"]"#) {
+    if let Ok(fetch_re) = regex::Regex::new(r#"fetch\s*\(\s*['"`](/api/[^'"`]+)['"`]"#) {
         for cap in fetch_re.captures_iter(content) {
             if let Some(m) = cap.get(1) {
                 let url = m.as_str().to_string();
-                if !api_calls.contains(&url) { api_calls.push(url); }
+                if !api_calls.contains(&url) {
+                    api_calls.push(url);
+                }
             }
         }
     }
 
-    // Extract connected routes via <Link href="...">
+    // Extract connected routes via <Link href="..."> or router.push(...)
     let mut connected_routes = Vec::new();
     if let Ok(link_re) = regex::Regex::new(r#"href\s*=\s*['"](/[^'"]*)['"]"#) {
         for cap in link_re.captures_iter(content) {
+            if let Some(m) = cap.get(1) {
+                let r = m.as_str().to_string();
+                if !connected_routes.contains(&r) && !r.starts_with("/api") && !r.starts_with("/_") {
+                    connected_routes.push(r);
+                }
+            }
+        }
+    }
+    if let Ok(push_re) = regex::Regex::new(r#"router\.push\s*\(\s*['"](/[^'"]*)['"]"#) {
+        for cap in push_re.captures_iter(content) {
             if let Some(m) = cap.get(1) {
                 let r = m.as_str().to_string();
                 if !connected_routes.contains(&r) && !r.starts_with("/api") && !r.starts_with("/_") {
@@ -1786,19 +1837,220 @@ pub fn harvest_file_to_axiom_contracts(
     });
 
     if let Some(files_arr) = contracts_root.get_mut("files").and_then(|f| f.as_array_mut()) {
-        if let Some(pos) = files_arr.iter().position(|f| f.get("path").and_then(|p| p.as_str()) == Some(&norm_path)) {
+        if let Some(pos) = files_arr
+            .iter()
+            .position(|f| f.get("path").and_then(|p| p.as_str()) == Some(&norm_path))
+        {
             files_arr[pos] = file_entry;
         } else {
             files_arr.push(file_entry);
         }
     }
+}
+
+pub fn harvest_file_to_axiom_contracts(
+    proj_dir: &std::path::Path,
+    project_id: &str,
+    file_path: &str,
+    content: &str,
+    files_list: &[Value],
+) {
+    let axiom_dir = proj_dir.join(".axiom");
+    let _ = std::fs::create_dir_all(&axiom_dir);
+    let contracts_path = axiom_dir.join("axiom-contracts.json");
+
+    let mut contracts_root: Value = if contracts_path.exists() {
+        if let Ok(c) = std::fs::read_to_string(&contracts_path) {
+            serde_json::from_str(&c).unwrap_or_else(|_| serde_json::json!({}))
+        } else {
+            serde_json::json!({})
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    upsert_file_contract_into_root(&mut contracts_root, project_id, file_path, content, files_list);
 
     contracts_root["lastUpdated"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
-    contracts_root["totalFilesTracked"] = serde_json::json!(contracts_root.get("files").and_then(|f| f.as_array()).map(|a| a.len()).unwrap_or(0));
+    contracts_root["totalFilesTracked"] = serde_json::json!(
+        contracts_root
+            .get("files")
+            .and_then(|f| f.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
+    );
 
     if let Ok(pretty) = serde_json::to_string_pretty(&contracts_root) {
         let _ = std::fs::write(&contracts_path, &pretty);
         let _ = std::fs::write(proj_dir.join("axiom-contracts.json"), &pretty);
+    }
+}
+
+/// Scans all generated/healed project files on disk and writes the up-to-date
+/// `.axiom/axiom-contracts.json` and root `axiom-contracts.json` in a single pass.
+pub fn refresh_axiom_contracts_for_project(
+    proj_dir: &std::path::Path,
+    project_id: &str,
+    files_list: &[Value],
+) {
+    let axiom_dir = proj_dir.join(".axiom");
+    let _ = std::fs::create_dir_all(&axiom_dir);
+    let contracts_path = axiom_dir.join("axiom-contracts.json");
+
+    let mut contracts_root = serde_json::json!({
+        "version": "1.0",
+        "projectId": project_id,
+        "lastUpdated": chrono::Utc::now().to_rfc3339(),
+        "files": []
+    });
+
+    fn collect_project_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if path.is_dir() {
+                    if name != "node_modules"
+                        && name != ".next"
+                        && name != ".git"
+                        && name != ".axiom"
+                        && name != "dist"
+                        && name != "build"
+                        && name != "target"
+                    {
+                        collect_project_files(&path, out);
+                    }
+                } else if path.is_file() {
+                    let lower = name.to_lowercase();
+                    if lower.ends_with(".ts")
+                        || lower.ends_with(".tsx")
+                        || lower.ends_with(".js")
+                        || lower.ends_with(".jsx")
+                        || lower.ends_with(".prisma")
+                        || lower == "package.json"
+                        || lower == "tsconfig.json"
+                    {
+                        out.push(path);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut discovered_paths = Vec::new();
+    collect_project_files(proj_dir, &mut discovered_paths);
+    discovered_paths.sort();
+
+    let mut all_file_specs: Vec<Value> = files_list.to_vec();
+    for p in &discovered_paths {
+        if let Ok(rel) = p.strip_prefix(proj_dir) {
+            let rel_norm = rel.to_string_lossy().replace('\\', "/");
+            if !all_file_specs.iter().any(|v| {
+                v.get("path")
+                    .and_then(|x| x.as_str())
+                    .map_or(false, |s| s.replace('\\', "/") == rel_norm)
+            }) {
+                all_file_specs.push(serde_json::json!({ "path": rel_norm }));
+            }
+        }
+    }
+
+    for p in &discovered_paths {
+        if let Ok(rel) = p.strip_prefix(proj_dir) {
+            let rel_norm = rel.to_string_lossy().replace('\\', "/");
+            if let Ok(content) = std::fs::read_to_string(p) {
+                upsert_file_contract_into_root(&mut contracts_root, project_id, &rel_norm, &content, &all_file_specs);
+            }
+        }
+    }
+
+    contracts_root["lastUpdated"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+    contracts_root["totalFilesTracked"] = serde_json::json!(
+        contracts_root
+            .get("files")
+            .and_then(|f| f.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
+    );
+
+    if let Ok(pretty) = serde_json::to_string_pretty(&contracts_root) {
+        let _ = std::fs::write(&contracts_path, &pretty);
+        let _ = std::fs::write(proj_dir.join("axiom-contracts.json"), &pretty);
+    }
+}
+
+/// Formats cross-file dependency and capability contracts from `.axiom/axiom-contracts.json`
+/// into a compact context block for subsequent LLM generations.
+pub fn format_axiom_contracts_prompt(proj_dir: &std::path::Path, current_file_path: &str) -> String {
+    let contracts_path = proj_dir.join(".axiom").join("axiom-contracts.json");
+    if !contracts_path.exists() {
+        return String::new();
+    }
+    let Ok(content) = std::fs::read_to_string(&contracts_path) else {
+        return String::new();
+    };
+    let Ok(root) = serde_json::from_str::<Value>(&content) else {
+        return String::new();
+    };
+    let Some(files) = root.get("files").and_then(|f| f.as_array()) else {
+        return String::new();
+    };
+    if files.is_empty() {
+        return String::new();
+    }
+
+    let cur_norm = current_file_path.replace('\\', "/");
+    let mut lines = Vec::new();
+    for entry in files {
+        let path = entry.get("path").and_then(|p| p.as_str()).unwrap_or("");
+        if path.is_empty() || path == cur_norm {
+            continue;
+        }
+        let role = entry.get("role").and_then(|r| r.as_str()).unwrap_or("source-module");
+        if role == "configuration" {
+            continue;
+        }
+        let exports: Vec<&str> = entry
+            .get("capabilities")
+            .and_then(|c| c.get("exports"))
+            .and_then(|e| e.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let api_calls: Vec<&str> = entry
+            .get("consumedContracts")
+            .and_then(|c| c.get("apiCalls"))
+            .and_then(|a| a.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let routes: Vec<&str> = entry
+            .get("connectedRoutes")
+            .and_then(|r| r.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+
+        if exports.is_empty() && api_calls.is_empty() && routes.is_empty() {
+            continue;
+        }
+        let mut summary = format!("- {} [{}]", path, role);
+        if !exports.is_empty() {
+            summary.push_str(&format!(" exports:[{}]", exports.join(", ")));
+        }
+        if !api_calls.is_empty() {
+            summary.push_str(&format!(" calls:[{}]", api_calls.join(", ")));
+        }
+        if !routes.is_empty() {
+            summary.push_str(&format!(" links:[{}]", routes.join(", ")));
+        }
+        lines.push(summary);
+        if lines.len() >= 16 {
+            break;
+        }
+    }
+
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("CROSS-FILE CONTRACTS REGISTRY (.axiom/axiom-contracts.json):\n{}\n", lines.join("\n"))
     }
 }
 
@@ -1989,7 +2241,7 @@ pub fn get_expert_system_prompt(
     if path_lower.contains("schema.prisma") {
         let db_archetype = get_project_database_archetype_from_dir(proj_dir);
         let mut prompt = format!(
-            "You are a Senior Database Architect. Write only the complete, valid schema.prisma code wrapped in markdown code blocks. No explanations.\n\n             {}             DATABASE GENERATION CHAIN-OF-THOUGHT (Execute in strict sequence):\n             Step 1 [Domain Enums]: Define all domain enums (Role, Status, Priority, Tier) at the very top of the schema.\n             Step 2 [Core Entities & Attributes]: Define models with IDs (@id @default(cuid())), scalar columns, and timestamps (createdAt, updatedAt). Make password fields optional (hashedPassword String?).\n             Step 3 [Relational Topography & Foreign Keys]:\n                    - One-to-Many: Put scalar foreign key (e.g. `ownerId String`) and `@relation(fields: [ownerId], references: [id])` on the child model. Put array (`projects Project[]`) on the parent model.\n                    - One-to-One: Put scalar foreign key WITH `@unique` on the child model (e.g. `projectId String @unique` and `@relation(fields: [projectId], references: [id])`). Put singular optional (`projectAnalytics Analytics?`) on parent model.\n                    - Multiple Relations Between Same Models: If a model defines two or more relations pointing to the SAME target model (e.g. `sourceWallet Wallet` and `destinationWallet Wallet?` in `Transaction`), you MUST assign unique relation names on BOTH models: `@relation(\"SourceWallet\", fields: [sourceWalletId], references: [id])` and on the target model `@relation(\"SourceWallet\")`.\n                    - Implicit Many-to-Many: Define array fields on both sides without `@relation(fields: ...)`.\n             Step 4 [Verification Gate]: Verify that:\n                    1. Every relation has exactly ONE matching opposite field with matching relation name.\n                    2. Zero duplicate relation fields exist between the same two models.\n                    3. If multiple relations exist between the same two models, each pair MUST have a distinct `@relation(\"Name\")`.\n                    4. Zero self-relations exist unless explicitly building a hierarchical tree (parent Model?, children Model[]).\n                    5. All foreign key scalars in 1-to-1 relations have `@unique`.\n\n             PRISMA SCHEMA RULES:\n             - The `@relation` attribute MUST ONLY be placed on relational object fields, never on scalar fields.\n             - For NextAuth schema, the VerificationToken model does not have a direct relation back to the User model.\n             - Fixed sets of values MUST be defined using Prisma `enum Name {{ VAL1 VAL2 }}`, NEVER as a relational `model`.\n",
+            "You are a Senior Database Architect. Write only the complete, valid schema.prisma code wrapped in markdown code blocks. No explanations.\n\n             {}             DATABASE GENERATION CHAIN-OF-THOUGHT (Execute in strict sequence):\n             Step 1 [Domain Enums]: Define all domain enums (Role, Status, Priority, Tier) at the very top of the schema.\n             Step 2 [Core Entities & Attributes]: Define models with IDs (@id @default(cuid())), scalar columns, and timestamps (createdAt, updatedAt). Make password fields optional (hashedPassword String?).\n             Step 3 [Relational Topography & Foreign Keys]:\n                    - One-to-Many: Put scalar foreign key (e.g. `ownerId String`) and `@relation(fields: [ownerId], references: [id])` on the child model. Put array (`projects Project[]`) on the parent model.\n                    - One-to-One: Put scalar foreign key WITH `@unique` on the child model (e.g. `projectId String @unique` and `@relation(fields: [projectId], references: [id])`). Put singular optional (`projectAnalytics Analytics?`) on parent model.\n                    - Multiple Relations Between Same Models: If a model defines two or more relations pointing to the SAME target model (e.g. `sourceWallet Wallet` and `destinationWallet Wallet?` in `Transaction`), you MUST assign unique relation names on BOTH models: `@relation(\"SourceWallet\", fields: [sourceWalletId], references: [id])` and on the target model `@relation(\"SourceWallet\")`.\n                    - Implicit Many-to-Many: Define array fields on both sides without `@relation(fields: ...)`.\n             Step 4 [Verification Gate]: Verify that:\n                    1. Every relation has exactly ONE matching opposite field with matching relation name.\n                    2. Zero duplicate relation fields exist between the same two models.\n                    3. If multiple relations exist between the same two models, each pair MUST have a distinct `@relation(\"Name\")`.\n                    4. Zero self-relations exist unless explicitly building a hierarchical tree (parent Model?, children Model[]).\n                    5. All foreign key scalars in 1-to-1 relations have `@unique`.\n\n             PRISMA SCHEMA RULES:\n             - The `@relation` attribute MUST ONLY be placed on relational object fields, never on scalar fields.\n             - Referential actions in `@relation` (`onDelete`, `onUpdate`) MUST use exact Prisma PascalCase keywords: `SetNull`, `Cascade`, `Restrict`, `NoAction`, `SetDefault` (NEVER uppercase SQL syntax like `SET_NULL` or `CASCADE`).\n             - For NextAuth schema, the VerificationToken model does not have a direct relation back to the User model.\n             - Fixed sets of values MUST be defined using Prisma `enum Name {{ VAL1 VAL2 }}`, NEVER as a relational `model`.\n",
             db_archetype
         );
 
@@ -2077,6 +2329,10 @@ pub fn get_expert_system_prompt(
                 }
             }
         }
+        let contracts_prompt = format_axiom_contracts_prompt(proj_dir, file_path);
+        if !contracts_prompt.is_empty() {
+            prompt.push_str(&format!("\n{}\n", contracts_prompt));
+        }
         if !context_ref.is_empty() {
             prompt.push_str(context_ref);
         }
@@ -2113,6 +2369,10 @@ pub fn get_expert_system_prompt(
                     prompt.push_str(&format!("\n{}\n", fmt_api));
                 }
             }
+        }
+        let contracts_prompt = format_axiom_contracts_prompt(proj_dir, file_path);
+        if !contracts_prompt.is_empty() {
+            prompt.push_str(&format!("\n{}\n", contracts_prompt));
         }
         if !context_ref.is_empty() {
             prompt.push_str(context_ref);
@@ -2236,6 +2496,11 @@ pub fn get_expert_system_prompt(
             }
         }
 
+        let contracts_prompt = format_axiom_contracts_prompt(proj_dir, file_path);
+        if !contracts_prompt.is_empty() {
+            prompt.push_str(&format!("\n{}\n", contracts_prompt));
+        }
+
         if !context_ref.is_empty() {
             prompt.push_str(context_ref);
         }
@@ -2314,6 +2579,7 @@ pub async fn run_orchestrator(
             "projectId": project_id,
             "phase": phase,
             "status": status,
+            "offlineWaiting": false,
             "message": msg,
             "progress": progress
         }));
@@ -2331,6 +2597,7 @@ pub async fn run_orchestrator(
             "projectId": project_id,
             "phase": phase,
             "status": status,
+            "offlineWaiting": false,
             "message": msg,
             "progress": progress,
             "currentFile": current_file,
@@ -2372,8 +2639,15 @@ pub async fn run_orchestrator(
         }
     }
 
+    let resuming_install_deps = existing_checkpoint
+        .as_ref()
+        .and_then(|cp| cp.get("phase").and_then(|v| v.as_str()))
+        .map_or(false, |p| p == "install-deps");
+
     let resume_base_pct: Option<f64> = files_to_generate_from_cp.as_ref().and_then(|ftg| {
-        if !completed_files.is_empty() && !ftg.is_empty() {
+        if resuming_install_deps {
+            Some(75.0)
+        } else if !completed_files.is_empty() && !ftg.is_empty() {
             Some((25.0 + (completed_files.len() as f64 / ftg.len() as f64) * 55.0).min(99.0))
         } else {
             None
@@ -2381,8 +2655,16 @@ pub async fn run_orchestrator(
     });
 
     emit_progress(
-        if resume_base_pct.is_some() { "generate-files" } else { "fetch-manifest" },
-        if files_to_generate_from_cp.is_some() {
+        if resuming_install_deps {
+            "install-deps"
+        } else if resume_base_pct.is_some() {
+            "generate-files"
+        } else {
+            "fetch-manifest"
+        },
+        if resuming_install_deps {
+            "Nastavljam instalaciju zavisnosti i završne provere..."
+        } else if files_to_generate_from_cp.is_some() {
             "Nastavljam generisanje sa sačuvanog checkpoint-a..."
         } else {
             "Initializing generation pipeline..."
@@ -4028,17 +4310,64 @@ export default function RootLayout({
     // Repair pubspec.yaml dependencies if they exist
     repair_pubspec_yaml_dependencies(&proj_dir);
 
+    // Persist install-deps phase before starting npm resolution
+    checkpoint_state["phase"] = serde_json::json!("install-deps");
+    checkpoint_state["offlineWaiting"] = serde_json::json!(false);
+    if let Some(obj) = checkpoint_state.as_object_mut() {
+        obj.remove("pausedReason");
+    }
+    checkpoint_state["updatedAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+    save_generation_checkpoint(&proj_dir, &checkpoint_state);
+
     // Run npm install with automatic self-healing and version locking
-    run_npm_install_with_auto_healing(&proj_dir, &window, "", Some(&task_id)).await;
+    let npm_install_outcome = run_npm_install_with_auto_healing(&proj_dir, &window, "", Some(&task_id)).await;
+    if npm_install_outcome == NpmInstallOutcome::OfflinePaused {
+        debug_log_to_file(format!(
+            "[Orchestrator] Pausing project '{}' ({}) at install-deps due to offline/network error.",
+            name, project_id
+        ));
+        checkpoint_state["status"] = serde_json::json!("paused");
+        checkpoint_state["phase"] = serde_json::json!("install-deps");
+        checkpoint_state["offlineWaiting"] = serde_json::json!(true);
+        checkpoint_state["pausedReason"] = serde_json::json!("offline_npm_install");
+        checkpoint_state["updatedAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+        save_generation_checkpoint(&proj_dir, &checkpoint_state);
+
+        let _ = project_update_status(
+            project_id.clone(),
+            "paused".to_string(),
+            serde_json::json!({
+                "offlineWaiting": true,
+                "pausedReason": "offline_npm_install"
+            }),
+        );
+
+        let _ = window.app_handle().emit("task:progress", serde_json::json!({
+            "taskId": task_id,
+            "projectId": project_id,
+            "phase": "paused",
+            "status": "paused",
+            "offlineWaiting": true,
+            "pausedReason": "offline_npm_install",
+            "message": "Nema internet konekcije — nastavljamo sa instalacijom paketa kada budemo ponovo online.",
+            "progress": 75.0
+        }));
+
+        unregister_task_control(&task_id, &project_id);
+        return Ok(());
+    }
+    let npm_install_ok = npm_install_outcome == NpmInstallOutcome::Installed;
 
     // AST Sanity Pass: Clean invalid React imports (e.g. useRouter in 'react'), hoist client directives across src/
     apply_ast_sanity_pass_to_project(&proj_dir);
 
     // Auto-run prisma generate & db push if Prisma schema exists in the project
+    let mut prisma_heal_err: Option<String> = None;
     let has_prisma = proj_dir.join("prisma/schema.prisma").exists() || proj_dir.join("schema.prisma").exists();
     if has_prisma {
         if let Err(e) = heal_prisma_schema_loop(&proj_dir, &window, &model_id, "install-deps").await {
             debug_log_to_file(format!("[Prisma Critical Error] Orchestrator schema healing failed: {}", e));
+            prisma_heal_err = Some(e);
         }
 
         // Run prisma db push to synchronize the database schema
@@ -4078,8 +4407,8 @@ export default function RootLayout({
     // Run self-healing compiler loop to automatically correct any compilation or syntax errors
     perform_self_healing_loop(&proj_dir, &model_id, &files_to_generate).await;
 
-    // Run automated post-generation manual/API test suite and route crawler
-    crate::self_healing::run_generation_auto_test_suite(&proj_dir, &window, &model_id).await;
+    // Run automated post-generation static, import, hook, and Prisma checks
+    let auto_test_warnings = crate::self_healing::run_generation_auto_test_suite(&proj_dir, &window, &model_id).await;
 
     // Generate Axiom Map (axiom-map.json)
     if let Err(e) = generate_axiom_map(&proj_dir) {
@@ -4094,6 +4423,7 @@ export default function RootLayout({
         normalize_project_route_links(&proj_dir, &routes_list);
     }
     generate_axiom_features_json(&proj_dir, name, &files_to_generate);
+    refresh_axiom_contracts_for_project(&proj_dir, &project_id, &files_to_generate);
 
     // 4. Save Project State
     emit_progress("save-project", "Saving project files...", 80.0);
@@ -4103,6 +4433,9 @@ export default function RootLayout({
         "name": name,
         "description": project_description,
         "status": "ready",
+        "metadata": {
+            "offlineWaiting": false
+        },
         "createdAt": chrono::Utc::now().to_rfc3339(),
         "updatedAt": chrono::Utc::now().to_rfc3339(),
     });
@@ -4110,11 +4443,36 @@ export default function RootLayout({
 
     checkpoint_state["status"] = serde_json::json!("completed");
     checkpoint_state["phase"] = serde_json::json!("complete");
+    checkpoint_state["offlineWaiting"] = serde_json::json!(false);
+    if let Some(obj) = checkpoint_state.as_object_mut() {
+        obj.remove("pausedReason");
+    }
     checkpoint_state["updatedAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
     save_generation_checkpoint(&proj_dir, &checkpoint_state);
     unregister_task_control(&task_id, &project_id);
 
-    emit_progress("complete", "Generation completed successfully!", 100.0);
+    let mut completion_warnings: Vec<String> = Vec::new();
+    if !npm_install_ok && proj_dir.join("package.json").exists() {
+        completion_warnings.push("npm install failed (check logs)".to_string());
+    }
+    if let Some(ref p_err) = prisma_heal_err {
+        completion_warnings.push(format!("Prisma validation/generation failed ({})", p_err));
+    }
+    for w in &auto_test_warnings {
+        if !completion_warnings.iter().any(|cw| cw.contains(w)) {
+            completion_warnings.push(w.clone());
+        }
+    }
+
+    let final_completion_msg = if completion_warnings.is_empty() {
+        "Generation completed successfully!".to_string()
+    } else {
+        format!(
+            "Project generated with warnings: {}.",
+            completion_warnings.join("; ")
+        )
+    };
+    emit_progress("complete", &final_completion_msg, 100.0);
 
     Ok(())
 }
@@ -4152,21 +4510,48 @@ pub async fn task_start_generation(
     if let Some(mut cp) = existing_cp {
         let status = cp.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
         if status != "completed" {
+            let prev_phase = cp.get("phase").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let completed_len = cp.get("completedFiles").and_then(|a| a.as_array()).map(|a| a.len()).unwrap_or(0);
             let total_len = cp.get("totalFiles").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
-            let pct = (25.0 + (completed_len as f64 / total_len as f64) * 55.0).min(99.0);
+            let resume_phase = if prev_phase == "install-deps" {
+                "install-deps"
+            } else {
+                "generate-files"
+            };
+            let pct = if prev_phase == "install-deps" {
+                75.0
+            } else {
+                (25.0 + (completed_len as f64 / total_len as f64) * 55.0).min(99.0)
+            };
+            let resume_msg = if prev_phase == "install-deps" {
+                "Internet konekcija aktivna — nastavljam instalaciju zavisnosti i završne provere...".to_string()
+            } else {
+                format!("Nastavljam generisanje ({}/{} fajlova)...", completed_len, total_len)
+            };
             cp["taskId"] = serde_json::json!(task_id);
             cp["status"] = serde_json::json!("generating");
-            cp["phase"] = serde_json::json!("generate-files");
+            cp["phase"] = serde_json::json!(resume_phase);
+            cp["offlineWaiting"] = serde_json::json!(false);
+            if let Some(obj) = cp.as_object_mut() {
+                obj.remove("pausedReason");
+            }
             cp["updatedAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
             save_generation_checkpoint(&proj_dir, &cp);
-            let _ = project_update_status(p_id.clone(), "generating".to_string(), serde_json::json!({}));
+            let _ = project_update_status(
+                p_id.clone(),
+                "generating".to_string(),
+                serde_json::json!({
+                    "offlineWaiting": false,
+                    "pausedReason": serde_json::Value::Null
+                }),
+            );
             let _ = window.app_handle().emit("task:progress", serde_json::json!({
                 "taskId": task_id,
                 "projectId": p_id,
-                "phase": "generate-files",
+                "phase": resume_phase,
                 "status": "generating",
-                "message": format!("Nastavljam generisanje ({}/{} fajlova)...", completed_len, total_len),
+                "offlineWaiting": false,
+                "message": resume_msg,
                 "progress": pct
             }));
         }
@@ -4269,9 +4654,20 @@ pub fn task_stop_generation(task_id: String) -> Result<(), String> {
         if let Some(mut cp) = load_generation_checkpoint(&proj_dir) {
             cp["status"] = serde_json::json!("stopped");
             cp["phase"] = serde_json::json!("stopped");
+            cp["offlineWaiting"] = serde_json::json!(false);
+            if let Some(obj) = cp.as_object_mut() {
+                obj.remove("pausedReason");
+            }
             cp["updatedAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
             save_generation_checkpoint(&proj_dir, &cp);
-            let _ = project_update_status(task_id, "stopped".to_string(), serde_json::json!({}));
+            let _ = project_update_status(
+                task_id,
+                "stopped".to_string(),
+                serde_json::json!({
+                    "offlineWaiting": false,
+                    "pausedReason": serde_json::Value::Null
+                }),
+            );
         }
         Ok(())
     }

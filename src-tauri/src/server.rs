@@ -578,7 +578,44 @@ pub async fn server_start(
     let enriched_path = ensure_node_toolchain_ready(Some(&window), "server:log").await;
 
     if needs_install {
-        run_npm_install_with_auto_healing(&proj_dir, &window, "server:log", None).await;
+        let install_outcome = run_npm_install_with_auto_healing(&proj_dir, &window, "server:log", None).await;
+        if install_outcome == NpmInstallOutcome::OfflinePaused {
+            let err_msg = "Nema internet konekcije ili je npm registar nedostupan. Nastavljamo sa instalacijom paketa kada budemo ponovo online.".to_string();
+            let _ = window.emit("server:log", serde_json::json!({
+                "text": format!("> [Offline Pause] Pokretanje servera pauzirano: {}\n", err_msg),
+                "type": "error"
+            }));
+            return Err(err_msg);
+        }
+        if install_outcome == NpmInstallOutcome::Failed {
+            let pkg_path = proj_dir.join("package.json");
+            let mut missing_runtime_pkgs: Vec<String> = Vec::new();
+            if !node_modules_dir.exists() {
+                missing_runtime_pkgs.push("node_modules".to_string());
+            } else if let Ok(pkg_content) = std::fs::read_to_string(&pkg_path) {
+                if let Ok(pkg_json) = serde_json::from_str::<Value>(&pkg_content) {
+                    if let Some(deps) = pkg_json.get("dependencies").and_then(|d| d.as_object()) {
+                        for dep_name in deps.keys() {
+                            if !node_modules_dir.join(dep_name).exists() {
+                                missing_runtime_pkgs.push(dep_name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !missing_runtime_pkgs.is_empty() {
+                let err_msg = format!(
+                    "Automatska instalacija npm zavisnosti nije uspela. Nedostaju kritični paketi: {}",
+                    missing_runtime_pkgs.join(", ")
+                );
+                let _ = window.emit("server:log", serde_json::json!({
+                    "text": format!("> [NPM Critical Error] Pokretanje servera otkazano: {}\n", err_msg),
+                    "type": "error"
+                }));
+                return Err(err_msg);
+            }
+        }
     }
     
     let settings = get_axiom_settings();

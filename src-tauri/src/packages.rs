@@ -866,7 +866,33 @@ pub fn _find_404_package(err_log: &str) -> Option<String> {
     None
 }
 
+pub fn is_core_framework_package(pkg_name: &str) -> bool {
+    matches!(
+        pkg_name.trim(),
+        "next"
+            | "react"
+            | "react-dom"
+            | "prisma"
+            | "@prisma/client"
+            | "next-auth"
+            | "@auth/prisma-adapter"
+            | "@next-auth/prisma-adapter"
+            | "typescript"
+            | "tailwindcss"
+            | "@types/react"
+            | "@types/react-dom"
+            | "@types/node"
+    )
+}
+
 pub fn remove_package_from_json(pkg_path: &std::path::Path, pkg_name: &str) -> bool {
+    if is_core_framework_package(pkg_name) {
+        debug_log_to_file(format!(
+            "[Core Lock] Refusing to remove core framework package '{}' from package.json",
+            pkg_name
+        ));
+        return false;
+    }
     if let Ok(content) = std::fs::read_to_string(pkg_path) {
         if let Ok(mut json_val) = serde_json::from_str::<Value>(&content) {
             let mut changed = false;
@@ -904,8 +930,9 @@ pub fn analyze_npm_install_failure(err_log: &str) -> Option<NpmFailureAction> {
     if let Some(idx) = err_log.find("No matching version found for ") {
         let after = &err_log[idx + 30..];
         let line = after.lines().next().unwrap_or("").trim();
-        let mut cleaned = line.to_string();
-        while cleaned.ends_with('.') || cleaned.ends_with('\'') || cleaned.ends_with('"') || cleaned.ends_with(';') {
+        let token = line.split_whitespace().next().unwrap_or("");
+        let mut cleaned = token.to_string();
+        while cleaned.ends_with('.') || cleaned.ends_with('\'') || cleaned.ends_with('"') || cleaned.ends_with(';') || cleaned.ends_with(',') {
             cleaned.pop();
         }
         if let Some(at_idx) = cleaned.rfind('@') {
@@ -980,13 +1007,47 @@ pub fn analyze_npm_install_failure(err_log: &str) -> Option<NpmFailureAction> {
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NpmInstallOutcome {
+    Installed,
+    OfflinePaused,
+    Failed,
+}
+
+pub fn is_npm_network_error(err_log: &str) -> bool {
+    let lower = err_log.to_lowercase();
+    err_log.contains("ENOTFOUND")
+        || err_log.contains("EAI_AGAIN")
+        || err_log.contains("EAI_NODATA")
+        || err_log.contains("ETIMEDOUT")
+        || err_log.contains("ECONNREFUSED")
+        || err_log.contains("ECONNRESET")
+        || err_log.contains("ENETUNREACH")
+        || err_log.contains("EHOSTUNREACH")
+        || err_log.contains("ERR_SOCKET_TIMEOUT")
+        || err_log.contains("ERR_NETWORK")
+        || err_log.contains("ENOTCACHED")
+        || lower.contains("network error")
+        || lower.contains("npm error network")
+        || lower.contains("npm err! network")
+        || lower.contains("socket hang up")
+        || lower.contains("network socket disconnected")
+        || lower.contains("getaddrinfo")
+        || lower.contains("fetch failed")
+        || lower.contains("request timeout")
+        || lower.contains("network appears to be offline")
+        || lower.contains("in offline mode")
+        || lower.contains("only-if-cached")
+        || (lower.contains("request to ") && lower.contains("failed, reason:"))
+}
+
 pub fn sanitize_package_json_value_for_offline(json_val: &mut Value) -> bool {
     let mut changed = false;
     let bogus_subpaths = [
         "fi", "hi", "hi2", "bi", "fa", "fa6", "md", "io", "io5", "bs", "ai", "ri", "tb", "lu",
         "si", "gi", "ti", "wi", "cg", "vsc", "go", "gr", "rx", "pi", "im", "sl", "tfi", "lia",
     ];
-    let banned_offline_pkgs = [
+    let banned_always_pkgs = [
         "@typescript-eslint/eslint-plugin",
         "@typescript-eslint/parser",
         "@typescript-eslint/project-service",
@@ -996,9 +1057,6 @@ pub fn sanitize_package_json_value_for_offline(json_val: &mut Value) -> bool {
         "eslint-config-next",
         "eslint",
         "prettier",
-        "babel-loader",
-        "webpack",
-        "webpack-cli",
         "jest",
         "ts-jest",
         "@types/jest",
@@ -1007,6 +1065,36 @@ pub fn sanitize_package_json_value_for_offline(json_val: &mut Value) -> bool {
         "@testing-library/jest-dom",
         "@testing-library/user-event",
     ];
+    // Next.js bundles its own Webpack pipeline internally; standalone webpack/dev-server
+    // entries in a Next.js project are LLM hallucinations that pull incompatible transitive deps
+    // (such as `shell-quote@^1.10.0` via `webpack-dev-server`). Non-Next.js projects keep theirs.
+    let banned_nextjs_bundler_pkgs = [
+        "babel-loader",
+        "webpack",
+        "webpack-cli",
+        "webpack-dev-server",
+        "webpack-hot-middleware",
+        "html-webpack-plugin",
+    ];
+
+    let has_pkg = |val: &Value, section: &str, name: &str| -> bool {
+        val.get(section)
+            .and_then(|d| d.as_object())
+            .map_or(false, |d| d.contains_key(name))
+    };
+    let has_next_script = json_val
+        .get("scripts")
+        .and_then(|s| s.as_object())
+        .map_or(false, |scripts| {
+            scripts.values().any(|v| {
+                v.as_str().map_or(false, |s| {
+                    s.contains("next dev") || s.contains("next build") || s.contains("next start")
+                })
+            })
+        });
+    let is_nextjs_ctx = has_pkg(json_val, "dependencies", "next")
+        || has_pkg(json_val, "devDependencies", "next")
+        || has_next_script;
 
     if let Some(obj) = json_val.as_object_mut() {
         let mut had_react_icons_subpath = false;
@@ -1019,9 +1107,16 @@ pub fn sanitize_package_json_value_for_offline(json_val: &mut Value) -> bool {
                         changed = true;
                     }
                 }
-                for banned in &banned_offline_pkgs {
+                for banned in &banned_always_pkgs {
                     if deps.remove(*banned).is_some() {
                         changed = true;
+                    }
+                }
+                if is_nextjs_ctx {
+                    for banned in &banned_nextjs_bundler_pkgs {
+                        if deps.remove(*banned).is_some() {
+                            changed = true;
+                        }
                     }
                 }
                 let scoped_to_remove: Vec<String> = deps
@@ -1115,57 +1210,340 @@ pub fn sanitize_package_json_for_offline(pkg_path: &std::path::Path) -> bool {
     false
 }
 
-pub fn set_package_version_to_wildcard(pkg_path: &std::path::Path, pkg_name: &str) -> bool {
+fn extract_npm_pkg_name_from_spec(raw: &str) -> Option<String> {
+    let trimmed = raw
+        .trim()
+        .trim_matches(|c: char| matches!(c, '\'' | '"' | '`' | ',' | ';' | '.' | '(' | ')' | '[' | ']'));
+    if trimmed.is_empty()
+        || trimmed.contains(':')
+        || trimmed.contains('\\')
+        || trimmed.starts_with('.')
+        || trimmed.starts_with('/')
+        || trimmed.starts_with('-')
+        || trimmed.starts_with('_')
+    {
+        return None;
+    }
+
+    let name = if let Some(rest) = trimmed.strip_prefix('@') {
+        let slash_idx = rest.find('/')?;
+        if slash_idx == 0 {
+            return None;
+        }
+        let after_slash = &rest[slash_idx + 1..];
+        let scope = &rest[..slash_idx];
+        let pkg_part = match after_slash.find('@') {
+            Some(at_idx) => &after_slash[..at_idx],
+            None => after_slash,
+        };
+        if pkg_part.is_empty() || pkg_part.contains('/') {
+            return None;
+        }
+        format!("@{}/{}", scope, pkg_part)
+    } else {
+        if trimmed.contains('/') {
+            return None;
+        }
+        let pkg_part = match trimmed.find('@') {
+            Some(at_idx) => &trimmed[..at_idx],
+            None => trimmed,
+        };
+        if pkg_part.is_empty() {
+            return None;
+        }
+        pkg_part.to_string()
+    };
+
+    if name.eq_ignore_ascii_case("root")
+        || name.eq_ignore_ascii_case("workspace")
+        || name.eq_ignore_ascii_case("npm")
+        || name.eq_ignore_ascii_case("node_modules")
+    {
+        return None;
+    }
+
+    let is_valid = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | '/'));
+    if is_valid {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+fn read_npm_debug_log_tail(err_log: &str) -> Option<String> {
+    for line in err_log.lines() {
+        let lower = line.to_lowercase();
+        if let Some(idx) = lower.find("complete log of this run can be found in:") {
+            let path_part = line[idx + "complete log of this run can be found in:".len()..]
+                .trim()
+                .trim_matches(|c: char| matches!(c, '\'' | '"' | '\r' | '\n'));
+            if path_part.is_empty() {
+                continue;
+            }
+            let log_path = std::path::Path::new(path_part);
+            if log_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(log_path) {
+                    const MAX_TAIL_BYTES: usize = 256 * 1024;
+                    if content.len() > MAX_TAIL_BYTES {
+                        let start = content.len() - MAX_TAIL_BYTES;
+                        let safe_start = content
+                            .char_indices()
+                            .find(|(i, _)| *i >= start)
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        return Some(content[safe_start..].to_string());
+                    }
+                    return Some(content);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn extract_offending_parent_from_npm_log(
+    err_log: &str,
+    failing_pkg: &str,
+    direct_deps: &[String],
+    root_name: Option<&str>,
+) -> Option<String> {
+    let mut full_log = err_log.to_string();
+    if let Some(debug_tail) = read_npm_debug_log_tail(err_log) {
+        full_log.push('\n');
+        full_log.push_str(&debug_tail);
+    }
+
+    let mut specific_candidates: Vec<String> = Vec::new();
+    let mut while_resolving_candidates: Vec<String> = Vec::new();
+
+    let push_unique = |vec: &mut Vec<String>, candidate: String| {
+        if candidate == failing_pkg {
+            return;
+        }
+        if let Some(rn) = root_name {
+            if candidate == rn {
+                return;
+            }
+        }
+        if !vec.contains(&candidate) {
+            vec.push(candidate);
+        }
+    };
+
+    for line in full_log.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Arborist debug log: `silly placeDep ROOT shell-quote@^1.10.0 OK for: webpack-dev-server@4.15.2 ...`
+        // or `silly placeDep node_modules/webpack-dev-server shell-quote@^1.10.0 ...`
+        if trimmed.contains("placeDep") && trimmed.contains(failing_pkg) {
+            if let Some(for_idx) = trimmed.find(" for: ") {
+                let after_for = &trimmed[for_idx + " for: ".len()..];
+                if let Some(tok) = after_for.split_whitespace().next() {
+                    if let Some(pkg) = extract_npm_pkg_name_from_spec(tok) {
+                        push_unique(&mut specific_candidates, pkg);
+                    }
+                }
+            }
+            if let Some(nm_idx) = trimmed.rfind("node_modules/") {
+                let after_nm = &trimmed[nm_idx + "node_modules/".len()..];
+                let path_tok = after_nm.split_whitespace().next().unwrap_or("");
+                let parts: Vec<&str> = path_tok.split('/').collect();
+                if let Some(first) = parts.first() {
+                    let cand = if first.starts_with('@') && parts.len() >= 2 {
+                        format!("{}/{}", first, parts[1])
+                    } else {
+                        (*first).to_string()
+                    };
+                    if let Some(pkg) = extract_npm_pkg_name_from_spec(&cand) {
+                        push_unique(&mut specific_candidates, pkg);
+                    }
+                }
+            }
+        }
+
+        if let Some(idx) = trimmed.find("requested by ") {
+            let after = &trimmed[idx + "requested by ".len()..];
+            if let Some(tok) = after.split_whitespace().next() {
+                if let Some(pkg) = extract_npm_pkg_name_from_spec(tok) {
+                    push_unique(&mut specific_candidates, pkg);
+                }
+            }
+        }
+
+        let no_prefix = trimmed
+            .trim_start_matches("npm error")
+            .trim_start_matches("npm ERR!")
+            .trim_start_matches("npm warn")
+            .trim_start_matches("npm WARN")
+            .trim();
+
+        if let Some(after_from) = no_prefix.strip_prefix("from ") {
+            if let Some(tok) = after_from.split_whitespace().next() {
+                if let Some(pkg) = extract_npm_pkg_name_from_spec(tok) {
+                    push_unique(&mut specific_candidates, pkg);
+                }
+            }
+        } else if let Some(from_idx) = no_prefix.find(" from ") {
+            let after_from = &no_prefix[from_idx + " from ".len()..];
+            if let Some(tok) = after_from.split_whitespace().next() {
+                if let Some(pkg) = extract_npm_pkg_name_from_spec(tok) {
+                    push_unique(&mut specific_candidates, pkg);
+                }
+            }
+        }
+
+        if let Some(wr_idx) = no_prefix.find("While resolving:") {
+            let after_wr = no_prefix[wr_idx + "While resolving:".len()..].trim();
+            if let Some(tok) = after_wr.split_whitespace().next() {
+                if let Some(pkg) = extract_npm_pkg_name_from_spec(tok) {
+                    push_unique(&mut while_resolving_candidates, pkg);
+                }
+            }
+        }
+    }
+
+    // 1. Highest confidence: specific parent reference matching a direct dependency
+    if !direct_deps.is_empty() {
+        if let Some(m) = specific_candidates
+            .iter()
+            .find(|c| direct_deps.iter().any(|d| d == *c))
+        {
+            return Some(m.clone());
+        }
+        // 2. Second highest: `While resolving:` entry that matches a direct dependency (not root project)
+        if let Some(m) = while_resolving_candidates
+            .iter()
+            .find(|c| direct_deps.iter().any(|d| d == *c))
+        {
+            return Some(m.clone());
+        }
+    }
+
+    // 3. Fallback: first specific candidate (e.g., transitive parent of transitive dep)
+    specific_candidates.into_iter().next()
+}
+
+pub fn apply_npm_etarget_heal(
+    pkg_path: &std::path::Path,
+    pkg_name: &str,
+    err_log: Option<&str>,
+) -> bool {
+    if is_core_framework_package(pkg_name) {
+        debug_log_to_file(format!(
+            "[Core Lock] Refusing to set core framework package '{}' to '*' in package.json",
+            pkg_name
+        ));
+        return false;
+    }
+
     if let Ok(content) = std::fs::read_to_string(pkg_path) {
         if let Ok(mut json_val) = serde_json::from_str::<Value>(&content) {
             let mut changed = false;
+            let mut found_direct = false;
+            let wildcard = serde_json::json!("*");
+
+            let root_name = json_val
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let mut direct_deps: Vec<String> = Vec::new();
+            for key in &["dependencies", "devDependencies"] {
+                if let Some(deps) = json_val.get(*key).and_then(|d| d.as_object()) {
+                    for k in deps.keys() {
+                        if !direct_deps.contains(k) {
+                            direct_deps.push(k.clone());
+                        }
+                    }
+                }
+            }
+
             if let Some(obj) = json_val.as_object_mut() {
                 if let Some(deps) = obj.get_mut("dependencies").and_then(|d| d.as_object_mut()) {
-                    if deps.contains_key(pkg_name) {
-                        deps.insert(pkg_name.to_string(), serde_json::json!("*"));
-                        changed = true;
+                    if let Some(cur) = deps.get(pkg_name) {
+                        found_direct = true;
+                        if cur != &wildcard {
+                            deps.insert(pkg_name.to_string(), wildcard.clone());
+                            changed = true;
+                        }
                     }
                 }
                 if let Some(dev_deps) = obj.get_mut("devDependencies").and_then(|d| d.as_object_mut()) {
-                    if dev_deps.contains_key(pkg_name) {
-                        dev_deps.insert(pkg_name.to_string(), serde_json::json!("*"));
-                        changed = true;
+                    if let Some(cur) = dev_deps.get(pkg_name) {
+                        found_direct = true;
+                        if cur != &wildcard {
+                            dev_deps.insert(pkg_name.to_string(), wildcard.clone());
+                            changed = true;
+                        }
                     }
                 }
 
-                // If pkg_name is a transitive dependency not directly listed in package.json
-                // (e.g. @typescript-eslint/project-service pulled by @typescript-eslint/parser or eslint-config-next),
-                // remove conflicting parent packages in the same @scope/ or eslint family so offline retry succeeds.
-                if !changed {
-                    let scope_prefix = if pkg_name.starts_with('@') {
-                        pkg_name.split('/').next().map(|s| format!("{}/", s))
-                    } else {
-                        None
-                    };
-                    let is_eslint_related = pkg_name.contains("eslint") || pkg_name.starts_with("@typescript-eslint/");
-
-                    for key in &["dependencies", "devDependencies"] {
-                        if let Some(deps) = obj.get_mut(*key).and_then(|d| d.as_object_mut()) {
-                            let keys_to_remove: Vec<String> = deps
-                                .keys()
-                                .filter(|k| {
-                                    if let Some(ref sp) = scope_prefix {
-                                        if k.starts_with(sp) {
-                                            return true;
-                                        }
-                                    }
-                                    if is_eslint_related && (k.contains("eslint") || k.starts_with("@typescript-eslint/")) {
-                                        return true;
-                                    }
-                                    false
-                                })
-                                .cloned()
-                                .collect();
-                            for k in keys_to_remove {
-                                deps.remove(&k);
-                                changed = true;
+                // If pkg_name is a transitive dependency not directly listed in package.json:
+                // 1) Remove eslint-family packages only when eslint itself is involved.
+                // 2) NEVER write global "overrides": { "<pkg>": "*" }! Only write parent-scoped
+                //    overrides ("overrides": { "<parent>": { "<pkg>": "*" } }) when the offending
+                //    parent package is positively identified from npm logs.
+                if !found_direct {
+                    let is_eslint_related =
+                        pkg_name.contains("eslint") || pkg_name.starts_with("@typescript-eslint/");
+                    if is_eslint_related {
+                        for key in &["dependencies", "devDependencies"] {
+                            if let Some(deps) = obj.get_mut(*key).and_then(|d| d.as_object_mut()) {
+                                let keys_to_remove: Vec<String> = deps
+                                    .keys()
+                                    .filter(|k| {
+                                        k.contains("eslint") || k.starts_with("@typescript-eslint/")
+                                    })
+                                    .cloned()
+                                    .collect();
+                                for k in keys_to_remove {
+                                    deps.remove(&k);
+                                    changed = true;
+                                }
                             }
                         }
+                    }
+
+                    if let Some(parent_pkg) = err_log.and_then(|log| {
+                        extract_offending_parent_from_npm_log(
+                            log,
+                            pkg_name,
+                            &direct_deps,
+                            root_name.as_deref(),
+                        )
+                    }) {
+                        let overrides_val = obj
+                            .entry("overrides")
+                            .or_insert_with(|| serde_json::json!({}));
+                        if let Some(overrides_obj) = overrides_val.as_object_mut() {
+                            match overrides_obj.get_mut(&parent_pkg) {
+                                Some(existing_parent_val) if existing_parent_val.is_object() => {
+                                    if let Some(parent_map) = existing_parent_val.as_object_mut() {
+                                        if parent_map.get(pkg_name) != Some(&wildcard) {
+                                            parent_map.insert(pkg_name.to_string(), wildcard);
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                                None => {
+                                    overrides_obj.insert(
+                                        parent_pkg,
+                                        serde_json::json!({ pkg_name: "*" }),
+                                    );
+                                    changed = true;
+                                }
+                                Some(_) => {}
+                            }
+                        }
+                    } else {
+                        debug_log_to_file(format!(
+                            "[Self-Healing] Transitive dependency '{}' failed without an identifiable parent; refusing to add global wildcard override.",
+                            pkg_name
+                        ));
                     }
                 }
             }
@@ -1178,6 +1556,10 @@ pub fn set_package_version_to_wildcard(pkg_path: &std::path::Path, pkg_name: &st
         }
     }
     false
+}
+
+pub fn set_package_version_to_wildcard(pkg_path: &std::path::Path, pkg_name: &str) -> bool {
+    apply_npm_etarget_heal(pkg_path, pkg_name, None)
 }
 
 pub fn lock_installed_dependencies(pkg_path: &std::path::Path) {
@@ -1366,10 +1748,10 @@ pub async fn run_npm_install_with_auto_healing(
     window: &tauri::Window,
     log_event: &str,
     task_id_opt: Option<&str>,
-) -> bool {
+) -> NpmInstallOutcome {
     let pkg_path = proj_dir.join("package.json");
     if !pkg_path.exists() {
-        return false;
+        return NpmInstallOutcome::Installed;
     }
 
     let enriched_path = ensure_node_toolchain_ready(Some(window), log_event).await;
@@ -1424,7 +1806,10 @@ pub async fn run_npm_install_with_auto_healing(
         if let Some(task_id) = task_id_opt {
             let _ = window.emit("task:progress", serde_json::json!({
                 "taskId": task_id,
+                "projectId": project_id,
                 "phase": "install-deps",
+                "status": "generating",
+                "offlineWaiting": false,
                 "message": msg,
                 "progress": progress
             }));
@@ -1438,19 +1823,42 @@ pub async fn run_npm_install_with_auto_healing(
         emit_log("> [Offline Sanitizer] Uklonjeni konfliktni linter/test paketi i duplikati iz package.json pre offline instalacije.\n", false);
     }
 
-    for attempt in 1..=4 {
-        emit_progress(&format!("Installing dependencies (attempt {}/4)...", attempt), 75.0 + (attempt as f64 - 1.0) * 0.7);
-        emit_log(&format!("> Running npm install, attempt {}/4...\n", attempt), false);
+    let mut prefer_offline = true;
+    let mut pending_npm_repair: Option<(String, String, String)> = None;
+    const MAX_ATTEMPTS: usize = 5;
+    for attempt in 1..=MAX_ATTEMPTS {
+        emit_progress(&format!("Installing dependencies (attempt {}/{})...", attempt, MAX_ATTEMPTS), 75.0 + (attempt as f64 - 1.0) * 0.6);
+        emit_log(
+            &format!(
+                "> Running npm install ({}), attempt {}/{}...\n",
+                if prefer_offline { "prefer-offline" } else { "online" },
+                attempt,
+                MAX_ATTEMPTS
+            ),
+            false,
+        );
 
         #[cfg(target_os = "windows")]
         let mut install_cmd = tokio::process::Command::new("cmd");
         #[cfg(target_os = "windows")]
-        install_cmd.arg("/C").arg("npm").arg("install").arg("--legacy-peer-deps").arg("--prefer-offline").current_dir(proj_dir);
+        {
+            install_cmd.arg("/C").arg("npm").arg("install").arg("--legacy-peer-deps");
+            if prefer_offline {
+                install_cmd.arg("--prefer-offline");
+            }
+            install_cmd.current_dir(proj_dir);
+        }
 
         #[cfg(not(target_os = "windows"))]
         let mut install_cmd = tokio::process::Command::new("npm");
         #[cfg(not(target_os = "windows"))]
-        install_cmd.arg("install").arg("--legacy-peer-deps").arg("--prefer-offline").current_dir(proj_dir);
+        {
+            install_cmd.arg("install").arg("--legacy-peer-deps");
+            if prefer_offline {
+                install_cmd.arg("--prefer-offline");
+            }
+            install_cmd.current_dir(proj_dir);
+        }
 
         #[cfg(target_os = "windows")]
         install_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
@@ -1516,9 +1924,20 @@ pub async fn run_npm_install_with_auto_healing(
 
         match status {
             Ok(exit_status) if exit_status.success() => {
+                if let Some((prev_eid, _, prev_source)) = pending_npm_repair.take() {
+                    crate::katastar::finalize_katastar_outcome(
+                        &prev_eid,
+                        true,
+                        &prev_source,
+                        "npm_install",
+                        None,
+                        None,
+                        "",
+                    );
+                }
                 emit_log("> npm install completed successfully.\n", false);
                 lock_installed_dependencies(&pkg_path);
-                return true;
+                return NpmInstallOutcome::Installed;
             }
             Ok(exit_status) => {
                 emit_log(&format!("> npm install failed with exit status: {}\n", exit_status), true);
@@ -1528,26 +1947,154 @@ pub async fn run_npm_install_with_auto_healing(
             }
         }
 
+        let lock_path = proj_dir.join("package-lock.json");
+        let is_network_err = is_npm_network_error(&err_log);
+        let cur_sig_info = crate::katastar::normalize_error_signature("npm", &err_log, Some("package.json"));
+
+        if let Some((prev_eid, prev_sig, prev_source)) = pending_npm_repair.take() {
+            if !is_network_err {
+                let prev_passed = prev_sig != cur_sig_info.error_signature;
+                crate::katastar::finalize_katastar_outcome(
+                    &prev_eid,
+                    prev_passed,
+                    &prev_source,
+                    "npm_install",
+                    None,
+                    None,
+                    "",
+                );
+            }
+        }
+
+        // If the machine is offline or registry is unreachable (after prefer-offline fallback),
+        // preserve package-lock.json and pause cleanly so execution resumes once back online.
+        if is_network_err {
+            emit_log(
+                "> [Offline / Network Error] Nema internet konekcije ili je npm registar nedostupan. Sačuvan je postojeći package-lock.json — nastavljamo sa instalacijom paketa kada budemo ponovo online.\n",
+                true,
+            );
+            return NpmInstallOutcome::OfflinePaused;
+        }
+
+        // When --prefer-offline hits a stale cached packument (common cause of false ETARGET / E404
+        // for newer transitive versions like shell-quote@^1.10.0), retry online first while keeping
+        // package-lock.json intact before weakening version ranges or removing valid packages.
+        if prefer_offline {
+            prefer_offline = false;
+            let eid = crate::katastar::register_repair_attempt(
+                "npm",
+                &err_log,
+                "package.json",
+                "deterministic",
+                "retry_online_without_prefer_offline",
+                None,
+                "Retry npm install online without --prefer-offline when cached packument is stale",
+                "",
+            );
+            pending_npm_repair = Some((eid, cur_sig_info.error_signature, "deterministic".to_string()));
+            emit_log("> [Self-Healing] Offline npm cache nije uspeo (moguć zastareo cache packument). Prelazim na online npm rezoluciju bez --prefer-offline...\n", false);
+            continue;
+        }
+
         if let Some(action) = analyze_npm_install_failure(&err_log) {
+            let had_lock = lock_path.exists();
+            if had_lock {
+                let _ = std::fs::remove_file(&lock_path);
+            }
             match action {
                 NpmFailureAction::SetWildcard(pkg_name) => {
-                    emit_log(&format!("> [Self-Healing] Package '{}' has no matching version. Updating its version to '*' in package.json and retrying...\n", pkg_name), false);
-                    set_package_version_to_wildcard(&pkg_path, &pkg_name);
+                    if is_core_framework_package(&pkg_name) {
+                        emit_log(
+                            &format!(
+                                "> [Core Lock] Paket '{}' je zaključani core framework paket i neće biti spušten na '*' u package.json.\n",
+                                pkg_name
+                            ),
+                            true,
+                        );
+                        break;
+                    }
+                    let eid = crate::katastar::register_repair_attempt(
+                        "npm",
+                        &err_log,
+                        "package.json",
+                        "deterministic",
+                        "npm_set_wildcard",
+                        None,
+                        &format!("Set wildcard or parent-scoped override for failing npm version range on '{}'", pkg_name),
+                        "",
+                    );
+                    pending_npm_repair = Some((eid, cur_sig_info.error_signature, "deterministic".to_string()));
+                    if apply_npm_etarget_heal(&pkg_path, &pkg_name, Some(&err_log)) {
+                        emit_log(&format!("> [Self-Healing] Package '{}' has no matching version. Applied safe dependency/parent-scoped override in package.json and retrying...\n", pkg_name), false);
+                    } else if had_lock {
+                        emit_log(&format!("> [Self-Healing] Could not safely rewrite '{}' without affecting global resolution. Removed stale package-lock.json and retrying...\n", pkg_name), false);
+                    } else {
+                        if let Some((prev_eid, _, prev_source)) = pending_npm_repair.take() {
+                            crate::katastar::finalize_katastar_outcome(&prev_eid, false, &prev_source, "npm_install", None, None, "");
+                        }
+                        emit_log(&format!("> [Self-Healing] Package '{}' could not be resolved safely (core-locked or unknown transitive parent). Aborting redundant retries.\n", pkg_name), true);
+                        break;
+                    }
                 }
                 NpmFailureAction::Remove(pkg_name) => {
-                    emit_log(&format!("> [Self-Healing] Package '{}' not found in npm registry. Removing from package.json and retrying...\n", pkg_name), false);
-                    remove_package_from_json(&pkg_path, &pkg_name);
+                    if is_core_framework_package(&pkg_name) {
+                        emit_log(
+                            &format!(
+                                "> [Core Lock] Paket '{}' je zaključani core framework paket i neće biti uklonjen iz package.json.\n",
+                                pkg_name
+                            ),
+                            true,
+                        );
+                        break;
+                    }
+                    let eid = crate::katastar::register_repair_attempt(
+                        "npm",
+                        &err_log,
+                        "package.json",
+                        "deterministic",
+                        "npm_remove_missing_pkg",
+                        None,
+                        &format!("Remove nonexistent/invalid package '{}' from package.json", pkg_name),
+                        "",
+                    );
+                    pending_npm_repair = Some((eid, cur_sig_info.error_signature, "deterministic".to_string()));
+                    if remove_package_from_json(&pkg_path, &pkg_name) {
+                        emit_log(&format!("> [Self-Healing] Package '{}' not found in npm registry or failed install. Removing from package.json and retrying...\n", pkg_name), false);
+                    } else if had_lock {
+                        emit_log(&format!("> [Self-Healing] Failed resolving transitive package '{}'. Removed stale package-lock.json and retrying...\n", pkg_name), false);
+                    } else {
+                        if let Some((prev_eid, _, prev_source)) = pending_npm_repair.take() {
+                            crate::katastar::finalize_katastar_outcome(&prev_eid, false, &prev_source, "npm_install", None, None, "");
+                        }
+                        emit_log(&format!("> [Self-Healing] Transitive package '{}' could not be resolved or removed from package.json. Aborting redundant retries.\n", pkg_name), true);
+                        break;
+                    }
                 }
             }
-        } else {
+        } else if lock_path.exists() {
+            let eid = crate::katastar::register_repair_attempt(
+                "npm",
+                &err_log,
+                "package.json",
+                "deterministic",
+                "npm_remove_stale_lock",
+                None,
+                "Remove stale package-lock.json and retry npm install",
+                "",
+            );
+            pending_npm_repair = Some((eid, cur_sig_info.error_signature, "deterministic".to_string()));
             emit_log("> [Self-Healing] No specific package error parsed. Deleting package-lock.json and retrying...\n", false);
-            let lock_path = proj_dir.join("package-lock.json");
-            if lock_path.exists() {
-                let _ = std::fs::remove_file(lock_path);
-            }
+            let _ = std::fs::remove_file(lock_path);
+        } else {
+            emit_log("> [Self-Healing] No actionable package fix found and no package-lock.json to clean. Aborting redundant retries.\n", true);
+            break;
         }
     }
 
-    false
+    if let Some((prev_eid, _, prev_source)) = pending_npm_repair.take() {
+        crate::katastar::finalize_katastar_outcome(&prev_eid, false, &prev_source, "npm_install", None, None, "");
+    }
+
+    NpmInstallOutcome::Failed
 }
 

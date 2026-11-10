@@ -23,7 +23,8 @@ import {
   FileCode,
   ChevronDown,
   ChevronUp,
-  X
+  X,
+  WifiOff
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useAppStore } from '../hooks/useAppStore';
@@ -306,6 +307,7 @@ function Layout() {
   const isComplete = activeTask && (activeTask.phase === 'complete' || activeTask.phase === 'success');
   const isError = activeTask && activeTask.phase === 'error';
   const isPaused = activeTask && (activeTask.phase === 'paused' || activeTask.status === 'paused');
+  const isOfflineWaiting = Boolean(isPaused && activeTask?.offlineWaiting);
   const isStopped = activeTask && (activeTask.phase === 'stopped' || activeTask.status === 'stopped');
   const isRunning = activeTask && !isComplete && !isError && !isStopped;
 
@@ -336,9 +338,13 @@ function Layout() {
     try {
       setTaskProgress(activeTask.taskId, {
         ...activeTask,
-        phase: 'generate-files',
+        phase: activeTask.offlineWaiting ? 'install-deps' : 'generate-files',
         status: 'generating',
-        message: 'Nastavak generisanja sa sačuvanog checkpoint-a...'
+        offlineWaiting: false,
+        pausedReason: null,
+        message: activeTask.offlineWaiting
+          ? 'Nastavljam instalaciju zavisnosti sa sačuvanog checkpoint-a...'
+          : 'Nastavak generisanja sa sačuvanog checkpoint-a...'
       });
       if (activeTask.projectId) {
         await window.electronAPI.task.resumeGeneration(activeTask.projectId);
@@ -427,6 +433,8 @@ function Layout() {
                   <CheckCircle2 className="w-4 h-4" />
                 ) : isError || isStopped ? (
                   <AlertCircle className="w-4 h-4" />
+                ) : isOfflineWaiting ? (
+                  <WifiOff className="w-4 h-4" />
                 ) : isPaused ? (
                   <Pause className="w-4 h-4" />
                 ) : (
@@ -438,6 +446,7 @@ function Layout() {
                   <h3 className="font-semibold text-sm text-white truncate">
                     {isComplete ? t('taskOverlay.complete') :
                      isError ? t('taskOverlay.failed') :
+                     isOfflineWaiting ? 'Čekam internet konekciju' :
                      isPaused ? 'Generisanje pauzirano' :
                      isStopped ? 'Generisanje prekinuto' :
                      t('taskOverlay.forging')}

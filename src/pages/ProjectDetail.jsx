@@ -18,7 +18,8 @@ import {
   CheckCircle2,
   AlertCircle,
   Clock,
-  Code2
+  Code2,
+  WifiOff
 } from 'lucide-react';
 import { useAppStore } from '../hooks/useAppStore';
 import { useI18n } from '../i18n/I18nContext';
@@ -102,11 +103,13 @@ function FileTree({ files, onSelect }) {
 }
 
 // Status badge
-function StatusBadge({ status }) {
+function StatusBadge({ status, offlineWaiting = false }) {
   const { t } = useI18n();
   const configs = {
     'generating': { icon: Loader2, className: 'text-amber-400', text: t('status.generating'), animate: true },
-    'paused': { icon: Clock, className: 'text-amber-400', text: t('status.paused') },
+    'paused': offlineWaiting
+      ? { icon: WifiOff, className: 'text-amber-400', text: 'Offline Pause' }
+      : { icon: Clock, className: 'text-amber-400', text: t('status.paused') },
     'stopped': { icon: AlertCircle, className: 'text-rose-400', text: t('status.stopped') },
     'awaiting-keys': { icon: AlertCircle, className: 'text-amber-400', text: t('status.awaitingKeys') },
     'ready': { icon: CheckCircle2, className: 'text-indigo-400', text: t('status.ready') },
@@ -261,7 +264,7 @@ function ProjectDetail() {
           <div>
             <h1 className="text-2xl font-bold text-white">{project.name}</h1>
             <div className="flex items-center gap-3 mt-1">
-              <StatusBadge status={project.status} />
+              <StatusBadge status={project.status} offlineWaiting={Boolean(project.metadata?.offlineWaiting)} />
               <span className="text-slate-500">•</span>
               <span className="text-sm text-slate-500">
                 Created {new Date(project.createdAt).toLocaleDateString()}
@@ -399,13 +402,25 @@ function ProjectDetail() {
       {(project.status === 'paused' || project.status === 'stopped' || project.status === 'generating') && (
         <div className="card p-4 bg-indigo-950/40 border-indigo-500/40 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <Clock className="w-5 h-5 text-indigo-400" />
+            {project.status === 'paused' && project.metadata?.offlineWaiting ? (
+              <WifiOff className="w-5 h-5 text-amber-400" />
+            ) : (
+              <Clock className="w-5 h-5 text-indigo-400" />
+            )}
             <div>
               <p className="text-sm font-medium text-white">
-                {project.status === 'paused' ? t('projectDetail.interruptedBannerPaused') : project.status === 'stopped' ? t('projectDetail.interruptedBannerStopped') : t('projectDetail.interruptedBannerGenerating')}
+                {project.status === 'paused'
+                  ? (project.metadata?.offlineWaiting
+                      ? 'Čekam internet konekciju — nastavljamo sa instalacijom paketa kada budemo ponovo online'
+                      : t('projectDetail.interruptedBannerPaused'))
+                  : project.status === 'stopped'
+                  ? t('projectDetail.interruptedBannerStopped')
+                  : t('projectDetail.interruptedBannerGenerating')}
               </p>
               <p className="text-xs text-slate-400">
-                {t('projectDetail.interruptedBannerDesc')}
+                {project.status === 'paused' && project.metadata?.offlineWaiting
+                  ? 'Svi fajlovi su bezbedno sačuvani na disku; čim uređaj ponovo dobije internet, instalacija paketa će se automatski nastaviti.'
+                  : t('projectDetail.interruptedBannerDesc')}
               </p>
             </div>
           </div>

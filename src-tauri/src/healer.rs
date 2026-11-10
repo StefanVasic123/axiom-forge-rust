@@ -345,6 +345,22 @@ pub async fn heal_prisma_schema_loop(
     const MAX_AI_HEALS: u32 = 3;
     let total_checks = MAX_AI_HEALS + 1;
     let mut previous_ai_unchanged = false;
+    let project_id = proj_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
+
+    struct PendingPrismaFix {
+        entry_id: String,
+        source: String,
+        error_signature: String,
+        before: String,
+        after: String,
+    }
+    let mut pending_prisma_fix: Option<PendingPrismaFix> = None;
+    let mut pending_ai_fixes: Vec<PendingPrismaFix> = Vec::new();
+    let mut tried_katastar_ids: Vec<String> = Vec::new();
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -407,6 +423,47 @@ pub async fn heal_prisma_schema_loop(
         };
 
         if output.status.success() {
+            if let Some(pf) = pending_prisma_fix.take() {
+                let atomic_patch = if pf.source == "katastar" {
+                    None
+                } else {
+                    crate::katastar::extract_safe_atomic_patch("prisma/schema.prisma", &pf.before, &pf.after)
+                };
+                crate::katastar::finalize_katastar_outcome(
+                    &pf.entry_id,
+                    true,
+                    &pf.source,
+                    "prisma_generate",
+                    atomic_patch,
+                    None,
+                    &resolved_model,
+                );
+            }
+            for pf in pending_ai_fixes.drain(..) {
+                let atomic_patch = crate::katastar::extract_safe_atomic_patch(
+                    "prisma/schema.prisma",
+                    &pf.before,
+                    &pf.after,
+                );
+                crate::katastar::finalize_katastar_outcome(
+                    &pf.entry_id,
+                    true,
+                    "ai",
+                    "prisma_generate",
+                    atomic_patch,
+                    None,
+                    &resolved_model,
+                );
+            }
+            if !project_id.is_empty() {
+                crate::katastar::complete_pending_project_repairs(
+                    &project_id,
+                    Some("prisma/schema.prisma"),
+                    true,
+                    "prisma_generate",
+                    &resolved_model,
+                );
+            }
             let _ = window.emit(log_channel, serde_json::json!({
                 "text": "> [Prisma Validator] Prisma Client uspešno generisan!\n",
                 "type": "info"
@@ -439,6 +496,67 @@ pub async fn heal_prisma_schema_loop(
             return Err("Neodgovarajuća verzija Prisma CLI paketa u kešu u odnosu na @prisma/client.".to_string());
         }
 
+        let cur_sig_info = crate::katastar::normalize_error_signature(
+            "prisma",
+            &error_log,
+            Some("prisma/schema.prisma"),
+        );
+
+        // Post-test verification for deterministic or Katastar rule applied on the previous iteration
+        if let Some(pf) = pending_prisma_fix.take() {
+            if cur_sig_info.error_signature == pf.error_signature {
+                crate::katastar::finalize_katastar_outcome(
+                    &pf.entry_id,
+                    false,
+                    &pf.source,
+                    "prisma_generate",
+                    None,
+                    None,
+                    &resolved_model,
+                );
+                if pf.source == "katastar" {
+                    let _ = std::fs::write(&schema_path, &pf.before);
+                    tried_katastar_ids.push(pf.entry_id.clone());
+                    let _ = window.emit(log_channel, serde_json::json!({
+                        "text": format!("> [Katastar] Pravilo '{}' nije uklonilo grešku u schema.prisma; vraćam prethodno stanje i nastavljam.\n", pf.entry_id),
+                        "type": "warning"
+                    }));
+                }
+            } else {
+                let atomic_patch = if pf.source == "katastar" {
+                    None
+                } else {
+                    crate::katastar::extract_safe_atomic_patch("prisma/schema.prisma", &pf.before, &pf.after)
+                };
+                crate::katastar::finalize_katastar_outcome(
+                    &pf.entry_id,
+                    true,
+                    &pf.source,
+                    "error_disappeared",
+                    atomic_patch,
+                    None,
+                    &resolved_model,
+                );
+            }
+        }
+
+        // If the most recent AI fix produced the exact same error signature, mark it failed immediately
+        if let Some(last_ai) = pending_ai_fixes.last() {
+            if cur_sig_info.error_signature == last_ai.error_signature {
+                if let Some(failed_ai) = pending_ai_fixes.pop() {
+                    crate::katastar::finalize_katastar_outcome(
+                        &failed_ai.entry_id,
+                        false,
+                        "ai",
+                        "prisma_generate",
+                        None,
+                        None,
+                        &resolved_model,
+                    );
+                }
+            }
+        }
+
         if attempt == MAX_AI_HEALS {
             break;
         }
@@ -453,6 +571,23 @@ pub async fn heal_prisma_schema_loop(
             if schema_content.contains("provider = \"sqlite\"") {
                 let updated = schema_content.replace("provider = \"sqlite\"", "provider = \"postgresql\"");
                 let _ = std::fs::write(&schema_path, &updated);
+                let eid = crate::katastar::register_repair_attempt(
+                    "prisma",
+                    &error_log,
+                    "prisma/schema.prisma",
+                    "deterministic",
+                    "prisma_provider_pg",
+                    None,
+                    "Switch Prisma datasource provider from sqlite to postgresql when enum types are declared",
+                    "",
+                );
+                pending_prisma_fix = Some(PendingPrismaFix {
+                    entry_id: eid,
+                    source: "deterministic".to_string(),
+                    error_signature: cur_sig_info.error_signature.clone(),
+                    before: schema_content,
+                    after: updated,
+                });
                 let _ = window.emit(log_channel, serde_json::json!({
                     "text": "> [Prisma Validator] Deterministički sinhronizujem provider = \"postgresql\" za podršku enum tipova. Ponovo testiram...\n",
                     "type": "info"
@@ -461,13 +596,82 @@ pub async fn heal_prisma_schema_loop(
             }
         }
 
-        // Deterministic auto-healing for ambiguous relations (P1012)
-        if error_log.contains("Ambiguous relation detected") || error_log.contains("P1012") {
-            let disambiguated = disambiguate_prisma_relations(&schema_content);
-            if disambiguated.replace("\r\n", "\n").trim() != schema_content.replace("\r\n", "\n").trim() {
-                let _ = std::fs::write(&schema_path, &disambiguated);
+        // Deterministic auto-healing for schema validation & relation errors (P1012, SET_NULL, duplicate back-relations)
+        if error_log.contains("Ambiguous relation detected")
+            || error_log.contains("Wrongly named relation detected")
+            || error_log.contains("Invalid referential action")
+            || error_log.contains("Error validating")
+            || error_log.contains("P1012")
+        {
+            let deterministically_fixed = post_process_generated_file(
+                "prisma/schema.prisma",
+                &schema_content,
+                &serde_json::json!({}),
+                false,
+            );
+            if !deterministically_fixed.trim().is_empty()
+                && deterministically_fixed.replace("\r\n", "\n").trim() != schema_content.replace("\r\n", "\n").trim()
+            {
+                let _ = std::fs::write(&schema_path, &deterministically_fixed);
+                let atomic_patch = crate::katastar::extract_safe_atomic_patch(
+                    "prisma/schema.prisma",
+                    &schema_content,
+                    &deterministically_fixed,
+                );
+                let eid = crate::katastar::register_repair_attempt(
+                    "prisma",
+                    &error_log,
+                    "prisma/schema.prisma",
+                    "deterministic",
+                    "deterministic_sanitizer",
+                    atomic_patch,
+                    "Apply deterministic Prisma referential action and relation pairing sanitizer",
+                    "",
+                );
+                pending_prisma_fix = Some(PendingPrismaFix {
+                    entry_id: eid,
+                    source: "deterministic".to_string(),
+                    error_signature: cur_sig_info.error_signature.clone(),
+                    before: schema_content,
+                    after: deterministically_fixed,
+                });
                 let _ = window.emit(log_channel, serde_json::json!({
-                    "text": "> [Prisma Validator] Deterministički razrešavam dvosmislene relacije (dodeljujem @relation imena). Ponovo testiram...\n",
+                    "text": "> [Prisma Validator] Deterministički popravljena schema.prisma (relacije / referencijalne akcije). Ponovo testiram...\n",
+                    "type": "info"
+                }));
+                continue;
+            }
+        }
+
+        // Phase A (Before calling AI): Consult Local Error Katastar for verified Prisma fixes & hints
+        let katastar_lookup = crate::katastar::lookup_katastar(
+            "prisma",
+            &error_log,
+            "prisma/schema.prisma",
+            &schema_content,
+            &tried_katastar_ids,
+        );
+        if let Some(best) = katastar_lookup.applicable_patches.first() {
+            let candidate = schema_content.replace(&best.patch.search, &best.patch.replace);
+            let sanitized_candidate = post_process_generated_file(
+                "prisma/schema.prisma",
+                &candidate,
+                &serde_json::json!({}),
+                false,
+            );
+            if !sanitized_candidate.trim().is_empty()
+                && sanitized_candidate.replace("\r\n", "\n").trim() != schema_content.replace("\r\n", "\n").trim()
+            {
+                let _ = std::fs::write(&schema_path, &sanitized_candidate);
+                pending_prisma_fix = Some(PendingPrismaFix {
+                    entry_id: best.entry_id.clone(),
+                    source: "katastar".to_string(),
+                    error_signature: cur_sig_info.error_signature.clone(),
+                    before: schema_content,
+                    after: sanitized_candidate,
+                });
+                let _ = window.emit(log_channel, serde_json::json!({
+                    "text": format!("> [Katastar] Primenjeno verifikovano pravilo '{}' na schema.prisma pre AI poziva. Ponovo testiram...\n", best.entry_id),
                     "type": "info"
                 }));
                 continue;
@@ -481,7 +685,7 @@ pub async fn heal_prisma_schema_loop(
 
         let failing_lines = extract_prisma_error_lines(&error_log, &schema_content);
 
-        let system_prompt = "You are an expert database administrator and Prisma specialist. \
+        let mut system_prompt = "You are an expert database administrator and Prisma specialist. \
             The prisma generate command failed with syntax or validation errors. \
             Review the schema.prisma content and the error log. Correct the schema.prisma file to fix the validation errors. \
             Strictly follow Prisma Schema language rules: \
@@ -493,8 +697,16 @@ pub async fn heal_prisma_schema_loop(
             6. Every relation needs an opposite field on the other model (e.g. `user User @relation(...)` on the child and `dashboards Dashboard[]` on User). If the relation uses a name (e.g. `name: \"TeamMember\"`), the opposite relation array MUST use the exact same name (e.g. `teams Team[] @relation(\"TeamMember\")`). CRITICAL: NEVER delete foreign key scalar fields (like `userId String` or `projectId String`). Always ADD the opposite relation field instead! \
             7. Fields pointing to another model (relations) CANNOT have a `@default()` attribute. For default values, use an `enum` or a scalar type (e.g. `String @default(\"USER\")`). \
             8. Ambiguous Relations (P1012): If a model defines two or more relations pointing to the same target model (e.g. `sourceWallet` and `destinationWallet` both pointing to `Wallet`), Prisma strictly requires unique relation names on BOTH models: `@relation(\"SourceWallet\", fields: ...)` and `@relation(\"DestinationWallet\", fields: ...)`. On the target model (Wallet), define matching opposite named relations: `sourceTransactions Transaction[] @relation(\"SourceWallet\")` and `destinationTransactions Transaction[] @relation(\"DestinationWallet\")`. Remove duplicate un-named arrays like `transactions` and `transactionsTransaction`. \
+            9. Referential Actions & Unique Relation Names (P1012): Referential actions inside `@relation(...)` (`onDelete`, `onUpdate`) MUST use exact Prisma PascalCase keywords: `SetNull`, `Cascade`, `Restrict`, `NoAction`, `SetDefault` (NEVER uppercase SQL keywords like `SET_NULL`, `CASCADE`, `NO_ACTION`, or `SET_DEFAULT`). Also NEVER keep two opposite relation fields on the same model using the same `@relation(\"...\")` name (e.g., if `tasks` and `tasksTask` both use `@relation(\"AssignedTo\")`, delete the duplicate `tasksTask`). \
             First, in exactly 1 concise sentence, identify the compiler rule that was violated on the failing line. \
-            Then, provide the complete corrected schema.prisma code wrapped in a ```prisma code block.";
+            Then, provide the complete corrected schema.prisma code wrapped in a ```prisma code block.".to_string();
+
+        if !katastar_lookup.hints.is_empty() {
+            system_prompt.push_str("\n\nPREVIOUSLY VERIFIED PRISMA SOLUTIONS FROM LOCAL KATASTAR:\n");
+            for h in katastar_lookup.hints.iter().take(3) {
+                system_prompt.push_str(&format!("- {}\n", h));
+            }
+        }
 
         let mut user_prompt = format!(
             "Prisma CLI error log:\n{}\n\nCurrent schema.prisma content:\n{}\n",
@@ -527,10 +739,19 @@ pub async fn heal_prisma_schema_loop(
         });
 
         let mut ai_content: Option<String> = None;
+        let mut ai_analysis_hint = cur_sig_info.normalized_sample.clone();
         match client.post("http://127.0.0.1:11434/api/chat").json(&ollama_req).send().await {
             Ok(resp) if resp.status().is_success() => {
                 if let Ok(resp_json) = resp.json::<Value>().await {
                     if let Some(content) = resp_json.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
+                        let first_line = content
+                            .lines()
+                            .map(|l| l.trim())
+                            .find(|l| !l.is_empty() && !l.starts_with("```"))
+                            .unwrap_or("");
+                        if !first_line.is_empty() {
+                            ai_analysis_hint = first_line.to_string();
+                        }
                         let cleaned = extract_code_content(content);
                         if !cleaned.trim().is_empty() {
                             ai_content = Some(cleaned);
@@ -563,6 +784,28 @@ pub async fn heal_prisma_schema_loop(
                 } else {
                     previous_ai_unchanged = false;
                     let _ = std::fs::write(&schema_path, &sanitized);
+                    let atomic_patch = crate::katastar::extract_safe_atomic_patch(
+                        "prisma/schema.prisma",
+                        &schema_content,
+                        &sanitized,
+                    );
+                    let eid = crate::katastar::register_repair_attempt(
+                        "prisma",
+                        &error_log,
+                        "prisma/schema.prisma",
+                        "ai",
+                        "prisma_heal",
+                        atomic_patch,
+                        &ai_analysis_hint,
+                        &resolved_model,
+                    );
+                    pending_ai_fixes.push(PendingPrismaFix {
+                        entry_id: eid,
+                        source: "ai".to_string(),
+                        error_signature: cur_sig_info.error_signature.clone(),
+                        before: schema_content,
+                        after: sanitized,
+                    });
                     let _ = window.emit(log_channel, serde_json::json!({
                         "text": "> [Prisma Validator] schema.prisma ažuriran (AI predlog + deterministički popravljač). Ponovo testiram...\n",
                         "type": "info"
@@ -576,6 +819,18 @@ pub async fn heal_prisma_schema_loop(
                 }));
             }
         }
+    }
+
+    for pf in pending_ai_fixes.drain(..) {
+        crate::katastar::finalize_katastar_outcome(
+            &pf.entry_id,
+            false,
+            "ai",
+            "prisma_generate",
+            None,
+            None,
+            &resolved_model,
+        );
     }
 
     Err(format!("Failed to validate and auto-heal Prisma schema after {} AI attempts.", MAX_AI_HEALS))
@@ -906,6 +1161,125 @@ pub fn extract_edits_from_json(parsed_json: &Value, default_path: &str) -> Vec<V
     edits
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SingleFileVerifyOutcome {
+    Passed(&'static str),
+    Failed(&'static str),
+    Inconclusive,
+}
+
+fn resolve_local_node_executable() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        let toolchain_node = get_base_dir()
+            .join("toolchain")
+            .join("node")
+            .join("node-v20.18.1-win-x64")
+            .join("node.exe");
+        if toolchain_node.exists() {
+            return toolchain_node.to_string_lossy().to_string();
+        }
+        for p in &[
+            r"C:\Program Files\nodejs\node.exe",
+            r"C:\Program Files (x86)\nodejs\node.exe",
+        ] {
+            if std::path::Path::new(p).exists() {
+                return (*p).to_string();
+            }
+        }
+    }
+    "node".to_string()
+}
+
+/// Fast local verification for interactive single-file heals (`tsc --noEmit` or `prisma validate`).
+/// Strictly avoids network calls and falls back to `Inconclusive` if local binaries or deps are missing.
+async fn verify_single_file_after_heal(
+    proj_dir: &std::path::Path,
+    rel_file_path: &str,
+    category: &str,
+    error_code: Option<&str>,
+) -> SingleFileVerifyOutcome {
+    let lower_rel = rel_file_path.replace('\\', "/").to_lowercase();
+    let node_exe = resolve_local_node_executable();
+
+    if lower_rel.ends_with(".prisma") {
+        let local_prisma_js = proj_dir.join("node_modules").join("prisma").join("build").join("index.js");
+        if !local_prisma_js.exists() {
+            return SingleFileVerifyOutcome::Inconclusive;
+        }
+        let mut cmd = tokio::process::Command::new(&node_exe);
+        cmd.arg(&local_prisma_js).arg("validate").current_dir(proj_dir);
+        cmd.env("NO_COLOR", "1").env("FORCE_COLOR", "0");
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(0x08000000);
+
+        return match tokio::time::timeout(std::time::Duration::from_secs(12), cmd.output()).await {
+            Ok(Ok(out)) if out.status.success() => SingleFileVerifyOutcome::Passed("prisma_validate"),
+            Ok(Ok(_)) => SingleFileVerifyOutcome::Failed("prisma_validate"),
+            _ => SingleFileVerifyOutcome::Inconclusive,
+        };
+    }
+
+    // `tsc` cannot detect Next.js missing `"use client"` or non-ReferenceError runtime errors
+    if error_code == Some("NEXT_USE_CLIENT")
+        || (category == "runtime" && error_code != Some("ReferenceError"))
+    {
+        return SingleFileVerifyOutcome::Inconclusive;
+    }
+
+    let is_ts_file = lower_rel.ends_with(".ts") || lower_rel.ends_with(".tsx");
+    let local_tsc_js = proj_dir.join("node_modules").join("typescript").join("bin").join("tsc");
+    let has_local_env = proj_dir.join("tsconfig.json").exists()
+        && local_tsc_js.exists()
+        && proj_dir.join("node_modules").join("react").exists()
+        && proj_dir.join("node_modules").join("next").exists();
+
+    if !is_ts_file || !has_local_env {
+        return SingleFileVerifyOutcome::Inconclusive;
+    }
+
+    let mut cmd = tokio::process::Command::new(&node_exe);
+    cmd.arg(&local_tsc_js)
+        .arg("--noEmit")
+        .arg("--pretty")
+        .arg("false")
+        .current_dir(proj_dir);
+    cmd.env("NO_COLOR", "1").env("FORCE_COLOR", "0");
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000);
+
+    match tokio::time::timeout(std::time::Duration::from_secs(15), cmd.output()).await {
+        Ok(Ok(out)) => {
+            if out.status.success() {
+                return SingleFileVerifyOutcome::Passed("tsc_noemit");
+            }
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+            .replace('\\', "/")
+            .to_lowercase();
+
+            if combined.contains("ts18003") || combined.contains("cannot find type definition file") {
+                return SingleFileVerifyOutcome::Inconclusive;
+            }
+
+            let file_still_fails = combined.lines().any(|line| {
+                let l = line.trim();
+                (l.starts_with(&lower_rel) || l.contains(&format!("/{}", lower_rel)))
+                    && l.contains("error ts")
+            });
+            if file_still_fails {
+                SingleFileVerifyOutcome::Failed("tsc_noemit")
+            } else {
+                SingleFileVerifyOutcome::Passed("error_disappeared")
+            }
+        }
+        _ => SingleFileVerifyOutcome::Inconclusive,
+    }
+}
+
 #[tauri::command]
 pub async fn project_heal_compile_error(
     project_id: String,
@@ -931,32 +1305,202 @@ pub async fn project_heal_compile_error(
         return Err(format!("Fajl {} ne postoji.", file_path));
     }
 
-    let raw_file_content = std::fs::read_to_string(&full_path)
-        .map_err(|e| {
-            let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Greška pri čitanju" }));
-            format!("Greška pri čitanju fajla: {}", e)
-        })?;
-
-    // Fast deterministic pre-heal pass (rewrites barrel imports, missing react-icons subpaths, useEffect deps, etc.)
-    let pre_sanitized = post_process_generated_file(&file_path, &raw_file_content, &serde_json::json!({}), true);
-    if pre_sanitized != raw_file_content {
-        let _ = std::fs::write(&full_path, &pre_sanitized);
-        ensure_axiom_inspector_injected(&proj_dir);
-        let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Uspešno popravljeno!" }));
-        let _ = window.emit("server:log", serde_json::json!({
-            "text": format!("> [AI Auto-Healing] Deterministički saniran kod i zavisnosti u: {}\n", file_path),
-            "type": "info"
-        }));
-        return Ok(true);
-    }
-
-    let file_content = strip_axiom_inspector_script(&pre_sanitized);
+    let rel_file_path = if let Ok(stripped) = std::path::Path::new(&file_path).strip_prefix(&proj_dir) {
+        stripped.to_str().unwrap_or("").replace('\\', "/")
+    } else {
+        file_path.replace('\\', "/")
+    };
 
     let settings = get_axiom_settings();
     let model = settings.get("modelId")
         .and_then(|m| m.as_str())
         .unwrap_or("qwen2.5-coder:7b")
         .to_string();
+
+    let sig_info = crate::katastar::normalize_error_signature("", &error_msg, Some(&rel_file_path));
+    let failed_prev_ids = crate::katastar::resolve_reoccurred_pending_repair(
+        &project_id,
+        &rel_file_path,
+        &sig_info.error_signature,
+        &model,
+    );
+    if !failed_prev_ids.is_empty() {
+        debug_log_to_file(format!(
+            "[Katastar] Previous pending repair(s) {:?} did not eliminate '{}' in '{}' -> marked failed.",
+            failed_prev_ids, sig_info.error_signature, rel_file_path
+        ));
+    }
+
+    let raw_file_content = std::fs::read_to_string(&full_path)
+        .map_err(|e| {
+            let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Greška pri čitanju" }));
+            format!("Greška pri čitanju fajla: {}", e)
+        })?;
+
+    let raw_clean = strip_axiom_inspector_script(&raw_file_content);
+
+    // Fast deterministic pre-heal pass (rewrites barrel imports, missing react-icons subpaths, useEffect deps, etc.)
+    let pre_sanitized = post_process_generated_file(&file_path, &raw_file_content, &serde_json::json!({}), true);
+    let active_clean_content = strip_axiom_inspector_script(&pre_sanitized);
+    if pre_sanitized != raw_file_content {
+        let _ = std::fs::write(&full_path, &pre_sanitized);
+        let atomic_patch = crate::katastar::extract_safe_atomic_patch(
+            &rel_file_path,
+            &raw_clean,
+            &active_clean_content,
+        );
+        let eid = crate::katastar::register_repair_attempt(
+            &sig_info.category,
+            &error_msg,
+            &rel_file_path,
+            "deterministic",
+            "deterministic_sanitizer",
+            atomic_patch.clone(),
+            "Deterministic sanitizer pre-heal (imports, hooks, client directives, schema)",
+            "",
+        );
+        let verify_res = verify_single_file_after_heal(
+            &proj_dir,
+            &rel_file_path,
+            &sig_info.category,
+            sig_info.error_code.as_deref(),
+        )
+        .await;
+        match verify_res {
+            SingleFileVerifyOutcome::Passed(vkind) => {
+                crate::katastar::finalize_katastar_outcome(
+                    &eid,
+                    true,
+                    "deterministic",
+                    vkind,
+                    atomic_patch,
+                    None,
+                    "",
+                );
+                ensure_axiom_inspector_injected(&proj_dir);
+                let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Uspešno popravljeno!" }));
+                let _ = window.emit("server:log", serde_json::json!({
+                    "text": format!("> [AI Auto-Healing] Deterministički saniran i verifikovan ({}) fajl: {}\n", vkind, file_path),
+                    "type": "info"
+                }));
+                return Ok(true);
+            }
+            SingleFileVerifyOutcome::Inconclusive => {
+                crate::katastar::track_pending_project_repair(
+                    &project_id,
+                    &rel_file_path,
+                    &sig_info.error_signature,
+                    &eid,
+                    "deterministic",
+                );
+                ensure_axiom_inspector_injected(&proj_dir);
+                let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Uspešno popravljeno!" }));
+                let _ = window.emit("server:log", serde_json::json!({
+                    "text": format!("> [AI Auto-Healing] Deterministički saniran kod i zavisnosti u: {}\n", file_path),
+                    "type": "info"
+                }));
+                return Ok(true);
+            }
+            SingleFileVerifyOutcome::Failed(vkind) => {
+                crate::katastar::finalize_katastar_outcome(
+                    &eid,
+                    false,
+                    "deterministic",
+                    vkind,
+                    None,
+                    None,
+                    "",
+                );
+                let _ = window.emit("server:log", serde_json::json!({
+                    "text": format!("> [AI Auto-Healing] Deterministički prolaz je očistio import/sintaksu, ali '{}' i dalje ima greške ({}); nastavljam sa Katastrom i AI popravkom...\n", file_path, vkind),
+                    "type": "info"
+                }));
+            }
+        }
+    }
+
+    // Phase A (Before calling AI): Consult Local Error Katastar for verified auto-patches & past hints
+    let katastar_lookup = crate::katastar::lookup_katastar(
+        &sig_info.category,
+        &error_msg,
+        &rel_file_path,
+        &active_clean_content,
+        &failed_prev_ids,
+    );
+    let has_tailwind_pre = proj_dir.join("tailwind.config.js").exists() || proj_dir.join("tailwind.config.ts").exists();
+    if let Some(best) = katastar_lookup.applicable_patches.first() {
+        let candidate = active_clean_content.replace(&best.patch.search, &best.patch.replace);
+        let mut processed = post_process_generated_file(&rel_file_path, &candidate, &serde_json::json!({}), has_tailwind_pre);
+        let project_routes = get_project_routes_from_dir(&proj_dir);
+        let routes_list: Vec<String> = project_routes.into_iter().map(|(r, _)| r).collect();
+        if !routes_list.is_empty() {
+            processed = sanitize_app_router_links_with_routes(&processed, &routes_list);
+        }
+        processed = sanitize_unhandled_session_loading(&processed);
+        if processed != active_clean_content && std::fs::write(&full_path, &processed).is_ok() {
+            let verify_res = verify_single_file_after_heal(
+                &proj_dir,
+                &rel_file_path,
+                &sig_info.category,
+                sig_info.error_code.as_deref(),
+            )
+            .await;
+            match verify_res {
+                SingleFileVerifyOutcome::Failed(vkind) => {
+                    crate::katastar::finalize_katastar_outcome(
+                        &best.entry_id,
+                        false,
+                        "katastar",
+                        vkind,
+                        None,
+                        None,
+                        &model,
+                    );
+                    let _ = std::fs::write(&full_path, &pre_sanitized);
+                    let _ = window.emit("server:log", serde_json::json!({
+                        "text": format!("> [Katastar] Pravilo '{}' nije rešilo '{}' ({}), vraćam prethodno stanje i pozivam AI...\n", best.entry_id, rel_file_path, vkind),
+                        "type": "warning"
+                    }));
+                }
+                SingleFileVerifyOutcome::Passed(vkind) => {
+                    crate::katastar::finalize_katastar_outcome(
+                        &best.entry_id,
+                        true,
+                        "katastar",
+                        vkind,
+                        None,
+                        None,
+                        &model,
+                    );
+                    ensure_axiom_inspector_injected(&proj_dir);
+                    let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Uspešno popravljeno!" }));
+                    let _ = window.emit("server:log", serde_json::json!({
+                        "text": format!("> [Katastar] Primenjeno i verifikovano pravilo '{}' ({}) bez pozivanja AI modela na: {}\n", best.entry_id, vkind, rel_file_path),
+                        "type": "info"
+                    }));
+                    return Ok(true);
+                }
+                SingleFileVerifyOutcome::Inconclusive => {
+                    crate::katastar::track_pending_project_repair(
+                        &project_id,
+                        &rel_file_path,
+                        &sig_info.error_signature,
+                        &best.entry_id,
+                        "katastar",
+                    );
+                    ensure_axiom_inspector_injected(&proj_dir);
+                    let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Uspešno popravljeno!" }));
+                    let _ = window.emit("server:log", serde_json::json!({
+                        "text": format!("> [Katastar] Primenjeno verifikovano pravilo '{}' bez pozivanja AI modela na: {}\n", best.entry_id, rel_file_path),
+                        "type": "info"
+                    }));
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
+    let file_content = active_clean_content.clone();
 
     let _ = window.emit("server:heal-status", serde_json::json!({
         "status": format!("Pozivanje AI modela ({}) u toku...", model)
@@ -995,12 +1539,12 @@ pub async fn project_heal_compile_error(
     if !rulepacks.is_empty() {
         system_prompt.push_str(&rulepacks);
     }
-
-    let rel_file_path = if let Ok(stripped) = std::path::Path::new(&file_path).strip_prefix(&proj_dir) {
-        stripped.to_str().unwrap_or("").replace('\\', "/")
-    } else {
-        file_path.replace('\\', "/")
-    };
+    if !katastar_lookup.hints.is_empty() {
+        system_prompt.push_str("\n\n--- PREVIOUSLY VERIFIED SOLUTIONS FROM LOCAL KATASTAR ---\n");
+        for h in katastar_lookup.hints.iter().take(3) {
+            system_prompt.push_str(&format!("- {}\n", h));
+        }
+    }
 
     let path_lower = rel_file_path.to_lowercase();
     let is_nav_or_link = path_lower.contains("navbar") 
@@ -1298,6 +1842,7 @@ pub async fn project_heal_compile_error(
 
                         use std::collections::HashMap;
                         let mut modified_files: HashMap<String, String> = HashMap::new();
+                        let mut before_contents: HashMap<String, String> = HashMap::new();
                         
                         for edit in edits {
                             let edit_path = match edit.get("path").and_then(|p| p.as_str()) {
@@ -1327,6 +1872,7 @@ pub async fn project_heal_compile_error(
                                 let target_full_path = proj_dir.join(&edit_path);
                                 if !target_full_path.exists() {
                                     modified_files.insert(edit_path.clone(), String::new());
+                                    before_contents.insert(edit_path.clone(), String::new());
                                 } else {
                                     let content = std::fs::read_to_string(&target_full_path)
                                         .map_err(|e| {
@@ -1334,6 +1880,7 @@ pub async fn project_heal_compile_error(
                                             debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
                                             err_msg
                                         })?;
+                                    before_contents.insert(edit_path.clone(), strip_axiom_inspector_script(&content));
                                     modified_files.insert(edit_path.clone(), content);
                                 }
                             }
@@ -1408,6 +1955,7 @@ pub async fn project_heal_compile_error(
                             "status": "Upisivanje ispravki na disk..."
                         }));
 
+                        let mut written_changes: Vec<(String, String, String)> = Vec::new();
                         for (edit_path, processed_content) in modified_files {
                             let mut processed = post_process_generated_file(&edit_path, &processed_content, &serde_json::json!({}), has_tailwind);
                             let project_routes = get_project_routes_from_dir(&proj_dir);
@@ -1417,6 +1965,9 @@ pub async fn project_heal_compile_error(
                             }
                             processed = sanitize_unhandled_session_loading(&processed);
                             let target_full_path = proj_dir.join(&edit_path);
+                            if let Some(parent) = target_full_path.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
                             std::fs::write(&target_full_path, &processed)
                                 .map_err(|e| {
                                     let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Greška pri upisu" }));
@@ -1424,12 +1975,81 @@ pub async fn project_heal_compile_error(
                                     debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
                                     err_msg
                                 })?;
+
+                            let before_clean = before_contents.get(&edit_path).cloned().unwrap_or_default();
+                            let after_clean = strip_axiom_inspector_script(&processed);
+                            if before_clean != after_clean && !before_clean.is_empty() {
+                                written_changes.push((edit_path.clone(), before_clean, after_clean));
+                            }
                             
                             let _ = window.emit("server:log", serde_json::json!({
                                 "text": format!("> [AI Auto-Healing] Uspešno popravljen fajl: {}\n", edit_path),
                                 "type": "info"
                             }));
                             debug_log_to_file(format!("[AI Auto-Healing] Successfully healed file: {}", edit_path));
+                        }
+
+                        if !written_changes.is_empty() {
+                            let verify_res = verify_single_file_after_heal(
+                                &proj_dir,
+                                &rel_file_path,
+                                &sig_info.category,
+                                sig_info.error_code.as_deref(),
+                            )
+                            .await;
+                            for (edit_path, before_clean, after_clean) in written_changes {
+                                let atomic_patch = crate::katastar::extract_safe_atomic_patch(
+                                    &edit_path,
+                                    &before_clean,
+                                    &after_clean,
+                                );
+                                let strategy_name = if atomic_patch.is_some() { "search_replace" } else { "ai_edit" };
+                                let eid = crate::katastar::register_repair_attempt(
+                                    &sig_info.category,
+                                    &error_msg,
+                                    &edit_path,
+                                    "ai",
+                                    strategy_name,
+                                    atomic_patch.clone(),
+                                    &explanation,
+                                    &model,
+                                );
+                                match verify_res {
+                                    SingleFileVerifyOutcome::Passed(vkind)
+                                        if edit_path == rel_file_path || vkind == "tsc_noemit" || vkind == "prisma_validate" =>
+                                    {
+                                        crate::katastar::finalize_katastar_outcome(
+                                            &eid,
+                                            true,
+                                            "ai",
+                                            vkind,
+                                            atomic_patch,
+                                            Some(&explanation),
+                                            &model,
+                                        );
+                                    }
+                                    SingleFileVerifyOutcome::Failed(vkind) if edit_path == rel_file_path => {
+                                        crate::katastar::finalize_katastar_outcome(
+                                            &eid,
+                                            false,
+                                            "ai",
+                                            vkind,
+                                            None,
+                                            None,
+                                            &model,
+                                        );
+                                    }
+                                    _ => {
+                                        crate::katastar::track_pending_project_repair(
+                                            &project_id,
+                                            &edit_path,
+                                            &sig_info.error_signature,
+                                            &eid,
+                                            "ai",
+                                        );
+                                    }
+                                }
+                            }
                         }
 
                         ensure_axiom_inspector_injected(&proj_dir);
@@ -1472,6 +2092,13 @@ pub async fn project_install_package(
     }
 
     let enriched_path = ensure_node_toolchain_ready(Some(&window), "server:log").await;
+    let pkg_json_path = proj_dir.join("package.json");
+    if sanitize_package_json_for_offline(&pkg_json_path) {
+        let _ = window.emit("server:log", serde_json::json!({
+            "text": "> [Offline Sanitizer] Očišćen package.json od konfliktnih dev/linter paketa pre instalacije.\n".to_string(),
+            "type": "info"
+        }));
+    }
 
     let _ = window.emit("server:log", serde_json::json!({
         "text": "> [AI Auto-Healing] Pokrećem npm install za paket...\n".to_string(),
@@ -1485,54 +2112,130 @@ pub async fn project_install_package(
         pkgs_to_install.push("@emotion/styled".to_string());
     }
 
-    #[cfg(target_os = "windows")]
-    let mut cmd = tokio::process::Command::new("cmd");
-    #[cfg(target_os = "windows")]
-    {
-        cmd.arg("/C").arg("npm").arg("install").arg("--legacy-peer-deps").arg("--prefer-offline");
-        for p in &pkgs_to_install {
-            cmd.arg(p);
-        }
-        cmd.current_dir(&proj_dir).env("PATH", &enriched_path);
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    let mut cmd = tokio::process::Command::new("npm");
-    #[cfg(not(target_os = "windows"))]
-    {
-        cmd.arg("install").arg("--legacy-peer-deps").arg("--prefer-offline");
-        for p in &pkgs_to_install {
-            cmd.arg(p);
-        }
-        cmd.current_dir(&proj_dir).env("PATH", &enriched_path);
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
-
-    match cmd.output().await {
-        Ok(output) => {
-            if output.status.success() {
-                let _ = window.emit("server:heal-status", serde_json::json!({
-                    "status": "Instalirano!"
-                }));
-                let _ = window.emit("server:log", serde_json::json!({
-                    "text": format!("> [AI Auto-Healing] Uspešno instaliran paket {}.\n", package_name),
-                    "type": "info"
-                }));
-                Ok(true)
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let _ = window.emit("server:heal-status", serde_json::json!({
-                    "status": "Greška pri instalaciji"
-                }));
-                Err(format!("npm install failed: {}", stderr))
+    let mut last_err: Option<String> = None;
+    let mut prefer_offline = true;
+    for _attempt in 1..=4 {
+        #[cfg(target_os = "windows")]
+        let mut cmd = tokio::process::Command::new("cmd");
+        #[cfg(target_os = "windows")]
+        {
+            cmd.arg("/C").arg("npm").arg("install").arg("--legacy-peer-deps");
+            if prefer_offline {
+                cmd.arg("--prefer-offline");
             }
+            for p in &pkgs_to_install {
+                cmd.arg(p);
+            }
+            cmd.current_dir(&proj_dir).env("PATH", &enriched_path);
         }
-        Err(e) => Err(format!("Failed to run npm install command: {}", e))
+
+        #[cfg(not(target_os = "windows"))]
+        let mut cmd = tokio::process::Command::new("npm");
+        #[cfg(not(target_os = "windows"))]
+        {
+            cmd.arg("install").arg("--legacy-peer-deps");
+            if prefer_offline {
+                cmd.arg("--prefer-offline");
+            }
+            for p in &pkgs_to_install {
+                cmd.arg(p);
+            }
+            cmd.current_dir(&proj_dir).env("PATH", &enriched_path);
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+
+        match cmd.output().await {
+            Ok(output) => {
+                if output.status.success() {
+                    lock_installed_dependencies(&pkg_json_path);
+                    let _ = window.emit("server:heal-status", serde_json::json!({
+                        "status": "Instalirano!"
+                    }));
+                    let _ = window.emit("server:log", serde_json::json!({
+                        "text": format!("> [AI Auto-Healing] Uspešno instaliran paket {}.\n", package_name),
+                        "type": "info"
+                    }));
+                    return Ok(true);
+                } else {
+                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    let combined_err = format!("{}\n{}", stdout, stderr);
+                    last_err = Some(format!("npm install failed: {}", stderr));
+
+                    if is_npm_network_error(&combined_err) {
+                        let offline_msg = format!(
+                            "Nema internet konekcije ili je npm registar nedostupan — nastavljamo sa instalacijom paketa '{}' kada budemo ponovo online.",
+                            package_name
+                        );
+                        last_err = Some(offline_msg.clone());
+                        let _ = window.emit("server:log", serde_json::json!({
+                            "text": format!("> [Offline / Network Error] {}\n", offline_msg),
+                            "type": "error"
+                        }));
+                        break;
+                    }
+
+                    if prefer_offline {
+                        prefer_offline = false;
+                        let _ = window.emit("server:log", serde_json::json!({
+                            "text": format!("> [AI Auto-Healing] Offline npm cache nije uspeo za {}, prelazim na online instalaciju...\n", package_name),
+                            "type": "info"
+                        }));
+                        continue;
+                    }
+
+                    let mut healed_conflict = false;
+                    if let Some(action) = analyze_npm_install_failure(&combined_err) {
+                        match action {
+                            NpmFailureAction::SetWildcard(conflict_pkg) => {
+                                if is_core_framework_package(&conflict_pkg) {
+                                    let _ = window.emit("server:log", serde_json::json!({
+                                        "text": format!("> [Core Lock] Paket '{}' je zaključani core framework paket i neće biti spušten na '*' tokom instalacije '{}'.\n", conflict_pkg, package_name),
+                                        "type": "error"
+                                    }));
+                                } else if apply_npm_etarget_heal(&pkg_json_path, &conflict_pkg, Some(&combined_err)) {
+                                    let _ = window.emit("server:log", serde_json::json!({
+                                        "text": format!("> [Self-Healing] Primenjen bezbedan dependency/parent-scoped override za konfliktan paket '{}' tokom instalacije '{}'. Ponovo pokušavam...\n", conflict_pkg, package_name),
+                                        "type": "info"
+                                    }));
+                                    healed_conflict = true;
+                                }
+                            }
+                            NpmFailureAction::Remove(conflict_pkg) if conflict_pkg != package_name => {
+                                if is_core_framework_package(&conflict_pkg) {
+                                    let _ = window.emit("server:log", serde_json::json!({
+                                        "text": format!("> [Core Lock] Paket '{}' je zaključani core framework paket i neće biti uklonjen tokom instalacije '{}'.\n", conflict_pkg, package_name),
+                                        "type": "error"
+                                    }));
+                                } else if remove_package_from_json(&pkg_json_path, &conflict_pkg) {
+                                    let _ = window.emit("server:log", serde_json::json!({
+                                        "text": format!("> [Self-Healing] Uklonjen nepostojeći/nevažeći paket '{}' iz package.json tokom instalacije '{}'. Ponovo pokušavam...\n", conflict_pkg, package_name),
+                                        "type": "info"
+                                    }));
+                                    healed_conflict = true;
+                                }
+                            }
+                            NpmFailureAction::Remove(_) => {}
+                        }
+                    }
+
+                    if !healed_conflict {
+                        break;
+                    }
+                }
+            }
+            Err(e) => return Err(format!("Failed to run npm install command: {}", e)),
+        }
     }
+
+    let _ = window.emit("server:heal-status", serde_json::json!({
+        "status": "Greška pri instalaciji"
+    }));
+    Err(last_err.unwrap_or_else(|| "npm install failed".to_string()))
 }
 
 #[tauri::command]

@@ -156,10 +156,22 @@ function appReducer(state, action) {
         }
       }
 
+      const nextPhase = progress?.phase ?? prevTask?.phase;
+      const nextStatus = progress?.status ?? prevTask?.status;
+      const isPausedProgress = nextPhase === 'paused' || nextStatus === 'paused';
+      const nextOfflineWaiting = progress?.offlineWaiting !== undefined
+        ? Boolean(progress.offlineWaiting)
+        : (isPausedProgress ? Boolean(prevTask?.offlineWaiting) : false);
+      const nextPausedReason = progress?.pausedReason !== undefined
+        ? progress.pausedReason
+        : (isPausedProgress ? (prevTask?.pausedReason ?? null) : null);
+
       nextTaskProgress[taskId] = {
         ...prevTask,
         ...progress,
         taskId,
+        offlineWaiting: nextOfflineWaiting,
+        pausedReason: nextPausedReason,
         currentFile: progress?.currentFile ?? prevTask?.currentFile ?? '',
         fileDescription: progress?.fileDescription ?? prevTask?.fileDescription ?? '',
         fileIndex: progress?.fileIndex ?? prevTask?.fileIndex ?? 0,

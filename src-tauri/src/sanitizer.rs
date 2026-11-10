@@ -1062,21 +1062,10 @@ pub fn post_process_generated_file(
         }
     }
 
-    // Apply learned global healing rules
-    let rules_path = get_base_dir().join("axiom-healing-rules.json");
-    if rules_path.exists() {
-        if let Ok(rules_content) = std::fs::read_to_string(&rules_path) {
-            if let Ok(rules_val) = serde_json::from_str::<Value>(&rules_content) {
-                if let Some(rules_arr) = rules_val.as_array() {
-                    for rule in rules_arr {
-                        if let (Some(search), Some(replace)) = (rule.get("search").and_then(|s| s.as_str()), rule.get("replace").and_then(|r| r.as_str())) {
-                            if processed.contains(search) {
-                                processed = processed.replace(search, replace);
-                            }
-                        }
-                    }
-                }
-            }
+    // Apply ONLY verified safe atomic rules from the Local Error & Solution Katastar
+    for (search, replace) in crate::katastar::get_verified_sanitizer_patches(file_path) {
+        if processed.contains(&search) {
+            processed = processed.replace(&search, &replace);
         }
     }
 
@@ -1091,6 +1080,11 @@ pub fn post_process_generated_file(
 
     // Rule for schema.prisma corrections
     if path_lower.ends_with("schema.prisma") {
+        // Normalize Windows line endings first so regexes and line-by-line passes behave consistently
+        if processed.contains('\r') {
+            processed = processed.replace("\r\n", "\n");
+        }
+
         // 0. Ensure provider = "postgresql" if enums, Json or postgresql url are present
         if processed.contains("enum ") || processed.contains("postgresql://") {
             if processed.contains("provider = \"sqlite\"") {
@@ -1101,6 +1095,9 @@ pub fn post_process_generated_file(
                     .replace("url      = \"file:./dev.db\"", "url      = env(\"DATABASE_URL\")");
             }
         }
+
+        // 0b. Normalize SQL-style / invalid Prisma referential actions (e.g., SET_NULL -> SetNull, CASCADE -> Cascade)
+        processed = normalize_prisma_referential_actions(&processed);
 
         // 1. Fix missing url in datasource block
         if processed.contains("datasource db {") {
@@ -1162,19 +1159,18 @@ pub fn post_process_generated_file(
                 if parts.len() >= 2 && parts[1].contains("[]") {
                     if let Some(rel_idx) = line.find("@relation") {
                         let after_rel = &line[rel_idx..];
-                        if let (Some(open_p), Some(close_p)) = (after_rel.find('('), after_rel.find(')')) {
-                            let inner = &after_rel[open_p + 1..close_p];
-                            if inner.contains("fields:") || inner.contains("references:") {
-                                let name_re = regex::Regex::new(r#"(?:name:\s*["']([^"']+)["']|["']([^"']+)["'])"#).ok();
-                                let rel_name = name_re.as_ref().and_then(|r| {
-                                    r.captures(inner).and_then(|c| c.get(1).or_else(|| c.get(2)).map(|m| m.as_str()))
-                                });
-                                match rel_name {
-                                    Some(name) => {
-                                        *line = format!("{}@relation(\"{}\"){}", &line[..rel_idx], name, &after_rel[close_p + 1..]);
-                                    }
-                                    None => {
-                                        *line = format!("{}{}", &line[..rel_idx].trim_end(), &after_rel[close_p + 1..]);
+                        if let Some(open_p) = after_rel.find('(') {
+                            if let Some(close_p) = find_matching_paren_in_attr(after_rel, open_p) {
+                                let inner = &after_rel[open_p + 1..close_p];
+                                if inner.contains("fields:") || inner.contains("references:") {
+                                    let rel_name = extract_prisma_relation_name(line);
+                                    match rel_name {
+                                        Some(name) => {
+                                            *line = format!("{}@relation(\"{}\"){}", &line[..rel_idx], name, &after_rel[close_p + 1..]);
+                                        }
+                                        None => {
+                                            *line = format!("{}{}", &line[..rel_idx].trim_end(), &after_rel[close_p + 1..]);
+                                        }
                                     }
                                 }
                             }
@@ -1208,20 +1204,14 @@ pub fn post_process_generated_file(
                             // Standardize common role pattern to String @default("USER")
                             *line = "  role             String   @default(\"USER\")".to_string();
                         } else if let Some(def_idx) = line.find("@default") {
-                            let mut paren_count = 0;
-                            let mut end_idx = def_idx;
-                            let chars: Vec<char> = line.chars().collect();
-                            for k in def_idx..chars.len() {
-                                if chars[k] == '(' { paren_count += 1; }
-                                else if chars[k] == ')' {
-                                    paren_count -= 1;
-                                    if paren_count == 0 { end_idx = k + 1; break; }
+                            if let Some(rel_open) = line[def_idx..].find('(') {
+                                let abs_open = def_idx + rel_open;
+                                if let Some(abs_close) = find_matching_paren_in_attr(line, abs_open) {
+                                    let end_idx = abs_close + 1;
+                                    let mut new_l = line[..def_idx].to_string();
+                                    new_l.push_str(line[end_idx..].trim_start());
+                                    *line = new_l;
                                 }
-                            }
-                            if end_idx > def_idx {
-                                let mut new_l = line[..def_idx].to_string();
-                                new_l.push_str(line[end_idx..].trim_start());
-                                *line = new_l;
                             }
                         }
                     }
@@ -1241,20 +1231,11 @@ pub fn post_process_generated_file(
                     let clean_type = parts[1].replace('?', "").replace('[', "").replace(']', "");
                     if primitives.contains(&clean_type.as_str()) {
                         if let Some(rel_idx) = line.find("@relation") {
-                            let mut paren_count = 0;
-                            let mut end_idx = rel_idx;
-                            let chars: Vec<char> = line.chars().collect();
-                            for k in rel_idx..chars.len() {
-                                if chars[k] == '(' {
-                                    paren_count += 1;
-                                } else if chars[k] == ')' {
-                                    paren_count -= 1;
-                                    if paren_count == 0 {
-                                        end_idx = k + 1;
-                                        break;
-                                    }
-                                }
-                            }
+                            let end_idx = line[rel_idx..]
+                                .find('(')
+                                .and_then(|rel_open| find_matching_paren_in_attr(line, rel_idx + rel_open))
+                                .map(|abs_close| abs_close + 1)
+                                .unwrap_or(rel_idx);
                             if end_idx > rel_idx {
                                 let mut new_line = line[..rel_idx].to_string();
                                 new_line.push_str(&line[end_idx..]);
@@ -1278,7 +1259,10 @@ pub fn post_process_generated_file(
         // 5c. Disambiguate multiple relations between the same models (assign explicit @relation("...") names)
         processed = disambiguate_prisma_relations(&processed);
 
-        // 6. Ensure all @relation definitions have their opposite relation on the target model
+        // 6. Clean ghost/duplicate back-relations and attach existing single back-relations before synthesizing missing ones
+        processed = sanitize_prisma_relations(&processed);
+
+        // 6b. Ensure all @relation definitions have their opposite relation on the target model
         processed = ensure_prisma_opposite_relations(&processed);
 
         // 7. Enforce Prisma relational integrity (1-to-1 @unique, prune ghost duplicate/self relations)
@@ -1310,7 +1294,19 @@ pub fn post_process_generated_file(
         }
         let is_nextjs_app_file = normalized_path.contains("/app/") || normalized_path.contains("app/")
             || normalized_path.contains("/components/") || normalized_path.contains("components/");
-        if is_nextjs_app_file {
+        let is_client_logic_file = normalized_path.contains("/hooks/") || normalized_path.starts_with("hooks/")
+            || normalized_path.contains("/context/") || normalized_path.starts_with("context/")
+            || normalized_path.contains("/contexts/") || normalized_path.starts_with("contexts/")
+            || normalized_path.contains("/providers/") || normalized_path.starts_with("providers/");
+        let is_api_or_route = path_lower.contains("/api/")
+            || path_lower.ends_with("route.ts")
+            || path_lower.ends_with("route.js");
+
+        if (is_nextjs_app_file || is_client_logic_file) && !is_api_or_route {
+            if path_lower.contains("/hooks/") || path_lower.contains("hook") {
+                processed = sanitize_custom_hook_functions(&processed);
+            }
+
             let mut has_custom_hooks = false;
             let bytes = processed.as_bytes();
             for i in 0..bytes.len() {
@@ -1353,14 +1349,11 @@ pub fn post_process_generated_file(
                 processed = format!("\"use client\";\n\n{}", processed);
             }
 
-            if !path_lower.contains("/api/") && !path_lower.ends_with("route.ts") && !path_lower.ends_with("route.js") {
-                processed = ensure_react_and_next_hook_imports(&processed);
-                processed = hoist_use_client_directive(&processed);
-                processed = sanitize_use_effect_deps(&processed);
+            processed = ensure_react_and_next_hook_imports(&processed);
+            processed = hoist_use_client_directive(&processed);
+            processed = sanitize_use_effect_deps(&processed);
+            if is_nextjs_app_file && (path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx")) {
                 processed = ensure_undeclared_toggle_states(&processed);
-                if path_lower.contains("/hooks/") || path_lower.contains("hook") {
-                    processed = sanitize_custom_hook_functions(&processed);
-                }
             }
         }
 
@@ -2199,6 +2192,205 @@ pub fn ensure_prisma_foreign_key_scalars(schema: &str) -> String {
     result
 }
 
+/// Extracts the Prisma relation name from `@relation(...)` on a field line.
+/// Recognizes both positional (`@relation("MyRel", ...)`) and explicit (`@relation(..., name: "MyRel")`)
+/// syntax without mistaking `map: "fk_name"` or trailing comments for a relation name.
+fn find_matching_paren_in_attr(s: &str, open_byte_idx: usize) -> Option<usize> {
+    let slice = s.get(open_byte_idx..)?;
+    if !slice.starts_with('(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut escaped = false;
+    for (rel_idx, ch) in slice.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if (in_double || in_single) && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if in_double || in_single {
+            continue;
+        }
+        if ch == '(' {
+            depth += 1;
+        } else if ch == ')' {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(open_byte_idx + rel_idx);
+            }
+        }
+    }
+    None
+}
+
+fn append_prisma_attr_before_comment(line: &str, attr: &str) -> String {
+    if let Some(comment_idx) = find_unquoted_comment_start(line) {
+        let before_comment = line[..comment_idx].trim_end();
+        let comment_part = &line[comment_idx..];
+        format!("{} {} {}", before_comment, attr, comment_part)
+    } else {
+        format!("{} {}", line.trim_end(), attr)
+    }
+}
+
+fn find_unquoted_comment_start(line: &str) -> Option<usize> {
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut escaped = false;
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if (in_double || in_single) && b == b'\\' {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if b == b'"' && !in_single {
+            in_double = !in_double;
+        } else if b == b'\'' && !in_double {
+            in_single = !in_single;
+        } else if !in_double && !in_single && b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+pub fn extract_prisma_relation_name(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.starts_with("//") {
+        return None;
+    }
+    let rel_idx = trimmed.find("@relation")?;
+    let after_rel = &trimmed[rel_idx + "@relation".len()..];
+    let after_ws = after_rel.trim_start();
+    if !after_ws.starts_with('(') {
+        return None;
+    }
+
+    let close_idx = find_matching_paren_in_attr(after_ws, 0)?;
+    let inner = &after_ws[1..close_idx];
+
+    if let Ok(named_re) = regex::Regex::new(r#"(?:^|[\s,])name\s*:\s*["']([^"']+)["']"#) {
+        if let Some(cap) = named_re.captures(inner) {
+            if let Some(m) = cap.get(1) {
+                return Some(m.as_str().to_string());
+            }
+        }
+    }
+
+    if let Ok(pos_re) = regex::Regex::new(r#"^\s*["']([^"']+)["']"#) {
+        if let Some(cap) = pos_re.captures(inner) {
+            if let Some(m) = cap.get(1) {
+                return Some(m.as_str().to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Normalizes SQL-style / invalid Prisma referential action casing inside `@relation(...)`
+/// (e.g. `onDelete: SET_NULL` -> `onDelete: SetNull`, `onDelete: CASCADE` -> `onDelete: Cascade`).
+pub fn normalize_prisma_referential_actions(schema: &str) -> String {
+    let action_re = match regex::Regex::new(
+        r"(?i)\b(onDelete|onUpdate)\s*:\s*(SET[\s_]*NULL|SET[\s_]*DEFAULT|NO[\s_]*ACTION|CASCADE|RESTRICT)\b",
+    ) {
+        Ok(r) => r,
+        Err(_) => return schema.to_string(),
+    };
+
+    let mut out_lines: Vec<String> = Vec::with_capacity(schema.lines().count() + 1);
+    for line in schema.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") || !trimmed.contains("@relation") {
+            out_lines.push(line.to_string());
+            continue;
+        }
+
+        if let Some(rel_idx) = line.find("@relation") {
+            let after_rel = &line[rel_idx..];
+            if let Some(open_p) = after_rel.find('(') {
+                let close_rel = find_matching_paren_in_attr(after_rel, open_p).map(|end_idx| end_idx + 1);
+                if let Some(end_span) = close_rel {
+                    let rel_span = &after_rel[..end_span];
+                    let fixed_span = action_re
+                        .replace_all(rel_span, |caps: &regex::Captures| {
+                            let attr = if caps[1].eq_ignore_ascii_case("onDelete") {
+                                "onDelete"
+                            } else {
+                                "onUpdate"
+                            };
+                            let compact: String = caps[2]
+                                .chars()
+                                .filter(|c| c.is_ascii_alphabetic())
+                                .collect::<String>()
+                                .to_ascii_uppercase();
+                            let canonical = match compact.as_str() {
+                                "SETNULL" => "SetNull",
+                                "SETDEFAULT" => "SetDefault",
+                                "NOACTION" => "NoAction",
+                                "CASCADE" => "Cascade",
+                                "RESTRICT" => "Restrict",
+                                _ => &caps[2],
+                            };
+                            format!("{}: {}", attr, canonical)
+                        })
+                        .to_string();
+                    out_lines.push(format!("{}{}{}", &line[..rel_idx], fixed_span, &after_rel[end_span..]));
+                    continue;
+                }
+            }
+        }
+        out_lines.push(line.to_string());
+    }
+
+    let mut result = out_lines.join("\n");
+    if schema.ends_with('\n') && !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
+
+fn is_single_field_unique(line: &str, fk_name: &str) -> bool {
+    let lt = line.trim();
+    if lt.is_empty() || lt.starts_with("//") {
+        return false;
+    }
+    if lt.split_whitespace().next() == Some(fk_name) && lt.contains("@unique") {
+        return true;
+    }
+    if lt.starts_with("@@unique") {
+        if let (Some(lb), Some(rb)) = (lt.find('['), lt.find(']')) {
+            if rb > lb {
+                let inner = lt[lb + 1..rb].trim();
+                return inner == fk_name;
+            }
+        }
+    }
+    false
+}
+
 /// Automatically identifies any @relation(fields: [...], references: [...]) that lacks
 /// an opposite relation field on the referenced model and deterministically injects it.
 /// Preserves explicit relation names (e.g. name: "TeamMember").
@@ -2224,12 +2416,32 @@ pub fn ensure_prisma_opposite_relations(schema: &str) -> String {
         return schema.to_string();
     }
 
-    let mut pending_inserts: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-    for m in &model_names {
-        pending_inserts.insert(m.clone(), Vec::new());
+    let mut defining_counts: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+    for source_model in &model_names {
+        if let Some(body) = model_bodies.get(source_model) {
+            for line in body.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") || !trimmed.contains("@relation") || !trimmed.contains("fields:") || !trimmed.contains("references:") {
+                    continue;
+                }
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    let clean_target = parts[1].replace(['?', '[', ']'], "");
+                    if model_names.contains(&clean_target) && clean_target != *source_model {
+                        *defining_counts.entry((source_model.clone(), clean_target)).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
     }
 
-    let rel_name_re = regex::Regex::new(r#"@relation\([^)]*(?:name:\s*["']([^"']+)["']|["']([^"']+)["'])"#).ok();
+    let mut pending_inserts: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    // (target_model -> Vec<(field_name, rel_name)>) when upgrading an existing un-named opposite in place
+    let mut pending_name_attachments: std::collections::HashMap<String, Vec<(String, String)>> = std::collections::HashMap::new();
+    for m in &model_names {
+        pending_inserts.insert(m.clone(), Vec::new());
+        pending_name_attachments.insert(m.clone(), Vec::new());
+    }
 
     for source_model in &model_names {
         let body = match model_bodies.get(source_model) {
@@ -2239,7 +2451,7 @@ pub fn ensure_prisma_opposite_relations(schema: &str) -> String {
 
         for line in body.lines() {
             let trimmed = line.trim();
-            if !trimmed.contains("@relation") || !trimmed.contains("fields:") || !trimmed.contains("references:") {
+            if trimmed.starts_with("//") || !trimmed.contains("@relation") || !trimmed.contains("fields:") || !trimmed.contains("references:") {
                 continue;
             }
 
@@ -2253,14 +2465,7 @@ pub fn ensure_prisma_opposite_relations(schema: &str) -> String {
                 continue;
             }
 
-            // Extract relation name if present
-            let rel_name: Option<String> = if let Some(ref re) = rel_name_re {
-                re.captures(trimmed).and_then(|c| {
-                    c.get(1).or_else(|| c.get(2)).map(|m| m.as_str().to_string())
-                })
-            } else {
-                None
-            };
+            let rel_name = extract_prisma_relation_name(trimmed);
 
             let target_body = match model_bodies.get(&clean_target) {
                 Some(b) => b,
@@ -2270,33 +2475,68 @@ pub fn ensure_prisma_opposite_relations(schema: &str) -> String {
             let mut has_opposite = false;
             for t_line in target_body.lines() {
                 let t_trim = t_line.trim();
+                if t_trim.starts_with("//") {
+                    continue;
+                }
                 let t_parts: Vec<&str> = t_trim.split_whitespace().collect();
                 if t_parts.len() >= 2 {
                     let t_clean_type = t_parts[1].replace(['?', '[', ']'], "");
-                    if t_clean_type == *source_model {
-                        if let Some(ref name) = rel_name {
-                            if t_trim.contains(&format!("\"{}\"", name)) || t_trim.contains(&format!("'{}'", name)) {
+                    if t_clean_type == *source_model && !t_trim.contains("fields:") {
+                        let t_rel_name = extract_prisma_relation_name(t_trim);
+                        match (&rel_name, &t_rel_name) {
+                            (Some(name), Some(t_name)) if name == t_name => {
                                 has_opposite = true;
                                 break;
                             }
-                        } else {
-                            has_opposite = true;
-                            break;
+                            (None, None) => {
+                                has_opposite = true;
+                                break;
+                            }
+                            _ => {}
                         }
                     }
                 }
             }
 
             if !has_opposite {
+                // If source_model only defines 1 relation to clean_target with an explicit name,
+                // and clean_target already has an un-named non-defining opposite field of type source_model
+                // (e.g. `User.tasks Task[]`), attach `@relation("...")` to it instead of creating `tasksTask`.
+                let def_count = defining_counts.get(&(source_model.clone(), clean_target.clone())).copied().unwrap_or(1);
+                if def_count == 1 {
+                    if let Some(ref r_name) = rel_name {
+                        let existing_unnamed_field = target_body.lines().find_map(|l| {
+                            let lt = l.trim();
+                            if lt.starts_with("//") || lt.contains("fields:") {
+                                return None;
+                            }
+                            let l_parts: Vec<&str> = lt.split_whitespace().collect();
+                            if l_parts.len() >= 2
+                                && l_parts[1].replace(['?', '[', ']'], "") == *source_model
+                                && extract_prisma_relation_name(lt).is_none()
+                            {
+                                Some(l_parts[0].to_string())
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(existing_field_name) = existing_unnamed_field {
+                            if let Some(attaches) = pending_name_attachments.get_mut(&clean_target) {
+                                if !attaches.iter().any(|(_, rn)| rn == r_name) {
+                                    attaches.push((existing_field_name, r_name.clone()));
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+
                 // Check if foreign key is unique (1-to-1 relation)
                 let is_one_to_one = if let Some(open_f) = trimmed.find("fields: [") {
                     let fk_slice = &trimmed[open_f + 9..];
                     if let Some(close_f) = fk_slice.find(']') {
                         let fk_name = fk_slice[..close_f].trim();
-                        body.lines().any(|l| {
-                            let lt = l.trim();
-                            lt.starts_with(fk_name) && lt.contains("@unique")
-                        })
+                        body.lines().any(|l| is_single_field_unique(l, fk_name))
                     } else {
                         false
                     }
@@ -2335,7 +2575,9 @@ pub fn ensure_prisma_opposite_relations(schema: &str) -> String {
                 // Check collisions with existing fields or pending inserts
                 let existing_inserts = pending_inserts.get(&clean_target).cloned().unwrap_or_default();
                 let has_existing_field_of_type = target_body.lines().any(|l| {
-                    let parts: Vec<&str> = l.trim().split_whitespace().collect();
+                    let t = l.trim();
+                    if t.starts_with("//") { return false; }
+                    let parts: Vec<&str> = t.split_whitespace().collect();
                     parts.len() >= 2 && parts[1].replace(['?', '[', ']'], "") == *source_model
                 }) || existing_inserts.iter().any(|l| {
                     let parts: Vec<&str> = l.trim().split_whitespace().collect();
@@ -2349,19 +2591,23 @@ pub fn ensure_prisma_opposite_relations(schema: &str) -> String {
 
                 if let Some(ref r_name) = rel_name {
                     let already_has_this_named_rel = target_body.lines().any(|l| {
-                        let t = l.trim();
-                        t.contains(&format!("\"{}\"", r_name)) || t.contains(&format!("'{}'", r_name))
+                        extract_prisma_relation_name(l).as_deref() == Some(r_name.as_str())
                     }) || existing_inserts.iter().any(|l| {
-                        let t = l.trim();
-                        t.contains(&format!("\"{}\"", r_name)) || t.contains(&format!("'{}'", r_name))
+                        extract_prisma_relation_name(l).as_deref() == Some(r_name.as_str())
+                    }) || pending_name_attachments.get(&clean_target).map_or(false, |a| {
+                        a.iter().any(|(_, rn)| rn == r_name)
                     });
                     if already_has_this_named_rel {
                         continue;
                     }
                 }
 
-                let has_collision = target_body.lines().any(|l| l.trim().starts_with(&field_name))
-                    || existing_inserts.iter().any(|i| i.trim().starts_with(&field_name));
+                let has_collision = target_body.lines().any(|l| {
+                    let t = l.trim();
+                    !t.starts_with("//") && t.split_whitespace().next() == Some(field_name.as_str())
+                }) || existing_inserts.iter().any(|i| {
+                    i.trim().split_whitespace().next() == Some(field_name.as_str())
+                });
                 if has_collision {
                     if rel_name.is_some() {
                         field_name = format!("{}{}", field_name, source_model);
@@ -2385,19 +2631,36 @@ pub fn ensure_prisma_opposite_relations(schema: &str) -> String {
     }
 
     let mut result = schema.to_string();
-    for (target_model, inserts) in pending_inserts {
-        if inserts.is_empty() {
+    for target_model in &model_names {
+        let inserts = pending_inserts.get(target_model).cloned().unwrap_or_default();
+        let attaches = pending_name_attachments.get(target_model).cloned().unwrap_or_default();
+        if inserts.is_empty() && attaches.is_empty() {
             continue;
         }
 
-        let pattern = format!(r"(?ms)(model\s+{}\s*\{{)([\s\S]*?)(\n*\}})", target_model);
+        let pattern = format!(r"(?ms)(^model\s+{}\s*\{{)([\s\S]*?)(\n*\}})", target_model);
         if let Ok(block_re) = regex::Regex::new(&pattern) {
-            let insert_str = inserts.join("\n");
             result = block_re.replace(&result, |caps: &regex::Captures| {
                 let p1 = &caps[1];
                 let p2 = &caps[2];
                 let p3 = &caps[3];
-                format!("{}{}\n{}\n{}", p1, p2.trim_end(), insert_str, p3.trim_start())
+                let mut body_lines: Vec<String> = p2.lines().map(|l| l.to_string()).collect();
+                for (fname, rname) in &attaches {
+                    for l in body_lines.iter_mut() {
+                        let t = l.trim();
+                        if !t.starts_with("//") && t.split_whitespace().next() == Some(fname.as_str()) && extract_prisma_relation_name(t).is_none() {
+                            *l = append_prisma_attr_before_comment(l, &format!("@relation(\"{}\")", rname));
+                            break;
+                        }
+                    }
+                }
+                let updated_body = body_lines.join("\n");
+                if inserts.is_empty() {
+                    format!("{}{}\n{}", p1, updated_body.trim_end(), p3.trim_start())
+                } else {
+                    let insert_str = inserts.join("\n");
+                    format!("{}{}\n{}\n{}", p1, updated_body.trim_end(), insert_str, p3.trim_start())
+                }
             }).to_string();
         }
     }
@@ -2442,11 +2705,6 @@ pub fn disambiguate_prisma_relations(schema: &str) -> String {
         return schema.to_string();
     }
 
-    let rel_name_re = match regex::Regex::new(r#"@relation\([^)]*(?:name:\s*["']([^"']+)["']|["']([^"']+)["'])"#) {
-        Ok(r) => r,
-        Err(_) => return schema.to_string(),
-    };
-
     struct DefiningRel {
         source_model: String,
         target_model: String,
@@ -2462,7 +2720,7 @@ pub fn disambiguate_prisma_relations(schema: &str) -> String {
         if let Some(lines) = model_bodies.get(source_model) {
             for (line_idx, line) in lines.iter().enumerate() {
                 let trimmed = line.trim();
-                if !trimmed.contains("@relation") || !trimmed.contains("fields:") || !trimmed.contains("references:") {
+                if trimmed.starts_with("//") || !trimmed.contains("@relation") || !trimmed.contains("fields:") || !trimmed.contains("references:") {
                     continue;
                 }
 
@@ -2477,19 +2735,13 @@ pub fn disambiguate_prisma_relations(schema: &str) -> String {
                     continue;
                 }
 
-                let rel_name = rel_name_re.captures(trimmed).and_then(|c| {
-                    c.get(1).or_else(|| c.get(2)).map(|m| m.as_str().to_string())
-                });
+                let rel_name = extract_prisma_relation_name(trimmed);
 
                 let is_one_to_one = if let Some(open_f) = trimmed.find("fields: [") {
                     let fk_slice = &trimmed[open_f + 9..];
                     if let Some(close_f) = fk_slice.find(']') {
                         let fk_name = fk_slice[..close_f].trim();
-                        lines.iter().any(|l| {
-                            let lt = l.trim();
-                            (lt.starts_with(fk_name) && lt.contains("@unique"))
-                                || (lt.starts_with("@@unique") && lt.contains(fk_name))
-                        })
+                        lines.iter().any(|l| is_single_field_unique(l, fk_name))
                     } else {
                         false
                     }
@@ -2553,7 +2805,15 @@ pub fn disambiguate_prisma_relations(schema: &str) -> String {
             if let Some(src_lines) = model_bodies.get_mut(&r.source_model) {
                 let original_line = &src_lines[r.line_idx];
                 let updated_line = if let Some(ref existing) = r.rel_name {
-                    original_line.replace(&format!("\"{}\"", existing), &format!("\"{}\"", rel_name))
+                    let dq = format!("\"{}\"", existing);
+                    let sq = format!("'{}'", existing);
+                    if original_line.contains(&dq) {
+                        original_line.replace(&dq, &format!("\"{}\"", rel_name))
+                    } else if original_line.contains(&sq) {
+                        original_line.replace(&sq, &format!("\"{}\"", rel_name))
+                    } else {
+                        original_line.clone()
+                    }
                 } else if original_line.contains("@relation(") {
                     original_line.replace("@relation(", &format!("@relation(\"{}\", ", rel_name))
                 } else {
@@ -2567,12 +2827,14 @@ pub fn disambiguate_prisma_relations(schema: &str) -> String {
                 if !is_self_relation {
                     target_lines.retain(|l| {
                         let trimmed = l.trim();
+                        if trimmed.starts_with("//") {
+                            return true;
+                        }
                         let parts: Vec<&str> = trimmed.split_whitespace().collect();
                         if parts.len() >= 2 {
                             let field_type = parts[1].replace(['?', '[', ']'], "");
                             if field_type == r.source_model && !trimmed.contains("fields:") {
-                                let r_name = rel_name_re.captures(trimmed).and_then(|c| c.get(1).or_else(|| c.get(2)).map(|m| m.as_str().to_string()));
-                                if r_name.is_none() {
+                                if extract_prisma_relation_name(trimmed).is_none() {
                                     return false;
                                 }
                             }
@@ -2594,10 +2856,13 @@ pub fn disambiguate_prisma_relations(schema: &str) -> String {
 
                 let already_has_named_opposite = target_lines.iter().any(|l| {
                     let trimmed = l.trim();
+                    if trimmed.starts_with("//") {
+                        return false;
+                    }
                     let parts: Vec<&str> = trimmed.split_whitespace().collect();
                     if parts.len() >= 2 {
                         let field_type = parts[1].replace(['?', '[', ']'], "");
-                        field_type == r.source_model && (trimmed.contains(&format!("\"{}\"", rel_name)) || trimmed.contains(&format!("'{}'", rel_name)))
+                        field_type == r.source_model && extract_prisma_relation_name(trimmed).as_deref() == Some(rel_name.as_str())
                     } else {
                         false
                     }
@@ -2608,11 +2873,14 @@ pub fn disambiguate_prisma_relations(schema: &str) -> String {
                     let mut updated_existing_back = false;
                     for t_line in target_lines.iter_mut() {
                         let trimmed = t_line.trim();
+                        if trimmed.starts_with("//") {
+                            continue;
+                        }
                         let parts: Vec<&str> = trimmed.split_whitespace().collect();
                         if parts.len() >= 2 {
                             let field_type = parts[1].replace(['?', '[', ']'], "");
                             if field_type == r.source_model && !trimmed.contains("fields:") && !trimmed.contains("@relation") {
-                                *t_line = format!("{} @relation(\"{}\")", t_line.trim_end(), rel_name);
+                                *t_line = append_prisma_attr_before_comment(t_line, &format!("@relation(\"{}\")", rel_name));
                                 updated_existing_back = true;
                                 break;
                             }
@@ -2660,9 +2928,9 @@ pub fn disambiguate_prisma_relations(schema: &str) -> String {
 }
 
 /// Enforces Prisma relational integrity:
-/// 1. Prunes ghost self-relations (e.g. `model Subscription { userSubscriptions Subscription[] @relation("UserSubscriptionsSecondary") }`).
-/// 2. Prunes orphaned duplicate back-relations (e.g. `userSubscriptions Subscription[] @relation("UserSubscriptionsSecondary")` when Subscription only defines `user User @relation("UserSubscriptions")`).
-/// 3. Synchronizes unmatched back-relation field relation names if only 1 defining relation exists.
+/// 1. Prunes ghost self-relations while preserving valid paired self-relations (e.g. `Category.parent` <-> `Category.children`).
+/// 2. Prunes orphaned or duplicate back-relations (e.g. `tasks` + `tasksTask` sharing `@relation("AssignedTo")`, or `UserSubscriptionsSecondary`).
+/// 3. Synchronizes unmatched un-named back-relation field relation names if only 1 unclaimed defining relation exists.
 /// 4. Enforces 1-to-1 foreign key `@unique` attribute on defining side (e.g. `projectId String @unique` for `Analytics.project`).
 pub fn sanitize_prisma_relations(schema: &str) -> String {
     let model_re = match regex::Regex::new(r"(?ms)^model\s+(\w+)\s*\{([^}]+)\}") {
@@ -2686,38 +2954,53 @@ pub fn sanitize_prisma_relations(schema: &str) -> String {
         return schema.to_string();
     }
 
-    let rel_name_re = match regex::Regex::new(r#"@relation\([^)]*(?:name:\s*["']([^"']+)["']|["']([^"']+)["'])"#) {
-        Ok(r) => r,
-        Err(_) => return schema.to_string(),
-    };
     let fields_re = match regex::Regex::new(r"fields:\s*\[([^\]]+)\]") {
         Ok(r) => r,
         Err(_) => return schema.to_string(),
     };
 
-    // 1. Prune ghost self-relations
+    // 1. Prune ghost / duplicate self-relations (preserving valid paired self-relations like parent <-> children)
     for m in &model_names {
         if let Some(lines) = model_bodies.get_mut(m) {
+            let mut defining_self_rel_names: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut self_rel_indices: Vec<(usize, Option<String>)> = Vec::new();
             for (idx, line) in lines.iter().enumerate() {
                 let trimmed = line.trim();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
                 let parts: Vec<&str> = trimmed.split_whitespace().collect();
                 if parts.len() >= 2 {
                     let field_type = parts[1].replace(['?', '[', ']'], "");
-                    if field_type == *m && trimmed.contains("@relation") && !trimmed.contains("fields:") {
-                        let rel_name = rel_name_re.captures(trimmed).and_then(|c| c.get(1).or_else(|| c.get(2)).map(|m| m.as_str().to_string()));
-                        self_rel_indices.push((idx, rel_name));
+                    if field_type == *m && trimmed.contains("@relation") {
+                        let rel_name = extract_prisma_relation_name(trimmed);
+                        if trimmed.contains("fields:") {
+                            if let Some(rname) = rel_name {
+                                defining_self_rel_names.insert(rname);
+                            }
+                        } else {
+                            self_rel_indices.push((idx, rel_name));
+                        }
                     }
                 }
             }
 
             let mut to_remove = std::collections::HashSet::new();
+            let mut seen_defining_self_opposites: std::collections::HashSet<String> = std::collections::HashSet::new();
             for (idx, rel_name) in &self_rel_indices {
                 if let Some(rname) = rel_name {
-                    let references_other_model = model_names.iter().any(|other| other != m && rname.contains(other.as_str()));
-                    let matches_count = self_rel_indices.iter().filter(|(_, r)| r.as_deref() == Some(rname.as_str())).count();
-                    if references_other_model || matches_count == 1 {
-                        to_remove.insert(*idx);
+                    if defining_self_rel_names.contains(rname) {
+                        // Valid self-relation opposite paired with a defining `fields:` relation on the same model.
+                        // Keep the first copy; prune any extra duplicate opposite copies.
+                        if !seen_defining_self_opposites.insert(rname.clone()) {
+                            to_remove.insert(*idx);
+                        }
+                    } else {
+                        let references_other_model = model_names.iter().any(|other| other != m && rname.contains(other.as_str()));
+                        let matches_count = self_rel_indices.iter().filter(|(_, r)| r.as_deref() == Some(rname.as_str())).count();
+                        if references_other_model || matches_count == 1 {
+                            to_remove.insert(*idx);
+                        }
                     }
                 }
             }
@@ -2734,23 +3017,32 @@ pub fn sanitize_prisma_relations(schema: &str) -> String {
         }
     }
 
-    // 2. Prune ghost duplicate relations & sync relation names
+    // 2. Prune ghost / duplicate back-relations & sync relation names
     for m1 in &model_names {
         let mut target_defining_map: std::collections::HashMap<String, Vec<(Option<String>, Vec<String>)>> = std::collections::HashMap::new();
+        let mut target_non_defining_map: std::collections::HashMap<String, Vec<Option<String>>> = std::collections::HashMap::new();
+
         for m2 in &model_names {
             if m2 == m1 { continue; }
             if let Some(m2_lines) = model_bodies.get(m2) {
                 for line in m2_lines {
                     let trimmed = line.trim();
+                    if trimmed.starts_with("//") {
+                        continue;
+                    }
                     let parts: Vec<&str> = trimmed.split_whitespace().collect();
                     if parts.len() >= 2 {
                         let t_type = parts[1].replace(['?', '[', ']'], "");
-                        if t_type == *m1 && trimmed.contains("fields:") {
-                            let r_name = rel_name_re.captures(trimmed).and_then(|c| c.get(1).or_else(|| c.get(2)).map(|m| m.as_str().to_string()));
-                            let fks: Vec<String> = fields_re.captures(trimmed)
-                                .map(|c| c[1].split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
-                                .unwrap_or_default();
-                            target_defining_map.entry(m2.clone()).or_default().push((r_name, fks));
+                        if t_type == *m1 {
+                            let r_name = extract_prisma_relation_name(trimmed);
+                            if trimmed.contains("fields:") {
+                                let fks: Vec<String> = fields_re.captures(trimmed)
+                                    .map(|c| c[1].split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+                                    .unwrap_or_default();
+                                target_defining_map.entry(m2.clone()).or_default().push((r_name, fks));
+                            } else {
+                                target_non_defining_map.entry(m2.clone()).or_default().push(r_name);
+                            }
                         }
                     }
                 }
@@ -2758,42 +3050,118 @@ pub fn sanitize_prisma_relations(schema: &str) -> String {
         }
 
         if let Some(lines) = model_bodies.get_mut(m1) {
-            let mut to_remove = std::collections::HashSet::new();
-            let mut line_updates: Vec<(usize, String)> = Vec::new();
-            let mut matched_defining_rels: std::collections::HashSet<(String, Option<String>)> = std::collections::HashSet::new();
+            struct BackCand {
+                idx: usize,
+                field_name: String,
+                t_type: String,
+                r_name: Option<String>,
+            }
 
+            let mut candidates: Vec<BackCand> = Vec::new();
             for (idx, line) in lines.iter().enumerate() {
                 let trimmed = line.trim();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
                 let parts: Vec<&str> = trimmed.split_whitespace().collect();
                 if parts.len() >= 2 {
                     let t_type = parts[1].replace(['?', '[', ']'], "");
-                    if model_names.contains(&t_type) && t_type != *m1 {
-                        let r_name = rel_name_re.captures(trimmed).and_then(|c| c.get(1).or_else(|| c.get(2)).map(|m| m.as_str().to_string()));
-                        let is_defining = trimmed.contains("fields:") && trimmed.contains("references:");
+                    let is_defining = trimmed.contains("fields:") && trimmed.contains("references:");
+                    if model_names.contains(&t_type) && t_type != *m1 && !is_defining {
+                        candidates.push(BackCand {
+                            idx,
+                            field_name: parts[0].to_string(),
+                            t_type,
+                            r_name: extract_prisma_relation_name(trimmed),
+                        });
+                    }
+                }
+            }
 
-                        if !is_defining {
-                            if let Some(defining_list) = target_defining_map.get(&t_type) {
-                                let matched = defining_list.iter().find(|(dr_name, _)| {
-                                    match (dr_name, &r_name) {
-                                        (Some(d), Some(r)) => d == r,
-                                        (None, None) => true,
-                                        _ => false,
-                                    }
-                                });
+            // Order exact-name candidates so natural names (e.g. `tasks`) claim before synthetic
+            // collision suffixes (e.g. `tasksTask`) even if they appear later in the model block.
+            let is_synthetic_dup = |c: &BackCand| -> bool {
+                candidates.iter().any(|other| {
+                    other.idx != c.idx
+                        && other.t_type == c.t_type
+                        && other.r_name == c.r_name
+                        && c.field_name == format!("{}{}", other.field_name, c.t_type)
+                })
+            };
 
-                                if let Some((matched_name, _)) = matched {
-                                    matched_defining_rels.insert((t_type.clone(), matched_name.clone()));
-                                } else {
-                                    if defining_list.len() == 1 && r_name.is_none() {
-                                        if let Some(ref d_name) = defining_list[0].0 {
-                                            line_updates.push((idx, format!("{} @relation(\"{}\")", line.trim_end(), d_name)));
-                                            matched_defining_rels.insert((t_type.clone(), Some(d_name.clone())));
-                                        }
-                                    } else {
-                                        to_remove.insert(idx);
-                                    }
-                                }
-                            }
+            let mut named_order: Vec<usize> = (0..candidates.len())
+                .filter(|&i| candidates[i].r_name.is_some())
+                .collect();
+            named_order.sort_by_key(|&i| (is_synthetic_dup(&candidates[i]), candidates[i].idx));
+
+            let mut to_remove = std::collections::HashSet::new();
+            let mut line_updates: Vec<(usize, String)> = Vec::new();
+            let mut claimed_defining: std::collections::HashMap<String, std::collections::HashSet<usize>> = std::collections::HashMap::new();
+            let mut claimed_m2m_named: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+            let mut claimed_m2m_unnamed_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+            // Pass 2A: Exact named matches and explicit named M2M
+            for ci in named_order {
+                let c = &candidates[ci];
+                let r_str = match c.r_name.as_deref() {
+                    Some(s) => s,
+                    None => continue,
+                };
+
+                if let Some(defining_list) = target_defining_map.get(&c.t_type) {
+                    let claimed = claimed_defining.entry(c.t_type.clone()).or_default();
+                    if let Some((d_idx, _)) = defining_list.iter().enumerate().find(|(di, (dr, _))| {
+                        !claimed.contains(di) && dr.as_deref() == Some(r_str)
+                    }) {
+                        claimed.insert(d_idx);
+                    } else if defining_list.iter().any(|(dr, _)| dr.as_deref() == Some(r_str)) {
+                        // Duplicate opposite field pointing to an already-claimed defining relation (e.g. `tasks` + `tasksTask`)
+                        to_remove.insert(c.idx);
+                    } else {
+                        // Not pointing to any defining rel — preserve only if target has symmetric named M2M (and not duplicated)
+                        let has_sym_m2m = target_non_defining_map
+                            .get(&c.t_type)
+                            .map_or(false, |list| list.iter().any(|rn| rn.as_deref() == Some(r_str)));
+                        if has_sym_m2m && claimed_m2m_named.insert((c.t_type.clone(), r_str.to_string())) {
+                            // Keep symmetric named M2M
+                        } else {
+                            to_remove.insert(c.idx);
+                        }
+                    }
+                } else {
+                    // Explicit named M2M where neither model defines `fields:` — still deduplicate exact duplicates on m1
+                    if !claimed_m2m_named.insert((c.t_type.clone(), r_str.to_string())) {
+                        to_remove.insert(c.idx);
+                    }
+                }
+            }
+
+            // Pass 2B: Un-named opposite fields
+            for c in candidates.iter().filter(|c| c.r_name.is_none()) {
+                if let Some(defining_list) = target_defining_map.get(&c.t_type) {
+                    let claimed = claimed_defining.entry(c.t_type.clone()).or_default();
+                    if let Some((d_idx, _)) = defining_list.iter().enumerate().find(|(di, (dr, _))| {
+                        !claimed.contains(di) && dr.is_none()
+                    }) {
+                        claimed.insert(d_idx);
+                    } else if defining_list.len() == 1 && !claimed.contains(&0) {
+                        if let Some(ref d_name) = defining_list[0].0 {
+                            claimed.insert(0);
+                            line_updates.push((
+                                c.idx,
+                                append_prisma_attr_before_comment(&lines[c.idx], &format!("@relation(\"{}\")", d_name)),
+                            ));
+                        }
+                    } else {
+                        // Allow coexisting implicit un-named M2M only if target also has un-named non-defining field(s) pointing back to m1
+                        let target_unnamed_total = target_non_defining_map
+                            .get(&c.t_type)
+                            .map_or(0, |list| list.iter().filter(|rn| rn.is_none()).count());
+                        let used = claimed_m2m_unnamed_counts.entry(c.t_type.clone()).or_insert(0);
+                        if *used < target_unnamed_total {
+                            *used += 1;
+                        } else {
+                            to_remove.insert(c.idx);
                         }
                     }
                 }
@@ -2820,6 +3188,9 @@ pub fn sanitize_prisma_relations(schema: &str) -> String {
         let m1_lines = model_bodies.get(m1).cloned().unwrap_or_default();
         for line in &m1_lines {
             let trimmed = line.trim();
+            if trimmed.starts_with("//") {
+                continue;
+            }
             let parts: Vec<&str> = trimmed.split_whitespace().collect();
             if parts.len() >= 2 {
                 let raw_type = parts[1];
@@ -2827,17 +3198,20 @@ pub fn sanitize_prisma_relations(schema: &str) -> String {
                 let target_model = raw_type.replace(['?', '[', ']'], "");
 
                 if is_singular && model_names.contains(&target_model) && target_model != *m1 && !trimmed.contains("fields:") {
-                    let r_name = rel_name_re.captures(trimmed).and_then(|c| c.get(1).or_else(|| c.get(2)).map(|m| m.as_str().to_string()));
+                    let r_name = extract_prisma_relation_name(trimmed);
 
                     if let Some(b_lines) = model_bodies.get_mut(&target_model) {
                         let mut fk_to_mark_unique: Option<String> = None;
                         for b_line in b_lines.iter() {
                             let bt = b_line.trim();
+                            if bt.starts_with("//") {
+                                continue;
+                            }
                             let bparts: Vec<&str> = bt.split_whitespace().collect();
                             if bparts.len() >= 2 {
                                 let bt_type = bparts[1].replace(['?', '[', ']'], "");
                                 if bt_type == *m1 && bt.contains("fields:") {
-                                    let b_rname = rel_name_re.captures(bt).and_then(|c| c.get(1).or_else(|| c.get(2)).map(|m| m.as_str().to_string()));
+                                    let b_rname = extract_prisma_relation_name(bt);
                                     let matches = match (&r_name, &b_rname) {
                                         (Some(r1), Some(r2)) => r1 == r2,
                                         (None, None) => true,
@@ -2857,19 +3231,15 @@ pub fn sanitize_prisma_relations(schema: &str) -> String {
                         }
 
                         if let Some(fk) = fk_to_mark_unique {
-                            let already_unique = b_lines.iter().any(|l| {
-                                let lt = l.trim();
-                                (lt.starts_with(&fk) && lt.contains("@unique"))
-                                    || (lt.starts_with("@@unique") && lt.contains(&fk))
-                            });
+                            let already_unique = b_lines.iter().any(|l| is_single_field_unique(l, &fk));
 
                             if !already_unique {
                                 for b_line in b_lines.iter_mut() {
                                     let lt = b_line.trim();
-                                    if lt.starts_with(&fk) {
+                                    if !lt.starts_with("//") {
                                         let l_parts: Vec<&str> = lt.split_whitespace().collect();
-                                        if !l_parts.is_empty() && l_parts[0] == fk {
-                                            b_line.push_str(" @unique");
+                                        if l_parts.first() == Some(&fk.as_str()) {
+                                            *b_line = append_prisma_attr_before_comment(b_line, "@unique");
                                             break;
                                         }
                                     }
@@ -3533,7 +3903,7 @@ pub fn sanitize_custom_hook_functions(content: &str) -> String {
         }
     }
 
-    if needs_use_callback_import && !modified.contains("useCallback") {
+    if needs_use_callback_import {
         modified = ensure_react_and_next_hook_imports(&modified);
     }
 

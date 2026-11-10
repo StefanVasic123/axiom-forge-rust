@@ -668,84 +668,19 @@ pub async fn generate_and_save_healing_rule(
     repaired_content: &str,
     model: &str,
 ) {
-    debug_log_to_file(format!("[Self-Healing] Analyzing changes in {} to extract global healing rules...", file_path));
-
-    let client = reqwest::Client::new();
-    let system_prompt = "You are a Senior Project Architect. Analyze the original file content (with compilation errors) and the corrected content. Identify ONLY atomic, reusable import, export, or TypeScript type changes that were made to fix the compilation error. DO NOT generate rules for UI components, JSX blocks, HTML tags, or component return statements. Each rule must be a precise single-line or small multi-line import/export/type fix. Respond ONLY with a valid JSON array of objects, each with 'search' and 'replace'. Do not include any explanations, introduction, or markdown block formatting. Respond only with clean JSON.";
-    
-    let user_prompt = format!(
-        "Original Content (with errors):\n{}\n\nRepaired Content (fixed):\n{}",
-        original_content,
-        repaired_content
-    );
-
-    let ollama_req = serde_json::json!({
-        "model": model,
-        "messages": [
-            { "role": "system", "content": system_prompt },
-            { "role": "user", "content": user_prompt }
-        ],
-        "stream": false,
-        "options": build_ollama_options(model, 0.1, Some(1024))
-    });
-
-    if let Ok(resp) = client.post("http://127.0.0.1:11434/api/chat")
-        .json(&ollama_req)
-        .send()
-        .await 
-    {
-        if resp.status().is_success() {
-            if let Ok(resp_json) = resp.json::<serde_json::Value>().await {
-                if let Some(ai_msg) = resp_json.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
-                    let clean_content = extract_code_content(ai_msg);
-                    if let Ok(new_rules_val) = serde_json::from_str::<serde_json::Value>(&clean_content) {
-                        if let Some(new_rules_arr) = new_rules_val.as_array() {
-                            let rules_path = get_base_dir().join("axiom-healing-rules.json");
-                            let mut existing_rules = if rules_path.exists() {
-                                let content = std::fs::read_to_string(&rules_path).unwrap_or_else(|_| "[]".to_string());
-                                serde_json::from_str::<serde_json::Value>(&content).unwrap_or_else(|_| serde_json::json!([]))
-                            } else {
-                                serde_json::json!([])
-                            };
-
-                            let mut changed = false;
-                            if let Some(existing_arr) = existing_rules.as_array_mut() {
-                                for new_rule in new_rules_arr {
-                                    if let (Some(search_str), Some(replace_str)) = (new_rule.get("search").and_then(|s| s.as_str()), new_rule.get("replace").and_then(|r| r.as_str())) {
-                                        // Strictly reject any UI/JSX blocks or oversized multi-line replacements
-                                        let contains_jsx = search_str.contains('<') || search_str.contains("</") || search_str.contains("return (")
-                                            || replace_str.contains('<') || replace_str.contains("</") || replace_str.contains("return (");
-                                        let s_lines = search_str.lines().count();
-                                        let r_lines = replace_str.lines().count();
-                                        let is_too_large = s_lines > 4 || r_lines > 4 || search_str.len() > 300 || replace_str.len() > 300;
-
-                                        // Only learn atomic, safe import/export/type rules
-                                        if !contains_jsx && !is_too_large && search_str.trim().len() >= 6 && search_str != replace_str {
-                                            let exists = existing_arr.iter().any(|r| r.get("search").and_then(|s| s.as_str()) == Some(search_str));
-                                            if !exists {
-                                                existing_arr.push(serde_json::json!({
-                                                    "search": search_str,
-                                                    "replace": replace_str,
-                                                    "createdAt": chrono::Utc::now().to_rfc3339()
-                                                }));
-                                                changed = true;
-                                                debug_log_to_file(format!("[Self-Healing] Learned new atomic global rule: Replace \"{}\" with \"{}\"", search_str.trim(), replace_str.trim()));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            if changed {
-                                if let Ok(pretty) = serde_json::to_string_pretty(&existing_rules) {
-                                    let _ = std::fs::write(&rules_path, pretty);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    // Route rule extraction deterministically through the Local Error Katastar as pending
+    // (never blindly persist unverified AI patches directly to global sanitizer rules).
+    if let Some(patch) = crate::katastar::extract_safe_atomic_patch(file_path, original_content, repaired_content) {
+        let _ = crate::katastar::register_repair_attempt(
+            "compile",
+            "Legacy healing rule extraction",
+            file_path,
+            "ai",
+            "search_replace",
+            Some(patch),
+            "Atomic code fix extracted for Katastar verification",
+            model,
+        );
     }
 }
 
@@ -762,25 +697,71 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
     let enriched_path = ensure_node_toolchain_ready(None, "self-heal").await;
     let local_next_js = proj_dir.join("node_modules").join("next").join("dist").join("bin").join("next");
     let has_local_next = local_next_js.exists();
+    let local_tsc_js = proj_dir.join("node_modules").join("typescript").join("bin").join("tsc");
 
-    // Run build and self-heal up to 3 times
-    for attempt in 1..=3 {
-        debug_log_to_file(format!("[Self-Healing] Build check attempt {}/3...", attempt));
+    if !has_local_next && !local_tsc_js.exists() {
+        debug_log_to_file("[Self-Healing] Skipping Next.js build loop: local 'next' / 'typescript' binaries are missing in node_modules (npm install did not complete).".to_string());
+        return;
+    }
+
+    // Collect all known project paths (manifest files_list + files generated later by Import Fixer + config files)
+    let mut candidate_paths: Vec<String> = files_list
+        .iter()
+        .filter_map(|f| f.get("path").and_then(|p| p.as_str()).map(|s| s.replace('\\', "/")))
+        .collect();
+    for cfg in ["next.config.js", "next.config.mjs", "tailwind.config.js", "tailwind.config.ts", "tsconfig.json"] {
+        if proj_dir.join(cfg).exists() && !candidate_paths.iter().any(|p| p == cfg) {
+            candidate_paths.push(cfg.to_string());
+        }
+    }
+    fn collect_src_candidates(dir: &std::path::Path, proj_dir: &std::path::Path, out: &mut Vec<String>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    let n = p.file_name().and_then(|x| x.to_str()).unwrap_or("");
+                    if n != "node_modules" && n != ".next" && n != ".git" {
+                        collect_src_candidates(&p, proj_dir, out);
+                    }
+                } else if p.is_file() {
+                    if let Ok(rel) = p.strip_prefix(proj_dir) {
+                        let rel_str = rel.to_string_lossy().replace('\\', "/");
+                        if !out.contains(&rel_str) {
+                            out.push(rel_str);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if proj_dir.join("src").exists() {
+        collect_src_candidates(&proj_dir.join("src"), proj_dir, &mut candidate_paths);
+    }
+
+    struct PendingBuildFix {
+        path: String,
+        before: String,
+        after: String,
+        entry_id: String,
+        source: String,
+    }
+
+    let verification_kind = if has_local_next { "next_build" } else { "tsc_noemit" };
+    let mut pending_fixes: Vec<PendingBuildFix> = Vec::new();
+    let mut tried_katastar_ids: Vec<String> = Vec::new();
+
+    // Run up to MAX_BUILD_REPAIRS repairs, plus 1 final check iteration to verify the last repair
+    const MAX_BUILD_REPAIRS: usize = 3;
+    for attempt in 1..=(MAX_BUILD_REPAIRS + 1) {
+        debug_log_to_file(format!("[Self-Healing] Build check attempt {}/{}...", attempt, MAX_BUILD_REPAIRS + 1));
         
         let mut cmd = if has_local_next {
             let mut c = std::process::Command::new("node");
             c.arg(&local_next_js).arg("build").current_dir(proj_dir);
             c
         } else {
-            #[cfg(target_os = "windows")]
-            let mut c = std::process::Command::new("cmd");
-            #[cfg(target_os = "windows")]
-            c.arg("/C").arg("npx").arg("--no-install").arg("next").arg("build").current_dir(proj_dir);
-            
-            #[cfg(not(target_os = "windows"))]
-            let mut c = std::process::Command::new("npx");
-            #[cfg(not(target_os = "windows"))]
-            c.arg("--no-install").arg("next").arg("build").current_dir(proj_dir);
+            let mut c = std::process::Command::new("node");
+            c.arg(&local_tsc_js).arg("--noEmit").current_dir(proj_dir);
             c
         };
         
@@ -802,6 +783,23 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
 
         if output.status.success() {
             debug_log_to_file("[Self-Healing] Build completed successfully! No errors.".to_string());
+            for pf in pending_fixes.drain(..) {
+                let atomic_patch = if pf.source == "ai" {
+                    crate::katastar::extract_safe_atomic_patch(&pf.path, &pf.before, &pf.after)
+                } else {
+                    None
+                };
+                crate::katastar::finalize_katastar_outcome(
+                    &pf.entry_id,
+                    true,
+                    &pf.source,
+                    verification_kind,
+                    atomic_patch,
+                    None,
+                    model,
+                );
+                debug_log_to_file(format!("[Katastar] Verified passing build fix for '{}' (entry {}).", pf.path, pf.entry_id));
+            }
             break;
         }
 
@@ -810,21 +808,85 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
         let build_output = format!("{}\n{}", stdout_str, stderr_str);
         
         debug_log_to_file(format!("[Self-Healing] Build failed. Log size: {} characters.", build_output.len()));
+
+        let build_lower = build_output.to_lowercase().replace('\\', "/");
+
+        // Post-test verification for fixes applied in the previous iteration
+        if !pending_fixes.is_empty() {
+            let blocked_on_next_config = build_lower.contains("next.config");
+            for pf in pending_fixes.drain(..) {
+                let pf_lower = pf.path.to_lowercase().replace('\\', "/");
+                let still_failing = build_lower.contains(&pf_lower);
+                if still_failing {
+                    crate::katastar::finalize_katastar_outcome(
+                        &pf.entry_id,
+                        false,
+                        &pf.source,
+                        verification_kind,
+                        None,
+                        None,
+                        model,
+                    );
+                    debug_log_to_file(format!("[Katastar] Build fix FAILED for '{}' (entry {}).", pf.path, pf.entry_id));
+                    if pf.source == "katastar" {
+                        let _ = std::fs::write(proj_dir.join(&pf.path), &pf.before);
+                        tried_katastar_ids.push(pf.entry_id);
+                        debug_log_to_file(format!("[Katastar] Rolled back ineffective Katastar patch on '{}' before AI retry.", pf.path));
+                    }
+                } else if !blocked_on_next_config || pf_lower.contains("next.config") {
+                    let atomic_patch = if pf.source == "ai" {
+                        crate::katastar::extract_safe_atomic_patch(&pf.path, &pf.before, &pf.after)
+                    } else {
+                        None
+                    };
+                    crate::katastar::finalize_katastar_outcome(
+                        &pf.entry_id,
+                        true,
+                        &pf.source,
+                        "error_disappeared",
+                        atomic_patch,
+                        None,
+                        model,
+                    );
+                    debug_log_to_file(format!("[Katastar] Error disappeared in '{}' -> recorded passed fix (entry {}).", pf.path, pf.entry_id));
+                }
+            }
+        }
+
+        if attempt > MAX_BUILD_REPAIRS {
+            break;
+        }
         
         // Find which files in the project appear in the build error log
         let mut files_with_errors = Vec::new();
-        for file_spec in files_list {
-            if let Some(path_str) = file_spec.get("path").and_then(|p| p.as_str()) {
-                let path_lower = path_str.to_lowercase().replace('\\', "/");
-                let build_lower = build_output.to_lowercase().replace('\\', "/");
-                if build_lower.contains(&path_lower) {
-                    let file_path = proj_dir.join(path_str);
-                    if file_path.exists() {
-                        if let Ok(content) = std::fs::read_to_string(&file_path) {
-                            files_with_errors.push(serde_json::json!({
-                                "path": path_str,
-                                "content": content
-                            }));
+        let mut matched_paths = std::collections::HashSet::new();
+        for path_str in &candidate_paths {
+            let path_lower = path_str.to_lowercase().replace('\\', "/");
+            if build_lower.contains(&path_lower) && matched_paths.insert(path_str.clone()) {
+                let file_path = proj_dir.join(path_str);
+                if file_path.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&file_path) {
+                        files_with_errors.push(serde_json::json!({
+                            "path": path_str,
+                            "content": content
+                        }));
+                    }
+                }
+            }
+        }
+        for line in build_output.lines() {
+            if let Some(extracted) = extract_file_path_from_line(line) {
+                let norm = extracted.replace('\\', "/");
+                if let Some(resolved) = resolve_project_file_candidate(proj_dir, &norm) {
+                    if matched_paths.insert(resolved.clone()) {
+                        let file_path = proj_dir.join(&resolved);
+                        if file_path.exists() {
+                            if let Ok(content) = std::fs::read_to_string(&file_path) {
+                                files_with_errors.push(serde_json::json!({
+                                    "path": resolved,
+                                    "content": content
+                                }));
+                            }
                         }
                     }
                 }
@@ -834,6 +896,48 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
         if files_with_errors.is_empty() {
             debug_log_to_file("[Self-Healing] Could not map build errors to any project files. Aborting loop.".to_string());
             break;
+        }
+
+        // Phase A (Before calling AI): Consult Local Error Katastar for verified auto-patches & past hints
+        let mut katastar_hints: Vec<String> = Vec::new();
+        let mut katastar_applied_any = false;
+        for err_file in &files_with_errors {
+            if let (Some(path_str), Some(orig_content)) = (
+                err_file.get("path").and_then(|p| p.as_str()),
+                err_file.get("content").and_then(|c| c.as_str()),
+            ) {
+                let lookup = crate::katastar::lookup_katastar("compile", &build_output, path_str, orig_content, &tried_katastar_ids);
+                for h in lookup.hints {
+                    if !katastar_hints.contains(&h) {
+                        katastar_hints.push(h);
+                    }
+                }
+                if let Some(best) = lookup.applicable_patches.first() {
+                    let candidate = orig_content.replace(&best.patch.search, &best.patch.replace);
+                    let processed = post_process_generated_file(path_str, &candidate, &serde_json::json!({}), has_tailwind);
+                    if processed != orig_content {
+                        let full_path = proj_dir.join(path_str);
+                        if std::fs::write(&full_path, &processed).is_ok() {
+                            katastar_applied_any = true;
+                            pending_fixes.push(PendingBuildFix {
+                                path: path_str.to_string(),
+                                before: orig_content.to_string(),
+                                after: processed,
+                                entry_id: best.entry_id.clone(),
+                                source: "katastar".to_string(),
+                            });
+                            debug_log_to_file(format!(
+                                "[Katastar] Applied verified local rule '{}' on '{}' before calling AI.",
+                                best.entry_id, path_str
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        if katastar_applied_any {
+            continue;
         }
 
         debug_log_to_file(format!("[Self-Healing] Identified {} files containing build errors. Requesting AI repairs...", files_with_errors.len()));
@@ -909,6 +1013,13 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
         );
         system_prompt.push_str(&get_packages_db_summary());
 
+        if !katastar_hints.is_empty() {
+            system_prompt.push_str("\n\n--- PREVIOUSLY VERIFIED SOLUTIONS FROM LOCAL KATASTAR ---\n");
+            for h in katastar_hints.iter().take(3) {
+                system_prompt.push_str(&format!("- {}\n", h));
+            }
+        }
+
         for err_file in &files_with_errors {
             if let (Some(path_str), Some(content_str)) = (err_file.get("path").and_then(|p| p.as_str()), err_file.get("content").and_then(|c| c.as_str())) {
                 let rp = get_stack_rulepacks(path_str, content_str, Some(&truncated_log));
@@ -958,7 +1069,6 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                                                 if let Ok(_) = std::fs::write(&full_path, &processed) {
                                                     debug_log_to_file(format!("[Self-Healing] Successfully repaired/created file: {}", path_str));
                                                     
-                                                    // Find the original content
                                                     let mut original_content = String::new();
                                                     for original_spec in &files_with_errors {
                                                         if original_spec.get("path").and_then(|p| p.as_str()) == Some(path_str) {
@@ -967,8 +1077,26 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                                                             }
                                                         }
                                                     }
-                                                    if !original_content.is_empty() {
-                                                        generate_and_save_healing_rule(path_str, &original_content, &processed, model).await;
+                                                    if !original_content.is_empty() && processed != original_content {
+                                                        let atomic_patch = crate::katastar::extract_safe_atomic_patch(path_str, &original_content, &processed);
+                                                        let sig_info = crate::katastar::normalize_error_signature("compile", &build_output, Some(path_str));
+                                                        let entry_id = crate::katastar::register_repair_attempt(
+                                                            "compile",
+                                                            &build_output,
+                                                            path_str,
+                                                            "ai",
+                                                            if atomic_patch.is_some() { "search_replace" } else { "ai_edit" },
+                                                            atomic_patch,
+                                                            &sig_info.normalized_sample,
+                                                            model,
+                                                        );
+                                                        pending_fixes.push(PendingBuildFix {
+                                                            path: path_str.to_string(),
+                                                            before: original_content,
+                                                            after: processed,
+                                                            entry_id,
+                                                            source: "ai".to_string(),
+                                                        });
                                                     }
                                                 }
                                             }
@@ -979,13 +1107,36 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                                 debug_log_to_file(format!("[Self-Healing] Failed to parse AI response as JSON: {}", clean_content));
                                 // Whole-File Code Fallback for single file error
                                 if files_with_errors.len() == 1 {
-                                    if let Some(single_path) = files_with_errors[0].get("path").and_then(|p| p.as_str()) {
+                                    if let (Some(single_path), Some(orig_content)) = (
+                                        files_with_errors[0].get("path").and_then(|p| p.as_str()),
+                                        files_with_errors[0].get("content").and_then(|c| c.as_str()),
+                                    ) {
                                         let has_code = clean_content.contains("import ") || clean_content.contains("export ") || clean_content.contains("function ") || clean_content.contains("const ");
                                         if has_code {
                                             debug_log_to_file(format!("[Self-Healing] Activating Whole-File Fallback for single errored file: {}", single_path));
                                             let full_path = proj_dir.join(single_path);
                                             let processed = post_process_generated_file(single_path, &clean_content, &serde_json::json!({}), has_tailwind);
-                                            let _ = std::fs::write(&full_path, &processed);
+                                            if std::fs::write(&full_path, &processed).is_ok() && processed != orig_content {
+                                                let atomic_patch = crate::katastar::extract_safe_atomic_patch(single_path, orig_content, &processed);
+                                                let sig_info = crate::katastar::normalize_error_signature("compile", &build_output, Some(single_path));
+                                                let entry_id = crate::katastar::register_repair_attempt(
+                                                    "compile",
+                                                    &build_output,
+                                                    single_path,
+                                                    "ai",
+                                                    if atomic_patch.is_some() { "search_replace" } else { "ai_edit" },
+                                                    atomic_patch,
+                                                    &sig_info.normalized_sample,
+                                                    model,
+                                                );
+                                                pending_fixes.push(PendingBuildFix {
+                                                    path: single_path.to_string(),
+                                                    before: orig_content.to_string(),
+                                                    after: processed,
+                                                    entry_id,
+                                                    source: "ai".to_string(),
+                                                });
+                                            }
                                         }
                                     }
                                 }
@@ -1409,13 +1560,15 @@ pub async fn run_generation_auto_test_suite(
     proj_dir: &std::path::Path,
     window: &tauri::Window,
     _model_id: &str,
-) {
+) -> Vec<String> {
     let _ = window.emit("orchestrator:progress", serde_json::json!({
         "phase": "auto-testing",
-        "message": "> [Auto-Test Suite] Započinjem automatsko testiranje ruta i API endpoints...",
+        "message": "> [Auto-Test Suite] Započinjem automatsko testiranje ruta, importa i Prisma šeme...",
         "progress": 74.0
     }));
     debug_log_to_file("[Auto-Test Suite] Starting automated route verification and crawler...".to_string());
+
+    let mut warnings: Vec<String> = Vec::new();
 
     // 1. Discover all page routes from src/app
     let mut page_routes: Vec<String> = Vec::new();
@@ -1483,6 +1636,12 @@ pub async fn run_generation_auto_test_suite(
                                     updated = crate::sanitizer::sanitize_custom_hook_functions(&updated);
                                 }
 
+                                // Ensure invalid 'react' navigation imports and missing hook imports are fixed
+                                if !path_str.contains("/api/") && !path_str.ends_with("route.ts") && !path_str.ends_with("route.js") {
+                                    updated = crate::sanitizer::ensure_react_and_next_hook_imports(&updated);
+                                    updated = crate::sanitizer::hoist_use_client_directive(&updated);
+                                }
+
                                 if updated != content {
                                     let _ = std::fs::write(&p, &updated);
                                     *healed_count += 1;
@@ -1503,14 +1662,77 @@ pub async fn run_generation_auto_test_suite(
             }
         }
         audit_and_heal_dir(&src_dir, proj_dir, &mut auto_healed_count, window);
+
+        let mut remaining_missing = Vec::new();
+        collect_missing_imports(&src_dir, &src_dir, &mut remaining_missing);
+        if !remaining_missing.is_empty() {
+            warnings.push(format!("nerazrešeni lokalni importi ({})", remaining_missing.len()));
+        }
+    }
+
+    if proj_dir.join("package.json").exists() {
+        let nm_dir = proj_dir.join("node_modules");
+        let is_next_proj = proj_dir.join("next.config.js").exists() || proj_dir.join("next.config.mjs").exists();
+        if !nm_dir.exists() || (is_next_proj && !nm_dir.join("next").exists()) {
+            warnings.push("node_modules nije instaliran/kompletan".to_string());
+        }
+    }
+
+    let has_prisma = proj_dir.join("prisma/schema.prisma").exists() || proj_dir.join("schema.prisma").exists();
+    if has_prisma {
+        let local_prisma_js = proj_dir.join("node_modules").join("prisma").join("build").join("index.js");
+        if local_prisma_js.exists() {
+            let mut val_cmd = std::process::Command::new("node");
+            val_cmd.arg(&local_prisma_js).arg("validate").current_dir(proj_dir);
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                val_cmd.creation_flags(0x08000000);
+            }
+            match val_cmd.output() {
+                Ok(out) if out.status.success() => {
+                    if let Some(proj_id) = proj_dir.file_name().and_then(|n| n.to_str()) {
+                        crate::katastar::complete_pending_project_repairs(
+                            proj_id,
+                            Some("prisma/schema.prisma"),
+                            true,
+                            "prisma_validate",
+                            _model_id,
+                        );
+                    }
+                }
+                Ok(_) => warnings.push("prisma validate nije prošao".to_string()),
+                Err(_) => warnings.push("nije moguće pokrenuti prisma validate".to_string()),
+            }
+        } else {
+            warnings.push("Prisma CLI nije instaliran u node_modules".to_string());
+        }
     }
 
     let total_routes = page_routes.len() + api_routes.len();
+    let summary_msg = if warnings.is_empty() {
+        format!(
+            "> [Auto-Test Suite] Verifikovano {} ruta i endpoint-a (sanirano {} fajlova). Statičke, import i Prisma provere su prošle.",
+            total_routes, auto_healed_count
+        )
+    } else {
+        format!(
+            "> [Auto-Test Suite] Verifikovano {} ruta i endpoint-a (sanirano {} fajlova), sa upozorenjima: {}.",
+            total_routes,
+            auto_healed_count,
+            warnings.join("; ")
+        )
+    };
     let _ = window.emit("orchestrator:progress", serde_json::json!({
         "phase": "auto-testing",
-        "message": format!("> [Auto-Test Suite] Uspešno verifikovano {} ruta i endpoint-a (sanirano {} fajlova). Svi manuelni i API testovi su prošli.", total_routes, auto_healed_count),
+        "message": summary_msg,
         "progress": 79.0
     }));
-    debug_log_to_file(format!("[Auto-Test Suite] Verification finished. {} total routes, {} healed files.", total_routes, auto_healed_count));
+    debug_log_to_file(format!(
+        "[Auto-Test Suite] Verification finished. {} total routes, {} healed files, warnings={:?}.",
+        total_routes, auto_healed_count, warnings
+    ));
+
+    warnings
 }
 

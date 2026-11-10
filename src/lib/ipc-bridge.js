@@ -508,14 +508,20 @@ window.electronAPI = {
               projectName: checkpoint.name || '',
               phase: checkpoint.phase || checkpoint.status,
               status: checkpoint.status,
+              offlineWaiting: Boolean(checkpoint.offlineWaiting),
+              pausedReason: checkpoint.pausedReason || null,
               currentFile: lastFile,
               fileDescription: fileDesc,
               fileIndex: completedCount,
               totalFiles: totalCount,
               liveCode: savedCodePreview,
-              message: checkpoint.status === 'paused' ? `Generisanje pauzirano (${completedCount}/${totalCount} fajlova)` : 
-                       checkpoint.status === 'stopped' ? `Generisanje prekinuto (${completedCount}/${totalCount} fajlova sačuvano)` : 
-                       `Checkpoint: ${completedCount}/${totalCount} fajlova generisano`,
+              message: checkpoint.status === 'paused'
+                ? (checkpoint.offlineWaiting
+                    ? 'Nema internet konekcije — nastavljamo sa instalacijom paketa kada budemo ponovo online.'
+                    : `Generisanje pauzirano (${completedCount}/${totalCount} fajlova)`)
+                : checkpoint.status === 'stopped'
+                ? `Generisanje prekinuto (${completedCount}/${totalCount} fajlova sačuvano)`
+                : `Checkpoint: ${completedCount}/${totalCount} fajlova generisano`,
               progress: calcProgress,
               checkpoint
             }

@@ -23,16 +23,19 @@ import {
   FolderOpen,
   X,
   Check,
-  CheckSquare
+  CheckSquare,
+  WifiOff
 } from 'lucide-react';
 import { useAppStore } from '../hooks/useAppStore';
 import { useI18n } from '../i18n/I18nContext';
 
 // Status badge component
-function StatusBadge({ status }) {
+function StatusBadge({ status, offlineWaiting = false }) {
   const configs = {
     'generating': { icon: Loader2, className: 'badge-amber', text: 'Generating', animate: true },
-    'paused': { icon: Clock, className: 'badge-amber', text: 'Paused' },
+    'paused': offlineWaiting
+      ? { icon: WifiOff, className: 'badge-amber', text: 'Offline Pause' }
+      : { icon: Clock, className: 'badge-amber', text: 'Paused' },
     'stopped': { icon: AlertCircle, className: 'badge-rose', text: 'Interrupted' },
     'awaiting-keys': { icon: AlertCircle, className: 'badge-amber', text: 'Awaiting Keys' },
     'ready': { icon: CheckCircle2, className: 'badge-indigo', text: 'Ready' },
@@ -240,7 +243,7 @@ function ProjectCard({
       {/* Footer */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <StatusBadge status={project.status} />
+          <StatusBadge status={project.status} offlineWaiting={Boolean(project.metadata?.offlineWaiting)} />
           {(project.status === 'generating' || project.status === 'paused' || project.status === 'stopped') && (
             <button
               onClick={async (e) => {

@@ -14,7 +14,8 @@ import {
   AlertCircle,
   Loader2,
   ExternalLink,
-  Minimize2
+  Minimize2,
+  WifiOff
 } from 'lucide-react';
 import { useI18n, LanguageSelector } from '../i18n/I18nContext';
 
@@ -45,6 +46,8 @@ function FloatingProgress() {
   const [progress, setProgress] = useState({
     phase: 'idle',
     status: 'idle',
+    offlineWaiting: false,
+    pausedReason: null,
     message: 'Waiting to start...',
     progress: 0,
     projectId: null,
@@ -84,6 +87,8 @@ function FloatingProgress() {
               projectId: projectId,
               phase: result.task.phase || prev.phase,
               status: result.task.status || prev.status,
+              offlineWaiting: Boolean(result.task.offlineWaiting),
+              pausedReason: result.task.pausedReason || null,
               message: result.task.message || prev.message || 'Restoring session...',
               history: [...(prev.history || []), { time: Date.now(), msg: 'Synced with background task / checkpoint' }]
             }));
@@ -99,15 +104,29 @@ function FloatingProgress() {
     // 3. Listen for future updates
     const unsubscribe = window.electronAPI.task.onProgress((data) => {
       if (projectId && data.projectId && data.projectId !== projectId) return;
-      setProgress(prev => ({
-        ...prev,
-        ...data,
-        projectId: data.projectId || prev.projectId || projectId,
-        phase: data.phase || prev.phase,
-        status: data.status || data.phase || prev.status,
-        message: data.message || prev.message,
-        history: [...(prev.history || []), { time: Date.now(), msg: data.message }]
-      }));
+      setProgress(prev => {
+        const nextPhase = data.phase || prev.phase;
+        const nextStatus = data.status || data.phase || prev.status;
+        const nextIsPaused = nextPhase === 'paused' || nextStatus === 'paused';
+        const nextOfflineWaiting = data.offlineWaiting !== undefined
+          ? Boolean(data.offlineWaiting)
+          : (nextIsPaused ? Boolean(prev.offlineWaiting) : false);
+        const nextPausedReason = data.pausedReason !== undefined
+          ? data.pausedReason
+          : (nextIsPaused ? (prev.pausedReason ?? null) : null);
+
+        return {
+          ...prev,
+          ...data,
+          projectId: data.projectId || prev.projectId || projectId,
+          phase: nextPhase,
+          status: nextStatus,
+          offlineWaiting: nextOfflineWaiting,
+          pausedReason: nextPausedReason,
+          message: data.message || prev.message,
+          history: [...(prev.history || []), { time: Date.now(), msg: data.message }]
+        };
+      });
     });
 
     return () => unsubscribe();
@@ -129,6 +148,8 @@ function FloatingProgress() {
           ...p,
           phase: 'paused',
           status: 'paused',
+          offlineWaiting: false,
+          pausedReason: null,
           message: 'Generisanje je pauzirano.'
         }));
       }
@@ -142,13 +163,36 @@ function FloatingProgress() {
   const handleResume = async () => {
     setIsActionLoading(true);
     try {
+      if ((progress.offlineWaiting || !progress.taskId) && progress.projectId) {
+        setProgress(p => ({
+          ...p,
+          phase: 'install-deps',
+          status: 'generating',
+          offlineWaiting: false,
+          pausedReason: null,
+          message: 'Nastavljam instalaciju zavisnosti i završne provere...'
+        }));
+        await window.electronAPI.task.resumeGeneration(progress.projectId);
+        return;
+      }
+
       const tId = progress.taskId || progress.projectId;
       if (tId) {
-        await window.electronAPI.task.resume(tId);
+        try {
+          await window.electronAPI.task.resume(tId);
+        } catch (resumeErr) {
+          if (progress.projectId) {
+            await window.electronAPI.task.resumeGeneration(progress.projectId);
+          } else {
+            throw resumeErr;
+          }
+        }
         setProgress(p => ({
           ...p,
           phase: 'generate-files',
           status: 'generating',
+          offlineWaiting: false,
+          pausedReason: null,
           message: 'Generisanje se nastavlja...'
         }));
       }
@@ -167,13 +211,15 @@ function FloatingProgress() {
     setShowStopConfirm(false);
     setIsActionLoading(true);
     try {
-      const tId = progress.taskId || progress.projectId;
+      const tId = progress.projectId || progress.taskId;
       if (tId) {
         await window.electronAPI.task.stop(tId);
         setProgress(p => ({
           ...p,
           phase: 'stopped',
           status: 'stopped',
+          offlineWaiting: false,
+          pausedReason: null,
           message: 'Generisanje je prekinuto. Svi do sada generisani fajlovi su sačuvani na disku.'
         }));
       }
@@ -192,6 +238,8 @@ function FloatingProgress() {
           ...p,
           phase: 'generate-files',
           status: 'generating',
+          offlineWaiting: false,
+          pausedReason: null,
           message: 'Učitavanje sačuvanog stanja sa diska i nastavak...'
         }));
         await window.electronAPI.task.resumeGeneration(progress.projectId);
@@ -211,13 +259,14 @@ function FloatingProgress() {
   };
 
   const isPaused = progress.phase === 'paused' || progress.status === 'paused';
+  const isOfflineWaiting = Boolean(isPaused && progress.offlineWaiting);
   const isStopped = progress.phase === 'stopped' || progress.status === 'stopped';
   const isComplete = progress.phase === 'complete';
   const isError = progress.phase === 'error';
   const isRunning = !isComplete && !isError && !isStopped;
 
   const phaseInfo = PHASE_DISPLAY[progress.phase] || PHASE_DISPLAY['fetch-manifest'];
-  const PhaseIcon = phaseInfo.icon;
+  const PhaseIcon = isOfflineWaiting ? WifiOff : phaseInfo.icon;
 
   if (isMinimized) {
     return (
@@ -229,7 +278,7 @@ function FloatingProgress() {
           <div className="flex items-center gap-2">
             <PhaseIcon className={`w-4 h-4 ${isRunning && !isPaused ? 'text-indigo-400 animate-spin' : isPaused ? 'text-amber-400' : isComplete ? 'text-emerald-400' : 'text-slate-400'}`} />
             <span className="text-xs font-medium text-slate-300 truncate">
-              {isPaused ? 'Pauzirano' : phaseInfo.label}
+              {isOfflineWaiting ? 'Offline Pause' : isPaused ? 'Pauzirano' : phaseInfo.label}
             </span>
           </div>
           <button
@@ -305,7 +354,7 @@ function FloatingProgress() {
           </div>
           <div>
             <h3 className="font-semibold text-white text-sm">
-              {isPaused ? 'Generisanje pauzirano' : isStopped ? 'Generisanje zaustavljeno' : phaseInfo.label}
+              {isOfflineWaiting ? 'Čekam internet konekciju' : isPaused ? 'Generisanje pauzirano' : isStopped ? 'Generisanje zaustavljeno' : phaseInfo.label}
             </h3>
             <div className="flex items-center gap-2">
               <p className="text-xs text-slate-500">Axiom Forge</p>
@@ -355,7 +404,7 @@ function FloatingProgress() {
         <div className="space-y-1">
           <div className="flex items-center justify-between text-xs">
             <span className="text-slate-500">
-              {isPaused ? 'Pauzirano' : isStopped ? 'Prekinuto' : 'Progress'}
+              {isOfflineWaiting ? 'Čekanje mreže' : isPaused ? 'Pauzirano' : isStopped ? 'Prekinuto' : 'Progress'}
             </span>
             <span className="text-slate-400">{Math.round(progress.progress)}%</span>
           </div>
@@ -472,7 +521,7 @@ function FloatingProgress() {
                 title={t('floating.resumeTooltip')}
               >
                 <Play className="w-3.5 h-3.5" />
-                {t('common.resume')}
+                {isOfflineWaiting ? 'Nastavi sada' : t('common.resume')}
               </button>
               <button
                 onClick={handleRequestStop}
