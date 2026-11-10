@@ -48,6 +48,8 @@ function FloatingProgress() {
     status: 'idle',
     offlineWaiting: false,
     pausedReason: null,
+    hasWarnings: false,
+    warnings: [],
     message: 'Waiting to start...',
     progress: 0,
     projectId: null,
@@ -81,6 +83,8 @@ function FloatingProgress() {
         try {
           const result = await window.electronAPI.task.getActiveTaskByProject(projectId);
           if (result.success && result.task) {
+            const taskWarnings = Array.isArray(result.task.warnings) ? result.task.warnings : [];
+            const taskHasWarnings = Boolean(result.task.hasWarnings || taskWarnings.length > 0);
             setProgress(prev => ({
               ...prev,
               ...result.task,
@@ -89,6 +93,8 @@ function FloatingProgress() {
               status: result.task.status || prev.status,
               offlineWaiting: Boolean(result.task.offlineWaiting),
               pausedReason: result.task.pausedReason || null,
+              hasWarnings: taskHasWarnings,
+              warnings: taskWarnings,
               message: result.task.message || prev.message || 'Restoring session...',
               history: [...(prev.history || []), { time: Date.now(), msg: 'Synced with background task / checkpoint' }]
             }));
@@ -114,6 +120,10 @@ function FloatingProgress() {
         const nextPausedReason = data.pausedReason !== undefined
           ? data.pausedReason
           : (nextIsPaused ? (prev.pausedReason ?? null) : null);
+        const nextWarnings = Array.isArray(data.warnings) ? data.warnings : (nextPhase === 'complete' ? (prev.warnings || []) : []);
+        const nextHasWarnings = data.hasWarnings !== undefined
+          ? Boolean(data.hasWarnings)
+          : (nextPhase === 'complete' ? Boolean(prev.hasWarnings || nextWarnings.length > 0) : false);
 
         return {
           ...prev,
@@ -123,6 +133,8 @@ function FloatingProgress() {
           status: nextStatus,
           offlineWaiting: nextOfflineWaiting,
           pausedReason: nextPausedReason,
+          hasWarnings: nextHasWarnings,
+          warnings: nextWarnings,
           message: data.message || prev.message,
           history: [...(prev.history || []), { time: Date.now(), msg: data.message }]
         };
@@ -264,9 +276,12 @@ function FloatingProgress() {
   const isComplete = progress.phase === 'complete';
   const isError = progress.phase === 'error';
   const isRunning = !isComplete && !isError && !isStopped;
+  const warningsList = Array.isArray(progress.warnings) ? progress.warnings : [];
+  const hasWarnings = Boolean(progress.hasWarnings || warningsList.length > 0);
+  const isCompleteWarn = isComplete && hasWarnings;
 
   const phaseInfo = PHASE_DISPLAY[progress.phase] || PHASE_DISPLAY['fetch-manifest'];
-  const PhaseIcon = isOfflineWaiting ? WifiOff : phaseInfo.icon;
+  const PhaseIcon = isOfflineWaiting ? WifiOff : isCompleteWarn ? AlertCircle : phaseInfo.icon;
 
   if (isMinimized) {
     return (
@@ -276,9 +291,9 @@ function FloatingProgress() {
       >
         <div className="flex items-center justify-between p-3">
           <div className="flex items-center gap-2">
-            <PhaseIcon className={`w-4 h-4 ${isRunning && !isPaused ? 'text-indigo-400 animate-spin' : isPaused ? 'text-amber-400' : isComplete ? 'text-emerald-400' : 'text-slate-400'}`} />
+            <PhaseIcon className={`w-4 h-4 ${isRunning && !isPaused ? 'text-indigo-400 animate-spin' : isPaused || isCompleteWarn ? 'text-amber-400' : isComplete ? 'text-emerald-400' : 'text-slate-400'}`} />
             <span className="text-xs font-medium text-slate-300 truncate">
-              {isOfflineWaiting ? 'Offline Pause' : isPaused ? 'Pauzirano' : phaseInfo.label}
+              {isOfflineWaiting ? 'Offline Pause' : isPaused ? 'Pauzirano' : isCompleteWarn ? 'Upozorenja' : phaseInfo.label}
             </span>
           </div>
           <button
@@ -293,7 +308,7 @@ function FloatingProgress() {
         <div className="h-1 bg-slate-800">
           <div 
             className={`h-full transition-all duration-300 ${
-              isPaused ? 'bg-amber-500' : isComplete ? 'bg-emerald-500' : 'bg-gradient-to-r from-indigo-500 to-violet-500'
+              isPaused || isCompleteWarn ? 'bg-amber-500' : isComplete ? 'bg-emerald-500' : 'bg-gradient-to-r from-indigo-500 to-violet-500'
             }`}
             style={{ width: `${progress.progress}%` }}
           />
@@ -338,6 +353,7 @@ function FloatingProgress() {
       <div className="flex items-center justify-between p-4 border-b border-slate-800">
         <div className="flex items-center gap-3">
           <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
+            isCompleteWarn ? 'bg-amber-500/20' :
             isComplete ? 'bg-emerald-500/20' : 
             isError ? 'bg-rose-500/20' : 
             isPaused ? 'bg-amber-500/20' :
@@ -345,6 +361,7 @@ function FloatingProgress() {
             'bg-indigo-500/20'
           }`}>
             <PhaseIcon className={`w-4 h-4 ${
+              isCompleteWarn ? 'text-amber-400' :
               isComplete ? 'text-emerald-400' : 
               isError ? 'text-rose-400' : 
               isPaused ? 'text-amber-400' :
@@ -354,7 +371,7 @@ function FloatingProgress() {
           </div>
           <div>
             <h3 className="font-semibold text-white text-sm">
-              {isOfflineWaiting ? 'Čekam internet konekciju' : isPaused ? 'Generisanje pauzirano' : isStopped ? 'Generisanje zaustavljeno' : phaseInfo.label}
+              {isOfflineWaiting ? 'Čekam internet konekciju' : isPaused ? 'Generisanje pauzirano' : isStopped ? 'Generisanje zaustavljeno' : isCompleteWarn ? 'Završeno sa upozorenjima' : phaseInfo.label}
             </h3>
             <div className="flex items-center gap-2">
               <p className="text-xs text-slate-500">Axiom Forge</p>
@@ -404,13 +421,14 @@ function FloatingProgress() {
         <div className="space-y-1">
           <div className="flex items-center justify-between text-xs">
             <span className="text-slate-500">
-              {isOfflineWaiting ? 'Čekanje mreže' : isPaused ? 'Pauzirano' : isStopped ? 'Prekinuto' : 'Progress'}
+              {isOfflineWaiting ? 'Čekanje mreže' : isPaused ? 'Pauzirano' : isStopped ? 'Prekinuto' : isCompleteWarn ? 'Završeno uz upozorenja' : 'Progress'}
             </span>
             <span className="text-slate-400">{Math.round(progress.progress)}%</span>
           </div>
           <div className="h-2 bg-slate-800 rounded-full overflow-hidden">
             <div 
               className={`h-full rounded-full transition-all duration-300 ${
+                isCompleteWarn ? 'bg-amber-500' :
                 isComplete ? 'bg-emerald-500' : 
                 isError ? 'bg-rose-500' : 
                 isPaused ? 'bg-amber-500' :
@@ -421,6 +439,21 @@ function FloatingProgress() {
             />
           </div>
         </div>
+
+        {/* Completion Warnings Summary */}
+        {isCompleteWarn && warningsList.length > 0 && (
+          <div className="p-3 bg-amber-500/10 border border-amber-500/25 rounded-lg space-y-1.5 max-h-32 overflow-y-auto window-no-drag">
+            <p className="text-xs font-semibold text-amber-300 flex items-center gap-1.5">
+              <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+              Preostala upozorenja ({warningsList.length})
+            </p>
+            <ul className="space-y-1 text-[11px] text-amber-200/90 list-disc pl-4">
+              {warningsList.map((w, idx) => (
+                <li key={idx} className="break-words">{w}</li>
+              ))}
+            </ul>
+          </div>
+        )}
 
         {/* URLs (if complete) */}
         {isComplete && progress.urls && (
@@ -564,10 +597,14 @@ function FloatingProgress() {
         {isComplete && (
           <button
             onClick={handleClose}
-            className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-emerald-600 text-white hover:bg-emerald-500 text-xs font-semibold transition-colors"
+            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-white text-xs font-semibold transition-colors ${
+              isCompleteWarn
+                ? 'bg-amber-600 hover:bg-amber-500'
+                : 'bg-emerald-600 hover:bg-emerald-500'
+            }`}
           >
-            <CheckCircle2 className="w-3.5 h-3.5" />
-            Završi
+            {isCompleteWarn ? <AlertCircle className="w-3.5 h-3.5" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
+            {isCompleteWarn ? 'Zatvori' : 'Završi'}
           </button>
         )}
       </div>

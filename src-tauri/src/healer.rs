@@ -374,8 +374,12 @@ pub async fn heal_prisma_schema_loop(
     }
 
     const MAX_AI_HEALS: u32 = 3;
+    const MAX_TOTAL_ITERATIONS: usize = 8;
     let total_checks = MAX_AI_HEALS + 1;
+    let mut ai_attempts_used: u32 = 0;
     let mut previous_ai_unchanged = false;
+    let mut best_schema: Option<(usize, String)> = None;
+    let mut seen_deterministic_schemas: std::collections::HashSet<String> = std::collections::HashSet::new();
     let project_id = proj_dir
         .file_name()
         .and_then(|n| n.to_str())
@@ -393,6 +397,18 @@ pub async fn heal_prisma_schema_loop(
     let mut pending_ai_fixes: Vec<PendingPrismaFix> = Vec::new();
     let mut tried_katastar_ids: Vec<String> = Vec::new();
 
+    let count_prisma_errors = |log: &str| -> usize {
+        if let Ok(re) = regex::Regex::new(r"Validation Error Count:\s*(\d+)") {
+            if let Some(cap) = re.captures(log) {
+                if let Some(n) = cap.get(1).and_then(|m| m.as_str().parse::<usize>().ok()) {
+                    return n.max(1);
+                }
+            }
+        }
+        let err_lines = log.lines().filter(|l| l.trim().starts_with("error:")).count();
+        err_lines.max(1)
+    };
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
@@ -400,11 +416,12 @@ pub async fn heal_prisma_schema_loop(
     let _ = ollama_start_server().await;
     let resolved_model = resolve_valid_ollama_model(&client, model_id).await;
 
-    // (4) attempt 0..=MAX_AI_HEALS -> the schema is re-validated after EVERY AI heal,
-    // including the last one.
-    for attempt in 0..=MAX_AI_HEALS {
+    // Loop separates deterministic / Katastar fixes from AI attempts (`ai_attempts_used <= MAX_AI_HEALS`),
+    // while bounding total validation passes at MAX_TOTAL_ITERATIONS.
+    for _iter in 0..MAX_TOTAL_ITERATIONS {
+        let display_check = (ai_attempts_used + 1).min(total_checks);
         let _ = window.emit(log_channel, serde_json::json!({
-            "text": format!("> [Prisma Validator] Provera i generisanje Prisma klijenta (provera {}/{})...\n", attempt + 1, total_checks),
+            "text": format!("> [Prisma Validator] Provera i generisanje Prisma klijenta (provera {}/{})...\n", display_check, total_checks),
             "type": "info"
         }));
 
@@ -527,6 +544,16 @@ pub async fn heal_prisma_schema_loop(
             return Err("Neodgovarajuća verzija Prisma CLI paketa u kešu u odnosu na @prisma/client.".to_string());
         }
 
+        if let Ok(disk_schema) = std::fs::read_to_string(&schema_path) {
+            let err_count = count_prisma_errors(&error_log);
+            let should_update_best = best_schema
+                .as_ref()
+                .map_or(true, |(best_cnt, _)| err_count < *best_cnt);
+            if should_update_best {
+                best_schema = Some((err_count, disk_schema));
+            }
+        }
+
         let cur_sig_info = crate::katastar::normalize_error_signature(
             "prisma",
             &error_log,
@@ -588,42 +615,43 @@ pub async fn heal_prisma_schema_loop(
             }
         }
 
-        if attempt == MAX_AI_HEALS {
-            break;
-        }
-
         let schema_content = match std::fs::read_to_string(&schema_path) {
             Ok(c) => c,
             Err(_) => break,
         };
+        let norm_current = schema_content.replace("\r\n", "\n").trim().to_string();
+        seen_deterministic_schemas.insert(norm_current.clone());
 
         // Deterministic auto-healing for unsupported enums connector error (P1012)
         if error_log.contains("does not support enums") || error_log.contains("current connector does not support enums") {
             if schema_content.contains("provider = \"sqlite\"") {
                 let updated = schema_content.replace("provider = \"sqlite\"", "provider = \"postgresql\"");
-                let _ = std::fs::write(&schema_path, &updated);
-                let eid = crate::katastar::register_repair_attempt(
-                    "prisma",
-                    &error_log,
-                    "prisma/schema.prisma",
-                    "deterministic",
-                    "prisma_provider_pg",
-                    None,
-                    "Switch Prisma datasource provider from sqlite to postgresql when enum types are declared",
-                    "",
-                );
-                pending_prisma_fix = Some(PendingPrismaFix {
-                    entry_id: eid,
-                    source: "deterministic".to_string(),
-                    error_signature: cur_sig_info.error_signature.clone(),
-                    before: schema_content,
-                    after: updated,
-                });
-                let _ = window.emit(log_channel, serde_json::json!({
-                    "text": "> [Prisma Validator] Deterministički sinhronizujem provider = \"postgresql\" za podršku enum tipova. Ponovo testiram...\n",
-                    "type": "info"
-                }));
-                continue;
+                let norm_next = updated.replace("\r\n", "\n").trim().to_string();
+                if seen_deterministic_schemas.insert(norm_next) {
+                    let _ = std::fs::write(&schema_path, &updated);
+                    let eid = crate::katastar::register_repair_attempt(
+                        "prisma",
+                        &error_log,
+                        "prisma/schema.prisma",
+                        "deterministic",
+                        "prisma_provider_pg",
+                        None,
+                        "Switch Prisma datasource provider from sqlite to postgresql when enum types are declared",
+                        "",
+                    );
+                    pending_prisma_fix = Some(PendingPrismaFix {
+                        entry_id: eid,
+                        source: "deterministic".to_string(),
+                        error_signature: cur_sig_info.error_signature.clone(),
+                        before: schema_content,
+                        after: updated,
+                    });
+                    let _ = window.emit(log_channel, serde_json::json!({
+                        "text": "> [Prisma Validator] Deterministički sinhronizujem provider = \"postgresql\" za podršku enum tipova. Ponovo testiram...\n",
+                        "type": "info"
+                    }));
+                    continue;
+                }
             }
         }
 
@@ -640,9 +668,8 @@ pub async fn heal_prisma_schema_loop(
                 &serde_json::json!({}),
                 false,
             );
-            if !deterministically_fixed.trim().is_empty()
-                && deterministically_fixed.replace("\r\n", "\n").trim() != schema_content.replace("\r\n", "\n").trim()
-            {
+            let norm_next = deterministically_fixed.replace("\r\n", "\n").trim().to_string();
+            if !norm_next.is_empty() && norm_next != norm_current && seen_deterministic_schemas.insert(norm_next) {
                 let _ = std::fs::write(&schema_path, &deterministically_fixed);
                 let atomic_patch = crate::katastar::extract_safe_atomic_patch(
                     "prisma/schema.prisma",
@@ -674,6 +701,49 @@ pub async fn heal_prisma_schema_loop(
             }
         }
 
+        // Deterministic fallback for unresolved/undeclared types: ONLY runs after giving AI at least 1 chance
+        // to define any forgotten model/enum, or if AI returned unchanged output.
+        if (ai_attempts_used >= 1 || previous_ai_unchanged) && error_log.contains("is neither a built-in type") {
+            let pruned = crate::sanitizer::prune_unresolved_prisma_relations(&schema_content);
+            let fixed_after_prune = post_process_generated_file(
+                "prisma/schema.prisma",
+                &pruned,
+                &serde_json::json!({}),
+                false,
+            );
+            let norm_next = fixed_after_prune.replace("\r\n", "\n").trim().to_string();
+            if !norm_next.is_empty() && norm_next != norm_current && seen_deterministic_schemas.insert(norm_next) {
+                let _ = std::fs::write(&schema_path, &fixed_after_prune);
+                let atomic_patch = crate::katastar::extract_safe_atomic_patch(
+                    "prisma/schema.prisma",
+                    &schema_content,
+                    &fixed_after_prune,
+                );
+                let eid = crate::katastar::register_repair_attempt(
+                    "prisma",
+                    &error_log,
+                    "prisma/schema.prisma",
+                    "deterministic",
+                    "prune_unresolved_relations",
+                    atomic_patch,
+                    "Remove unresolved relation fields referencing undeclared Prisma types",
+                    "",
+                );
+                pending_prisma_fix = Some(PendingPrismaFix {
+                    entry_id: eid,
+                    source: "deterministic".to_string(),
+                    error_signature: cur_sig_info.error_signature.clone(),
+                    before: schema_content,
+                    after: fixed_after_prune,
+                });
+                let _ = window.emit(log_channel, serde_json::json!({
+                    "text": "> [Prisma Validator] Uklanjam nedeklarisane relacione reference nakon AI pokušaja i ponovo testiram šemu...\n",
+                    "type": "info"
+                }));
+                continue;
+            }
+        }
+
         // Phase A (Before calling AI): Consult Local Error Katastar for verified Prisma fixes & hints
         let katastar_lookup = crate::katastar::lookup_katastar(
             "prisma",
@@ -690,9 +760,8 @@ pub async fn heal_prisma_schema_loop(
                 &serde_json::json!({}),
                 false,
             );
-            if !sanitized_candidate.trim().is_empty()
-                && sanitized_candidate.replace("\r\n", "\n").trim() != schema_content.replace("\r\n", "\n").trim()
-            {
+            let norm_next = sanitized_candidate.replace("\r\n", "\n").trim().to_string();
+            if !norm_next.is_empty() && norm_next != norm_current && seen_deterministic_schemas.insert(norm_next) {
                 let _ = std::fs::write(&schema_path, &sanitized_candidate);
                 pending_prisma_fix = Some(PendingPrismaFix {
                     entry_id: best.entry_id.clone(),
@@ -709,8 +778,13 @@ pub async fn heal_prisma_schema_loop(
             }
         }
 
+        if ai_attempts_used >= MAX_AI_HEALS {
+            break;
+        }
+        ai_attempts_used += 1;
+
         let _ = window.emit(log_channel, serde_json::json!({
-            "text": format!("> [Prisma Validator] Započinjem AI auto-healing za schema.prisma (pokušaj {}/{})...\n", attempt + 1, MAX_AI_HEALS),
+            "text": format!("> [Prisma Validator] Započinjem AI auto-healing za schema.prisma (pokušaj {}/{})...\n", ai_attempts_used, MAX_AI_HEALS),
             "type": "info"
         }));
 
@@ -721,14 +795,15 @@ pub async fn heal_prisma_schema_loop(
             Review the schema.prisma content and the error log. Correct the schema.prisma file to fix the validation errors. \
             Strictly follow Prisma Schema language rules: \
             1. Optional/nullable relation fields must only have ? on their type (e.g. password String? but NOT password? String?). \
-            2. In relations, ensure fields (like userId) are explicitly declared in the model (e.g. userId String) and matches the relation fields parameter. \
+            2. In relations, ensure foreign key scalars referenced in `@relation(fields: [...])` are explicitly declared in the model and match the referenced type. \
             3. Do not use @db.Json native type annotation on String[] fields. Use standard Prisma types. \
-            4. The @relation attribute (e.g. `@relation(fields: [userId], references: [id])`) MUST ONLY be placed on relational object fields (like `user User`), never on scalar fields (like `userId String`). Placing @relation on a scalar field will throw an 'Invalid field type, not a relation' error. \
-            5. For NextAuth schema, the VerificationToken model does not have a direct relation back to the User model; do not define a verificationTokens relation field on the User model. \
-            6. Every relation needs an opposite field on the other model (e.g. `user User @relation(...)` on the child and `dashboards Dashboard[]` on User). If the relation uses a name (e.g. `name: \"TeamMember\"`), the opposite relation array MUST use the exact same name (e.g. `teams Team[] @relation(\"TeamMember\")`). CRITICAL: NEVER delete foreign key scalar fields (like `userId String` or `projectId String`). Always ADD the opposite relation field instead! \
-            7. Fields pointing to another model (relations) CANNOT have a `@default()` attribute. For default values, use an `enum` or a scalar type (e.g. `String @default(\"USER\")`). \
-            8. Ambiguous Relations (P1012): If a model defines two or more relations pointing to the same target model (e.g. `sourceWallet` and `destinationWallet` both pointing to `Wallet`), Prisma strictly requires unique relation names on BOTH models: `@relation(\"SourceWallet\", fields: ...)` and `@relation(\"DestinationWallet\", fields: ...)`. On the target model (Wallet), define matching opposite named relations: `sourceTransactions Transaction[] @relation(\"SourceWallet\")` and `destinationTransactions Transaction[] @relation(\"DestinationWallet\")`. Remove duplicate un-named arrays like `transactions` and `transactionsTransaction`. \
-            9. Referential Actions & Unique Relation Names (P1012): Referential actions inside `@relation(...)` (`onDelete`, `onUpdate`) MUST use exact Prisma PascalCase keywords: `SetNull`, `Cascade`, `Restrict`, `NoAction`, `SetDefault` (NEVER uppercase SQL keywords like `SET_NULL`, `CASCADE`, `NO_ACTION`, or `SET_DEFAULT`). Also NEVER keep two opposite relation fields on the same model using the same `@relation(\"...\")` name (e.g., if `tasks` and `tasksTask` both use `@relation(\"AssignedTo\")`, delete the duplicate `tasksTask`). \
+            4. The @relation attribute (e.g. `@relation(fields: [userId], references: [id])`) MUST ONLY be placed on relational object fields (never on scalar fields). Placing @relation on a scalar field throws 'Invalid field type, not a relation'. \
+            5. For NextAuth schema, the VerificationToken model does not have a direct relation back to the User model; do not define a verificationTokens relation field on User. \
+            6. Every relation needs an opposite field on the target model. If a relation uses an explicit `@relation(\"Name\")`, the opposite field MUST use the exact same `@relation(\"Name\")`. CRITICAL: Never delete valid foreign key scalar fields unless removing a dangling undeclared relation; add or align the opposite field instead. \
+            7. Relation object fields pointing to another model CANNOT have a `@default()` attribute. Only scalar or enum fields can have `@default(...)`. \
+            8. Ambiguous Relations (P1012): If a model defines two or more relations pointing to the same target model, assign unique relation names on BOTH models (`@relation(\"RoleA\", fields: ...)` paired with `@relation(\"RoleA\")`, etc.) and remove any extra duplicate un-named or synthetic arrays. \
+            9. Referential Actions & Unique Relation Names (P1012): Referential actions inside `@relation(...)` (`onDelete`, `onUpdate`) MUST use exact Prisma PascalCase keywords: `SetNull`, `Cascade`, `Restrict`, `NoAction`, `SetDefault` (NEVER uppercase SQL keywords like `SET_NULL`, `CASCADE`, `NO_ACTION`, or `SET_DEFAULT`). Never keep two opposite relation fields on the same model sharing the same `@relation(\"...\")` name. \
+            10. Undefined Types (P1012 'is neither a built-in type'): NEVER rename an undefined field type to the current model's own name or an unrelated model (that creates an invalid self-list or mismatched relation). Either define the missing model/enum cleanly if required, or remove the dangling relation field completely. \
             First, in exactly 1 concise sentence, identify the compiler rule that was violated on the failing line. \
             Then, provide the complete corrected schema.prisma code wrapped in a ```prisma code block.".to_string();
 
@@ -800,7 +875,7 @@ pub async fn heal_prisma_schema_loop(
 
         match ai_content {
             Some(cleaned) => {
-                // Guard against partial LLM responses (e.g. returning only a single `model Payment { ... }` block
+                // Guard against partial LLM responses (e.g. returning only a single `model ... { ... }` block
                 // instead of the full schema.prisma, which would wipe out `datasource db`, `generator client`, and other models).
                 let merged_candidate = merge_prisma_ai_response(&schema_content, &cleaned);
                 // (1) Never write raw LLM output: run it through the deterministic sanitizer first
@@ -848,6 +923,14 @@ pub async fn heal_prisma_schema_loop(
                     "text": format!("> [Prisma Validator] AI model '{}' nije vratio upotrebljiv odgovor.\n", resolved_model),
                     "type": "warning"
                 }));
+            }
+        }
+    }
+
+    if let Some((_, cleanest)) = best_schema {
+        if let Ok(cur_disk) = std::fs::read_to_string(&schema_path) {
+            if cur_disk.replace("\r\n", "\n").trim() != cleanest.replace("\r\n", "\n").trim() {
+                let _ = std::fs::write(&schema_path, &cleanest);
             }
         }
     }
@@ -2181,7 +2264,7 @@ pub async fn project_heal_compile_error(
         \n\n\
         CRITICAL RULES:\n\
         1. Respond ONLY with a valid JSON object matching the format described below. Do not write any explanations, introductory text, or markdown code blocks (do not wrap in ```json). Just the raw JSON.\n\
-        2. In the JSON structure, under 'edits', each 'target' block must exactly match (character-for-character, including leading whitespace and indentation) a unique substring in the target file. To create a missing local module file, set 'path' to its full path with extension (e.g. 'src/models/MaintenanceAlert.ts') and 'target' to \"\".\n\
+        2. In the JSON structure, under 'edits', each 'target' block must exactly match (character-for-character, including leading whitespace and indentation) a unique substring in the target file. To create a missing local module file, set 'path' to its full path with extension (e.g. 'src/models/Entity.ts') and 'target' to \"\".\n\
         3. Do NOT include placeholders in 'replacement'. The code must be complete and ready to run.\n\
         4. Focus on resolving the reported error cleanly. Do not make unrelated changes.\n\
         5. DATABASE RESILIENCY: Domain models under 'src/models/' MUST be pure TypeScript interfaces/types ONLY (never import '@/lib/prisma' or 'new PrismaClient()'). If a server route or Prisma query fails at runtime, handle errors safely without importing Prisma into 'use client' files.\n\
@@ -2189,7 +2272,7 @@ pub async fn project_heal_compile_error(
         7. STRICT UI & DESIGN PRESERVATION: NEVER delete or strip UI components, hero sections, product grids, forms, tables, or buttons to bypass a compilation error. Fix the underlying TypeScript, import, export, or syntax error in place.\n\
         8. MANDATORY TAILWIND CSS: All JSX elements MUST continue to use comprehensive Tailwind CSS utility classes. NEVER degrade styled elements into raw, unstyled HTML.\n\
         9. STRICTLY NO PROSE IN CODE: NEVER put natural-language sentences, explanations, 'The error indicates...', or numbered lists ('1. Ensure...', '2. Verify...') inside 'replacement' or source code!\n\
-        10. VALID PATHS & ALIASES ONLY: Local Next.js imports MUST use '@/' alias without file extension (e.g. `import { X } from '@/models/MaintenanceAlert'`, NEVER bare `'src/models/...'`). Every JSON edit `'path'` MUST include its proper file extension (e.g. `.ts`, `.tsx`, `.css`, `.prisma`), NEVER an extensionless module path.\n\
+        10. VALID PATHS & ALIASES ONLY: Local Next.js imports MUST use '@/' alias without file extension (e.g. `import { X } from '@/models/Entity'`, NEVER bare `'src/models/...'`). Every JSON edit `'path'` MUST include its proper file extension (e.g. `.ts`, `.tsx`, `.css`, `.prisma`), NEVER an extensionless module path.\n\
         \n\n\
         JSON FORMAT:\n\
         {\n\
@@ -2371,6 +2454,15 @@ pub async fn project_heal_compile_error(
                 "\n--- Existing Project Source Files (import via `@/...` without extension) ---\n{}\n--------------------------------------------------------------------------\n",
                 existing_mods.join("\n")
             ));
+        }
+    }
+
+    let dts_ctx = crate::self_healing::inspect_dts_exports_for_file(&proj_dir, &file_content, &current_error_context);
+    if !dts_ctx.is_empty() && project_context.len() < max_aux_total_chars {
+        let remaining_budget = max_aux_total_chars.saturating_sub(project_context.len());
+        let capped_dts = truncate_context_snippet(&dts_ctx, remaining_budget.min(2500));
+        if !capped_dts.is_empty() {
+            project_context.push_str(&format!("\n{}\n", capped_dts));
         }
     }
 

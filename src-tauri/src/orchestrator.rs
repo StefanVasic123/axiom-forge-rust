@@ -86,14 +86,24 @@ pub enum GenerationPhase {
 
 pub fn get_generation_phase(file_path: &str, project_type: &str) -> GenerationPhase {
     let path_lower = file_path.to_lowercase().replace('\\', "/");
-    
+    let is_root_json = !path_lower.contains('/') && path_lower.ends_with(".json");
+    let is_config_location = path_lower.starts_with("config/")
+        || path_lower.contains("/config/")
+        || path_lower.contains(".config.");
+
     match project_type {
         "nextjs" | "mern" => {
-            if path_lower == "package.json" || path_lower == "tsconfig.json" || 
-               path_lower == "tailwind.config.js" || path_lower == "postcss.config.js" || 
-               path_lower == "next.config.js" || path_lower.contains("config") || path_lower.ends_with(".json") {
+            if path_lower == "package.json"
+                || path_lower == "tsconfig.json"
+                || path_lower == "components.json"
+                || path_lower == "tailwind.config.js"
+                || path_lower == "postcss.config.js"
+                || path_lower == "next.config.js"
+                || is_config_location
+                || is_root_json
+            {
                 GenerationPhase::Config
-            } else if path_lower.contains("schema.prisma") || path_lower.contains("prisma") || path_lower.contains("models/") || path_lower.contains("database") {
+            } else if path_lower.contains("schema.prisma") || path_lower.contains("prisma") || path_lower.contains("models/") || path_lower.contains("types/") || path_lower.contains("database") {
                 GenerationPhase::DatabaseOrMain
             } else if path_lower.contains("hooks/") || path_lower.contains("utils/") || path_lower.contains("lib/") {
                 GenerationPhase::LogicOrHooks
@@ -107,7 +117,7 @@ pub fn get_generation_phase(file_path: &str, project_type: &str) -> GenerationPh
             }
         }
         "electron" | "rust" => {
-            if path_lower == "package.json" || path_lower == "cargo.toml" || path_lower.contains("config") {
+            if path_lower == "package.json" || path_lower == "cargo.toml" || is_config_location || is_root_json {
                 GenerationPhase::Config
             } else if path_lower.contains("main.js") || path_lower.contains("main.ts") || path_lower.contains("preload.js") || 
                       path_lower.contains("main.rs") || path_lower.contains("commands") {
@@ -117,7 +127,7 @@ pub fn get_generation_phase(file_path: &str, project_type: &str) -> GenerationPh
             }
         }
         "flutter" => {
-            if path_lower.contains("pubspec.yaml") || path_lower.contains("config") {
+            if path_lower.contains("pubspec.yaml") || is_config_location {
                 GenerationPhase::Config
             } else if path_lower.contains("models/") || path_lower.contains("sqlite") || path_lower.contains("db") || 
                       path_lower.contains("api") || path_lower.contains("bloc") || path_lower.contains("provider") {
@@ -215,7 +225,7 @@ pub fn get_context_files_for(file_path: &str, proj_dir: &std::path::Path) -> Str
         if let Some(ar_path) = actual_auth_route {
             if let Ok(content) = std::fs::read_to_string(&ar_path) {
                 context.push_str(&format!(
-                    "\nReference: NextAuth configuration (src/app/api/auth/[...nextauth]/route.ts):\n```typescript\n{}\n```\n",
+                    "\nReference ONLY (NEVER import /api/**/route or authOptions directly in 'use client' files or hooks — use next-auth/react or fetch('/api/auth/...') instead): NextAuth configuration (src/app/api/auth/[...nextauth]/route.ts):\n```typescript\n{}\n```\n",
                     content
                 ));
             }
@@ -325,19 +335,83 @@ pub async fn validate_file_with_abstract_rules(
         }
     }
 
-    // 5. Client component boundary validation
+    // 5. Client component & hook boundary validation
     let is_client_file = trimmed.starts_with("\"use client\"")
         || trimmed.starts_with("'use client'")
         || trimmed.lines().take(5).any(|l| {
             let t = l.trim();
             t == "\"use client\";" || t == "\"use client\"" || t == "'use client';" || t == "'use client'"
         });
-    if is_client_file && !path_lower.ends_with("route.ts") && !path_lower.ends_with("route.js") {
-        if trimmed.contains("export default async function") {
+    let is_hook_file = (path_lower.contains("/hooks/") || path_lower.starts_with("hooks/")) && !path_lower.contains("/api/");
+    let is_route_handler = path_lower.ends_with("route.ts") || path_lower.ends_with("route.js");
+    if (is_client_file || is_hook_file) && !is_route_handler {
+        if is_client_file && trimmed.contains("export default async function") {
             return Err("Client Component ('use client') cannot be declared as `export default async function`.".to_string());
         }
-        if trimmed.contains("'@/lib/prisma'") || trimmed.contains("\"@/lib/prisma\"") || trimmed.contains("new PrismaClient") {
-            return Err("Client Component ('use client') must NOT import @/lib/prisma or instantiate PrismaClient.".to_string());
+        if trimmed.contains("new PrismaClient") {
+            return Err("Client Component / hook must NOT instantiate PrismaClient.".to_string());
+        }
+        let raw_lines: Vec<&str> = trimmed.lines().collect();
+        let mut idx_l = 0usize;
+        while idx_l < raw_lines.len() {
+            let t = raw_lines[idx_l].trim();
+            if t.starts_with("import ") || t.starts_with("import{") {
+                let mut end_l = idx_l;
+                let mut stmt = raw_lines[idx_l].to_string();
+                let is_side_effect = t.starts_with("import '") || t.starts_with("import \"");
+                if !is_side_effect {
+                    while !stmt.contains(" from ") && !stmt.contains("from'") && !stmt.contains("from\"") && !stmt.trim_end().ends_with(';') && end_l + 1 < raw_lines.len() {
+                        end_l += 1;
+                        stmt.push('\n');
+                        stmt.push_str(raw_lines[end_l]);
+                    }
+                }
+                let flat = stmt.replace('\n', " ");
+                let flat_trim = flat.trim();
+                let is_explicit_type = flat_trim.starts_with("import type ") || flat_trim.starts_with("import type{");
+                let is_inline_all_types = if !is_explicit_type && flat_trim.contains('{') && flat_trim.contains('}') {
+                    if let (Some(ob), Some(cb)) = (flat_trim.find('{'), flat_trim.find('}')) {
+                        if ob < cb {
+                            let inner = &flat_trim[ob + 1..cb];
+                            let items: Vec<&str> = inner.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                            !items.is_empty() && items.iter().all(|it| it.starts_with("type "))
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                let is_type_only = is_explicit_type || is_inline_all_types;
+                if !is_type_only {
+                    if let Some(spec) = crate::sanitizer::extract_import_specifier(flat_trim) {
+                        let s_low = spec.to_lowercase();
+                        let is_server_mod = s_low == "@prisma/client"
+                            || s_low == "@/lib/prisma"
+                            || s_low == "~/lib/prisma"
+                            || s_low.ends_with("/lib/prisma");
+                        let is_api_route_import = s_low.starts_with("@/app/api/")
+                            || s_low.starts_with("~/app/api/")
+                            || s_low.starts_with("src/app/api/")
+                            || s_low.starts_with("app/api/")
+                            || (s_low.contains("/api/")
+                                && (s_low.ends_with("/route")
+                                    || s_low.ends_with("/route.ts")
+                                    || s_low.ends_with("/route.js")));
+                        if is_server_mod {
+                            return Err("Client Component / hook must NOT import @/lib/prisma or runtime symbols from @prisma/client.".to_string());
+                        }
+                        if is_api_route_import {
+                            return Err("Client Component / hook must NOT import Next.js API route handlers (/api/**/route); call fetch('/api/...') instead.".to_string());
+                        }
+                    }
+                }
+                idx_l = end_l + 1;
+                continue;
+            }
+            idx_l += 1;
         }
     }
 
@@ -1036,7 +1110,7 @@ pub fn get_project_design_archetype_from_dir(proj_dir: &std::path::Path) -> Stri
 pub fn resolve_database_archetype_prompt(project_name: &str, project_description: &str, category: &str) -> String {
     let combined = format!("{} {} {}", project_name, project_description, category).to_lowercase();
 
-    let (archetype_name, domain_entities, relational_guidance, architectural_hints) = if combined.contains("crypto")
+    let (archetype_name, modeling_priority, relational_guidance, architectural_hints) = if combined.contains("crypto")
         || combined.contains("blockchain")
         || combined.contains("cyber")
         || combined.contains("security")
@@ -1046,9 +1120,9 @@ pub fn resolve_database_archetype_prompt(project_name: &str, project_description
     {
         (
             "FinTech / Trading & Ledger Domain",
-            "User, Wallet, Account, Transaction, LedgerEntry, AuditLog",
-            "Wallets link 1-to-1 or 1-to-many to User. Transactions link to source/destination Wallets. Use high-precision Decimals (`@db.Decimal(18, 4)`) for currency amounts.",
-            "Enforce strict audit timestamps (`createdAt`, `updatedAt`). Use enums for TransactionStatus (PENDING, COMPLETED, FAILED) and TransactionType (DEPOSIT, WITHDRAWAL, TRANSFER)."
+            "Derive core account, holding/balance, transaction, and audit-log entities strictly from the project's specification and contract.",
+            "Link sub-accounts and ledger transactions to their owning account/identity via explicit foreign keys, using named `@relation` tags whenever a single child references multiple parent roles (e.g. source vs. destination).",
+            "Use high-precision numeric types (`Float` or `Decimal @db.Decimal(18, 4)`), immutable timestamps (`createdAt`, `updatedAt`), and status/type enums matching the workflow."
         )
     } else if combined.contains("ecommerce")
         || combined.contains("e-commerce")
@@ -1061,9 +1135,9 @@ pub fn resolve_database_archetype_prompt(project_name: &str, project_description
     {
         (
             "E-Commerce & Digital Marketplace Domain",
-            "User, Product, Category, Order, OrderItem, Cart, CartItem, Review",
-            "User has many Orders. Order has many OrderItems. Product links to OrderItems and Categories. Use Float or Decimal for prices.",
-            "Use enums for OrderStatus (PENDING, PAID, SHIPPED, DELIVERED, CANCELLED) and PaymentStatus. Include inventory count (`stock Int @default(0)`)."
+            "Derive catalog item, category, order/booking, line-item, and review entities strictly from the project's specification and contract.",
+            "Normalize 1-to-many ownership from parent collections to line items/bookings using explicit scalar foreign keys on child records and matching opposite arrays on parent records.",
+            "Include pricing, currency, stock/capacity scalars, and clean status/payment enums instead of hardcoding unrelated SaaS tables."
         )
     } else if combined.contains("health")
         || combined.contains("medical")
@@ -1078,25 +1152,25 @@ pub fn resolve_database_archetype_prompt(project_name: &str, project_description
     {
         (
             "EdTech / HealthTech Care & Progression Domain",
-            "User, Course, Module, Lesson, Enrollment, Progress, Certificate (or Patient, Appointment, Record)",
-            "Course has many Modules. Module has many Lessons. User has many Enrollments. Progress tracks Lesson completion per User.",
-            "Use enums for UserRole (STUDENT, INSTRUCTOR, ADMIN), ProgressStatus, and Priority. Include completion percentage or score fields."
+            "Derive domain curriculum/care program, unit/session, participant/enrollment, and progression/record entities strictly from the project's specification and contract.",
+            "Connect hierarchical structural levels downward via 1-to-many foreign keys and attach participant tracking records via composite or unique relations where needed.",
+            "Include progress metrics, timestamps, optional role/status enums, and nullable personal credentials so local auth/seeding works reliably."
         )
     } else {
         (
-            "Executive B2B SaaS & Work Management Domain",
-            "User, Team, Project, Task, Subscription, Analytics, ActivityLog",
-            "User has many Projects and belongs to Teams. Project has many Tasks. Subscription links to User (or Team). Analytics links 1-to-1 to Project (with @unique on projectId).",
-            "Use enums for Role (ADMIN, MEMBER, GUEST), Status (PENDING, IN_PROGRESS, COMPLETED), and Priority (LOW, MEDIUM, HIGH, URGENT). Include start/due dates and activity metrics."
+            "Domain Operations & Workspace Platform",
+            "Model ONLY the exact domain entities required by the project description and REQUIRED DATABASE MODELS CONTRACT (never inject generic placeholder entities that do not belong to the domain).",
+            "Represent every relationship strictly with symmetric opposite fields and explicit foreign keys on the child side; mark 1-to-1 foreign keys `@unique`.",
+            "Define role, status, and priority enums at the top of the schema when fixed choices apply, and include `createdAt` / `updatedAt` timestamps on persisted entities."
         )
     };
 
     format!(
         "APPLICATION DATABASE DOMAIN ARCHETYPE ({}):\n\
-         - Recommended Core Entities: {}\n\
+         - Domain Modeling Priority: {}\n\
          - Relational Topography Guidance: {}\n\
          - Production Architectural Hints: {}\n\n",
-        archetype_name, domain_entities, relational_guidance, architectural_hints
+        archetype_name, modeling_priority, relational_guidance, architectural_hints
     )
 }
 
@@ -1133,28 +1207,28 @@ pub fn resolve_api_domain_archetype(category: &str) -> &'static str {
     let cat_lower = category.to_lowercase();
     if cat_lower.contains("fintech") || cat_lower.contains("trading") || cat_lower.contains("crypto") || cat_lower.contains("banking") || cat_lower.contains("finance") {
         "API DOMAIN ARCHETYPE: FinTech, Ledger & Transaction Management\n\
-         - Primary models: Wallets, Accounts, Transactions, Ledgers, Invoices.\n\
-         - Handlers deal with balances, currency codes (USD, EUR), status (PENDING, COMPLETED, FAILED), and audit trails.\n\
-         - In GET handlers, return realistic financial records with decimal amounts and ISO timestamps.\n\
-         - In POST mutations, validate amount > 0 and update wallet balances atomically."
+         - Target ONLY the financial/ledger models declared in ACTIVE DATABASE MODELS.\n\
+         - Handlers deal with balances, currency amounts, status transitions, and audit trails.\n\
+         - In GET handlers, return realistic domain records with formatted amounts and ISO timestamps.\n\
+         - In POST mutations, validate positive numeric amounts and persist mutations safely."
     } else if cat_lower.contains("ecommerce") || cat_lower.contains("marketplace") || cat_lower.contains("store") || cat_lower.contains("retail") || cat_lower.contains("shop") {
         "API DOMAIN ARCHETYPE: E-Commerce, Product Catalog & Order Management\n\
-         - Primary models: Products, Categories, Orders, OrderItems, Cart.\n\
-         - Handlers deal with product SKUs, prices, stock levels, and order fulfillment status.\n\
-         - In GET handlers, return rich product catalogs with category badges and inventory status.\n\
-         - In POST orders, create order records and line items linked to user."
+         - Target ONLY the catalog, order, and customer models declared in ACTIVE DATABASE MODELS.\n\
+         - Handlers deal with catalog attributes, prices, stock/availability, and fulfillment state.\n\
+         - In GET handlers, return rich catalog/order records matching schema fields.\n\
+         - In POST mutations, validate payloads with Zod and link created records cleanly."
     } else if cat_lower.contains("edtech") || cat_lower.contains("education") || cat_lower.contains("course") || cat_lower.contains("health") || cat_lower.contains("care") || cat_lower.contains("learning") {
         "API DOMAIN ARCHETYPE: EdTech, HealthCare & Progression Tracking\n\
-         - Primary models: Courses/Programs, Modules, Lessons, Enrollments, Progress, Certifications.\n\
-         - Handlers deal with completion percentages (0-100), active enrollment, and content progression.\n\
-         - In GET handlers, return courses with module counts, instructor metadata, and student progress.\n\
-         - In POST progress, record completion timestamps and update total progress percentage."
+         - Target ONLY the domain models declared in ACTIVE DATABASE MODELS.\n\
+         - Handlers deal with participant registrations, progression metrics (0-100), schedules, and structured content.\n\
+         - In GET handlers, return entities with related counts/metadata matching exact schema relation names.\n\
+         - In POST mutations, record timestamps and update status/progression cleanly."
     } else {
-        "API DOMAIN ARCHETYPE: Executive B2B SaaS, Projects & Collaborative Workspaces\n\
-         - Primary models: Workspaces, Projects, Tasks, TeamMembers, Subscriptions, Activities.\n\
-         - Handlers deal with project statuses (PLANNING, ACTIVE, COMPLETED), task priorities (LOW, MEDIUM, HIGH, URGENT), and team assignments.\n\
-         - In GET handlers, return projects with task counts, team avatars, and activity logs.\n\
-         - In POST tasks/projects, assign creator ownerId and default to status ACTIVE/TODO."
+        "API DOMAIN ARCHETYPE: Domain Operations, Resource & Collaborative Workflows\n\
+         - Target ONLY the domain models and field names declared in ACTIVE DATABASE MODELS (never invent missing model delegates).\n\
+         - Handlers deal with status transitions, priorities, assignments, and domain metrics.\n\
+         - In GET handlers, return domain entities with exact relation inclusions and fallback sample data.\n\
+         - In POST mutations, validate inputs with Zod using sensible `.optional().default(...)` fallbacks."
     }
 }
 
@@ -1203,6 +1277,21 @@ Step 3 [Visual Hierarchy & Layout]:
 Step 4 [Navigation & Dual Export]:
        - Every <Link> MUST point to a verified route from VERIFIED APPLICATION ROUTES.
        - Export component as BOTH named (`export { ComponentName }`) and default (`export default ComponentName`)."#;
+
+pub const UI_ROUTE_PAGE_CHAIN_OF_THOUGHT: &str = r#"FRONTEND UI GENERATION CHAIN-OF-THOUGHT (Execute in strict sequence):
+Step 1 [Client Boundary & Imports]:
+       - Place 'use client'; at line 1 if the page/layout uses hooks or interactivity.
+       - Import icons ONLY from subpaths ('react-icons/hi', 'react-icons/fa', 'lucide-react'), NEVER from bare 'react-icons'.
+       - Import verified hooks from '@/hooks' and UI primitives from '@/components/ui/*'.
+Step 2 [Domain Mock State]:
+       - Pre-populate state with 4-6 realistic domain mockup items matching the project archetype so the page renders rich visual content immediately.
+Step 3 [Visual Hierarchy & Layout]:
+       - Header: Prominent page title, descriptive subtitle, and primary CTA action button.
+       - Metric Cards: Responsive grid (grid-cols-1 sm:grid-cols-2 lg:grid-cols-4) with KPI numbers, labels, trend badges.
+       - Work Surface: Main interactive area with search input, status filter tabs, and responsive data cards or table.
+Step 4 [Navigation & Default Export Only]:
+       - Every <Link> MUST point to a verified route from VERIFIED APPLICATION ROUTES.
+       - Next.js App Router route files (`page.tsx`, `layout.tsx`, `loading.tsx`, `error.tsx`, `not-found.tsx`, `template.tsx`, `default.tsx`, `global-error.tsx`) MUST use ONLY `export default ComponentName` (and reserved Next.js exports such as `metadata` / `dynamic`); NEVER emit named component, function, or const exports."#;
 
 pub fn get_scoped_ui_rules(file_path: &str) -> String {
     let path_lower = file_path.to_lowercase().replace('\\', "/");
@@ -2183,7 +2272,7 @@ pub fn refresh_axiom_contracts_for_project(
 }
 
 /// Formats cross-file dependency and capability contracts from `.axiom/axiom-contracts.json`
-/// into a compact context block for subsequent LLM generations.
+/// into a compact, dependency-prioritized context block for subsequent LLM generations.
 pub fn format_axiom_contracts_prompt(proj_dir: &std::path::Path, current_file_path: &str) -> String {
     let contracts_path = proj_dir.join(".axiom").join("axiom-contracts.json");
     if !contracts_path.exists() {
@@ -2203,10 +2292,30 @@ pub fn format_axiom_contracts_prompt(proj_dir: &std::path::Path, current_file_pa
     }
 
     let cur_norm = current_file_path.replace('\\', "/");
-    let mut lines = Vec::new();
+    let direct_deps: std::collections::HashSet<String> = files
+        .iter()
+        .find(|entry| {
+            entry
+                .get("path")
+                .and_then(|p| p.as_str())
+                .map(|p| p.replace('\\', "/").eq_ignore_ascii_case(&cur_norm))
+                .unwrap_or(false)
+        })
+        .and_then(|entry| entry.get("dependencies"))
+        .and_then(|d| d.get("internal"))
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.replace('\\', "/").to_lowercase()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut ranked: Vec<((u8, String), String)> = Vec::new();
     for entry in files {
-        let path = entry.get("path").and_then(|p| p.as_str()).unwrap_or("");
-        if path.is_empty() || path == cur_norm {
+        let raw_path = entry.get("path").and_then(|p| p.as_str()).unwrap_or("");
+        let path = raw_path.replace('\\', "/");
+        if path.is_empty() || path.eq_ignore_ascii_case(&cur_norm) {
             continue;
         }
         let role = entry.get("role").and_then(|r| r.as_str()).unwrap_or("source-module");
@@ -2234,6 +2343,21 @@ pub fn format_axiom_contracts_prompt(proj_dir: &std::path::Path, current_file_pa
         if exports.is_empty() && api_calls.is_empty() && routes.is_empty() {
             continue;
         }
+
+        let priority: u8 = if direct_deps.contains(&path.to_lowercase()) {
+            0
+        } else {
+            match role {
+                "database-schema" | "domain-model" => 1,
+                "client-hook" => 2,
+                "source-module" | "layout" => 3,
+                "api-route" => 4,
+                "ui-component" => 5,
+                "page-route" => 6,
+                _ => 7,
+            }
+        };
+
         let mut summary = format!("- {} [{}]", path, role);
         if !exports.is_empty() {
             summary.push_str(&format!(" exports:[{}]", exports.join(", ")));
@@ -2244,10 +2368,22 @@ pub fn format_axiom_contracts_prompt(proj_dir: &std::path::Path, current_file_pa
         if !routes.is_empty() {
             summary.push_str(&format!(" links:[{}]", routes.join(", ")));
         }
-        lines.push(summary);
-        if lines.len() >= 16 {
+        ranked.push(((priority, path), summary));
+    }
+
+    ranked.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut total_chars: usize = 0;
+    for (_, summary) in ranked {
+        if lines.len() >= 24 {
             break;
         }
+        if !lines.is_empty() && total_chars + summary.len() + 1 > 3500 {
+            break;
+        }
+        total_chars += summary.len() + 1;
+        lines.push(summary);
     }
 
     if lines.is_empty() {
@@ -2255,6 +2391,178 @@ pub fn format_axiom_contracts_prompt(proj_dir: &std::path::Path, current_file_pa
     } else {
         format!("CROSS-FILE CONTRACTS REGISTRY (.axiom/axiom-contracts.json):\n{}\n", lines.join("\n"))
     }
+}
+
+fn parse_lbg_relation_entry(raw: &str) -> (String, String, bool) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return (String::new(), String::new(), false);
+    }
+    let (rel_field, type_part) = if let Some((lhs, rhs)) = trimmed.split_once(':') {
+        let f = lhs.split_whitespace().next().unwrap_or("").trim().to_string();
+        let t = rhs.split_whitespace().next().unwrap_or("").trim();
+        (f, t)
+    } else {
+        let toks: Vec<&str> = trimmed.split_whitespace().collect();
+        if toks.len() >= 2 && toks[1].chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
+            (toks[0].to_string(), toks[1])
+        } else {
+            (String::new(), toks.first().copied().unwrap_or(""))
+        }
+    };
+    let clean_tok = type_part.split('(').next().unwrap_or(type_part).trim();
+    let is_array = clean_tok.contains('[');
+    let target_model = clean_tok
+        .replace(['?', '[', ']', ',', ';'], "")
+        .trim()
+        .to_string();
+    (rel_field, target_model, is_array)
+}
+
+/// Validates and cleans relational graph contracts inside `live_builder_guide.json` using
+/// model-agnostic Prisma graph invariants:
+/// - Rejects relations referencing undeclared models (`target_model` missing from `models`),
+/// - Rejects unsupervised self-list relations (`M[]`) that lack a singular `M?` partner (or pair),
+/// - Rejects one-sided broken relations whose target model has neither an opposite relation nor FK.
+/// Preserves single-model (`models.len() < 2`) partial contracts unchanged.
+pub fn sanitize_live_builder_guide_contracts(lbg: &Value) -> Value {
+    let mut out = lbg.clone();
+    let Some(models_obj) = out
+        .get_mut("sharedContracts")
+        .and_then(|c| c.get_mut("database"))
+        .and_then(|d| d.get_mut("models"))
+        .and_then(|m| m.as_object_mut())
+    else {
+        return out;
+    };
+
+    let declared_models: std::collections::HashSet<String> = models_obj.keys().cloned().collect();
+    if declared_models.len() < 2 {
+        return out;
+    }
+
+    let fields_map: std::collections::HashMap<String, std::collections::HashSet<String>> = models_obj
+        .iter()
+        .map(|(m_name, m_val)| {
+            let fset: std::collections::HashSet<String> = m_val
+                .get("fields")
+                .and_then(|f| f.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .filter_map(|s| s.split([':', ' ', '\t']).next())
+                        .map(|s| s.trim().to_lowercase())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            (m_name.clone(), fset)
+        })
+        .collect();
+
+    let max_iters = declared_models.len() + 1;
+    for _ in 0..max_iters {
+        let mut rels_snapshot: std::collections::HashMap<String, Vec<(String, String, bool)>> = std::collections::HashMap::new();
+        for (m_name, m_val) in models_obj.iter() {
+            let parsed_list: Vec<(String, String, bool)> = m_val
+                .get("relations")
+                .and_then(|r| r.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(parse_lbg_relation_entry)
+                        .collect()
+                })
+                .unwrap_or_default();
+            rels_snapshot.insert(m_name.clone(), parsed_list);
+        }
+
+        let mut changed_any = false;
+        let model_keys: Vec<String> = models_obj.keys().cloned().collect();
+        for m_name in model_keys {
+            let Some(m_obj) = models_obj.get_mut(&m_name).and_then(|v| v.as_object_mut()) else {
+                continue;
+            };
+            let Some(rels_arr) = m_obj.get("relations").and_then(|r| r.as_array()).cloned() else {
+                continue;
+            };
+
+            let self_rels = rels_snapshot.get(&m_name).map(|v| v.as_slice()).unwrap_or(&[]);
+            let self_singular_count = self_rels
+                .iter()
+                .filter(|(_, tgt, is_arr)| *tgt == m_name && !*is_arr)
+                .count();
+            let self_list_count = self_rels
+                .iter()
+                .filter(|(_, tgt, is_arr)| *tgt == m_name && *is_arr)
+                .count();
+            let self_fields = fields_map.get(&m_name);
+
+            let mut filtered_rels: Vec<Value> = Vec::with_capacity(rels_arr.len());
+            for rel_val in &rels_arr {
+                let Some(rel_str) = rel_val.as_str() else {
+                    filtered_rels.push(rel_val.clone());
+                    continue;
+                };
+                let (rel_field, target_model, is_array) = parse_lbg_relation_entry(rel_str);
+                if target_model.is_empty() || !declared_models.contains(&target_model) {
+                    changed_any = true;
+                    continue;
+                }
+
+                if target_model == m_name {
+                    if is_array && self_singular_count == 0 && self_list_count < 2 {
+                        changed_any = true;
+                        continue;
+                    }
+                    filtered_rels.push(rel_val.clone());
+                    continue;
+                }
+
+                let target_has_rel_back = rels_snapshot
+                    .get(&target_model)
+                    .map(|list| list.iter().any(|(_, t, _)| *t == m_name))
+                    .unwrap_or(false);
+                let m_fk_camel = format!("{}id", m_name.to_lowercase());
+                let m_fk_snake = format!("{}_id", m_name.to_lowercase());
+                let target_has_fk_to_m = fields_map
+                    .get(&target_model)
+                    .map(|fs| fs.contains(&m_fk_camel) || fs.contains(&m_fk_snake))
+                    .unwrap_or(false);
+                let self_has_fk_to_target = self_fields
+                    .map(|fs| {
+                        let t_camel = format!("{}id", target_model.to_lowercase());
+                        let t_snake = format!("{}_id", target_model.to_lowercase());
+                        let f_camel = if rel_field.is_empty() { String::new() } else { format!("{}id", rel_field.to_lowercase()) };
+                        let f_snake = if rel_field.is_empty() { String::new() } else { format!("{}_id", rel_field.to_lowercase()) };
+                        fs.contains(&t_camel)
+                            || fs.contains(&t_snake)
+                            || (!f_camel.is_empty() && fs.contains(&f_camel))
+                            || (!f_snake.is_empty() && fs.contains(&f_snake))
+                    })
+                    .unwrap_or(false);
+
+                let keep = target_has_rel_back
+                    || (is_array && target_has_fk_to_m)
+                    || (!is_array && self_has_fk_to_target);
+                if keep {
+                    filtered_rels.push(rel_val.clone());
+                } else {
+                    changed_any = true;
+                }
+            }
+
+            if filtered_rels.len() != rels_arr.len() {
+                m_obj.insert("relations".to_string(), Value::Array(filtered_rels));
+            }
+        }
+
+        if !changed_any {
+            break;
+        }
+    }
+
+    out
 }
 
 /// Formats database contract JSON into a compact, high-signal prompt block.
@@ -2444,12 +2752,13 @@ pub fn get_expert_system_prompt(
     if path_lower.contains("schema.prisma") {
         let db_archetype = get_project_database_archetype_from_dir(proj_dir);
         let mut prompt = format!(
-            "You are a Senior Database Architect. Write only the complete, valid schema.prisma code wrapped in markdown code blocks. No explanations.\n\n             {}             DATABASE GENERATION CHAIN-OF-THOUGHT (Execute in strict sequence):\n             Step 1 [Domain Enums]: Define all domain enums (Role, Status, Priority, Tier) at the very top of the schema.\n             Step 2 [Core Entities & Attributes]: Define models with IDs (@id @default(cuid())), scalar columns, and timestamps (createdAt, updatedAt). Make password fields optional (hashedPassword String?).\n             Step 3 [Relational Topography & Foreign Keys]:\n                    - One-to-Many: Put scalar foreign key (e.g. `ownerId String`) and `@relation(fields: [ownerId], references: [id])` on the child model. Put array (`projects Project[]`) on the parent model.\n                    - One-to-One: Put scalar foreign key WITH `@unique` on the child model (e.g. `projectId String @unique` and `@relation(fields: [projectId], references: [id])`). Put singular optional (`projectAnalytics Analytics?`) on parent model.\n                    - Multiple Relations Between Same Models: If a model defines two or more relations pointing to the SAME target model (e.g. `sourceWallet Wallet` and `destinationWallet Wallet?` in `Transaction`), you MUST assign unique relation names on BOTH models: `@relation(\"SourceWallet\", fields: [sourceWalletId], references: [id])` and on the target model `@relation(\"SourceWallet\")`.\n                    - Implicit Many-to-Many: Define array fields on both sides without `@relation(fields: ...)`.\n             Step 4 [Verification Gate]: Verify that:\n                    1. Every relation has exactly ONE matching opposite field with matching relation name.\n                    2. Zero duplicate relation fields exist between the same two models.\n                    3. If multiple relations exist between the same two models, each pair MUST have a distinct `@relation(\"Name\")`.\n                    4. Zero self-relations exist unless explicitly building a hierarchical tree (parent Model?, children Model[]).\n                    5. All foreign key scalars in 1-to-1 relations have `@unique`.\n\n             PRISMA SCHEMA RULES:\n             - The `@relation` attribute MUST ONLY be placed on relational object fields, never on scalar fields.\n             - Referential actions in `@relation` (`onDelete`, `onUpdate`) MUST use exact Prisma PascalCase keywords: `SetNull`, `Cascade`, `Restrict`, `NoAction`, `SetDefault` (NEVER uppercase SQL syntax like `SET_NULL` or `CASCADE`).\n             - For NextAuth schema, the VerificationToken model does not have a direct relation back to the User model.\n             - Fixed sets of values MUST be defined using Prisma `enum Name {{ VAL1 VAL2 }}`, NEVER as a relational `model`.\n",
+            "You are a Senior Database Architect. Write only the complete, valid schema.prisma code wrapped in markdown code blocks. No explanations.\n\n             {}             DATABASE GENERATION CHAIN-OF-THOUGHT (Execute in strict sequence):\n             Step 1 [Domain Enums]: Define all domain enums (e.g. Role, Status, Priority) at the top of the schema when fixed choice sets exist.\n             Step 2 [Core Entities & Attributes]: Define models with IDs (@id @default(cuid())), scalar columns, and timestamps (createdAt, updatedAt). Make password fields optional (hashedPassword String?).\n             Step 3 [Relational Topography & Foreign Keys]:\n                    - One-to-Many: Put scalar foreign key (e.g. `<parentId> String`) and `@relation(fields: [<parentId>], references: [id])` on `<ChildModel>`. Put the symmetric list field (`<children> <ChildModel>[]`) on `<ParentModel>`.\n                    - One-to-One: Put scalar foreign key WITH `@unique` on `<ChildModel>` (`<parentId> String @unique` and `@relation(fields: [<parentId>], references: [id])`) and optional singular inverse (`<child> <ChildModel>?`) on `<ParentModel>`.\n                    - Multiple Relations Between Same Models: If `<ModelA>` defines two or more relations pointing to the SAME `<ModelB>` (`<roleA> <ModelB>` and `<roleB> <ModelB>?`), you MUST assign distinct `@relation(\"RoleA\", fields: [<roleAId>], references: [id])` / `@relation(\"RoleB\", ...)` tags and matching `@relation(\"RoleA\")` / `@relation(\"RoleB\")` opposite fields on `<ModelB>`.\n                    - Implicit Many-to-Many: Define array fields on both `<ModelA>` and `<ModelB>` ONLY when BOTH sides declare matching opposite arrays.\n             Step 4 [Verification Gate]: Verify before finalizing:\n                    1. Every relation field has an opposite field on a declared model in this schema (zero undefined model types, zero one-sided dangling array fields).\n                    2. Zero duplicate relation fields exist between the same two models.\n                    3. If multiple relations exist between the same two models, each pair has a distinct `@relation(\"Name\")`.\n                    4. Zero self-relations (`Model[]`) exist unless defining a tree with both `parent <Model>? @relation(\"<Model>Hierarchy\", fields: [parentId], references: [id])` and `children <Model>[] @relation(\"<Model>Hierarchy\")`.\n                    5. All foreign key scalars in 1-to-1 relations have `@unique`.\n\n             PRISMA SCHEMA RULES:\n             - The `@relation` attribute MUST ONLY be placed on relational object fields, never on scalar fields.\n             - Referential actions in `@relation` (`onDelete`, `onUpdate`) MUST use exact Prisma PascalCase keywords: `SetNull`, `Cascade`, `Restrict`, `NoAction`, `SetDefault` (NEVER uppercase SQL syntax like `SET_NULL` or `CASCADE`).\n             - For NextAuth schema, the VerificationToken model does not have a direct relation back to the User model.\n             - Fixed sets of values MUST be defined using Prisma `enum Name {{ VAL1 VAL2 }}`, NEVER as a relational `model`.\n",
             db_archetype
         );
 
         if let Some(ref lbg) = lbg_val {
-            if let Some(db_models) = lbg.get("sharedContracts").and_then(|c| c.get("database")).and_then(|d| d.get("models")) {
+            let clean_lbg = sanitize_live_builder_guide_contracts(lbg);
+            if let Some(db_models) = clean_lbg.get("sharedContracts").and_then(|c| c.get("database")).and_then(|d| d.get("models")) {
                 prompt.push_str(&format!("\nREQUIRED DATABASE MODELS CONTRACT:\n{}\n", db_models));
             }
         }
@@ -2620,10 +2929,16 @@ pub fn get_expert_system_prompt(
     // Strictly isolated from backend Prisma schemas and NextAuth server internals!
     let is_react_frontend = (path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx")) && !is_custom_hook;
     if is_react_frontend {
+        let is_route_file = crate::sanitizer::is_app_router_route_file(file_path);
+        let ui_cot = if is_route_file {
+            UI_ROUTE_PAGE_CHAIN_OF_THOUGHT
+        } else {
+            UI_GENERATION_CHAIN_OF_THOUGHT
+        };
         let mut prompt = format!(
             "You are a Principal React & Tailwind CSS Product Designer and Frontend Engineer. Write only clean, complete, production-ready React code wrapped in markdown code blocks. No explanations.\n\n\
              {}\n\n",
-            UI_GENERATION_CHAIN_OF_THOUGHT
+            ui_cot
         );
 
         // Inject tailored Design Archetype tokens based on the project's domain & category
@@ -2636,7 +2951,7 @@ pub fn get_expert_system_prompt(
                  - DOM HIERARCHY: Outermost elements returned MUST be `<html lang=\"en\"><body className=\"min-h-screen flex flex-col bg-slate-50 text-slate-900 antialiased selection:bg-indigo-600 selection:text-white\">...</body></html>`.\n\
                  - GLOBAL PROVIDERS: Wrap all global providers inside `<body>` around `{children}`. If NextAuth is configured, wrap with `<SessionProvider>`.\n\
                  - PERSISTENT NAVIGATION & STICKY FOOTER: Always import and mount `<Navbar />` (from `@/components/Navbar`) at the top, wrap `{children}` in `<main className=\"flex-1 flex flex-col w-full\">{children}</main>`, and mount `<Footer />` (from `@/components/Footer`) at the bottom.\n\
-                 - MANDATORY DEFAULT EXPORT: RootLayout MUST have `export default function RootLayout({ children }: { children: React.ReactNode })`.\n\
+                 - MANDATORY DEFAULT EXPORT: RootLayout MUST have `export default function RootLayout({ children }: { children: React.ReactNode })` and MUST NOT emit arbitrary named value exports.\n\
                  - Mark the layout file with 'use client'; at line 1.\n\n"
             );
         } else if path_lower == "src/app/page.tsx" || path_lower == "src/app/page.jsx" || path_lower == "app/page.tsx" || path_lower == "app/page.jsx" {
@@ -2648,15 +2963,21 @@ pub fn get_expert_system_prompt(
                  - DATA RESILIENCY: Pre-populate state with 4-6 realistic domain mockup items so the page is rich and interactive out-of-the-box.\n\n"
             );
         } else {
-            prompt.push_str(
+            let export_compat_rule = if is_route_file {
+                "- DEFAULT EXPORT ONLY: Next.js App Router route files MUST export ONLY `export default ComponentName` (and reserved Next.js exports such as `metadata`); NEVER emit named component/function/const exports."
+            } else {
+                "- DUAL EXPORT COMPATIBILITY: Export the component as both a named export (`export { ComponentName }`) and default export (`export default ComponentName`)."
+            };
+            prompt.push_str(&format!(
                 "CORE FRONTEND COMPONENT RULES:\n\
-                 - CLIENT-SIDE BOUNDARY: NEVER import `@prisma/client` in React components. Fetch data from `/api/...` endpoints.\n\
+                 - CLIENT-SIDE BOUNDARY: NEVER import `@prisma/client` or `/api/**/route` in React components or hooks. Fetch data from `/api/...` endpoints.\n\
                  - STRICT TYPE DEFINITIONS & IMPORTS: Declare TypeScript interfaces cleanly inside the file. Import icons ONLY from valid subpaths (`'react-icons/hi'`, `'react-icons/fa'`, `'react-icons/fi'`, `'react-icons/io5'`, or `'lucide-react'`), NEVER from bare `'react-icons'`.\n\
-                 - NEXT.JS LINK RULE: Do NOT place `<a>` tags inside `<Link>`. Put `className` and `prefetch={false}` directly on `<Link>`.\n\
+                 - NEXT.JS LINK RULE: Do NOT place `<a>` tags inside `<Link>`. Put `className` and `prefetch={{false}}` directly on `<Link>`.\n\
                  - NO DEAD IMPORTS: Do not import external local modules unless they exist in the project; prefer clean self-contained components or verified `@/components/ui/*` primitives.\n\
-                 - DUAL EXPORT COMPATIBILITY: Export the component as both a named export (`export { ComponentName }`) and default export (`export default ComponentName`).\n\
-                 - NO MANUAL AXIOM ATTRS: Never declare or use 'data-axiom-component' or 'data-axiom-file' props.\n\n"
-            );
+                 {}\n\
+                 - NO MANUAL AXIOM ATTRS: Never declare or use 'data-axiom-component' or 'data-axiom-file' props.\n\n",
+                export_compat_rule
+            ));
         }
 
         // Inject surgical, role-specific UI rulepacks for this exact file
@@ -4055,10 +4376,20 @@ export default function RootLayout({
         }
     }) || project_type == "nextjs";
 
-    // Sort files_to_generate by generation phase
+    // Sort files_to_generate by generation phase (with deterministic sub-ordering inside Phase 1)
     files_to_generate.sort_by_key(|file_spec| {
         let file_path = file_spec.get("path").and_then(|p| p.as_str()).unwrap_or("");
-        get_generation_phase(file_path, &project_type)
+        let p_lower = file_path.replace('\\', "/").to_lowercase();
+        let db_sub_priority = if p_lower.contains("schema.prisma") {
+            0u8
+        } else if p_lower.ends_with("lib/prisma.ts") || p_lower.ends_with("lib/prisma.js") {
+            1u8
+        } else if p_lower.contains("/models/") || p_lower.starts_with("models/") || p_lower.contains("/types/") || p_lower.starts_with("types/") {
+            2u8
+        } else {
+            3u8
+        };
+        (get_generation_phase(file_path, &project_type), db_sub_priority, file_path.to_string())
     });
 
     if let Some(pct) = resume_base_pct {
@@ -4100,7 +4431,8 @@ export default function RootLayout({
     let lbg_path = axiom_dir.join("live_builder_guide.json");
     
     if let Some(lbg_val) = manifest.get("liveBuilderGuide") {
-        if let Ok(lbg_content) = serde_json::to_string_pretty(lbg_val) {
+        let sanitized_lbg = sanitize_live_builder_guide_contracts(lbg_val);
+        if let Ok(lbg_content) = serde_json::to_string_pretty(&sanitized_lbg) {
             let _ = fs::write(&lbg_path, lbg_content);
         }
     } else if !lbg_path.exists() {
@@ -4637,8 +4969,16 @@ export default function RootLayout({
         }
     }
 
-    // Ensure barrel index.ts files exist in src/hooks, src/types, src/utils, src/config
+    // Ensure barrel index.ts files exist and normalize route links BEFORE pre-build hygiene & compiler healing
     ensure_directory_barrel_files(&proj_dir);
+    let pre_routes = get_project_routes_from_dir(&proj_dir);
+    let pre_routes_list: Vec<String> = pre_routes.into_iter().map(|(r, _)| r).collect();
+    if !pre_routes_list.is_empty() {
+        normalize_project_route_links(&proj_dir, &pre_routes_list);
+    }
+
+    // Run pre-build hygiene pass (tsconfig, package.json, bare imports, CSS dedup, UI primitives, App Router route exports)
+    crate::self_healing::run_hygiene_pass_on_project(&proj_dir);
 
     // Run self-healing compiler loop to automatically correct any compilation or syntax errors
     let heal_warnings = perform_self_healing_loop(&proj_dir, &model_id, &files_to_generate).await;
@@ -4646,47 +4986,21 @@ export default function RootLayout({
     // Run automated post-generation static, import, hook, and Prisma checks
     let auto_test_warnings = crate::self_healing::run_generation_auto_test_suite(&proj_dir, &window, &model_id).await;
 
-    // Generate Axiom Map (axiom-map.json)
+    // Refresh route links and write final up-to-date project graphs & contracts after healing
+    let post_routes = get_project_routes_from_dir(&proj_dir);
+    let post_routes_list: Vec<String> = post_routes.into_iter().map(|(r, _)| r).collect();
+    if !post_routes_list.is_empty() {
+        normalize_project_route_links(&proj_dir, &post_routes_list);
+    }
+
     if let Err(e) = generate_axiom_map(&proj_dir) {
         debug_log_to_file(format!("[Axiom Map] Greška pri kreiranju axiom-map.json: {}", e));
     }
-
-    // Generate project dependency graph metadata
     generate_project_metadata(&proj_dir, &project_id, &files_to_generate);
-    let project_routes = get_project_routes_from_dir(&proj_dir);
-    let routes_list: Vec<String> = project_routes.into_iter().map(|(r, _)| r).collect();
-    if !routes_list.is_empty() {
-        normalize_project_route_links(&proj_dir, &routes_list);
-    }
     generate_axiom_features_json(&proj_dir, name, &files_to_generate);
     refresh_axiom_contracts_for_project(&proj_dir, &project_id, &files_to_generate);
 
-    // 4. Save Project State
-    emit_progress("save-project", "Saving project files...", 80.0);
-    
-    let new_proj = serde_json::json!({
-        "id": project_id,
-        "name": name,
-        "description": project_description,
-        "status": "ready",
-        "metadata": {
-            "offlineWaiting": false
-        },
-        "createdAt": chrono::Utc::now().to_rfc3339(),
-        "updatedAt": chrono::Utc::now().to_rfc3339(),
-    });
-    let _ = project_save(new_proj);
-
-    checkpoint_state["status"] = serde_json::json!("completed");
-    checkpoint_state["phase"] = serde_json::json!("complete");
-    checkpoint_state["offlineWaiting"] = serde_json::json!(false);
-    if let Some(obj) = checkpoint_state.as_object_mut() {
-        obj.remove("pausedReason");
-    }
-    checkpoint_state["updatedAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
-    save_generation_checkpoint(&proj_dir, &checkpoint_state);
-    unregister_task_control(&task_id, &project_id);
-
+    // Assemble honest completion warnings BEFORE persisting final state and emitting completion event
     let mut completion_warnings: Vec<String> = Vec::new();
     if !npm_install_ok && proj_dir.join("package.json").exists() {
         completion_warnings.push("npm install failed (check logs)".to_string());
@@ -4704,6 +5018,37 @@ export default function RootLayout({
             completion_warnings.push(w.clone());
         }
     }
+    let has_warnings = !completion_warnings.is_empty();
+
+    // 4. Save Project State
+    emit_progress("save-project", "Saving project files...", 80.0);
+
+    let new_proj = serde_json::json!({
+        "id": project_id,
+        "name": name,
+        "description": project_description,
+        "status": "ready",
+        "metadata": {
+            "offlineWaiting": false,
+            "hasWarnings": has_warnings,
+            "warnings": completion_warnings
+        },
+        "createdAt": chrono::Utc::now().to_rfc3339(),
+        "updatedAt": chrono::Utc::now().to_rfc3339(),
+    });
+    let _ = project_save(new_proj);
+
+    checkpoint_state["status"] = serde_json::json!("completed");
+    checkpoint_state["phase"] = serde_json::json!("complete");
+    checkpoint_state["offlineWaiting"] = serde_json::json!(false);
+    checkpoint_state["hasWarnings"] = serde_json::json!(has_warnings);
+    checkpoint_state["warnings"] = serde_json::json!(completion_warnings);
+    if let Some(obj) = checkpoint_state.as_object_mut() {
+        obj.remove("pausedReason");
+    }
+    checkpoint_state["updatedAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+    save_generation_checkpoint(&proj_dir, &checkpoint_state);
+    unregister_task_control(&task_id, &project_id);
 
     let final_completion_msg = if completion_warnings.is_empty() {
         "Generation completed successfully!".to_string()
@@ -4713,7 +5058,21 @@ export default function RootLayout({
             completion_warnings.join("; ")
         )
     };
-    emit_progress("complete", &final_completion_msg, 100.0);
+    debug_log_to_file(format!(
+        "[Orchestrator Progress] Emit final complete - hasWarnings={}, message={}",
+        has_warnings, final_completion_msg
+    ));
+    let _ = window.app_handle().emit("task:progress", serde_json::json!({
+        "taskId": task_id,
+        "projectId": project_id,
+        "phase": "complete",
+        "status": "completed",
+        "offlineWaiting": false,
+        "hasWarnings": has_warnings,
+        "warnings": completion_warnings,
+        "message": final_completion_msg,
+        "progress": 100.0
+    }));
 
     Ok(())
 }

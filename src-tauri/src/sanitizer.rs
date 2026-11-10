@@ -1399,6 +1399,427 @@ pub fn normalize_project_route_links(proj_dir: &std::path::Path, valid_routes: &
     walk_and_sanitize(proj_dir, valid_routes);
 }
 
+pub fn extract_import_specifier(stmt_flat: &str) -> Option<String> {
+    let trimmed = stmt_flat.trim();
+    if let Some(rest) = trimmed.strip_prefix("import") {
+        let after_kw = rest.trim_start();
+        if after_kw.starts_with('\'') || after_kw.starts_with('"') {
+            let q = after_kw.chars().next()?;
+            let inner = &after_kw[1..];
+            if let Some(end) = inner.find(q) {
+                return Some(inner[..end].trim().to_string());
+            }
+        }
+    }
+    if let Some(idx) = trimmed.rfind(" from ") {
+        let after_from = trimmed[idx + 6..].trim_start();
+        let q = after_from.chars().next()?;
+        if q == '\'' || q == '"' {
+            let inner = &after_from[1..];
+            if let Some(end) = inner.find(q) {
+                return Some(inner[..end].trim().to_string());
+            }
+        }
+    }
+    for pat in ["from'", "from\""] {
+        if let Some(idx) = trimmed.rfind(pat) {
+            let after_from = &trimmed[idx + 4..];
+            let q = after_from.chars().next()?;
+            let inner = &after_from[1..];
+            if let Some(end) = inner.find(q) {
+                return Some(inner[..end].trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Returns true if `file_path` is a special Next.js App Router route convention file
+/// (e.g. `page.tsx`, `layout.tsx`, `loading.tsx`, `error.tsx`, `not-found.tsx`,
+/// `template.tsx`, `default.tsx`, `global-error.tsx`) outside API routes.
+pub fn is_app_router_route_file(file_path: &str) -> bool {
+    let norm = file_path
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_lowercase();
+    let in_app_dir = norm.starts_with("src/app/")
+        || norm.starts_with("app/")
+        || norm.contains("/app/");
+    if !in_app_dir || norm.starts_with("api/") || norm.contains("/api/") {
+        return false;
+    }
+    let file_name = std::path::Path::new(&norm)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    matches!(
+        file_name,
+        "page.tsx"
+            | "page.jsx"
+            | "page.ts"
+            | "page.js"
+            | "layout.tsx"
+            | "layout.jsx"
+            | "layout.ts"
+            | "layout.js"
+            | "loading.tsx"
+            | "loading.jsx"
+            | "loading.js"
+            | "error.tsx"
+            | "error.jsx"
+            | "error.js"
+            | "not-found.tsx"
+            | "not-found.jsx"
+            | "not-found.js"
+            | "template.tsx"
+            | "template.jsx"
+            | "template.js"
+            | "default.tsx"
+            | "default.jsx"
+            | "default.js"
+            | "global-error.tsx"
+            | "global-error.jsx"
+            | "global-error.js"
+    )
+}
+
+fn is_reserved_nextjs_route_export(name: &str) -> bool {
+    matches!(
+        name,
+        "metadata"
+            | "generateMetadata"
+            | "viewport"
+            | "generateViewport"
+            | "dynamic"
+            | "dynamicParams"
+            | "revalidate"
+            | "fetchCache"
+            | "runtime"
+            | "preferredRegion"
+            | "maxDuration"
+            | "generateStaticParams"
+            | "generateImageMetadata"
+            | "generateSitemaps"
+    )
+}
+
+/// Scans top-level brace depth (`brace_depth == 0`) outside strings and comments to strip
+/// illegal non-reserved named value exports from Next.js App Router route files (`page.tsx`,
+/// `layout.tsx`, etc.) while keeping `export default`, `export type`/`interface`/`declare`,
+/// and official Next.js route segment config/metadata exports intact. Ensures `export default`
+/// exists if a component declaration lost its invalid named `export`.
+pub fn sanitize_app_router_route_exports(content: &str, file_path: &str) -> String {
+    if !is_app_router_route_file(file_path) {
+        return content.to_string();
+    }
+
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out_lines: Vec<String> = Vec::with_capacity(lines.len());
+    let mut brace_depth: usize = 0;
+    let mut in_block_comment = false;
+    let mut in_tmpl_text = false;
+    let mut tmpl_expr_stack: Vec<usize> = Vec::new();
+    let mut has_default_export = false;
+    let mut export_lost_component: Option<String> = None;
+    let mut fallback_component_candidate: Option<String> = None;
+
+    let is_pascal_case_component = |name: &str| -> bool {
+        name.chars().next().map_or(false, |c| c.is_ascii_uppercase())
+            && name.chars().any(|c| c.is_ascii_lowercase())
+    };
+    let is_route_primary_component = |name: &str| -> bool {
+        name.ends_with("Page")
+            || name.ends_with("Layout")
+            || name == "Home"
+            || name == "NotFound"
+            || name == "Loading"
+            || name == "Error"
+            || name.ends_with("Error")
+            || name.ends_with("Template")
+    };
+
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+        let top_level = brace_depth == 0 && !in_block_comment && !in_tmpl_text && tmpl_expr_stack.is_empty();
+
+        // Track brace depth for this line (to compute depth for the NEXT line).
+        let update_depth = |text: &str, depth: &mut usize, blk_cmt: &mut bool, tmpl_txt: &mut bool, expr_stk: &mut Vec<usize>| {
+            let chars: Vec<char> = text.chars().collect();
+            let mut k = 0usize;
+            let mut quote: Option<char> = None;
+            while k < chars.len() {
+                let c = chars[k];
+                if *blk_cmt {
+                    if c == '*' && k + 1 < chars.len() && chars[k + 1] == '/' {
+                        *blk_cmt = false;
+                        k += 2;
+                        continue;
+                    }
+                    k += 1;
+                    continue;
+                }
+                if *tmpl_txt {
+                    if c == '\\' {
+                        k += 2;
+                        continue;
+                    }
+                    if c == '`' {
+                        *tmpl_txt = false;
+                    } else if c == '$' && k + 1 < chars.len() && chars[k + 1] == '{' {
+                        *depth += 1;
+                        expr_stk.push(1);
+                        *tmpl_txt = false;
+                        k += 2;
+                        continue;
+                    }
+                    k += 1;
+                    continue;
+                }
+                if let Some(q) = quote {
+                    if c == '\\' {
+                        k += 2;
+                        continue;
+                    }
+                    if c == q {
+                        quote = None;
+                    }
+                    k += 1;
+                    continue;
+                }
+                if c == '/' && k + 1 < chars.len() {
+                    if chars[k + 1] == '/' {
+                        break;
+                    }
+                    if chars[k + 1] == '*' {
+                        *blk_cmt = true;
+                        k += 2;
+                        continue;
+                    }
+                }
+                if c == '\'' || c == '"' {
+                    quote = Some(c);
+                } else if c == '`' {
+                    *tmpl_txt = true;
+                } else if c == '{' {
+                    *depth += 1;
+                    if let Some(top) = expr_stk.last_mut() {
+                        *top += 1;
+                    }
+                } else if c == '}' {
+                    *depth = depth.saturating_sub(1);
+                    if let Some(top) = expr_stk.last_mut() {
+                        *top = top.saturating_sub(1);
+                        if *top == 0 {
+                            expr_stk.pop();
+                            *tmpl_txt = true;
+                        }
+                    }
+                }
+                k += 1;
+            }
+        };
+
+        if top_level && (trimmed.starts_with("export default") || (trimmed.starts_with("export {") && trimmed.contains("as default"))) {
+            has_default_export = true;
+        }
+
+        // Capture PascalCase component declarations even without `export`, prioritizing primary route components (*Page/*Layout/Home)
+        if top_level {
+            let check_decl = trimmed.strip_prefix("export default ").or_else(|| trimmed.strip_prefix("export ")).unwrap_or(trimmed).trim();
+            let cand_opt = if let Some(rest) = check_decl.strip_prefix("async function ").or_else(|| check_decl.strip_prefix("function ")) {
+                let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                if is_pascal_case_component(&name) { Some(name) } else { None }
+            } else if let Some(rest) = check_decl.strip_prefix("const ") {
+                let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                if is_pascal_case_component(&name)
+                    && (check_decl.contains("=>")
+                        || check_decl.contains("React.FC")
+                        || check_decl.contains("FC<")
+                        || check_decl.contains(": FC")
+                        || check_decl.contains("forwardRef")
+                        || check_decl.contains("React.memo")
+                        || check_decl.contains("= (")
+                        || check_decl.contains("= async (")
+                        || check_decl.contains("= function"))
+                {
+                    Some(name)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(cand) = cand_opt {
+                let is_primary = is_route_primary_component(&cand);
+                let prev_primary = fallback_component_candidate.as_deref().map_or(false, |p| is_route_primary_component(p));
+                if fallback_component_candidate.is_none() || (is_primary && !prev_primary) {
+                    fallback_component_candidate = Some(cand);
+                }
+            }
+        }
+
+        if top_level && trimmed.starts_with("export ") {
+            if trimmed.starts_with("export default")
+                || trimmed.starts_with("export type ")
+                || trimmed.starts_with("export type{")
+                || trimmed.starts_with("export type *")
+                || trimmed.starts_with("export interface ")
+                || trimmed.starts_with("export declare ")
+                || trimmed.starts_with("export namespace ")
+            {
+                out_lines.push(line.to_string());
+                update_depth(line, &mut brace_depth, &mut in_block_comment, &mut in_tmpl_text, &mut tmpl_expr_stack);
+                i += 1;
+                continue;
+            }
+
+            // Runtime wildcard re-exports (`export * from '...'`) are illegal on Next.js App Router route files
+            if trimmed.starts_with("export *") {
+                update_depth(line, &mut brace_depth, &mut in_block_comment, &mut in_tmpl_text, &mut tmpl_expr_stack);
+                i += 1;
+                continue;
+            }
+
+            // Local export list `export { A, B };` (may span multiple lines)
+            if trimmed.starts_with("export {") || trimmed.starts_with("export{") {
+                let mut stmt = line.to_string();
+                let mut end_idx = i;
+                while !stmt.contains('}') && end_idx + 1 < lines.len() {
+                    end_idx += 1;
+                    stmt.push('\n');
+                    stmt.push_str(lines[end_idx]);
+                }
+                let norm_stmt: String = stmt.split_whitespace().collect::<Vec<_>>().join(" ");
+                let is_reexport_from = norm_stmt.contains("} from '")
+                    || norm_stmt.contains("} from \"")
+                    || norm_stmt.contains("}from '")
+                    || norm_stmt.contains("}from \"");
+                if is_reexport_from {
+                    // Preserve `export { default } from '...'` or `export { Foo as default } from '...'`
+                    if norm_stmt.contains("default") {
+                        has_default_export = true;
+                        out_lines.push(stmt);
+                    } else {
+                        // Drop invalid value re-export from external module on Next.js route file
+                    }
+                    for j in i..=end_idx {
+                        update_depth(lines[j], &mut brace_depth, &mut in_block_comment, &mut in_tmpl_text, &mut tmpl_expr_stack);
+                    }
+                    i = end_idx + 1;
+                    continue;
+                }
+
+                if let (Some(ob), Some(cb)) = (stmt.find('{'), stmt.rfind('}')) {
+                    let inner = &stmt[ob + 1..cb];
+                    let mut kept_items = Vec::new();
+                    for raw_item in inner.split(',') {
+                        let item = raw_item.trim();
+                        if item.is_empty() {
+                            continue;
+                        }
+                        if item == "type" || item.starts_with("type ") {
+                            kept_items.push(item.to_string());
+                            continue;
+                        }
+                        let (orig_name, exported_name) = if let Some((lhs, rhs)) = item.split_once(" as ") {
+                            (lhs.trim(), rhs.trim())
+                        } else {
+                            (item, item)
+                        };
+                        if exported_name == "default" {
+                            has_default_export = true;
+                            kept_items.push(item.to_string());
+                        } else if is_reserved_nextjs_route_export(exported_name) {
+                            kept_items.push(item.to_string());
+                        } else if is_pascal_case_component(orig_name) {
+                            let is_route_primary = is_route_primary_component(orig_name);
+                            let prev_primary = export_lost_component.as_deref().map_or(false, |p| is_route_primary_component(p));
+                            if export_lost_component.is_none() || (is_route_primary && !prev_primary) {
+                                export_lost_component = Some(orig_name.to_string());
+                            }
+                        }
+                    }
+                    if !kept_items.is_empty() {
+                        let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+                        out_lines.push(format!("{}export {{ {} }};", indent, kept_items.join(", ")));
+                    }
+                    for j in i..=end_idx {
+                        update_depth(lines[j], &mut brace_depth, &mut in_block_comment, &mut in_tmpl_text, &mut tmpl_expr_stack);
+                    }
+                    i = end_idx + 1;
+                    continue;
+                }
+            }
+
+            // Declaration export: `export [async] function <Name>` / `export const|let|var|class|enum <Name>`
+            let after_export = trimmed.strip_prefix("export ").unwrap_or("").trim_start();
+            let decl_kw_and_ident: Option<(&str, String)> = [
+                "async function ",
+                "function ",
+                "const ",
+                "let ",
+                "var ",
+                "class ",
+                "enum ",
+            ]
+            .iter()
+            .find_map(|kw| {
+                after_export.strip_prefix(kw).map(|rest| {
+                    let id = rest
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect::<String>();
+                    (*kw, id)
+                })
+            });
+
+            if let Some((decl_kw, ident)) = decl_kw_and_ident {
+                if !ident.is_empty() && !is_reserved_nextjs_route_export(&ident) {
+                    let can_be_component = matches!(decl_kw, "async function " | "function " | "const " | "let ");
+                    if can_be_component && is_pascal_case_component(&ident) {
+                        let is_route_primary = is_route_primary_component(&ident);
+                        let prev_primary = export_lost_component.as_deref().map_or(false, |p| is_route_primary_component(p));
+                        if export_lost_component.is_none() || (is_route_primary && !prev_primary) {
+                            export_lost_component = Some(ident);
+                        }
+                    }
+                    // Strip only the `export ` keyword, keeping indentation & declaration intact
+                    let stripped_line = if let Some(pos) = line.find("export ") {
+                        format!("{}{}", &line[..pos], &line[pos + 7..])
+                    } else {
+                        line.to_string()
+                    };
+                    out_lines.push(stripped_line.clone());
+                    update_depth(&stripped_line, &mut brace_depth, &mut in_block_comment, &mut in_tmpl_text, &mut tmpl_expr_stack);
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+
+        out_lines.push(line.to_string());
+        update_depth(line, &mut brace_depth, &mut in_block_comment, &mut in_tmpl_text, &mut tmpl_expr_stack);
+        i += 1;
+    }
+
+    let mut result = out_lines.join("\n");
+    if content.ends_with('\n') && !result.ends_with('\n') {
+        result.push('\n');
+    }
+    if !has_default_export {
+        if let Some(comp) = export_lost_component.or(fallback_component_candidate) {
+            if !result.ends_with('\n') {
+                result.push('\n');
+            }
+            result.push_str(&format!("\nexport default {};\n", comp));
+        }
+    }
+    result
+}
+
 pub fn post_process_generated_file(
     file_path: &str,
     content: &str,
@@ -2313,9 +2734,16 @@ export const config = {
 
         // Dual-export synchronization (both named and default export) for components, UI primitives, and hooks
         // Prevents: Attempted import error: 'Button' is not exported from '@/components/ui/button'
-        if !path_lower.contains("/api/") && !path_lower.ends_with("route.ts") && !path_lower.ends_with("route.js") && !path_lower.ends_with("middleware.ts") {
+        // Strictly NEVER apply to Next.js App Router route files (`page.tsx`, `layout.tsx`, `error.tsx`, etc.).
+        if !is_app_router_route_file(&normalized_path)
+            && !path_lower.contains("/api/")
+            && !path_lower.ends_with("route.ts")
+            && !path_lower.ends_with("route.js")
+            && !path_lower.ends_with("middleware.ts")
+            && !path_lower.ends_with("middleware.js")
+        {
             if let Some(stem) = std::path::Path::new(&normalized_path).file_stem().and_then(|s| s.to_str()) {
-                if stem != "page" && stem != "layout" && stem != "index" && stem != "loading" && stem != "error" && stem != "not-found" {
+                if stem != "index" {
                     let mut pascal_name = String::new();
                     let mut cap_next = true;
                     for c in stem.chars() {
@@ -2377,40 +2805,8 @@ export const config = {
                 processed = processed.replace("export default async function", "export default function");
             }
 
-            // Ensure layout.tsx / page.tsx never omit export default (prevents RSC default.then crash)
-            if path_lower.ends_with("layout.tsx") || path_lower.ends_with("layout.jsx") || path_lower.ends_with("page.tsx") || path_lower.ends_with("page.jsx") {
-                if !processed.contains("export default") {
-                    let mut found_comp: Option<String> = None;
-                    for candidate in &["RootLayout", "Layout", "HomePage", "Page", "Home", "DashboardPage", "Dashboard", "ProfilePage", "Profile", "LoginPage", "RegisterPage"] {
-                        if processed.contains(&format!("function {}", candidate)) || processed.contains(&format!("const {}", candidate)) {
-                            found_comp = Some(candidate.to_string());
-                            break;
-                        }
-                    }
-                    if found_comp.is_none() {
-                        // Dynamically scan for any PascalCase function or const declaration
-                        for line in processed.lines() {
-                            let t = line.trim().trim_start_matches("export ").trim();
-                            if let Some(rest) = t.strip_prefix("function ") {
-                                let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
-                                if name.chars().next().map_or(false, |c| c.is_uppercase()) {
-                                    found_comp = Some(name);
-                                    break;
-                                }
-                            } else if let Some(rest) = t.strip_prefix("const ") {
-                                let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
-                                if name.chars().next().map_or(false, |c| c.is_uppercase()) && (t.contains("=>") || t.contains("React.FC") || t.contains("FC")) {
-                                    found_comp = Some(name);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if let Some(comp) = found_comp {
-                        processed.push_str(&format!("\nexport default {};\n", comp));
-                    }
-                }
-            }
+            // NOTE: App Router default export synthesis + illegal named export cleanup
+            // is handled by `sanitize_app_router_route_exports(...)` below (AST-depth aware).
 
             // Prisma Client import normalization
             processed = processed
@@ -2504,41 +2900,102 @@ export default function Home() {
                 .replace("new Resend(process.env.RESEND_API_KEY || '')", "new Resend(process.env.RESEND_API_KEY || 're_dummy_key_for_dev_preview')");
         }
 
-        // Enforce client component invariants AFTER all `"use client"` directives and import normalizations have run
+        // Enforce client & custom-hook boundaries AFTER all `"use client"` directives and import normalizations have run
         let is_client_file = processed.contains("\"use client\"") || processed.contains("'use client'");
-        if is_client_file {
-            if processed.contains("export default async function") {
-                processed = processed.replace("export default async function", "export default function");
-            }
-            // Strip server-only value imports (Prisma, bcrypt, fs) from client components to prevent webpack & RSC crashes
-            // Preserve pure `import type ... from '@prisma/client'` because TS erases type imports cleanly.
-            if !path_lower.ends_with("route.ts") && !path_lower.ends_with("route.js") {
-                let filtered_lines: Vec<&str> = processed
-                    .lines()
-                    .filter(|line| {
-                        let t = line.trim();
-                        if t.starts_with("import ") {
-                            let is_type_only = t.starts_with("import type ") || t.starts_with("import type{");
-                            let is_server_value_import = (!is_type_only && (t.contains("'@prisma/client'") || t.contains("\"@prisma/client\"")))
-                                || t.contains("'@/lib/prisma'")
-                                || t.contains("\"@/lib/prisma\"")
-                                || t.contains("'bcrypt'")
-                                || t.contains("\"bcrypt\"")
-                                || t.contains("'bcryptjs'")
-                                || t.contains("\"bcryptjs\"")
-                                || t.contains("'fs'")
-                                || t.contains("\"fs\"")
-                                || t.contains("'node:fs'")
-                                || t.contains("\"node:fs\"")
-                                || t.contains("'fs/promises'")
-                                || t.contains("\"fs/promises\"");
-                            return !is_server_value_import;
+        let is_hook_file = (path_lower.contains("/hooks/") || path_lower.starts_with("hooks/")) && !path_lower.contains("/api/");
+        let is_route_handler = path_lower.ends_with("route.ts") || path_lower.ends_with("route.js");
+
+        if is_client_file && processed.contains("export default async function") {
+            processed = processed.replace("export default async function", "export default function");
+        }
+
+        if (is_client_file || is_hook_file) && !is_route_handler {
+            // Strip server-only and API-route value imports (Prisma, bcrypt, fs, api/**/route)
+            // while preserving pure `import type ...` declarations (multi-line safe).
+            let raw_lines: Vec<&str> = processed.lines().collect();
+            let mut filtered_lines: Vec<String> = Vec::with_capacity(raw_lines.len());
+            let mut idx_l = 0usize;
+            while idx_l < raw_lines.len() {
+                let t = raw_lines[idx_l].trim();
+                if t.starts_with("import ") || t.starts_with("import{") {
+                    let mut end_l = idx_l;
+                    let mut stmt = raw_lines[idx_l].to_string();
+                    let is_side_effect = t.starts_with("import '") || t.starts_with("import \"");
+                    if !is_side_effect {
+                        while !stmt.contains(" from ") && !stmt.contains("from'") && !stmt.contains("from\"") && !stmt.trim_end().ends_with(';') && end_l + 1 < raw_lines.len() {
+                            end_l += 1;
+                            stmt.push('\n');
+                            stmt.push_str(raw_lines[end_l]);
                         }
-                        true
-                    })
-                    .collect();
-                processed = filtered_lines.join("\n");
+                    }
+                    let flat = stmt.replace('\n', " ");
+                    let flat_trim = flat.trim();
+                    let is_explicit_type = flat_trim.starts_with("import type ") || flat_trim.starts_with("import type{");
+                    let is_inline_all_types = if !is_explicit_type && flat_trim.contains('{') && flat_trim.contains('}') {
+                        if let (Some(ob), Some(cb)) = (flat_trim.find('{'), flat_trim.find('}')) {
+                            if ob < cb {
+                                let inner = &flat_trim[ob + 1..cb];
+                                let items: Vec<&str> = inner.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                                !items.is_empty() && items.iter().all(|it| it.starts_with("type "))
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    let is_type_only = is_explicit_type || is_inline_all_types;
+
+                    let spec_opt = extract_import_specifier(flat_trim);
+                    let is_forbidden_server_import = if let Some(ref spec) = spec_opt {
+                        let s_low = spec.to_lowercase();
+                        let is_server_mod = s_low == "@prisma/client"
+                            || s_low == "@/lib/prisma"
+                            || s_low == "~/lib/prisma"
+                            || s_low.ends_with("/lib/prisma")
+                            || s_low == "bcrypt"
+                            || s_low == "bcryptjs"
+                            || s_low == "fs"
+                            || s_low == "node:fs"
+                            || s_low == "fs/promises";
+                        let is_api_route_import = s_low.starts_with("@/app/api/")
+                            || s_low.starts_with("~/app/api/")
+                            || s_low.starts_with("src/app/api/")
+                            || s_low.starts_with("app/api/")
+                            || (s_low.contains("/api/")
+                                && (s_low.ends_with("/route")
+                                    || s_low.ends_with("/route.ts")
+                                    || s_low.ends_with("/route.js")));
+                        !is_type_only && (is_server_mod || is_api_route_import)
+                    } else {
+                        false
+                    };
+
+                    if is_forbidden_server_import {
+                        idx_l = end_l + 1;
+                        continue;
+                    }
+                    for k in idx_l..=end_l {
+                        filtered_lines.push(raw_lines[k].to_string());
+                    }
+                    idx_l = end_l + 1;
+                    continue;
+                }
+                filtered_lines.push(raw_lines[idx_l].to_string());
+                idx_l += 1;
             }
+            let had_trailing_nl = processed.ends_with('\n');
+            processed = filtered_lines.join("\n");
+            if had_trailing_nl && !processed.ends_with('\n') {
+                processed.push('\n');
+            }
+        }
+
+        // Strip invalid named value exports on Next.js App Router route files (page/layout/error/loading/etc.)
+        if is_app_router_route_file(&normalized_path) {
+            processed = sanitize_app_router_route_exports(&processed, &normalized_path);
         }
 
         // Apply across all TS/TSX/JS/JSX files (hooks, components, pages, API routes):
@@ -3547,27 +4004,34 @@ pub fn sanitize_prisma_relations(schema: &str) -> String {
         Err(_) => return schema.to_string(),
     };
 
-    // 1. Prune ghost / duplicate self-relations (preserving valid paired self-relations like parent <-> children)
+    // 1. Prune ghost / duplicate self-relations (preserving valid paired self-relations like parent <-> children
+    // and valid symmetric named self-M2M relations, while pruning un-paired or un-annotated self-lists like `projects Club[]`).
     for m in &model_names {
         if let Some(lines) = model_bodies.get_mut(m) {
             let mut defining_self_rel_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let mut self_rel_indices: Vec<(usize, Option<String>)> = Vec::new();
+            let mut has_unnamed_defining_self_rel = false;
+            let mut named_self_rel_indices: Vec<(usize, String)> = Vec::new();
+            let mut unnamed_self_rel_indices: Vec<usize> = Vec::new();
             for (idx, line) in lines.iter().enumerate() {
                 let trimmed = line.trim();
-                if trimmed.starts_with("//") {
+                if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("@@") || trimmed.starts_with('@') || trimmed.starts_with("/*") {
                     continue;
                 }
                 let parts: Vec<&str> = trimmed.split_whitespace().collect();
                 if parts.len() >= 2 {
                     let field_type = parts[1].replace(['?', '[', ']'], "");
-                    if field_type == *m && trimmed.contains("@relation") {
+                    if field_type == *m {
                         let rel_name = extract_prisma_relation_name(trimmed);
                         if trimmed.contains("fields:") {
                             if let Some(rname) = rel_name {
                                 defining_self_rel_names.insert(rname);
+                            } else {
+                                has_unnamed_defining_self_rel = true;
                             }
+                        } else if let Some(rname) = rel_name {
+                            named_self_rel_indices.push((idx, rname));
                         } else {
-                            self_rel_indices.push((idx, rel_name));
+                            unnamed_self_rel_indices.push(idx);
                         }
                     }
                 }
@@ -3575,21 +4039,29 @@ pub fn sanitize_prisma_relations(schema: &str) -> String {
 
             let mut to_remove = std::collections::HashSet::new();
             let mut seen_defining_self_opposites: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for (idx, rel_name) in &self_rel_indices {
-                if let Some(rname) = rel_name {
-                    if defining_self_rel_names.contains(rname) {
-                        // Valid self-relation opposite paired with a defining `fields:` relation on the same model.
-                        // Keep the first copy; prune any extra duplicate opposite copies.
-                        if !seen_defining_self_opposites.insert(rname.clone()) {
-                            to_remove.insert(*idx);
-                        }
-                    } else {
-                        let references_other_model = model_names.iter().any(|other| other != m && rname.contains(other.as_str()));
-                        let matches_count = self_rel_indices.iter().filter(|(_, r)| r.as_deref() == Some(rname.as_str())).count();
-                        if references_other_model || matches_count == 1 {
-                            to_remove.insert(*idx);
-                        }
+            for (idx, rname) in &named_self_rel_indices {
+                if defining_self_rel_names.contains(rname) {
+                    // Valid self-relation opposite paired with a defining `fields:` relation on the same model.
+                    // Keep the first copy; prune any extra duplicate opposite copies.
+                    if !seen_defining_self_opposites.insert(rname.clone()) {
+                        to_remove.insert(*idx);
                     }
+                } else {
+                    let references_other_model = model_names.iter().any(|other| other != m && rname.contains(other.as_str()));
+                    let matches_count = named_self_rel_indices.iter().filter(|(_, r)| r == rname).count();
+                    if references_other_model || matches_count == 1 {
+                        to_remove.insert(*idx);
+                    }
+                }
+            }
+
+            // Prune any un-annotated self-relation without an un-named defining `fields:` self-relation on the same model
+            let mut kept_one_unnamed_self = false;
+            for idx in unnamed_self_rel_indices {
+                if has_unnamed_defining_self_rel && !kept_one_unnamed_self {
+                    kept_one_unnamed_self = true;
+                } else {
+                    to_remove.insert(idx);
                 }
             }
 
@@ -3615,7 +4087,7 @@ pub fn sanitize_prisma_relations(schema: &str) -> String {
             if let Some(m2_lines) = model_bodies.get(m2) {
                 for line in m2_lines {
                     let trimmed = line.trim();
-                    if trimmed.starts_with("//") {
+                    if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("@@") || trimmed.starts_with('@') || trimmed.starts_with("/*") {
                         continue;
                     }
                     let parts: Vec<&str> = trimmed.split_whitespace().collect();
@@ -3648,7 +4120,7 @@ pub fn sanitize_prisma_relations(schema: &str) -> String {
             let mut candidates: Vec<BackCand> = Vec::new();
             for (idx, line) in lines.iter().enumerate() {
                 let trimmed = line.trim();
-                if trimmed.starts_with("//") {
+                if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("@@") || trimmed.starts_with('@') || trimmed.starts_with("/*") {
                     continue;
                 }
                 let parts: Vec<&str> = trimmed.split_whitespace().collect();
@@ -3717,8 +4189,13 @@ pub fn sanitize_prisma_relations(schema: &str) -> String {
                         }
                     }
                 } else {
-                    // Explicit named M2M where neither model defines `fields:` — still deduplicate exact duplicates on m1
-                    if !claimed_m2m_named.insert((c.t_type.clone(), r_str.to_string())) {
+                    // Explicit named M2M where neither model defines `fields:` — require symmetric opposite on target and deduplicate
+                    let has_sym_m2m = target_non_defining_map
+                        .get(&c.t_type)
+                        .map_or(false, |list| list.iter().any(|rn| rn.as_deref() == Some(r_str)));
+                    if has_sym_m2m && claimed_m2m_named.insert((c.t_type.clone(), r_str.to_string())) {
+                        // Keep symmetric named M2M
+                    } else {
                         to_remove.insert(c.idx);
                     }
                 }
@@ -3752,6 +4229,17 @@ pub fn sanitize_prisma_relations(schema: &str) -> String {
                             to_remove.insert(c.idx);
                         }
                     }
+                } else {
+                    // No defining `fields:` relation on target model: keep only symmetric implicit un-named M2M; prune one-sided orphan fields
+                    let target_unnamed_total = target_non_defining_map
+                        .get(&c.t_type)
+                        .map_or(0, |list| list.iter().filter(|rn| rn.is_none()).count());
+                    let used = claimed_m2m_unnamed_counts.entry(c.t_type.clone()).or_insert(0);
+                    if *used < target_unnamed_total {
+                        *used += 1;
+                    } else {
+                        to_remove.insert(c.idx);
+                    }
                 }
             }
 
@@ -3776,7 +4264,7 @@ pub fn sanitize_prisma_relations(schema: &str) -> String {
         let m1_lines = model_bodies.get(m1).cloned().unwrap_or_default();
         for line in &m1_lines {
             let trimmed = line.trim();
-            if trimmed.starts_with("//") {
+            if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("@@") || trimmed.starts_with('@') || trimmed.starts_with("/*") {
                 continue;
             }
             let parts: Vec<&str> = trimmed.split_whitespace().collect();
@@ -4558,6 +5046,110 @@ pub fn ensure_undeclared_toggle_states(content: &str) -> String {
             if let Some(pos) = result.find('{') {
                 result.insert_str(pos + 1, &format!("\n{}", declaration));
             }
+        }
+    }
+
+    result
+}
+
+/// Removes model field declarations whose base type is neither a Prisma built-in scalar,
+/// `Unsupported(...)`, nor any declared `model`, `enum`, composite `type`, or `view` in `schema`.
+/// Used as a deterministic fallback in Prisma healing if an undefined type persists after AI repair.
+pub fn prune_unresolved_prisma_relations(schema: &str) -> String {
+    let mut known_types: std::collections::HashSet<String> = [
+        "String", "Boolean", "Int", "BigInt", "Float", "Decimal", "DateTime", "Json", "Bytes",
+        "Unsupported",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+
+    if let Ok(decl_re) = regex::Regex::new(r"(?m)^(?:model|enum|type|view)\s+(\w+)\s*\{") {
+        for cap in decl_re.captures_iter(schema) {
+            if let Some(m) = cap.get(1) {
+                known_types.insert(m.as_str().to_string());
+            }
+        }
+    }
+
+    let model_re = match regex::Regex::new(r"(?ms)^model\s+(\w+)\s*\{([^}]+)\}") {
+        Ok(r) => r,
+        Err(_) => return schema.to_string(),
+    };
+
+    let mut replacements: Vec<(String, Vec<String>)> = Vec::new();
+    for cap in model_re.captures_iter(schema) {
+        let Some(m_name) = cap.get(1).map(|m| m.as_str().to_string()) else {
+            continue;
+        };
+        let Some(m_body) = cap.get(2).map(|m| m.as_str()) else {
+            continue;
+        };
+
+        let mut kept_lines = Vec::new();
+        let mut changed = false;
+        let mut in_block_comment = false;
+
+        for line in m_body.lines() {
+            let trimmed = line.trim();
+            if in_block_comment {
+                kept_lines.push(line.to_string());
+                if trimmed.contains("*/") {
+                    in_block_comment = false;
+                }
+                continue;
+            }
+            if trimmed.starts_with("/*") {
+                kept_lines.push(line.to_string());
+                if !trimmed.contains("*/") {
+                    in_block_comment = true;
+                }
+                continue;
+            }
+            if trimmed.is_empty()
+                || trimmed.starts_with("//")
+                || trimmed.starts_with("@@")
+                || trimmed.starts_with('@')
+            {
+                kept_lines.push(line.to_string());
+                continue;
+            }
+
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let raw_type = parts[1];
+                let clean_base = raw_type
+                    .trim_end_matches(&['?', '[', ']'][..])
+                    .replace(['?', '[', ']'], "");
+                let base_ident = clean_base.split('(').next().unwrap_or(&clean_base).trim();
+                if !base_ident.is_empty() && !known_types.contains(base_ident) {
+                    changed = true;
+                    continue;
+                }
+            }
+
+            kept_lines.push(line.to_string());
+        }
+
+        if changed {
+            replacements.push((m_name, kept_lines));
+        }
+    }
+
+    if replacements.is_empty() {
+        return schema.to_string();
+    }
+
+    let mut result = schema.to_string();
+    for (m_name, lines) in replacements {
+        let pattern = format!(r"(?ms)(^model\s+{}\s*\{{)([\s\S]*?)(\n*\}})", m_name);
+        if let Ok(block_re) = regex::Regex::new(&pattern) {
+            let body_str = lines.join("\n");
+            result = block_re
+                .replace(&result, |caps: &regex::Captures| {
+                    format!("{}{}\n{}", &caps[1], body_str.trim_end(), caps[3].trim_start())
+                })
+                .to_string();
         }
     }
 

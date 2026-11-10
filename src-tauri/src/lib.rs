@@ -1719,17 +1719,24 @@ export function useProjects() {
         assert!(hook_prompt.contains("/api/projects"));
         assert!(!hook_prompt.contains("ROOT LAYOUT ARCHITECTURE RULES"));
 
-        // 2. Verify UI Page scope
+        // 2. Verify UI Page route scope gets Default Export Only (never Dual Export)
         let ui_prompt = get_expert_system_prompt("src/app/dashboard/projects/page.tsx", "nextjs", "", "", "", "", &temp_dir);
         assert!(ui_prompt.contains("FRONTEND UI GENERATION CHAIN-OF-THOUGHT"));
         assert!(ui_prompt.contains("Step 1 [Client Boundary & Imports]"));
         assert!(ui_prompt.contains("Step 2 [Domain Mock State]"));
         assert!(ui_prompt.contains("Step 3 [Visual Hierarchy & Layout]"));
-        assert!(ui_prompt.contains("Step 4 [Navigation & Dual Export]"));
+        assert!(ui_prompt.contains("Step 4 [Navigation & Default Export Only]"));
+        assert!(ui_prompt.contains("DEFAULT EXPORT ONLY:"));
+        assert!(!ui_prompt.contains("DUAL EXPORT COMPATIBILITY:"));
         assert!(ui_prompt.contains("VERIFIED API ENDPOINTS TO CALL:"));
         assert!(ui_prompt.contains("/api/projects"));
         assert!(ui_prompt.contains("VERIFIED CUSTOM HOOKS (Import from '@/hooks'):"));
         assert!(ui_prompt.contains("useProjects"));
+
+        // 3. Verify regular UI Component scope still receives Dual Export
+        let comp_prompt = get_expert_system_prompt("src/components/Navbar.tsx", "nextjs", "", "", "", "", &temp_dir);
+        assert!(comp_prompt.contains("Step 4 [Navigation & Dual Export]"));
+        assert!(comp_prompt.contains("DUAL EXPORT COMPATIBILITY:"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -3169,6 +3176,370 @@ export function useMaintenanceAlerts() {
 
         let ui_after = std::fs::read_to_string(temp_dir.join("components/ui.tsx")).unwrap();
         assert!(ui_after.contains("export const Card ="));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_app_router_route_export_guards_and_template_depth_v48() {
+        let page_src = r#"import React from 'react';
+import type { Metadata } from 'next';
+
+export const metadata: Metadata = { title: 'Members' };
+export type MemberSummary = { id: string; label: string };
+export * from './utils';
+
+const sampleTemplate = `literal { inside backtick`;
+export const HelperBadge = () => <span>Helper</span>;
+export function formatMember(name: string) { return name.trim(); }
+
+export function MembersPage() {
+  const inlineObj = { count: 1 };
+  const label = `${inlineObj.count} items`;
+  return <div>{label}</div>;
+}
+
+export { HelperBadge, metadata };
+"#;
+        let processed_page = post_process_generated_file("src/app/members/page.tsx", page_src, &serde_json::json!({}), false);
+        assert!(processed_page.contains("export const metadata: Metadata"));
+        assert!(processed_page.contains("export type MemberSummary"));
+        assert!(!processed_page.contains("export * from './utils'"));
+        assert!(!processed_page.contains("export const HelperBadge"));
+        assert!(processed_page.contains("const HelperBadge = () =>"));
+        assert!(!processed_page.contains("export function formatMember"));
+        assert!(processed_page.contains("function formatMember(name: string)"));
+        assert!(!processed_page.contains("export function MembersPage"));
+        assert!(processed_page.contains("function MembersPage()"));
+        assert!(processed_page.contains("export { metadata };"));
+        assert!(!processed_page.contains("export { HelperBadge"));
+        assert!(processed_page.contains("export default MembersPage;"));
+        assert!(!processed_page.contains("export default HelperBadge;"));
+
+        let layout_src = r#"import React from 'react';
+export const metadata = { title: 'Root' };
+export function HelperShell() { return <div />; }
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return <html lang="en"><body>{children}</body></html>;
+}
+"#;
+        let processed_layout = post_process_generated_file("src/app/layout.tsx", layout_src, &serde_json::json!({}), false);
+        assert!(processed_layout.contains("export const metadata"));
+        assert!(!processed_layout.contains("export function HelperShell"));
+        assert!(processed_layout.contains("export default function RootLayout"));
+
+        let widget_src = "import React from 'react';\nexport default function Widget() { return <div />; }\n";
+        let processed_widget = post_process_generated_file("src/components/Widget.tsx", widget_src, &serde_json::json!({}), false);
+        assert!(processed_widget.contains("export { Widget };"));
+    }
+
+    #[test]
+    fn test_client_hook_boundary_stripping_and_validation_v48() {
+        let hook_src = r#""use client";
+import { useState } from 'react';
+import type { Member } from '@prisma/client';
+import { type MemberStatus } from '@prisma/client';
+import { prisma } from '../lib/prisma';
+import {
+  GET,
+  POST
+} from '@/app/api/events/route';
+
+export function useEvents() {
+  const [items, setItems] = useState<Member[]>([]);
+  return { items, setItems };
+}
+"#;
+        let cleaned_hook = post_process_generated_file("src/hooks/useEvents.ts", hook_src, &serde_json::json!({}), false);
+        assert!(cleaned_hook.contains("import type { Member } from '@prisma/client';"));
+        assert!(cleaned_hook.contains("import { type MemberStatus } from '@prisma/client';"));
+        assert!(!cleaned_hook.contains("../lib/prisma"));
+        assert!(!cleaned_hook.contains("@/lib/prisma"));
+        assert!(!cleaned_hook.contains("@/app/api/events/route"));
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let bad_client_api = "\"use client\";\nimport { GET } from '@/app/api/events/route';\nexport default function Panel() { return <div />; }\n";
+            assert!(crate::orchestrator::validate_file_with_abstract_rules("src/components/Panel.tsx", bad_client_api, "qwen").await.is_err());
+
+            let bad_hook_prisma = "import { prisma } from '@/lib/prisma';\nexport function useEvents() { return { prisma }; }\n";
+            assert!(crate::orchestrator::validate_file_with_abstract_rules("src/hooks/useEvents.ts", bad_hook_prisma, "qwen").await.is_err());
+
+            let valid_hook_types = "\"use client\";\nimport { useState } from 'react';\nimport type { Member } from '@prisma/client';\nimport { type MemberRole } from '@prisma/client';\nexport function useMembers() { const [list] = useState<Member[]>([]); return { list }; }\n";
+            assert!(crate::orchestrator::validate_file_with_abstract_rules("src/hooks/useMembers.ts", valid_hook_types, "qwen").await.is_ok());
+        });
+    }
+
+    #[test]
+    fn test_prisma_graph_sanitization_and_lbg_contracts_v48() {
+        let broken_prisma = r#"datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Status {
+  ACTIVE
+  ARCHIVED
+}
+
+model Category {
+  id       String     @id @default(cuid())
+  parentId String?
+  parent   Category?  @relation("CategoryHierarchy", fields: [parentId], references: [id])
+  children Category[] @relation("CategoryHierarchy")
+}
+
+model Record {
+  id      String   @id @default(cuid())
+  status  Status   @default(ACTIVE)
+  records Record[]
+  events  Event[]
+  tags    Tag[]
+}
+
+model Event {
+  id    String @id @default(cuid())
+  title String
+}
+
+model Tag {
+  id      String   @id @default(cuid())
+  name    String
+  records Record[]
+}
+"#;
+        let sanitized_prisma = sanitize_prisma_relations(broken_prisma);
+        assert!(sanitized_prisma.contains("children Category[] @relation(\"CategoryHierarchy\")"));
+        let record_block = sanitized_prisma
+            .split("model Record")
+            .nth(1)
+            .and_then(|s| s.split("model ").next())
+            .unwrap_or("");
+        assert!(
+            !record_block.contains("records Record[]"),
+            "Expected self-list pruned from model Record:\n{}",
+            record_block
+        );
+        assert!(
+            !record_block.contains("Event[]"),
+            "Expected unilateral Event[] pruned from model Record:\n{}",
+            record_block
+        );
+        assert!(record_block.contains("tags    Tag[]") || record_block.contains("tags Tag[]"));
+        // Verify Tag still keeps bilateral `records Record[]` while Record drops self-list `records Record[]`
+        let tag_block = sanitized_prisma.split("model Tag").nth(1).unwrap_or("");
+        assert!(tag_block.contains("records Record[]"));
+
+        let schema_with_missing_type = r#"model Member {
+  id     String @id @default(cuid())
+  ghosts GhostEntity[]
+  meta   Unsupported("tsvector")?
+}
+"#;
+        let pruned_unknown = crate::sanitizer::prune_unresolved_prisma_relations(schema_with_missing_type);
+        assert!(!pruned_unknown.contains("GhostEntity"));
+        assert!(pruned_unknown.contains("Unsupported(\"tsvector\")"));
+
+        let lbg = serde_json::json!({
+            "sharedContracts": {
+                "database": {
+                    "models": {
+                        "Member": {
+                            "fields": ["id", "name"],
+                            "relations": [
+                                "records: Record[]",
+                                "members: Member[]",
+                                "missing: UnknownModel[]"
+                            ]
+                        },
+                        "Event": {
+                            "fields": ["id", "memberId"],
+                            "relations": [
+                                "member: Member",
+                                "auditLogs: AuditEntry[]"
+                            ]
+                        },
+                        "AuditEntry": {
+                            "fields": ["id", "action"],
+                            "relations": []
+                        },
+                        "Category": {
+                            "fields": ["id", "parentId"],
+                            "relations": [
+                                "parent: Category?",
+                                "children: Category[]"
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+        let clean_lbg = crate::orchestrator::sanitize_live_builder_guide_contracts(&lbg);
+        let member_rels = clean_lbg["sharedContracts"]["database"]["models"]["Member"]["relations"].as_array().unwrap();
+        assert!(member_rels.is_empty(), "Expected orphan/unknown relations pruned: {:?}", member_rels);
+        let event_rels = clean_lbg["sharedContracts"]["database"]["models"]["Event"]["relations"].as_array().unwrap();
+        assert_eq!(event_rels.len(), 1);
+        assert_eq!(event_rels[0].as_str(), Some("member: Member"));
+        let cat_rels = clean_lbg["sharedContracts"]["database"]["models"]["Category"]["relations"].as_array().unwrap();
+        assert_eq!(cat_rels.len(), 2);
+
+        // Single-model partial contract must be preserved unchanged
+        let single_lbg = serde_json::json!({
+            "sharedContracts": {
+                "database": {
+                    "models": {
+                        "Module": {
+                            "fields": ["id", "title"],
+                            "relations": ["items: Item[]"]
+                        }
+                    }
+                }
+            }
+        });
+        let single_after = crate::orchestrator::sanitize_live_builder_guide_contracts(&single_lbg);
+        assert_eq!(single_after["sharedContracts"]["database"]["models"]["Module"]["relations"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_katastar_boilerplate_filtering_and_features_mapping_v48() {
+        let raw_prisma_err = "Error: Prisma schema validation - (get-dmmf wasm)\nError code: P1012\nerror: Type \"Phantom\" is neither a built-in type, nor refers to another model.\n  -->  prisma\\schema.prisma:12\n   |\n12 |   ref Phantom[]\nValidation Error Count: 1\n[Context: getDmmf]\nPrisma CLI Version : 5.22.0";
+        let prisma_sig = crate::katastar::normalize_error_signature("prisma", raw_prisma_err, Some("prisma/schema.prisma"));
+        assert_eq!(prisma_sig.error_code.as_deref(), Some("P1012"));
+        assert!(!prisma_sig.normalized_sample.contains("get-dmmf"));
+        assert!(!prisma_sig.normalized_sample.contains("Validation Error Count"));
+
+        let raw_next_err = "Failed to compile.\nBuild failed because of webpack errors\n> Build error occurred\nImport trace for requested module:\n./src/hooks/useEvents.ts\nModule not found: Can't resolve 'some-missing-pkg'";
+        let next_sig = crate::katastar::normalize_error_signature("", raw_next_err, Some("src/hooks/useEvents.ts"));
+        assert_eq!(next_sig.error_code.as_deref(), Some("MODULE_NOT_FOUND"));
+        assert!(!next_sig.normalized_sample.starts_with("Failed to compile"));
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v48_feat_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join(".axiom")).unwrap();
+
+        let files = vec![
+            serde_json::json!({ "path": "src/app/api/events/route.ts" }),
+            serde_json::json!({ "path": "src/app/events/page.tsx" }),
+            serde_json::json!({ "path": "src/services/sync.ts" }),
+            serde_json::json!({ "path": "src/types/record.ts" }),
+            serde_json::json!({ "path": "src/config/env.ts" }),
+        ];
+        crate::editor_ai::generate_axiom_features_json(&temp_dir, "demo", &files);
+        let feat_val: Value = serde_json::from_str(&std::fs::read_to_string(temp_dir.join("axiom-features.json")).unwrap()).unwrap();
+        let feat_names: Vec<String> = feat_val["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["name"].as_str().map(|s| s.to_string()))
+            .collect();
+        assert!(feat_names.contains(&"API & Backend".to_string()));
+        assert!(feat_names.contains(&"App Pages & Routes".to_string()));
+        assert!(feat_names.contains(&"Services".to_string()));
+        assert!(feat_names.contains(&"TypeScript Types".to_string()));
+        assert!(feat_names.contains(&"Configuration".to_string()));
+        assert!(!feat_names.contains(&"src".to_string()));
+
+        // Contract prompt prioritizes direct dependencies (rank 0)
+        std::fs::write(
+            temp_dir.join(".axiom/axiom-contracts.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "version": "1.0",
+                "files": [
+                    {
+                        "path": "src/components/EventPanel.tsx",
+                        "role": "ui-component",
+                        "dependencies": { "internal": ["src/hooks/useEvents.ts"], "external": [] },
+                        "capabilities": { "exports": ["EventPanel"] },
+                        "consumedContracts": { "apiCalls": [] },
+                        "connectedRoutes": []
+                    },
+                    {
+                        "path": "src/hooks/useUnrelated.ts",
+                        "role": "client-hook",
+                        "dependencies": { "internal": [], "external": [] },
+                        "capabilities": { "exports": ["useUnrelated"] },
+                        "consumedContracts": { "apiCalls": [] },
+                        "connectedRoutes": []
+                    },
+                    {
+                        "path": "src/hooks/useEvents.ts",
+                        "role": "client-hook",
+                        "dependencies": { "internal": [], "external": [] },
+                        "capabilities": { "exports": ["useEvents"] },
+                        "consumedContracts": { "apiCalls": ["/api/events"] },
+                        "connectedRoutes": []
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let prompt = crate::orchestrator::format_axiom_contracts_prompt(&temp_dir, "src/components/EventPanel.tsx");
+        let events_idx = prompt.find("src/hooks/useEvents.ts").unwrap();
+        let unrelated_idx = prompt.find("src/hooks/useUnrelated.ts").unwrap();
+        assert!(events_idx < unrelated_idx, "Direct internal dependency must sort first:\n{}", prompt);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_dts_export_inspection_and_wildcard_bailout_v48() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v48_dts_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let nm = temp_dir.join("node_modules");
+
+        // 1. Clean package with exports.types + depth-1 relative `export *`
+        let wk_dir = nm.join("widget-kit").join("dist");
+        std::fs::create_dir_all(&wk_dir).unwrap();
+        std::fs::write(
+            nm.join("widget-kit/package.json"),
+            r#"{"name":"widget-kit","exports":{".":{"types":"./dist/index.d.ts"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            wk_dir.join("index.d.ts"),
+            "export declare function createWidget(): void;\nexport interface WidgetOptions { id: string; }\nexport * from './extra';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            wk_dir.join("extra.d.ts"),
+            "export declare const WIDGET_VERSION: string;\n",
+        )
+        .unwrap();
+
+        // 2. Depth > 1 wildcard chain (must trigger Bailout Guard -> incomplete = true -> omitted)
+        let dw_dir = nm.join("deep-wild-kit");
+        std::fs::create_dir_all(&dw_dir).unwrap();
+        std::fs::write(dw_dir.join("index.d.ts"), "export declare const TOP_ONLY: number;\nexport * from './sub';\n").unwrap();
+        std::fs::write(dw_dir.join("sub.d.ts"), "export * from './nested';\n").unwrap();
+
+        // 3. External wildcard re-export (must trigger Bailout Guard -> omitted)
+        let ew_dir = nm.join("ext-wild-kit");
+        std::fs::create_dir_all(&ew_dir).unwrap();
+        std::fs::write(ew_dir.join("index.d.ts"), "export declare const LOCAL_SYM: boolean;\nexport * from 'other-pkg';\n").unwrap();
+
+        let source_code = "import { badWidget } from 'widget-kit';\nimport { x } from 'deep-wild-kit';\nimport { y } from 'ext-wild-kit';\n";
+        let err_ctx = "error TS2305: Module '\"widget-kit\"' has no exported member 'badWidget'.";
+        let out = crate::self_healing::inspect_dts_exports_for_file(&temp_dir, source_code, err_ctx);
+
+        assert!(out.contains("widget-kit"));
+        assert!(out.contains("createWidget"));
+        assert!(out.contains("WidgetOptions"));
+        assert!(out.contains("WIDGET_VERSION"));
+
+        // When only incomplete packages are queried directly, Bailout Guard returns empty instead of partial list
+        let incomplete_src = "import { x } from 'deep-wild-kit';\nimport { y } from 'ext-wild-kit';\n";
+        let incomplete_err = "error TS2305: has no exported member";
+        let bail_out = crate::self_healing::inspect_dts_exports_for_file(&temp_dir, incomplete_src, incomplete_err);
+        assert!(bail_out.trim().is_empty(), "Incomplete wildcard .d.ts must bail out:\n{}", bail_out);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

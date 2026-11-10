@@ -523,6 +523,8 @@ window.electronAPI = {
                 ? `Generisanje prekinuto (${completedCount}/${totalCount} fajlova sačuvano)`
                 : `Checkpoint: ${completedCount}/${totalCount} fajlova generisano`,
               progress: calcProgress,
+              hasWarnings: Boolean(checkpoint.hasWarnings || (Array.isArray(checkpoint.warnings) && checkpoint.warnings.length > 0)),
+              warnings: Array.isArray(checkpoint.warnings) ? checkpoint.warnings : [],
               checkpoint
             }
           };

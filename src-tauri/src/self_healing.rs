@@ -965,6 +965,9 @@ pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
                             if next.contains("react-icons") || next.contains("-icons-react") {
                                 next = crate::sanitizer::sanitize_react_icons_imports(&next);
                             }
+                            if crate::sanitizer::is_app_router_route_file(&rel) {
+                                next = crate::sanitizer::sanitize_app_router_route_exports(&next, &rel);
+                            }
                             if next != c {
                                 let _ = std::fs::write(&p, next);
                             }
@@ -1054,6 +1057,462 @@ fn collect_exporter_context_for_file(proj_dir: &std::path::Path, rel_path: &str,
     ctx
 }
 
+fn strip_dts_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let chars: Vec<char> = src.chars().collect();
+    let mut i = 0usize;
+    let mut in_block = false;
+    while i < chars.len() {
+        if in_block {
+            if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                in_block = false;
+                i += 2;
+            } else {
+                if chars[i] == '\n' {
+                    out.push('\n');
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if chars[i] == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            in_block = true;
+            i += 2;
+            continue;
+        }
+        if chars[i] == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+fn split_pkg_specifier(spec: &str) -> (String, String) {
+    let clean = spec.split(['?', '#']).next().unwrap_or(spec).trim();
+    if let Some(rest) = clean.strip_prefix('@') {
+        let mut parts = rest.splitn(3, '/');
+        let scope = parts.next().unwrap_or("");
+        let name = parts.next().unwrap_or("");
+        let sub = parts.next().unwrap_or("");
+        if scope.is_empty() || name.is_empty() {
+            (clean.to_string(), String::new())
+        } else {
+            (format!("@{}/{}", scope, name), sub.to_string())
+        }
+    } else {
+        let mut parts = clean.splitn(2, '/');
+        let name = parts.next().unwrap_or("");
+        let sub = parts.next().unwrap_or("");
+        (name.to_string(), sub.to_string())
+    }
+}
+
+fn extract_types_path_from_export_val(val: &Value) -> Option<String> {
+    match val {
+        Value::String(s) => {
+            if s.ends_with(".d.ts") || s.ends_with(".d.mts") || s.ends_with(".d.cts") {
+                Some(s.clone())
+            } else {
+                None
+            }
+        }
+        Value::Object(map) => {
+            if let Some(t) = map.get("types").and_then(|v| extract_types_path_from_export_val(v)) {
+                return Some(t);
+            }
+            for key in ["import", "default", "require", "node"] {
+                if let Some(sub) = map.get(key) {
+                    if let Some(t) = extract_types_path_from_export_val(sub) {
+                        return Some(t);
+                    }
+                }
+            }
+            None
+        }
+        Value::Array(arr) => arr.iter().find_map(extract_types_path_from_export_val),
+        _ => None,
+    }
+}
+
+fn resolve_dts_entry_in_dir(base_dir: &std::path::Path, rel: &str) -> Option<std::path::PathBuf> {
+    let clean = rel.trim().trim_start_matches("./");
+    if clean.is_empty() {
+        return None;
+    }
+    let candidate = normalize_path_components(&base_dir.join(clean));
+    if !candidate.starts_with(base_dir) {
+        return None;
+    }
+    for cand in [
+        candidate.clone(),
+        std::path::PathBuf::from(format!("{}.d.ts", candidate.to_string_lossy())),
+        std::path::PathBuf::from(format!("{}.d.mts", candidate.to_string_lossy())),
+        candidate.join("index.d.ts"),
+        candidate.join("index.d.mts"),
+    ] {
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+fn resolve_external_dts_path(proj_dir: &std::path::Path, spec: &str) -> Option<std::path::PathBuf> {
+    let nm_dir = proj_dir.join("node_modules");
+    if !nm_dir.is_dir() {
+        return None;
+    }
+    let (pkg_root, subpath) = split_pkg_specifier(spec);
+    if pkg_root.is_empty() {
+        return None;
+    }
+    let pkg_dir = nm_dir.join(&pkg_root);
+    let types_pkg_name = if let Some(stripped) = pkg_root.strip_prefix('@') {
+        stripped.replace('/', "__")
+    } else {
+        pkg_root.clone()
+    };
+    let at_types_dir = nm_dir.join("@types").join(&types_pkg_name);
+
+    // 1. Check package.json in node_modules/<pkg>
+    let pkg_json_path = pkg_dir.join("package.json");
+    if pkg_json_path.is_file() {
+        if let Ok(raw) = std::fs::read_to_string(&pkg_json_path) {
+            if let Ok(pkg_val) = serde_json::from_str::<Value>(&raw) {
+                let export_key = if subpath.is_empty() {
+                    ".".to_string()
+                } else {
+                    format!("./{}", subpath)
+                };
+                if let Some(exports_obj) = pkg_val.get("exports").and_then(|e| e.as_object()) {
+                    if let Some(target_val) = exports_obj.get(&export_key) {
+                        if let Some(types_rel) = target_val
+                            .get("types")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string())
+                            .or_else(|| extract_types_path_from_export_val(target_val))
+                        {
+                            if let Some(p) = resolve_dts_entry_in_dir(&pkg_dir, &types_rel) {
+                                return Some(p);
+                            }
+                        }
+                    }
+                    // Wildcard export fallback (e.g. "./*": { "types": "./dist/*.d.ts" })
+                    if !subpath.is_empty() {
+                        for (pat, val) in exports_obj {
+                            if let Some((prefix, suffix)) = pat.split_once('*') {
+                                let clean_prefix = prefix.trim_start_matches("./");
+                                if subpath.starts_with(clean_prefix) && subpath.ends_with(suffix) {
+                                    let wildcard_mid = &subpath[clean_prefix.len()..subpath.len() - suffix.len()];
+                                    if let Some(tmpl) = val
+                                        .get("types")
+                                        .and_then(|t| t.as_str())
+                                        .map(|s| s.to_string())
+                                        .or_else(|| extract_types_path_from_export_val(val))
+                                    {
+                                        let concrete = tmpl.replace('*', wildcard_mid);
+                                        if let Some(p) = resolve_dts_entry_in_dir(&pkg_dir, &concrete) {
+                                            return Some(p);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if subpath.is_empty() {
+                    for field in ["types", "typings"] {
+                        if let Some(rel) = pkg_val.get(field).and_then(|v| v.as_str()) {
+                            if let Some(p) = resolve_dts_entry_in_dir(&pkg_dir, rel) {
+                                return Some(p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Direct file/index fallbacks in node_modules/<pkg>
+    if pkg_dir.is_dir() {
+        if subpath.is_empty() {
+            for rel in ["index.d.ts", "index.d.mts", "dist/index.d.ts", "lib/index.d.ts", "types/index.d.ts"] {
+                if let Some(p) = resolve_dts_entry_in_dir(&pkg_dir, rel) {
+                    return Some(p);
+                }
+            }
+        } else {
+            for rel in [
+                subpath.clone(),
+                format!("dist/{}", subpath),
+                format!("lib/{}", subpath),
+                format!("types/{}", subpath),
+            ] {
+                if let Some(p) = resolve_dts_entry_in_dir(&pkg_dir, &rel) {
+                    return Some(p);
+                }
+            }
+        }
+    }
+
+    // 3. Fallback to node_modules/@types/<pkg>
+    if at_types_dir.is_dir() {
+        if subpath.is_empty() {
+            return resolve_dts_entry_in_dir(&at_types_dir, "index.d.ts");
+        } else {
+            return resolve_dts_entry_in_dir(&at_types_dir, &subpath);
+        }
+    }
+
+    None
+}
+
+struct DtsParseResult {
+    symbols: Vec<String>,
+    has_default: bool,
+    incomplete: bool,
+}
+
+fn collect_dts_exports_single_file(content: &str, out_syms: &mut Vec<String>, seen: &mut std::collections::HashSet<String>, has_default: &mut bool) -> (Vec<String>, bool) {
+    let cleaned = strip_dts_comments(content);
+    let mut wildcard_targets: Vec<String> = Vec::new();
+    let mut external_or_unparseable_wildcard = false;
+
+    let Ok(decl_re) = regex::Regex::new(r#"(?m)^\s*export\s+(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:function\*?|const|let|var|class|enum|interface|type|namespace)\s+([A-Za-z_$][A-Za-z0-9_$]*)"#) else {
+        return (wildcard_targets, true);
+    };
+    for cap in decl_re.captures_iter(&cleaned) {
+        if let Some(m) = cap.get(1) {
+            let sym = m.as_str().to_string();
+            if sym != "default" && seen.insert(sym.clone()) {
+                out_syms.push(sym);
+            }
+        }
+    }
+
+    let Ok(default_re) = regex::Regex::new(r#"(?m)^\s*export\s+(?:default\b|=\s*)"#) else {
+        return (wildcard_targets, true);
+    };
+    if default_re.is_match(&cleaned) {
+        *has_default = true;
+    }
+
+    let Ok(braced_re) = regex::Regex::new(r#"(?ms)^\s*export\s+(?:type\s+)?\{([^}]+)\}"#) else {
+        return (wildcard_targets, true);
+    };
+    for cap in braced_re.captures_iter(&cleaned) {
+        let inner = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        for raw_item in inner.split(',') {
+            let item = raw_item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            let item = item.strip_prefix("type ").map(|s| s.trim()).unwrap_or(item);
+            let exported_name = if let Some((_, rhs)) = item.split_once(" as ") {
+                rhs.trim()
+            } else {
+                item
+            };
+            if exported_name == "default" {
+                *has_default = true;
+            } else if !exported_name.is_empty()
+                && exported_name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+                && seen.insert(exported_name.to_string())
+            {
+                out_syms.push(exported_name.to_string());
+            }
+        }
+    }
+
+    let Ok(ns_star_re) = regex::Regex::new(r#"(?m)^\s*export\s+\*\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*)\s+from\s+['"][^'"]+['"]"#) else {
+        return (wildcard_targets, true);
+    };
+    for cap in ns_star_re.captures_iter(&cleaned) {
+        if let Some(m) = cap.get(1) {
+            let sym = m.as_str().to_string();
+            if seen.insert(sym.clone()) {
+                out_syms.push(sym);
+            }
+        }
+    }
+
+    let Ok(star_re) = regex::Regex::new(r#"(?m)^\s*export\s+(?:type\s+)?\*\s+from\s+['"]([^'"]+)['"]"#) else {
+        return (wildcard_targets, true);
+    };
+    for cap in star_re.captures_iter(&cleaned) {
+        if let Some(m) = cap.get(1) {
+            let target = m.as_str().trim();
+            if target.starts_with('.') {
+                wildcard_targets.push(target.to_string());
+            } else {
+                external_or_unparseable_wildcard = true;
+            }
+        }
+    }
+
+    (wildcard_targets, external_or_unparseable_wildcard)
+}
+
+fn parse_dts_exports_with_guard(entry_path: &std::path::Path) -> DtsParseResult {
+    let mut symbols = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut has_default = false;
+
+    let Ok(root_content) = std::fs::read_to_string(entry_path) else {
+        return DtsParseResult { symbols, has_default, incomplete: true };
+    };
+
+    let (wildcards, ext_bad) = collect_dts_exports_single_file(&root_content, &mut symbols, &mut seen, &mut has_default);
+    if ext_bad || wildcards.len() > 15 {
+        return DtsParseResult { symbols, has_default, incomplete: true };
+    }
+
+    let parent_dir = entry_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    for rel_target in wildcards {
+        let joined = normalize_path_components(&parent_dir.join(&rel_target));
+        let resolved_sub = [
+            joined.clone(),
+            joined.with_extension("d.ts"),
+            joined.with_extension("d.mts"),
+            std::path::PathBuf::from(format!("{}.d.ts", joined.to_string_lossy())),
+            joined.join("index.d.ts"),
+            joined.join("index.d.mts"),
+        ]
+        .into_iter()
+        .find(|p| p.is_file());
+
+        let Some(sub_path) = resolved_sub else {
+            return DtsParseResult { symbols, has_default, incomplete: true };
+        };
+        let Ok(sub_content) = std::fs::read_to_string(&sub_path) else {
+            return DtsParseResult { symbols, has_default, incomplete: true };
+        };
+        let (nested_wildcards, nested_ext_bad) = collect_dts_exports_single_file(&sub_content, &mut symbols, &mut seen, &mut has_default);
+        // Depth > 1 wildcard re-exports cannot be safely closed without deep traversal: bail out cleanly
+        if nested_ext_bad || !nested_wildcards.is_empty() {
+            return DtsParseResult { symbols, has_default, incomplete: true };
+        }
+    }
+
+    DtsParseResult {
+        symbols,
+        has_default,
+        incomplete: false,
+    }
+}
+
+/// Inspects real `.d.ts` type definitions in `node_modules/` for external npm packages imported
+/// by `file_content` when `error_context` indicates missing symbol/export/module errors.
+/// Enforces a strict wildcard bailout guard (max depth 1, <= 15 relative `export *`) so a
+/// truncated partial symbol list is never presented as exhaustive truth to the LLM.
+pub fn inspect_dts_exports_for_file(proj_dir: &std::path::Path, file_content: &str, error_context: &str) -> String {
+    let err_lower = error_context.to_lowercase();
+    let has_symbol_or_mod_err = error_context.contains("TS2305")
+        || error_context.contains("TS2614")
+        || error_context.contains("TS2724")
+        || error_context.contains("TS2307")
+        || error_context.contains("TS2339")
+        || err_lower.contains("has no exported member")
+        || err_lower.contains("does not contain a default export")
+        || err_lower.contains("attempted import error")
+        || err_lower.contains("module not found");
+    if !has_symbol_or_mod_err || !proj_dir.join("node_modules").is_dir() {
+        return String::new();
+    }
+
+    let Ok(ext_re) = regex::Regex::new(r#"(?:import\s+(?:type\s+)?[\s\S]*?\s+from\s+|import\s+|require\s*\(\s*)['"]([^'"]+)['"]"#) else {
+        return String::new();
+    };
+    let mut specs: Vec<String> = Vec::new();
+    for cap in ext_re.captures_iter(file_content) {
+        let raw_spec = cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+        if raw_spec.is_empty()
+            || raw_spec.starts_with('.')
+            || raw_spec.starts_with('/')
+            || raw_spec.starts_with("@/")
+            || raw_spec.starts_with("~/")
+            || raw_spec.starts_with("src/")
+            || raw_spec.starts_with("app/")
+            || raw_spec.starts_with("node:")
+            || raw_spec.ends_with(".css")
+            || raw_spec.ends_with(".scss")
+        {
+            continue;
+        }
+        if !specs.iter().any(|s| s == raw_spec) {
+            specs.push(raw_spec.to_string());
+        }
+    }
+    if specs.is_empty() {
+        return String::new();
+    }
+
+    // Prioritize external specifiers directly mentioned in `error_context`
+    let mentioned: Vec<String> = specs
+        .iter()
+        .filter(|s| error_context.contains(s.as_str()) || err_lower.contains(&s.to_lowercase()))
+        .cloned()
+        .collect();
+    let ordered_specs = if !mentioned.is_empty() { mentioned } else { specs };
+
+    let err_tokens: std::collections::HashSet<String> = error_context
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$')
+        .filter(|t| t.len() >= 2)
+        .map(|t| t.to_lowercase())
+        .collect();
+
+    let mut lines: Vec<String> = Vec::new();
+    for spec in ordered_specs.into_iter().take(3) {
+        let Some(dts_path) = resolve_external_dts_path(proj_dir, &spec) else {
+            continue;
+        };
+        let parsed = parse_dts_exports_with_guard(&dts_path);
+        if parsed.incomplete || (parsed.symbols.is_empty() && !parsed.has_default) {
+            continue;
+        }
+
+        let total_syms = parsed.symbols.len();
+        let mut syms = parsed.symbols;
+        syms.sort_by(|a, b| {
+            let a_low = a.to_lowercase();
+            let b_low = b.to_lowercase();
+            let a_hit = err_tokens.contains(&a_low) || err_tokens.iter().any(|t| t.len() >= 3 && (a_low.contains(t) || t.contains(&a_low)));
+            let b_hit = err_tokens.contains(&b_low) || err_tokens.iter().any(|t| t.len() >= 3 && (b_low.contains(t) || t.contains(&b_low)));
+            b_hit.cmp(&a_hit).then_with(|| a.cmp(b))
+        });
+
+        let truncated_extra = total_syms.saturating_sub(40);
+        let displayed: Vec<String> = syms.into_iter().take(40).collect();
+        let sym_str = if displayed.is_empty() {
+            "(default export only)".to_string()
+        } else if truncated_extra > 0 {
+            format!("{} (+{} more exports)", displayed.join(", "), truncated_extra)
+        } else {
+            displayed.join(", ")
+        };
+        lines.push(format!(
+            "- `{}` [default export: {}]: {}",
+            spec,
+            if parsed.has_default { "yes" } else { "no" },
+            sym_str
+        ));
+    }
+
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nExternal package `.d.ts` exports (verified from node_modules):\n{}\n",
+            lines.join("\n")
+        )
+    }
+}
+
 fn run_tsc_check(proj_dir: &std::path::Path, local_tsc_js: &std::path::Path, enriched_path: &str) -> Result<(bool, String, Vec<TscDiagnostic>), String> {
     let mut cmd = std::process::Command::new("node");
     cmd.arg(local_tsc_js)
@@ -1087,7 +1546,7 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
         return unresolved_warnings;
     }
 
-    debug_log_to_file("[Self-Healing] Running Pre-Build Hygiene Pass (v0.1.47)...".to_string());
+    debug_log_to_file(format!("[Self-Healing] Running Pre-Build Hygiene Pass (v{})...", env!("CARGO_PKG_VERSION")));
     run_hygiene_pass_on_project(proj_dir);
 
     let enriched_path = ensure_node_toolchain_ready(None, "self-heal").await;
@@ -1182,9 +1641,10 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
     // Discovers ALL type & import errors simultaneously and repairs in topological order.
     // =========================================================================
     if has_local_tsc {
-        const MAX_TSC_ROUNDS: usize = 3;
+        const MAX_TSC_ROUNDS: usize = 8;
         let mut pending_tsc_fixes: Vec<PendingBuildFix> = Vec::new();
         let mut prev_total_tsc_errors: Option<usize> = None;
+        let mut rollback_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
         for round in 1..=(MAX_TSC_ROUNDS + 1) {
             let Ok((tsc_ok, tsc_log, diags)) = run_tsc_check(proj_dir, &local_tsc_js, &enriched_path) else {
@@ -1242,6 +1702,9 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                         }
                         if pf.source == "katastar" || !improved {
                             restore_pending_file_snapshot(proj_dir, &pf.path, &pf.before);
+                            if pf.source == "ai" {
+                                *rollback_counts.entry(pf_key.clone()).or_insert(0) += 1;
+                            }
                             debug_log_to_file(format!(
                                 "[Self-Healing] Rolled back Tier 1 {} edit on '{}' (errors {} -> {}, total spiked={}).",
                                 pf.source, pf.path, pf.prev_file_errors, cur_errs, total_spiked
@@ -1283,12 +1746,27 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
             }
 
             let mut sorted_files: Vec<(String, Vec<&TscDiagnostic>)> = per_file_diags.into_iter().collect();
-            sorted_files.sort_by_key(|(path_str, _)| (file_dependency_layer_priority(path_str), path_str.clone()));
-            sorted_files.truncate(2);
+            sorted_files.sort_by_key(|(path_str, _)| {
+                let rb = *rollback_counts.get(&path_str.to_lowercase()).unwrap_or(&0);
+                (rb >= 2, rb, file_dependency_layer_priority(path_str), path_str.clone())
+            });
+            if sorted_files.iter().all(|(p, _)| *rollback_counts.get(&p.to_lowercase()).unwrap_or(&0) >= 2) {
+                let sample: Vec<String> = diags
+                    .iter()
+                    .take(4)
+                    .map(|d| format!("{}:{} {} ({})", d.file, d.line, d.code, d.message.chars().take(70).collect::<String>()))
+                    .collect();
+                unresolved_warnings.push(format!("TypeScript greške ({}): {}", diags.len(), sample.join(" | ")));
+                debug_log_to_file("[Self-Healing] Stopping Tier 1 tsc loop: all remaining failing files reached max rollback threshold (2).".to_string());
+                break;
+            }
+            sorted_files.retain(|(p, _)| *rollback_counts.get(&p.to_lowercase()).unwrap_or(&0) < 2);
+            sorted_files.truncate(3);
 
             // Try Katastar verified patches first
             let mut katastar_hints: Vec<String> = Vec::new();
             let mut katastar_applied_any = false;
+            let mut per_file_diag_blocks: std::collections::HashMap<String, String> = std::collections::HashMap::new();
             for (path_str, file_diags) in &sorted_files {
                 let full_path = proj_dir.join(path_str);
                 let Ok(orig_content) = std::fs::read_to_string(&full_path) else { continue };
@@ -1297,6 +1775,7 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                     .map(|d| format!("{}({}:{}): {} {}", d.file, d.line, d.col, d.code, d.message))
                     .collect::<Vec<String>>()
                     .join("\n");
+                per_file_diag_blocks.insert(path_str.to_lowercase(), diag_block.clone());
                 let lookup = crate::katastar::lookup_katastar("compile", &diag_block, path_str, &orig_content, &tried_katastar_ids);
                 for h in lookup.hints {
                     if !katastar_hints.contains(&h) {
@@ -1344,6 +1823,10 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                 }
                 if exporter_context.len() < 4500 {
                     exporter_context.push_str(&collect_exporter_context_for_file(proj_dir, path_str, &orig_content));
+                }
+                if exporter_context.len() < 6000 {
+                    let file_diag_ref = per_file_diag_blocks.get(&path_str.to_lowercase()).map(|s| s.as_str()).unwrap_or("");
+                    exporter_context.push_str(&inspect_dts_exports_for_file(proj_dir, &orig_content, file_diag_ref));
                 }
                 pkg_ctx.push_str(path_str);
                 pkg_ctx.push('\n');
@@ -1448,11 +1931,15 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                                         .find(|(p, _)| p.eq_ignore_ascii_case(&path_str))
                                         .map(|(_, d)| d.len())
                                         .unwrap_or(1);
+                                    let file_diag_raw = per_file_diag_blocks
+                                        .get(&path_str.to_lowercase())
+                                        .map(|s| s.as_str())
+                                        .unwrap_or(&diag_summary);
                                     let atomic_patch = crate::katastar::extract_safe_atomic_patch(&path_str, &before, &processed);
-                                    let sig_info = crate::katastar::normalize_error_signature("compile", &diag_summary, Some(&path_str));
+                                    let sig_info = crate::katastar::normalize_error_signature("compile", file_diag_raw, Some(&path_str));
                                     let entry_id = crate::katastar::register_repair_attempt(
                                         "compile",
-                                        &diag_summary,
+                                        file_diag_raw,
                                         &path_str,
                                         "ai",
                                         if atomic_patch.is_some() { "search_replace" } else { "ai_edit" },
@@ -1710,6 +2197,9 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                 }
                 if exporter_context.len() < 4500 {
                     exporter_context.push_str(&collect_exporter_context_for_file(proj_dir, err_path, c));
+                }
+                if exporter_context.len() < 6000 {
+                    exporter_context.push_str(&inspect_dts_exports_for_file(proj_dir, c, &build_output));
                 }
                 pkg_ctx.push_str(err_path);
                 pkg_ctx.push('\n');

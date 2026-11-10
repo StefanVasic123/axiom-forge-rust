@@ -7,7 +7,17 @@ pub fn generate_axiom_features_json(proj_dir: &std::path::Path, project_name: &s
         if let Some(path_str) = file_spec.get("path").and_then(|p| p.as_str()) {
             let normalized = path_str.replace('\\', "/");
             let parts: Vec<&str> = normalized.split('/').collect();
-            let top_dir = if parts.len() > 1 { parts[0].to_string() } else { "__root__".to_string() };
+            let top_dir = if parts.len() > 3 && parts[0].eq_ignore_ascii_case("src") && parts[1].eq_ignore_ascii_case("app") && parts[2].eq_ignore_ascii_case("api") {
+                "api".to_string()
+            } else if parts.len() > 2 && parts[0].eq_ignore_ascii_case("src") {
+                parts[1].to_string()
+            } else if parts.len() > 2 && parts[0].eq_ignore_ascii_case("app") && parts[1].eq_ignore_ascii_case("api") {
+                "api".to_string()
+            } else if parts.len() > 1 {
+                parts[0].to_string()
+            } else {
+                "__root__".to_string()
+            };
             
             files_by_dir.entry(top_dir).or_insert_with(Vec::new).push(file_spec.clone());
         }
@@ -16,20 +26,26 @@ pub fn generate_axiom_features_json(proj_dir: &std::path::Path, project_name: &s
     let mut features = Vec::new();
     for (dir, dir_files) in files_by_dir {
         let feature_name = match dir.to_lowercase().as_str() {
+            "app" => "App Pages & Routes".to_string(),
             "components" => "UI Components".to_string(),
             "pages" => "Pages & Routes".to_string(),
             "api" => "API & Backend".to_string(),
             "routes" => "Routes".to_string(),
             "controllers" => "Controllers".to_string(),
             "models" => "Data Models".to_string(),
+            "types" => "TypeScript Types".to_string(),
             "views" => "Views & Templates".to_string(),
+            "services" => "Services".to_string(),
             "utils" => "Utilities".to_string(),
             "hooks" => "React Hooks".to_string(),
-            "context" => "App State & Context".to_string(),
+            "context" | "contexts" => "App State & Context".to_string(),
             "store" => "State Management".to_string(),
             "auth" => "Authentication".to_string(),
+            "config" => "Configuration".to_string(),
+            "prisma" => "Database Schema".to_string(),
             "lib" => "Core Library".to_string(),
             "styles" => "Styles".to_string(),
+            "src" => "Source Files".to_string(),
             "__root__" => "Root Files".to_string(),
             other => other.to_string(),
         };

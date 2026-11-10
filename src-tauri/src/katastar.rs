@@ -257,15 +257,24 @@ pub fn normalize_error_signature(category_hint: &str, raw_error: &str, file_path
             .and_then(|c| c.get(1))
             .map(|m| m.as_str().to_string());
 
+        let is_prisma_boilerplate = |l: &str| -> bool {
+            l.is_empty()
+                || l.starts_with("Environment variables loaded")
+                || l.starts_with("Prisma schema loaded")
+                || l.starts_with("Datasource ")
+                || l.starts_with("Error: Prisma schema validation")
+                || l.starts_with("Error code:")
+                || l.starts_with("Validation Error Count:")
+                || l.starts_with("[Context:")
+                || l.starts_with("Prisma CLI Version")
+                || l.starts_with("-->")
+                || l.starts_with('|')
+        };
+
         let core_line = cleaned
             .lines()
             .map(|l| l.trim())
-            .filter(|l| {
-                !l.is_empty()
-                    && !l.starts_with("Environment variables loaded")
-                    && !l.starts_with("Prisma schema loaded")
-                    && !l.starts_with("Datasource ")
-            })
+            .filter(|l| !is_prisma_boilerplate(l))
             .find(|l| {
                 l.starts_with("error:")
                     || l.contains("Error validating:")
@@ -276,12 +285,7 @@ pub fn normalize_error_signature(category_hint: &str, raw_error: &str, file_path
                 cleaned
                     .lines()
                     .map(|l| l.trim())
-                    .find(|l| {
-                        !l.is_empty()
-                            && !l.starts_with("Environment variables loaded")
-                            && !l.starts_with("Prisma schema loaded")
-                            && !l.starts_with("Datasource ")
-                    })
+                    .find(|l| !is_prisma_boilerplate(l))
             })
             .unwrap_or("prisma validation error");
 
@@ -359,8 +363,8 @@ pub fn normalize_error_signature(category_hint: &str, raw_error: &str, file_path
                     || l.contains("npm ERR!")
                     || l.contains("notarget")
                     || l.contains("missing package")
-                    || !l.is_empty()
             })
+            .or_else(|| cleaned.lines().map(|l| l.trim()).find(|l| !l.is_empty()))
             .unwrap_or("npm install error");
         return ErrorSignatureInfo {
             category,
@@ -369,6 +373,21 @@ pub fn normalize_error_signature(category_hint: &str, raw_error: &str, file_path
             normalized_sample: truncate_chars(first_err_line, 220),
         };
     }
+
+    let is_next_compile_boilerplate = |l: &str| -> bool {
+        let ll = l
+            .trim()
+            .trim_start_matches(|c: char| matches!(c, '>' | '-' | '*' | '•' | '⨯' | '✓' | '▲' | ' '))
+            .to_lowercase();
+        ll.is_empty()
+            || ll == "failed to compile."
+            || ll == "failed to compile"
+            || ll.starts_with("error: failed to compile")
+            || ll.starts_with("build failed because of webpack")
+            || ll.starts_with("build error occurred")
+            || ll.starts_with("import trace for requested module")
+            || ll.starts_with("next.js (")
+    };
 
     // Compile & Runtime normalization
     if lower.contains("you're importing a component that needs")
@@ -417,7 +436,14 @@ pub fn normalize_error_signature(category_hint: &str, raw_error: &str, file_path
         let sample = cleaned
             .lines()
             .map(|l| l.trim())
-            .find(|l| l.contains("Can't resolve") || l.contains("Cannot find module") || !l.is_empty())
+            .filter(|l| !is_next_compile_boilerplate(l))
+            .find(|l| l.contains("Can't resolve") || l.contains("Cannot find module") || l.contains("TS2307"))
+            .or_else(|| {
+                cleaned
+                    .lines()
+                    .map(|l| l.trim())
+                    .find(|l| !is_next_compile_boilerplate(l) && !l.is_empty())
+            })
             .unwrap_or("Module not found");
         return ErrorSignatureInfo {
             category: "compile".to_string(),
@@ -460,12 +486,18 @@ pub fn normalize_error_signature(category_hint: &str, raw_error: &str, file_path
     let first_err = cleaned
         .lines()
         .map(|l| l.trim())
+        .filter(|l| !is_next_compile_boilerplate(l))
         .find(|l| {
             let ll = l.to_lowercase();
             (ll.contains("error") || ll.contains("failed") || ll.contains("syntaxerror") || ll.contains("typeerror"))
                 && l.len() > 6
         })
-        .or_else(|| cleaned.lines().map(|l| l.trim()).find(|l| l.len() > 4))
+        .or_else(|| {
+            cleaned
+                .lines()
+                .map(|l| l.trim())
+                .find(|l| !is_next_compile_boilerplate(l) && l.len() > 4)
+        })
         .unwrap_or("unknown error");
 
     let mut norm_line = first_err.to_string();

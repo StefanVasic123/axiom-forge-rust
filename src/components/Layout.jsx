@@ -310,6 +310,8 @@ function Layout() {
   const isOfflineWaiting = Boolean(isPaused && activeTask?.offlineWaiting);
   const isStopped = activeTask && (activeTask.phase === 'stopped' || activeTask.status === 'stopped');
   const isRunning = activeTask && !isComplete && !isError && !isStopped;
+  const activeWarnings = Array.isArray(activeTask?.warnings) ? activeTask.warnings : [];
+  const hasCompletionWarnings = Boolean(isComplete && (activeTask?.hasWarnings || activeWarnings.length > 0));
 
   const handlePauseTask = async () => {
     if (!activeTask) return;
@@ -406,6 +408,7 @@ function Layout() {
           <div className="w-full bg-slate-950 h-1.5 overflow-hidden">
             <div
               className={`h-full transition-all duration-300 bg-gradient-to-r ${
+                hasCompletionWarnings ? 'from-amber-500 to-orange-500' :
                 isComplete ? 'from-emerald-500 to-teal-500' :
                 isError || isStopped ? 'from-rose-500 to-red-500' :
                 isPaused ? 'from-amber-500 to-orange-500' :
@@ -423,13 +426,16 @@ function Layout() {
             <div className="flex items-center gap-3 min-w-0">
               <div
                 className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${
+                  hasCompletionWarnings ? 'bg-amber-500/15 text-amber-400' :
                   isComplete ? 'bg-emerald-500/10 text-emerald-400' :
                   isError || isStopped ? 'bg-rose-500/10 text-rose-400' :
                   isPaused ? 'bg-amber-500/10 text-amber-400' :
                   'bg-indigo-500/15 text-indigo-400'
                 }`}
               >
-                {isComplete ? (
+                {hasCompletionWarnings ? (
+                  <AlertCircle className="w-4 h-4" />
+                ) : isComplete ? (
                   <CheckCircle2 className="w-4 h-4" />
                 ) : isError || isStopped ? (
                   <AlertCircle className="w-4 h-4" />
@@ -444,7 +450,8 @@ function Layout() {
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
                   <h3 className="font-semibold text-sm text-white truncate">
-                    {isComplete ? t('taskOverlay.complete') :
+                    {hasCompletionWarnings ? 'Završeno sa upozorenjima' :
+                     isComplete ? t('taskOverlay.complete') :
                      isError ? t('taskOverlay.failed') :
                      isOfflineWaiting ? 'Čekam internet konekciju' :
                      isPaused ? 'Generisanje pauzirano' :
@@ -468,7 +475,9 @@ function Layout() {
             <div className="flex items-center gap-1.5 shrink-0">
               <span
                 className={`px-2 py-0.5 rounded-md text-xs font-bold border ${
-                  isComplete
+                  hasCompletionWarnings
+                    ? 'bg-amber-500/15 border-amber-500/30 text-amber-300'
+                    : isComplete
                     ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-300'
                     : isError || isStopped
                     ? 'bg-rose-500/15 border-rose-500/30 text-rose-300'
@@ -645,11 +654,29 @@ function Layout() {
                 </div>
               )}
 
+              {hasCompletionWarnings && activeWarnings.length > 0 && (
+                <div className="rounded-xl bg-amber-500/10 border border-amber-500/25 p-2.5 space-y-1 max-h-28 overflow-y-auto">
+                  <p className="text-[11px] font-semibold text-amber-300 flex items-center gap-1.5">
+                    <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                    Preostala upozorenja ({activeWarnings.length})
+                  </p>
+                  <ul className="space-y-0.5 text-[10.5px] text-amber-200/90 list-disc pl-4">
+                    {activeWarnings.slice(0, 4).map((w, idx) => (
+                      <li key={idx} className="break-words">{w}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
               {isComplete && activeTask.projectId && (
                 <div className="pt-2 flex gap-2">
                   <button
                     onClick={handleViewProject}
-                    className="w-full py-2 px-3 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold shadow-lg shadow-emerald-600/20 transition-all text-center"
+                    className={`w-full py-2 px-3 text-white rounded-lg text-xs font-semibold shadow-lg transition-all text-center ${
+                      hasCompletionWarnings
+                        ? 'bg-amber-600 hover:bg-amber-500 shadow-amber-600/20'
+                        : 'bg-emerald-600 hover:bg-emerald-500 shadow-emerald-600/20'
+                    }`}
                   >
                     {t('taskOverlay.viewProject')}
                   </button>
