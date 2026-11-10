@@ -448,6 +448,19 @@ pub async fn heal_prisma_schema_loop(
             Err(_) => break,
         };
 
+        // Deterministic auto-healing for unsupported enums connector error (P1012)
+        if error_log.contains("does not support enums") || error_log.contains("current connector does not support enums") {
+            if schema_content.contains("provider = \"sqlite\"") {
+                let updated = schema_content.replace("provider = \"sqlite\"", "provider = \"postgresql\"");
+                let _ = std::fs::write(&schema_path, &updated);
+                let _ = window.emit(log_channel, serde_json::json!({
+                    "text": "> [Prisma Validator] Deterministički sinhronizujem provider = \"postgresql\" za podršku enum tipova. Ponovo testiram...\n",
+                    "type": "info"
+                }));
+                continue;
+            }
+        }
+
         // Deterministic auto-healing for ambiguous relations (P1012)
         if error_log.contains("Ambiguous relation detected") || error_log.contains("P1012") {
             let disambiguated = disambiguate_prisma_relations(&schema_content);
@@ -602,8 +615,10 @@ pub fn merge_prisma_ai_response(original_schema: &str, ai_response: &str) -> Str
             }
         }
         if !merged.contains("datasource ") {
+            let provider = if merged.contains("enum ") || merged.contains("postgresql://") { "postgresql" } else { "sqlite" };
             merged = format!(
-                "datasource db {{\n  provider = \"sqlite\"\n  url      = env(\"DATABASE_URL\")\n}}\n\n{}",
+                "datasource db {{\n  provider = \"{}\"\n  url      = env(\"DATABASE_URL\")\n}}\n\n{}",
+                provider,
                 merged
             );
         }

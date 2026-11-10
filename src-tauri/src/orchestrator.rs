@@ -759,6 +759,27 @@ pub const UI_DESIGN_FOUNDATION_RULEPACK: &str = r#"MOBILE-FIRST & RESPONSIVE UI 
 5. RESPONSIVE TABLE WRAPPER: Always wrap `<table>` elements inside `<div className="w-full overflow-x-auto rounded-2xl border border-slate-200 bg-white shadow-sm">` so wide tables scroll horizontally on mobile devices without breaking page layout.
 6. SAFE DATE FORMATTING: Dates in JSON responses or state may be ISO strings or Date objects. NEVER call `.toLocaleDateString()` directly on a property (e.g. `item.startDate.toLocaleDateString()` throws a TypeError when `startDate` is a string!). Always wrap with `new Date(item.startDate).toLocaleDateString()`."#;
 
+pub const METACOGNITIVE_UI_STATE_RULEPACK: &str = r#"METACOGNITIVE UI COMPONENT STATE & INTERACTION PROTOCOL (MANDATORY FOR ALL UI FILES):
+You are writing a React UI component. Before emitting the JSX markup, you MUST follow this strict 3-phase cognitive sequence:
+
+PHASE 1 — INTERACTIVE STATE & USER ACTION IDENTIFICATION:
+Before writing the `return (...)` JSX block, systematically evaluate all interactive elements required by this component's specific domain logic (such as drawer or dialog toggles, navigation tabs, filter selections, text or numeric inputs, collection lists, and loading indicators). For every interactive element, determine its semantic category, exact type, and logical initial value:
+- Binary toggles (visibility flags, open/closed controls, boolean switches): initialize with an explicit boolean (`false` or `true`).
+- Discrete selectors (active tabs, category filters, text queries): initialize with an empty string or the first valid option.
+- Ordered collections (data rows, selected identifier arrays, tag lists): initialize with a domain-realistic mock array or an empty array `[]`.
+- Single records or nullable entities: initialize with `null` or a structured default object.
+
+PHASE 2 — MANDATORY STATE DECLARATION (BEFORE ANY JSX):
+Every single piece of reactive state MUST be explicitly declared via `useState(...)` at the very top of the component function body, immediately following external routing or session hooks, and strictly BEFORE any helper functions, event handlers, or JSX return statements.
+Always ensure `import { useState } from 'react';` is present at the top of the file whenever local state is declared.
+
+PHASE 3 — STRICT JSX USAGE ENFORCEMENT:
+In the `return (...)` JSX block, every identifier referenced in an `onClick`, `onChange`, conditional expression, ternary condition, or property binding MUST strictly originate from one of these three explicit sources:
+1. Declared in the component's props interface and destructured in the function signature.
+2. Explicitly declared via a React hook (`useState`, `useMemo`, `useCallback`) in Phase 2.
+3. Imported at the top of the file (components, icons, utilities).
+NEVER emit JSX that references an undeclared identifier or an undeclared state setter. Every variable used in JSX conditions or handlers MUST exist in the component's local scope before the JSX return begins."#;
+
 pub const UI_NAVBAR_RULEPACK: &str = r#"SCOPED NAVBAR, BRAND LOGO & HAMBURGER MENU RULES:
 1. STICKY GLASSMORPHISM HEADER: Structure the navbar as `<header className="sticky top-0 z-50 w-full backdrop-blur-md bg-white/90 border-b border-slate-200/80 shadow-sm">` with an inner container `<div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">`.
 2. INLINE SVG BRAND LOGO LOCKUP (NO BROKEN IMAGE FILES & NO HAMBURGER ICON IN BRAND BADGE):
@@ -1187,6 +1208,7 @@ pub fn get_stack_rulepacks(file_path: &str, file_content: &str, error_msg: Optio
         if is_react_file && !is_api_or_route_handler {
             rules.push(NEXTJS_REACT_RULEPACK);
             rules.push(UI_DESIGN_FOUNDATION_RULEPACK);
+            rules.push(METACOGNITIVE_UI_STATE_RULEPACK);
 
             if path_lower.contains("navbar") || path_lower.contains("header") || path_lower.contains("sidebar") || path_lower.contains("/nav") {
                 rules.push(UI_NAVBAR_RULEPACK);
@@ -1507,6 +1529,276 @@ pub fn harvest_file_contract_to_lbg(proj_dir: &std::path::Path, file_path: &str,
             let _ = std::fs::create_dir_all(parent);
         }
         let _ = std::fs::write(&lbg_path, pretty);
+    }
+}
+
+/// Harvests and maintains the unified `.axiom/axiom-contracts.json` and `axiom-contracts.json` in real time.
+/// Dynamically extracts:
+/// 1. Internal dependencies (imported project files with @/ or relative paths) and external npm packages.
+/// 2. Role (ui-component, page-route, client-hook, api-route, database-schema, layout, config).
+/// 3. Declared capabilities (exported components/functions/hooks/types, Prisma models, API methods).
+/// 4. Declared UI states (useState hooks with inferred/declared types and default initializers).
+/// 5. Consumed capabilities (API routes fetched, custom hooks called, Prisma models queried).
+/// 6. Connected UI routes (<Link href="..."> or router.push(...)).
+pub fn harvest_file_to_axiom_contracts(
+    proj_dir: &std::path::Path,
+    project_id: &str,
+    file_path: &str,
+    content: &str,
+    files_list: &[Value],
+) {
+    let axiom_dir = proj_dir.join(".axiom");
+    let _ = std::fs::create_dir_all(&axiom_dir);
+    let contracts_path = axiom_dir.join("axiom-contracts.json");
+
+    let mut contracts_root: Value = if contracts_path.exists() {
+        if let Ok(c) = std::fs::read_to_string(&contracts_path) {
+            serde_json::from_str(&c).unwrap_or_else(|_| serde_json::json!({}))
+        } else {
+            serde_json::json!({})
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    if !contracts_root.is_object() {
+        contracts_root = serde_json::json!({
+            "version": "1.0",
+            "projectId": project_id,
+            "lastUpdated": chrono::Utc::now().to_rfc3339(),
+            "files": []
+        });
+    }
+
+    let norm_path = file_path.replace('\\', "/");
+    let path_lower = norm_path.to_lowercase();
+
+    // Determine role
+    let role = if path_lower.ends_with("schema.prisma") {
+        "database-schema"
+    } else if (path_lower.contains("/api/") || path_lower.starts_with("api/")) && (path_lower.ends_with("route.ts") || path_lower.ends_with("route.js")) {
+        "api-route"
+    } else if path_lower.contains("/hooks/") || path_lower.contains("hook") {
+        "client-hook"
+    } else if path_lower.ends_with("layout.tsx") || path_lower.ends_with("layout.jsx") {
+        "layout"
+    } else if path_lower.ends_with("page.tsx") || path_lower.ends_with("page.jsx") || path_lower.ends_with("page.js") {
+        "page-route"
+    } else if path_lower.contains("/components/") {
+        "ui-component"
+    } else if path_lower.ends_with(".config.js") || path_lower.ends_with(".config.mjs") || path_lower.ends_with(".config.ts") || path_lower == "tsconfig.json" {
+        "configuration"
+    } else {
+        "source-module"
+    };
+
+    // Extract dependencies: internal vs external
+    let mut internal_deps = Vec::new();
+    let mut external_deps = Vec::new();
+
+    let node_builtins = [
+        "fs", "path", "http", "https", "os", "crypto", "stream", "util", "events", "assert", "dns", "net", "tls", "querystring", "url", "zlib", "buffer"
+    ];
+
+    if let Ok(import_re) = regex::Regex::new(r#"(?:import\s+(?:[^"';]+\s+from\s+)?|require\s*\(\s*|require\.resolve\s*\(\s*)['"]([^'"]+)['"]"#) {
+        for cap in import_re.captures_iter(content) {
+            if let Some(m) = cap.get(1) {
+                let specifier = m.as_str().trim();
+                if specifier.starts_with('.') || specifier.starts_with("@/") || specifier.starts_with("~/") {
+                    let resolved = if let Some(stripped) = specifier.strip_prefix("@/") {
+                        format!("src/{}", stripped)
+                    } else if let Some(stripped) = specifier.strip_prefix("~/") {
+                        format!("src/{}", stripped)
+                    } else if let Some(parent) = std::path::Path::new(&norm_path).parent() {
+                        let res = parent.join(specifier);
+                        let mut normalized_parts = Vec::new();
+                        for comp in res.components() {
+                            match comp {
+                                std::path::Component::Normal(c) => {
+                                    if let Some(cs) = c.to_str() { normalized_parts.push(cs); }
+                                }
+                                std::path::Component::ParentDir => { normalized_parts.pop(); }
+                                _ => {}
+                            }
+                        }
+                        normalized_parts.join("/")
+                    } else {
+                        specifier.to_string()
+                    };
+
+                    let mut matched_target = resolved.clone();
+                    for f in files_list {
+                        if let Some(p) = f.get("path").and_then(|p| p.as_str()) {
+                            let p_norm = p.replace('\\', "/");
+                            let p_no_ext = std::path::Path::new(&p_norm).with_extension("");
+                            let p_no_ext_str = p_no_ext.to_str().unwrap_or("");
+                            if p_norm == resolved || p_no_ext_str == resolved || p_norm == format!("{}.tsx", resolved) || p_norm == format!("{}.ts", resolved) {
+                                matched_target = p_norm;
+                                break;
+                            }
+                        }
+                    }
+                    if !internal_deps.contains(&matched_target) {
+                        internal_deps.push(matched_target);
+                    }
+                } else {
+                    let pkg_name = specifier.split('/').next().unwrap_or(specifier).to_string();
+                    let full_pkg = if specifier.starts_with('@') {
+                        let parts: Vec<&str> = specifier.split('/').collect();
+                        if parts.len() > 1 { format!("{}/{}", parts[0], parts[1]) } else { pkg_name }
+                    } else {
+                        pkg_name
+                    };
+                    if !node_builtins.contains(&full_pkg.as_str()) && !external_deps.contains(&full_pkg) {
+                        external_deps.push(full_pkg);
+                    }
+                }
+            }
+        }
+    }
+
+    // Extract UI states (useState hooks)
+    let mut state_contracts = serde_json::Map::new();
+    if role == "ui-component" || role == "page-route" || role == "layout" {
+        if let Ok(state_re) = regex::Regex::new(r#"const\s*\[\s*([a-zA-Z0-9_]+)\s*,\s*([a-zA-Z0-9_]+)\s*\]\s*=\s*useState(?:<([^>]+)>)?\s*\(([^)]*)\)"#) {
+            for cap in state_re.captures_iter(content) {
+                if let (Some(state_name), Some(setter_name)) = (cap.get(1), cap.get(2)) {
+                    let s_name = state_name.as_str();
+                    let set_name = setter_name.as_str();
+                    let type_param = cap.get(3).map(|m| m.as_str().trim().to_string());
+                    let default_val = cap.get(4).map(|m| m.as_str().trim().to_string()).unwrap_or_default();
+
+                    let inferred_type = if let Some(tp) = type_param {
+                        tp
+                    } else if default_val == "false" || default_val == "true" {
+                        "boolean".to_string()
+                    } else if default_val.starts_with('[') || default_val.ends_with(']') {
+                        "array".to_string()
+                    } else if default_val.starts_with('"') || default_val.starts_with('\'') {
+                        "string".to_string()
+                    } else if default_val.parse::<f64>().is_ok() {
+                        "number".to_string()
+                    } else if default_val == "null" {
+                        "nullable-object".to_string()
+                    } else {
+                        "any".to_string()
+                    };
+
+                    state_contracts.insert(s_name.to_string(), serde_json::json!({
+                        "setter": set_name,
+                        "type": inferred_type,
+                        "defaultValue": default_val
+                    }));
+                }
+            }
+        }
+    }
+
+    // Extract API endpoints (for api-route)
+    let mut endpoints = Vec::new();
+    if role == "api-route" {
+        let methods = ["GET", "POST", "PUT", "DELETE", "PATCH"];
+        for m in methods {
+            if content.contains(&format!("export async function {}", m)) || content.contains(&format!("export function {}", m)) {
+                endpoints.push(m.to_string());
+            }
+        }
+    }
+
+    // Extract Prisma models
+    let mut prisma_models = Vec::new();
+    let mut prisma_enums = Vec::new();
+    if role == "database-schema" {
+        if let Ok(model_re) = regex::Regex::new(r"(?m)^model\s+([a-zA-Z0-9_]+)\s*\{") {
+            for cap in model_re.captures_iter(content) {
+                if let Some(m) = cap.get(1) { prisma_models.push(m.as_str().to_string()); }
+            }
+        }
+        if let Ok(enum_re) = regex::Regex::new(r"(?m)^enum\s+([a-zA-Z0-9_]+)\s*\{") {
+            for cap in enum_re.captures_iter(content) {
+                if let Some(e) = cap.get(1) { prisma_enums.push(e.as_str().to_string()); }
+            }
+        }
+    }
+
+    // Extract exported symbols
+    let mut exports = Vec::new();
+    if let Ok(export_re) = regex::Regex::new(r#"(?:export\s+(?:default\s+)?(?:function|const|class|type|interface)\s+([a-zA-Z0-9_]+)|export\s*\{\s*([^}]+)\s*\})"#) {
+        for cap in export_re.captures_iter(content) {
+            if let Some(name) = cap.get(1) {
+                let n = name.as_str().trim();
+                if !n.is_empty() && !exports.contains(&n.to_string()) {
+                    exports.push(n.to_string());
+                }
+            } else if let Some(list) = cap.get(2) {
+                for item in list.as_str().split(',') {
+                    let cleaned = item.trim().split_whitespace().next().unwrap_or("").trim();
+                    if !cleaned.is_empty() && !exports.contains(&cleaned.to_string()) {
+                        exports.push(cleaned.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Extract consumed API routes via fetch
+    let mut api_calls = Vec::new();
+    if let Ok(fetch_re) = regex::Regex::new(r#"fetch\s*\(\s*['"](/api/[^'"]+)['"]"#) {
+        for cap in fetch_re.captures_iter(content) {
+            if let Some(m) = cap.get(1) {
+                let url = m.as_str().to_string();
+                if !api_calls.contains(&url) { api_calls.push(url); }
+            }
+        }
+    }
+
+    // Extract connected routes via <Link href="...">
+    let mut connected_routes = Vec::new();
+    if let Ok(link_re) = regex::Regex::new(r#"href\s*=\s*['"](/[^'"]*)['"]"#) {
+        for cap in link_re.captures_iter(content) {
+            if let Some(m) = cap.get(1) {
+                let r = m.as_str().to_string();
+                if !connected_routes.contains(&r) && !r.starts_with("/api") && !r.starts_with("/_") {
+                    connected_routes.push(r);
+                }
+            }
+        }
+    }
+
+    let file_entry = serde_json::json!({
+        "path": norm_path,
+        "role": role,
+        "dependencies": {
+            "internal": internal_deps,
+            "external": external_deps
+        },
+        "capabilities": {
+            "exports": exports,
+            "states": state_contracts,
+            "endpoints": endpoints,
+            "models": prisma_models,
+            "enums": prisma_enums
+        },
+        "consumedContracts": {
+            "apiCalls": api_calls
+        },
+        "connectedRoutes": connected_routes
+    });
+
+    if let Some(files_arr) = contracts_root.get_mut("files").and_then(|f| f.as_array_mut()) {
+        if let Some(pos) = files_arr.iter().position(|f| f.get("path").and_then(|p| p.as_str()) == Some(&norm_path)) {
+            files_arr[pos] = file_entry;
+        } else {
+            files_arr.push(file_entry);
+        }
+    }
+
+    contracts_root["lastUpdated"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+    contracts_root["totalFilesTracked"] = serde_json::json!(contracts_root.get("files").and_then(|f| f.as_array()).map(|a| a.len()).unwrap_or(0));
+
+    if let Ok(pretty) = serde_json::to_string_pretty(&contracts_root) {
+        let _ = std::fs::write(&contracts_path, &pretty);
+        let _ = std::fs::write(proj_dir.join("axiom-contracts.json"), &pretty);
     }
 }
 
@@ -3372,6 +3664,7 @@ export default function RootLayout({
         if already_on_disk {
             if let Ok(c) = fs::read_to_string(&full_disk_path) {
                 harvest_file_contract_to_lbg(&proj_dir, file_path, &c);
+                harvest_file_to_axiom_contracts(&proj_dir, &project_id, file_path, &c, &files_to_generate);
             }
             continue;
         }
@@ -3647,6 +3940,7 @@ export default function RootLayout({
         }
         let _ = fs::write(&full_disk_path, &processed_content);
         harvest_file_contract_to_lbg(&proj_dir, file_path, &processed_content);
+        harvest_file_to_axiom_contracts(&proj_dir, &project_id, file_path, &processed_content, &files_to_generate);
 
         // Emit final live code preview with completed, fully processed code
         let preview = extract_live_code_preview(&processed_content);

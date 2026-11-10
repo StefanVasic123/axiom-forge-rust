@@ -1170,8 +1170,14 @@ export default function EditorPage() {
         }
         if (data.pathname) {
           setCurrentPreviewRoute(data.pathname);
+          // Only clear runtime error if the snapshot has clean DOM content AND no error reported in last 12 seconds
           if (!data.snapshot?.nextjsOverlay?.hasError) {
-            setPreviewRuntimeError(null);
+            setPreviewRuntimeError(prev => {
+              if (prev && Date.now() - prev.time < 12000) {
+                return prev;
+              }
+              return null;
+            });
           }
         }
       }
@@ -1197,11 +1203,13 @@ export default function EditorPage() {
           path: data.path || currentPreviewRoute,
           time: Date.now()
         });
-        if (data.sourceFile) {
-          const normSource = data.sourceFile.replace(/\\/g, '/').replace(/^\.\//, '');
+        const targetFilePath = data.sourceFile
+          ? data.sourceFile.replace(/\\/g, '/').replace(/^\.\//, '')
+          : (resolveRouteToFile(data.path || currentPreviewRoute)?.path || resolveRouteToFile(currentPreviewRoute)?.path || 'src/app/page.tsx');
+        if (targetFilePath) {
           setCompileError(prev => prev || {
             projectId,
-            filePath: normSource,
+            filePath: targetFilePath,
             errorMessage: data.details || data.message || 'Runtime error in preview'
           });
           setShowTerminal(true);

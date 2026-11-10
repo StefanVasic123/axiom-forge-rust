@@ -466,7 +466,7 @@ pub fn repair_package_json_dependencies(proj_dir: &std::path::Path) {
                                 
                                 for line in lines.iter_mut() {
                                     let trimmed = line.trim();
-                                    if (trimmed.starts_with("import ") || trimmed.starts_with("import{") || trimmed.starts_with("import type") || trimmed.contains("require(")) 
+                                    if (trimmed.starts_with("import ") || trimmed.starts_with("import{") || trimmed.starts_with("import type") || trimmed.contains("require(") || trimmed.contains("require.resolve(")) 
                                         && (trimmed.contains('\'') || trimmed.contains('"') || trimmed.contains('`')) 
                                     {
                                         let chars: Vec<char> = line.chars().collect();
@@ -508,7 +508,7 @@ pub fn repair_package_json_dependencies(proj_dir: &std::path::Path) {
                                 // Parse import/require paths for package.json dependency gathering
                                 for line in content_to_parse.lines() {
                                     let line = line.trim();
-                                    if (line.starts_with("import ") || line.starts_with("import{") || line.starts_with("import type") || line.contains("require(")) && (line.contains('\'') || line.contains('"') || line.contains('`')) {
+                                    if (line.starts_with("import ") || line.starts_with("import{") || line.starts_with("import type") || line.contains("require(") || line.contains("require.resolve(")) && (line.contains('\'') || line.contains('"') || line.contains('`')) {
                                         let chars: Vec<char> = line.chars().collect();
                                         let mut i = 0;
                                         while i < chars.len() {

@@ -267,7 +267,10 @@ pub async fn editor_ai_edit(
     model_id: Option<String>,
     visual_context: Option<Value>,
 ) -> Result<AIEditResult, String> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let initial_model = model_id.unwrap_or_else(|| "qwen2.5-coder:7b".to_string());
     let model = resolve_valid_ollama_model(&client, &initial_model).await;
     
@@ -306,7 +309,7 @@ pub async fn editor_ai_edit(
          file_path, strip_axiom_inspector_script(&content), prompt
     );
     
-    if let Some(ctx) = visual_context {
+    if let Some(ref ctx) = visual_context {
         if let Some(tag_name) = ctx.get("tagName").and_then(|t| t.as_str()) {
             user_prompt.push_str(&format!(
                 "\nVisual Context (user clicked/inspected this element in the browser preview):\n\
@@ -484,14 +487,120 @@ pub async fn editor_ai_edit(
                                     error: Some(format!("AI model generated targeted edit JSON, but the target code was not matched in the file: {}", fail_reason)),
                                 });
                             } else {
-                                debug_log_to_file("[AI Edit] Falling back to treating model output as full file content.".to_string());
-                                let mut temp_content = clean_content;
-                                let project_routes = get_project_routes_from_dir(&proj_dir);
-                                let routes_list: Vec<String> = project_routes.into_iter().map(|(r, _)| r).collect();
-                                if !routes_list.is_empty() {
-                                    temp_content = sanitize_app_router_links_with_routes(&temp_content, &routes_list);
+                                // 1. PRISMA SCHEMA PARTIAL MERGE
+                                if rel_file_path.ends_with("schema.prisma") {
+                                    debug_log_to_file("[AI Edit] Merging Prisma schema models and enums.".to_string());
+                                    let merged_schema = crate::healer::merge_prisma_ai_response(&content, &clean_content);
+                                    final_content = post_process_generated_file(&rel_file_path, &merged_schema, &serde_json::json!({}), false);
                                 }
-                                final_content = post_process_generated_file(&rel_file_path, &temp_content, &serde_json::json!({}), true);
+                                // 2. API ROUTE HANDLER CHECK
+                                else if (rel_file_path.contains("/api/") || rel_file_path.ends_with("route.ts") || rel_file_path.ends_with("route.js"))
+                                    && (clean_content.contains("export async function GET") 
+                                        || clean_content.contains("export async function POST")
+                                        || clean_content.contains("export async function PUT")
+                                        || clean_content.contains("export async function DELETE")
+                                        || clean_content.contains("export async function PATCH"))
+                                {
+                                    if clean_content.contains("import ") {
+                                        // Complete route handler file
+                                        final_content = post_process_generated_file(&rel_file_path, &clean_content, &serde_json::json!({}), true);
+                                    } else {
+                                        // Partial handler snippet: try replacing the specific method handler in original file
+                                        let methods = ["GET", "POST", "PUT", "DELETE", "PATCH"];
+                                        let mut replaced_method = false;
+                                        for m in methods {
+                                            if clean_content.contains(&format!("export async function {}", m)) {
+                                                let pattern = format!(r"(?ms)^export\s+async\s+function\s+{}\b[^{{]*\{{.*?\n\}}", m);
+                                                if let Ok(method_re) = regex::Regex::new(&pattern) {
+                                                    if method_re.is_match(&content) {
+                                                        let updated = method_re.replace(&content, &clean_content).to_string();
+                                                        final_content = post_process_generated_file(&rel_file_path, &updated, &serde_json::json!({}), true);
+                                                        replaced_method = true;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if !replaced_method {
+                                            let updated = format!("{}\n\n{}", content.trim_end(), clean_content.trim());
+                                            final_content = post_process_generated_file(&rel_file_path, &updated, &serde_json::json!({}), true);
+                                        }
+                                    }
+                                }
+                                else {
+                                    // 3. UI / REACT CODE FILE SAFETY GUARD
+                                    let is_code_file = rel_file_path.ends_with(".tsx") || rel_file_path.ends_with(".ts") || rel_file_path.ends_with(".jsx") || rel_file_path.ends_with(".js");
+                                    let is_complete_code = !is_code_file 
+                                        || clean_content.contains("export default") 
+                                        || clean_content.contains("export const") 
+                                        || (clean_content.lines().count() >= 15 && clean_content.lines().count() >= (content.lines().count() / 2));
+
+                                    if is_complete_code {
+                                        debug_log_to_file("[AI Edit] Falling back to treating model output as full file content.".to_string());
+                                        let mut temp_content = clean_content;
+                                        let project_routes = get_project_routes_from_dir(&proj_dir);
+                                        let routes_list: Vec<String> = project_routes.into_iter().map(|(r, _)| r).collect();
+                                        if !routes_list.is_empty() {
+                                            temp_content = sanitize_app_router_links_with_routes(&temp_content, &routes_list);
+                                        }
+                                        final_content = post_process_generated_file(&rel_file_path, &temp_content, &serde_json::json!({}), true);
+                                    } else {
+                                        // 4. UNIVERSAL SURGICAL ELEMENT REPLACEMENT (Button, Div, Section, Header, Nav, H1-H6, Input, Form, etc.)
+                                        let mut applied_visual_snippet = false;
+                                        if let Some(ref ctx) = visual_context {
+                                            if let Some(tag_name) = ctx.get("tagName").and_then(|t| t.as_str()) {
+                                                let tag_lower = tag_name.to_lowercase();
+                                                let clean_trimmed = clean_content.trim();
+                                                if clean_trimmed.to_lowercase().contains(&format!("<{}", tag_lower)) {
+                                                    let element_text = ctx.get("text").and_then(|t| t.as_str()).unwrap_or("").trim();
+                                                    
+                                                    // Find matching tag occurrence
+                                                    let mut matched_range = None;
+                                                    if let Ok(tag_re) = regex::Regex::new(&format!(r#"(?s)<{}\b[^>]*>"#, tag_lower)) {
+                                                        for mat in tag_re.find_iter(&content) {
+                                                            if !element_text.is_empty() {
+                                                                let after_tag = &content[mat.end()..];
+                                                                let sample_len = std::cmp::min(120, after_tag.len());
+                                                                if after_tag[..sample_len].contains(element_text) {
+                                                                    matched_range = Some(mat.range());
+                                                                    break;
+                                                                }
+                                                            } else {
+                                                                matched_range = Some(mat.range());
+                                                                break;
+                                                            }
+                                                        }
+                                                        if matched_range.is_none() {
+                                                            matched_range = tag_re.find(&content).map(|m| m.range());
+                                                        }
+                                                    }
+
+                                                    if let Some(range) = matched_range {
+                                                        let repl_tag = if let Some(close_bracket) = clean_trimmed.find('>') {
+                                                            &clean_trimmed[..=close_bracket]
+                                                        } else {
+                                                            clean_trimmed
+                                                        };
+                                                        let mut updated = content.clone();
+                                                        updated.replace_range(range, repl_tag);
+                                                        final_content = post_process_generated_file(&rel_file_path, &updated, &serde_json::json!({}), true);
+                                                        applied_visual_snippet = true;
+                                                        debug_log_to_file(format!("[AI Edit] Successfully applied universal visual tag replacement for <{}>.", tag_lower));
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        if !applied_visual_snippet {
+                                            debug_log_to_file("[AI Edit Safety Guard] Model returned a partial code snippet that would corrupt the file. Aborting edit.".to_string());
+                                            return Ok(AIEditResult {
+                                                success: false,
+                                                new_content: None,
+                                                error: Some("AI model returned a partial code fragment instead of the full file or targeted JSON edits. Aborted to avoid corrupting file.".to_string()),
+                                            });
+                                        }
+                                    }
+                                }
                             }
                         }
                         
@@ -547,7 +656,10 @@ pub async fn editor_ai_project_edit(
     prompt: String,
     model_id: Option<String>,
 ) -> Result<ProjectEditResult, String> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let initial_model = model_id.unwrap_or_else(|| "qwen2.5-coder:7b".to_string());
     let model = resolve_valid_ollama_model(&client, &initial_model).await;
     let proj_dir = get_project_path(&project_id);

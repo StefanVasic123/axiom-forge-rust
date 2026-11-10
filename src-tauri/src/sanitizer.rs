@@ -1080,8 +1080,28 @@ pub fn post_process_generated_file(
         }
     }
 
+    // Rule for next.config.js / next.config.mjs resilient web fallbacks
+    if path_lower.contains("next.config") {
+        if processed.contains("require.resolve(") && !processed.contains("try { return require.resolve") {
+            if let Ok(resolve_re) = regex::Regex::new(r#"require\.resolve\s*\(\s*['"]([^'"]+)['"]\s*\)"#) {
+                processed = resolve_re.replace_all(&processed, "(() => { try { return require.resolve('$1'); } catch (_) { return false; } })()").to_string();
+            }
+        }
+    }
+
     // Rule for schema.prisma corrections
     if path_lower.ends_with("schema.prisma") {
+        // 0. Ensure provider = "postgresql" if enums, Json or postgresql url are present
+        if processed.contains("enum ") || processed.contains("postgresql://") {
+            if processed.contains("provider = \"sqlite\"") {
+                processed = processed.replace("provider = \"sqlite\"", "provider = \"postgresql\"");
+            }
+            if processed.contains("url = \"file:./dev.db\"") || processed.contains("url      = \"file:./dev.db\"") {
+                processed = processed.replace("url = \"file:./dev.db\"", "url      = env(\"DATABASE_URL\")")
+                    .replace("url      = \"file:./dev.db\"", "url      = env(\"DATABASE_URL\")");
+            }
+        }
+
         // 1. Fix missing url in datasource block
         if processed.contains("datasource db {") {
             if let Some(start_idx) = processed.find("datasource db {") {
@@ -1337,6 +1357,7 @@ pub fn post_process_generated_file(
                 processed = ensure_react_and_next_hook_imports(&processed);
                 processed = hoist_use_client_directive(&processed);
                 processed = sanitize_use_effect_deps(&processed);
+                processed = ensure_undeclared_toggle_states(&processed);
                 if path_lower.contains("/hooks/") || path_lower.contains("hook") {
                     processed = sanitize_custom_hook_functions(&processed);
                 }
@@ -3368,9 +3389,13 @@ pub fn sanitize_use_effect_deps(content: &str) -> String {
                 let body_slice = &after_use_effect[open_body + 1..end_brace];
                 let after_body = &after_use_effect[end_brace + 1..];
                 let trimmed_after_body = after_body.trim_start();
+                let ws1_len = after_body.len() - trimmed_after_body.len();
 
                 if trimmed_after_body.starts_with(',') {
-                    let after_comma = trimmed_after_body[1..].trim_start();
+                    let comma_slice = &trimmed_after_body[1..];
+                    let after_comma = comma_slice.trim_start();
+                    let ws2_len = comma_slice.len() - after_comma.len();
+
                     if after_comma.starts_with('[') {
                         if let Some(close_bracket) = after_comma.find(']') {
                             let deps_str = &after_comma[1..close_bracket];
@@ -3404,12 +3429,11 @@ pub fn sanitize_use_effect_deps(content: &str) -> String {
                             result.push_str(prefix);
                             result.push_str(&format!(", [{}]", new_deps_str));
 
-                            // Find offset past the closing bracket in after_use_effect
-                            if let Some(brk_pos) = after_use_effect.find(deps_str) {
-                                let offset = brk_pos + deps_str.len() + 1; // past ']'
-                                remaining = &after_use_effect[offset..];
-                                matched = true;
-                            }
+                            // Mathematical exact offset to past the ']' bracket:
+                            // end_brace + 1 ('}') + ws1_len + 1 (',') + ws2_len + close_bracket + 1 (']')
+                            let offset = end_brace + 1 + ws1_len + 1 + ws2_len + close_bracket + 1;
+                            remaining = &after_use_effect[offset..];
+                            matched = true;
                         }
                     }
                 }
@@ -3514,4 +3538,70 @@ pub fn sanitize_custom_hook_functions(content: &str) -> String {
     }
 
     modified
+}
+
+/// Automatically detects and declares missing boolean toggle states (such as `is[A-Z]\w*Open`)
+/// that are referenced in JSX onClick or ternary conditions but were forgotten by the LLM in useState.
+pub fn ensure_undeclared_toggle_states(content: &str) -> String {
+    if !content.contains("Open") {
+        return content.to_string();
+    }
+
+    let toggle_re = match regex::Regex::new(r"\b(is[A-Z][a-zA-Z0-9_]*Open)\b") {
+        Ok(r) => r,
+        Err(_) => return content.to_string(),
+    };
+
+    let mut missing_states: Vec<String> = Vec::new();
+    for cap in toggle_re.captures_iter(content) {
+        if let Some(m) = cap.get(1) {
+            let var_name = m.as_str();
+            let is_declared = content.contains(&format!("const [{},", var_name))
+                || content.contains(&format!("const [ {},", var_name))
+                || content.contains(&format!("let {}", var_name))
+                || content.contains(&format!("const {} =", var_name))
+                || content.contains(&format!("{}: boolean", var_name))
+                || content.contains(&format!("{}:", var_name))
+                || content.contains(&format!("props.{}", var_name))
+                || content.contains(&format!("{{ {}", var_name));
+
+            if !is_declared && !missing_states.contains(&var_name.to_string()) {
+                missing_states.push(var_name.to_string());
+            }
+        }
+    }
+
+    if missing_states.is_empty() {
+        return content.to_string();
+    }
+
+    let mut result = content.to_string();
+
+    if !result.contains("useState") {
+        result = ensure_react_and_next_hook_imports(&result);
+    }
+
+    for var_name in missing_states {
+        let setter_name = format!("set{}{}", var_name[..1].to_uppercase(), &var_name[1..]);
+        let declaration = format!("  const [{}, {}] = useState(false);\n", var_name, setter_name);
+
+        let mut inserted = false;
+        if let Some(pos) = result.find(") => {") {
+            let insert_idx = pos + 6;
+            result.insert_str(insert_idx, &format!("\n{}", declaration));
+            inserted = true;
+        } else if let Some(pos) = result.find(") {") {
+            let insert_idx = pos + 3;
+            result.insert_str(insert_idx, &format!("\n{}", declaration));
+            inserted = true;
+        }
+
+        if !inserted {
+            if let Some(pos) = result.find('{') {
+                result.insert_str(pos + 1, &format!("\n{}", declaration));
+            }
+        }
+    }
+
+    result
 }
