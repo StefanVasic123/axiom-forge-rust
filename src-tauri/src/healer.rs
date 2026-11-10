@@ -1,33 +1,56 @@
 use crate::*;
 
+fn normalize_rel_path_str(raw: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for seg in raw.replace('\\', "/").split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s.to_string()),
+        }
+    }
+    parts.join("/")
+}
+
 pub fn resolve_import_path(proj_dir: &std::path::Path, import_path: &str, current_file: &str) -> Option<String> {
     let clean_path = import_path.trim().replace('\'', "").replace('"', "");
     let mut resolved = None;
-    
-    if clean_path.starts_with("@/") {
-        let suffix = &clean_path[2..];
+
+    if let Some(suffix) = clean_path.strip_prefix("@/").or_else(|| clean_path.strip_prefix("~/")) {
         let test_src = proj_dir.join("src").join(suffix);
-        if test_src.exists() || proj_dir.join("src").join(format!("{}.tsx", suffix)).exists() || proj_dir.join("src").join(format!("{}.ts", suffix)).exists() {
+        if test_src.exists()
+            || proj_dir.join("src").join(format!("{}.tsx", suffix)).exists()
+            || proj_dir.join("src").join(format!("{}.ts", suffix)).exists()
+            || proj_dir.join("src").join(format!("{}.jsx", suffix)).exists()
+            || proj_dir.join("src").join(format!("{}.js", suffix)).exists()
+        {
             resolved = Some(format!("src/{}", suffix));
         } else {
             resolved = Some(suffix.to_string());
         }
+    } else if clean_path.starts_with("src/") {
+        resolved = Some(clean_path.clone());
     } else if clean_path.starts_with('.') {
         if let Some(parent) = std::path::Path::new(current_file).parent() {
             let path = parent.join(&clean_path);
-            resolved = path.to_str().map(|s| s.replace('\\', "/"));
+            resolved = path.to_str().map(normalize_rel_path_str);
         }
     }
-    
+
     if let Some(path_str) = resolved {
-        let normalized = path_str.replace('\\', "/");
+        let normalized = normalize_rel_path_str(&path_str);
+        if proj_dir.join(&normalized).is_file() {
+            return Some(normalized);
+        }
         for ext in &["tsx", "ts", "jsx", "js"] {
             let test_file = format!("{}.{}", normalized, ext);
-            if proj_dir.join(&test_file).exists() {
+            if proj_dir.join(&test_file).is_file() {
                 return Some(test_file);
             }
             let index_file = format!("{}/index.{}", normalized, ext);
-            if proj_dir.join(&index_file).exists() {
+            if proj_dir.join(&index_file).is_file() {
                 return Some(index_file);
             }
         }
@@ -126,7 +149,15 @@ pub fn extract_related_project_files_for_error(
     // 3. For any identifier in quoted_tokens, check if a file named <token>.tsx, <token>.ts, etc. exists in the project
     for token in &quoted_tokens {
         if !token.contains('/') && !token.contains(' ') && token.len() >= 3 {
-            for sub in &["src/components", "components", "src/hooks", "hooks", "src/lib", "lib", "src/utils", "utils"] {
+            for sub in &[
+                "src/components", "components",
+                "src/hooks", "hooks",
+                "src/lib", "lib",
+                "src/utils", "utils",
+                "src/models", "models",
+                "src/types", "types",
+                "src/services", "services",
+            ] {
                 for ext in &["tsx", "ts", "jsx", "js"] {
                     let candidate = format!("{}/{}.{}", sub, token, ext);
                     if proj_dir.join(&candidate).is_file() && candidate != current_file {
@@ -889,13 +920,78 @@ pub fn merge_prisma_ai_response(original_schema: &str, ai_response: &str) -> Str
     ai_response.to_string()
 }
 
-pub fn looks_like_code_payload(s: &str) -> bool {
+pub fn has_prose_leak_in_code(s: &str) -> bool {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return false;
     }
+    let lower = trimmed.to_lowercase();
+    if lower.contains("the error indicates")
+        || lower.contains("this could be due to")
+        || lower.contains("several reasons such as")
+        || lower.contains("here is the corrected")
+        || lower.contains("here is the fixed")
+        || lower.contains("here's the corrected")
+        || lower.contains("here's the fixed")
+        || lower.contains("to fix this, you")
+        || lower.contains("to resolve this error,")
+    {
+        return true;
+    }
+
+    let mut has_step_1 = false;
+    let mut has_step_2 = false;
+    let mut first_non_comment_checked = false;
+    for line in trimmed.lines() {
+        let lt = line.trim();
+        if lt.is_empty() || lt.starts_with("//") || lt.starts_with("/*") || lt.starts_with('*') {
+            continue;
+        }
+        let ll = lt.to_lowercase();
+        if ll.starts_with("1. ") {
+            has_step_1 = true;
+        } else if ll.starts_with("2. ") {
+            has_step_2 = true;
+        }
+        if !first_non_comment_checked {
+            first_non_comment_checked = true;
+            let starts_with_prose_opener = ll.starts_with("here is ")
+                || ll.starts_with("here's ")
+                || ll.starts_with("to fix ")
+                || ll.starts_with("to resolve ")
+                || ll.starts_with("you can ")
+                || ll.starts_with("you need to ")
+                || ll.starts_with("you should ")
+                || ll.starts_with("please check ")
+                || ll.starts_with("please ensure ")
+                || ll.starts_with("sure, here")
+                || ll.starts_with("i have fixed")
+                || ll.starts_with("the error ")
+                || ll.starts_with("this error ");
+            if starts_with_prose_opener
+                && !lt.ends_with(';')
+                && !lt.ends_with('{')
+                && !lt.ends_with('}')
+            {
+                return true;
+            }
+        }
+    }
+    has_step_1 && has_step_2
+}
+
+pub fn looks_like_code_payload(s: &str) -> bool {
+    let trimmed = s.trim();
+    if trimmed.is_empty() || trimmed.starts_with("```") {
+        return false;
+    }
     // Cannot be a raw JSON object or array
-    if (trimmed.starts_with('{') && trimmed.ends_with('}')) || (trimmed.starts_with('[') && trimmed.ends_with(']')) {
+    if (trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+    {
+        return false;
+    }
+    if has_prose_leak_in_code(trimmed) {
         return false;
     }
     // Single-line natural language prose (e.g. explanations ending with a period and lacking code syntax) is NOT code
@@ -905,24 +1001,93 @@ pub fn looks_like_code_payload(s: &str) -> bool {
         && !trimmed.contains('{')
         && !trimmed.contains('}')
         && !trimmed.contains('=')
+        && !trimmed.contains("=>")
     {
         return false;
     }
-    trimmed.contains('\n')
-        || trimmed.starts_with("import ")
+
+    let has_ts_js_kw = trimmed.starts_with("import ")
+        || trimmed.starts_with("import{")
         || trimmed.starts_with("export ")
         || trimmed.starts_with("const ")
         || trimmed.starts_with("let ")
+        || trimmed.starts_with("var ")
         || trimmed.starts_with("function ")
+        || trimmed.starts_with("async function ")
         || trimmed.starts_with("class ")
         || trimmed.starts_with("interface ")
         || trimmed.starts_with("type ")
+        || trimmed.starts_with("enum ")
+        || trimmed.starts_with("'use client'")
+        || trimmed.starts_with("\"use client\"")
+        || trimmed.starts_with("'use server'")
+        || trimmed.starts_with("\"use server\"")
+        || trimmed.contains("\nimport ")
+        || trimmed.contains("\nexport ")
+        || trimmed.contains("\nconst ")
+        || trimmed.contains("\nfunction ")
+        || trimmed.contains("\nasync function ")
+        || trimmed.contains("\ninterface ")
+        || trimmed.contains("\ntype ")
+        || trimmed.contains("\nenum ")
         || trimmed.contains("from '")
         || trimmed.contains("from \"")
-        || trimmed.contains("=>")
-        || (trimmed.contains('<') && trimmed.contains('>'))
-        || trimmed.contains("model ")
-        || trimmed.contains("datasource ")
+        || trimmed.contains("require(")
+        || trimmed.contains("module.exports")
+        || trimmed.contains("=>");
+
+    let has_prisma_block = regex::Regex::new(r"(?m)^\s*(?:model|enum|datasource|generator)\s+[A-Za-z_]\w*\s*\{")
+        .map(|re| re.is_match(trimmed))
+        .unwrap_or(false);
+
+    let has_css_rule = trimmed.contains("@tailwind ")
+        || trimmed.contains("@apply ")
+        || trimmed.contains(":root")
+        || (trimmed.contains('{')
+            && trimmed.contains('}')
+            && trimmed.contains(':')
+            && trimmed.contains(';'));
+
+    let has_jsx_tags = trimmed.contains("</") || (trimmed.contains('<') && trimmed.contains("/>"));
+    let has_stmt_block = trimmed.contains("return ")
+        && (trimmed.contains(';') || (trimmed.contains('{') && trimmed.contains('}')));
+
+    has_ts_js_kw || has_prisma_block || has_css_rule || has_jsx_tags || has_stmt_block
+}
+
+/// Guards against AI "fixing" compile errors by deleting large sections of UI/JSX or logic.
+pub fn detect_destructive_code_drop(file_path: &str, before: &str, after: &str) -> Option<String> {
+    let lower = file_path.to_lowercase();
+    if !(lower.ends_with(".tsx")
+        || lower.ends_with(".ts")
+        || lower.ends_with(".jsx")
+        || lower.ends_with(".js"))
+    {
+        return None;
+    }
+    if before.trim().len() < 400 {
+        return None;
+    }
+    let before_non_empty = before.lines().filter(|l| !l.trim().is_empty()).count();
+    let after_non_empty = after.lines().filter(|l| !l.trim().is_empty()).count();
+    if before_non_empty >= 20 && after_non_empty * 5 < before_non_empty * 2 {
+        return Some(format!(
+            "Destruktivno brisanje koda u '{}': broj linija opao sa {} na {} (>60% koda obrisano).",
+            file_path, before_non_empty, after_non_empty
+        ));
+    }
+    if lower.ends_with(".tsx") || lower.ends_with(".jsx") {
+        let count_jsx = |src: &str| -> usize { src.matches("</").count() + src.matches("/>").count() };
+        let before_jsx = count_jsx(before);
+        let after_jsx = count_jsx(after);
+        if before_jsx >= 6 && (after_jsx == 0 || after_jsx * 3 < before_jsx) {
+            return Some(format!(
+                "Destruktivno brisanje UI/JSX elemenata u '{}': JSX tagovi opali sa {} na {}.",
+                file_path, before_jsx, after_jsx
+            ));
+        }
+    }
+    None
 }
 
 pub fn is_valid_file_path(s: &str) -> bool {
@@ -930,39 +1095,94 @@ pub fn is_valid_file_path(s: &str) -> bool {
     if trimmed.is_empty() || trimmed.len() > 260 {
         return false;
     }
-    // File paths cannot contain newlines, spaces, or code syntax characters
-    if trimmed.contains('\n')
-        || trimmed.contains(' ')
-        || trimmed.contains(';')
-        || trimmed.contains('{')
-        || trimmed.contains('}')
-        || trimmed.contains('(')
-        || trimmed.contains(')')
-        || trimmed.contains('<')
-        || trimmed.contains('>')
-        || trimmed.contains('=')
-        || trimmed.contains('\'')
-        || trimmed.contains('"')
+    let norm = trimmed.replace('\\', "/");
+    if norm.starts_with('/')
+        || norm.ends_with('/')
+        || norm.contains("..")
+        || norm.contains(':')
     {
         return false;
     }
-    let lower = trimmed.to_lowercase().replace('\\', "/");
+    // File paths cannot contain newlines, spaces, or code syntax characters
+    if norm.contains('\n')
+        || norm.contains('\r')
+        || norm.contains('\t')
+        || norm.contains(' ')
+        || norm.contains(';')
+        || norm.contains('{')
+        || norm.contains('}')
+        || norm.contains('(')
+        || norm.contains(')')
+        || norm.contains('<')
+        || norm.contains('>')
+        || norm.contains('=')
+        || norm.contains('\'')
+        || norm.contains('"')
+        || norm.contains('`')
+        || norm.contains('*')
+        || norm.contains('?')
+        || norm.contains(',')
+    {
+        return false;
+    }
+    let lower = norm.to_lowercase();
     let has_valid_ext = lower.ends_with(".tsx")
         || lower.ends_with(".ts")
         || lower.ends_with(".jsx")
         || lower.ends_with(".js")
+        || lower.ends_with(".mjs")
+        || lower.ends_with(".cjs")
         || lower.ends_with(".prisma")
         || lower.ends_with(".css")
         || lower.ends_with(".scss")
+        || lower.ends_with(".sass")
         || lower.ends_with(".json")
         || lower.ends_with(".html")
         || lower.ends_with(".md")
-        || lower.ends_with(".svg");
+        || lower.ends_with(".mdx")
+        || lower.ends_with(".svg")
+        || lower.ends_with(".sql")
+        || lower.ends_with(".yaml")
+        || lower.ends_with(".yml")
+        || lower.ends_with(".toml");
 
     if has_valid_ext {
         return true;
     }
-    lower.starts_with("src/") || lower.starts_with("app/") || lower.starts_with("prisma/")
+    let basename = lower.rsplit('/').next().unwrap_or("");
+    matches!(
+        basename,
+        ".env"
+            | ".env.local"
+            | ".env.example"
+            | ".env.development"
+            | ".env.production"
+            | ".gitignore"
+            | ".eslintrc"
+            | ".prettierrc"
+            | "dockerfile"
+            | "makefile"
+    )
+}
+
+fn normalize_local_specifier_for_import(spec: &str) -> String {
+    let trimmed = spec.trim().replace('\\', "/");
+    let mut s = if let Some(rest) = trimmed.strip_prefix("src/").or_else(|| trimmed.strip_prefix("~/")) {
+        format!("@/{}", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("./src/") {
+        format!("@/{}", rest)
+    } else {
+        trimmed
+    };
+    if s.starts_with("@/") || s.starts_with("./") || s.starts_with("../") {
+        for ext in &[".tsx", ".ts", ".jsx", ".js"] {
+            if s.ends_with(ext) {
+                s.truncate(s.len() - ext.len());
+                break;
+            }
+        }
+    }
+    s
 }
 
 pub fn recursively_find_edits(value: &Value, current_path: &str, edits: &mut Vec<Value>) {
@@ -974,15 +1194,102 @@ pub fn recursively_find_edits(value: &Value, current_path: &str, edits: &mut Vec
             let mut has_explicit_empty_replacement = false;
             let mut context_path = current_path.to_string();
 
+            let is_move = map.get("type").and_then(|t| t.as_str()) == Some("move");
+            let has_path_swap_keys = (map.contains_key("newPath") || map.contains_key("new_path"))
+                && (map.contains_key("path")
+                    || map.contains_key("oldPath")
+                    || map.contains_key("old_path")
+                    || map.contains_key("targetPath")
+                    || map.contains_key("from"));
+            let has_code_payload_key = map.keys().any(|k| {
+                let kl = k.to_lowercase();
+                matches!(
+                    kl.as_str(),
+                    "code" | "content" | "replacement" | "replace" | "replacewith" | "replace_with"
+                )
+            });
+
+            // Handle import / path rewrite objects (e.g. `{"type":"import","path":"src/models/X","newPath":"src/models/X.ts"}` or `{"from":...,"to":...}`)
+            let is_import_rewrite = !is_move
+                && !has_code_payload_key
+                && (map.get("type").and_then(|t| t.as_str()) == Some("import")
+                    || (map.contains_key("from") && map.contains_key("to"))
+                    || has_path_swap_keys);
+
+            if is_import_rewrite {
+                let has_explicit_old_key = map.contains_key("from")
+                    || map.contains_key("oldPath")
+                    || map.contains_key("old_path")
+                    || map.contains_key("targetPath");
+
+                let explicit_file = map
+                    .get("file")
+                    .or_else(|| map.get("filePath"))
+                    .or_else(|| map.get("file_path"))
+                    .or_else(|| map.get("filename"))
+                    .or_else(|| if has_explicit_old_key { map.get("path") } else { None })
+                    .and_then(|v| v.as_str())
+                    .filter(|s| is_valid_file_path(s))
+                    .map(|s| normalize_rel_path_str(s))
+                    .unwrap_or_else(|| context_path.clone());
+
+                let old_raw = map
+                    .get("from")
+                    .or_else(|| map.get("oldPath"))
+                    .or_else(|| map.get("old_path"))
+                    .or_else(|| map.get("targetPath"))
+                    .or_else(|| map.get("path"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches(|c| c == '\'' || c == '"');
+
+                let new_raw = map
+                    .get("to")
+                    .or_else(|| map.get("newPath"))
+                    .or_else(|| map.get("new_path"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches(|c| c == '\'' || c == '"');
+
+                let is_numeric_ref = old_raw.chars().all(|c| c.is_ascii_digit())
+                    || new_raw.chars().all(|c| c.is_ascii_digit());
+                if !old_raw.is_empty()
+                    && !new_raw.is_empty()
+                    && !is_numeric_ref
+                    && !old_raw.contains('\n')
+                    && !new_raw.contains('\n')
+                {
+                    let normalized_new = normalize_local_specifier_for_import(new_raw);
+                    if is_valid_file_path(&explicit_file) && normalized_new != old_raw {
+                        edits.push(serde_json::json!({
+                            "path": explicit_file,
+                            "target": format!("'{}'", old_raw),
+                            "replacement": format!("'{}'", normalized_new)
+                        }));
+                        return;
+                    }
+                }
+            }
+
             // First pass: check if there is an explicit valid file path in this object (e.g. "file": "src/components/Navbar.tsx")
             for (k, v) in map {
                 let k_lower = k.to_lowercase();
+                if matches!(k_lower.as_str(), "newpath" | "new_path" | "oldpath" | "old_path" | "targetpath") {
+                    continue;
+                }
                 if let Some(s) = v.as_str() {
-                    if is_valid_file_path(s) {
-                        if k_lower.contains("file") || k_lower.contains("path") || k_lower.contains("filename") {
-                            context_path = s.to_string();
-                            detected_path = Some(s.to_string());
-                        }
+                    if is_valid_file_path(s)
+                        && (k_lower == "file"
+                            || k_lower == "filepath"
+                            || k_lower == "file_path"
+                            || k_lower == "filename"
+                            || k_lower == "path")
+                    {
+                        let norm_p = s.trim().replace('\\', "/");
+                        context_path = norm_p.clone();
+                        detected_path = Some(norm_p);
                     }
                 }
             }
@@ -1011,24 +1318,6 @@ pub fn recursively_find_edits(value: &Value, current_path: &str, edits: &mut Vec
                 }
             }
 
-            // Check if object is an import rewrite rule (e.g. { "type": "import", "from": "react-icons", "to": "react-icons/hi", "symbol": "HiOutlineChartBar" })
-            let is_move = map.get("type").and_then(|t| t.as_str()) == Some("move");
-            let has_import_fix = !is_move && (map.get("type").and_then(|t| t.as_str()) == Some("import")
-                || (map.contains_key("from") && map.contains_key("to")));
-            if has_import_fix {
-                let from_str = map.get("from").and_then(|f| f.as_str()).unwrap_or("").trim();
-                let to_str = map.get("to").and_then(|t| t.as_str()).unwrap_or("").trim();
-                let is_numeric_ref = from_str.chars().all(|c| c.is_ascii_digit()) || to_str.chars().all(|c| c.is_ascii_digit());
-                if !from_str.is_empty() && !to_str.is_empty() && !is_numeric_ref {
-                    edits.push(serde_json::json!({
-                        "path": context_path.clone(),
-                        "target": format!("'{}'", from_str),
-                        "replacement": format!("'{}'", to_str)
-                    }));
-                    return;
-                }
-            }
-
             // Second pass: extract code and target/search strings from leaf edit object
             for (k, v) in map {
                 let k_lower = k.to_lowercase();
@@ -1036,28 +1325,100 @@ pub fn recursively_find_edits(value: &Value, current_path: &str, edits: &mut Vec
                 // Explicitly skip descriptive metadata fields so prose explanations are never treated as code
                 if matches!(
                     k_lower.as_str(),
-                    "explanation" | "reason" | "description" | "summary" | "analysis" | "message" | "note" | "thought" | "error" | "status" | "type" | "name" | "id"
+                    "explanation"
+                        | "reason"
+                        | "reasons"
+                        | "description"
+                        | "summary"
+                        | "analysis"
+                        | "message"
+                        | "note"
+                        | "notes"
+                        | "thought"
+                        | "error"
+                        | "status"
+                        | "type"
+                        | "name"
+                        | "id"
+                        | "response"
+                        | "answer"
+                        | "reply"
+                        | "steps"
+                        | "instructions"
+                        | "details"
+                        | "cause"
+                        | "causes"
+                        | "fix_steps"
+                        | "suggestion"
+                        | "suggestions"
+                        | "symbol"
+                        | "line"
+                        | "column"
+                        | "newpath"
+                        | "new_path"
+                        | "newfile"
+                        | "new_file"
                 ) {
                     continue;
                 }
 
                 if let Some(s) = v.as_str() {
-                    if is_valid_file_path(s) && detected_path.is_none() {
-                        detected_path = Some(s.to_string());
-                    } else if k_lower.contains("target") || k_lower.contains("search") || k_lower.contains("old") || k_lower.contains("original") || k_lower.contains("before") || k_lower.contains("find") {
+                    if is_valid_file_path(s)
+                        && detected_path.is_none()
+                        && (k_lower == "file"
+                            || k_lower == "filepath"
+                            || k_lower == "file_path"
+                            || k_lower == "filename"
+                            || k_lower == "path")
+                    {
+                        detected_path = Some(s.trim().replace('\\', "/"));
+                    } else if matches!(
+                        k_lower.as_str(),
+                        "target" | "search" | "old" | "oldcode" | "old_code" | "original" | "before" | "find" | "match"
+                    ) || k_lower.contains("target")
+                        || k_lower.contains("search")
+                        || k_lower.contains("original")
+                    {
                         if !s.is_empty() {
                             detected_target = Some(s.to_string());
                         }
-                    } else if (k_lower == "path" || k_lower == "file") && !is_valid_file_path(s) && !s.is_empty() {
-                        // The model put the search/target string in the "path" field!
+                    } else if (k_lower == "path" || k_lower == "file")
+                        && !is_valid_file_path(s)
+                        && (s.contains(' ') || s.contains(';') || s.contains('\n'))
+                    {
+                        // The model put an inline search/target snippet into the "path" field
                         detected_target = Some(s.to_string());
-                    } else if k_lower.contains("replacement") || k_lower.contains("replace") || k_lower.contains("code") || k_lower.contains("content") || k_lower.contains("solution") || k_lower.contains("fixed") || k_lower.contains("new") || k_lower == "with" || k_lower == "to" || k_lower == "insert" || k_lower == "val" || k_lower == "value" {
+                    } else if matches!(
+                        k_lower.as_str(),
+                        "replacement"
+                            | "replace"
+                            | "replacewith"
+                            | "replace_with"
+                            | "code"
+                            | "content"
+                            | "newcode"
+                            | "new_code"
+                            | "newcontent"
+                            | "new_content"
+                            | "newtext"
+                            | "new_text"
+                            | "fixedcode"
+                            | "fixed_code"
+                            | "fixedcontent"
+                            | "solution"
+                            | "with"
+                            | "to"
+                            | "insert"
+                    ) {
                         if !s.trim().is_empty() {
                             detected_code = Some(s.to_string());
-                        } else if k_lower == "replacement" || k_lower == "replace" || k_lower == "new" {
+                        } else if matches!(k_lower.as_str(), "replacement" | "replace" | "newcode" | "new_code") {
                             has_explicit_empty_replacement = true;
                         }
-                    } else if looks_like_code_payload(s) && detected_code.is_none() && detected_target.as_deref() != Some(s) {
+                    } else if looks_like_code_payload(s)
+                        && detected_code.is_none()
+                        && detected_target.as_deref() != Some(s)
+                    {
                         detected_code = Some(s.to_string());
                     }
                 }
@@ -1071,45 +1432,89 @@ pub fn recursively_find_edits(value: &Value, current_path: &str, edits: &mut Vec
             if let Some(code) = detected_code {
                 let final_path = detected_path.unwrap_or_else(|| context_path.clone());
                 let final_target = detected_target.unwrap_or_default();
-                edits.push(serde_json::json!({
-                    "path": final_path,
-                    "target": final_target,
-                    "replacement": code
-                }));
-                return;
+                let final_is_md = final_path.to_lowercase().ends_with(".md");
+                let final_is_json = final_path.to_lowercase().ends_with(".json");
+
+                let code_ok = if !final_is_md && has_prose_leak_in_code(&code) {
+                    false
+                } else if final_target.is_empty() && !code.trim().is_empty() {
+                    if final_is_json {
+                        serde_json::from_str::<Value>(&code).is_ok()
+                    } else {
+                        looks_like_code_payload(&code)
+                    }
+                } else {
+                    true
+                };
+
+                if code_ok && is_valid_file_path(&final_path) {
+                    edits.push(serde_json::json!({
+                        "path": final_path,
+                        "target": final_target,
+                        "replacement": code
+                    }));
+                    return;
+                }
             }
 
             for (k, v) in map {
                 let kl = k.to_lowercase();
-                if (v.is_object() || v.is_array()) && !matches!(
-                    kl.as_str(),
-                    "explanation" | "reason" | "description" | "summary" | "analysis" | "message" | "note" | "thought"
-                ) {
-                    recursively_find_edits(v, &context_path, edits);
+                if (v.is_object() || v.is_array())
+                    && !matches!(
+                        kl.as_str(),
+                        "explanation"
+                            | "reason"
+                            | "reasons"
+                            | "description"
+                            | "summary"
+                            | "analysis"
+                            | "message"
+                            | "note"
+                            | "notes"
+                            | "thought"
+                            | "steps"
+                            | "instructions"
+                            | "details"
+                    )
+                {
+                    let child_ctx = if is_valid_file_path(k) {
+                        k.trim().replace('\\', "/")
+                    } else {
+                        context_path.clone()
+                    };
+                    recursively_find_edits(v, &child_ctx, edits);
+                } else if let Some(s) = v.as_str() {
+                    if is_valid_file_path(k) && looks_like_code_payload(s) {
+                        edits.push(serde_json::json!({
+                            "path": k.trim().replace('\\', "/"),
+                            "target": "",
+                            "replacement": s
+                        }));
+                    }
                 }
             }
-        },
+        }
         Value::Array(arr) => {
             for item in arr {
                 recursively_find_edits(item, current_path, edits);
             }
-        },
+        }
         Value::String(s) => {
-            if looks_like_code_payload(s) && edits.is_empty() {
+            if is_valid_file_path(current_path) && looks_like_code_payload(s) && edits.is_empty() {
                 edits.push(serde_json::json!({
                     "path": current_path,
                     "target": "",
                     "replacement": s
                 }));
             }
-        },
+        }
         _ => {}
     }
 }
 
 pub fn extract_code_from_malformed_json_response(raw: &str, default_path: &str) -> Option<Vec<Value>> {
     let trimmed = raw.trim();
-    
+
     // Check if raw text has an embedded code block inside "content": `...` or "content": "..."
     // or "replacement": `...` or "replacement": "..."
     let markers = ["\"content\":", "\"replacement\":", "\"code\":"];
@@ -1117,11 +1522,14 @@ pub fn extract_code_from_malformed_json_response(raw: &str, default_path: &str) 
         if let Some(pos) = trimmed.find(marker) {
             let before = &trimmed[..pos];
             let mut detected_path = default_path.to_string();
-            // Dynamically search for any file path referenced in the envelope before the marker
+            // Dynamically search for any valid file path referenced in the envelope before the marker
             for token in before.split('"') {
                 if is_valid_file_path(token) {
                     detected_path = token.replace('\\', "/");
                 }
+            }
+            if !is_valid_file_path(&detected_path) {
+                continue;
             }
 
             let after = trimmed[pos + marker.len()..].trim();
@@ -1130,11 +1538,13 @@ pub fn extract_code_from_malformed_json_response(raw: &str, default_path: &str) 
                     let code = after[1..=end_bt].trim();
                     if !code.is_empty() {
                         let unescaped = code.replace("\\\"", "\"").replace("\\n", "\n").replace("\\\\", "\\");
-                        return Some(vec![serde_json::json!({
-                            "path": detected_path,
-                            "target": "",
-                            "replacement": unescaped
-                        })]);
+                        if looks_like_code_payload(&unescaped) {
+                            return Some(vec![serde_json::json!({
+                                "path": detected_path,
+                                "target": "",
+                                "replacement": unescaped
+                            })]);
+                        }
                     }
                 }
             } else if after.starts_with('"') {
@@ -1142,11 +1552,13 @@ pub fn extract_code_from_malformed_json_response(raw: &str, default_path: &str) 
                     let code = after[1..=end_quote].trim();
                     if !code.is_empty() {
                         let unescaped = code.replace("\\\"", "\"").replace("\\n", "\n").replace("\\\\", "\\");
-                        return Some(vec![serde_json::json!({
-                            "path": detected_path,
-                            "target": "",
-                            "replacement": unescaped
-                        })]);
+                        if looks_like_code_payload(&unescaped) {
+                            return Some(vec![serde_json::json!({
+                                "path": detected_path,
+                                "target": "",
+                                "replacement": unescaped
+                            })]);
+                        }
                     }
                 }
             }
@@ -1166,6 +1578,12 @@ enum SingleFileVerifyOutcome {
     Passed(&'static str),
     Failed(&'static str),
     Inconclusive,
+}
+
+struct VerifyDetail {
+    outcome: SingleFileVerifyOutcome,
+    raw_output: String,
+    file_errors: Vec<String>,
 }
 
 fn resolve_local_node_executable() -> String {
@@ -1191,21 +1609,29 @@ fn resolve_local_node_executable() -> String {
     "node".to_string()
 }
 
-/// Fast local verification for interactive single-file heals (`tsc --noEmit` or `prisma validate`).
-/// Strictly avoids network calls and falls back to `Inconclusive` if local binaries or deps are missing.
-async fn verify_single_file_after_heal(
+/// Fast local verification for interactive single-file heals (`tsc --noEmit --incremental false` or `prisma validate`).
+/// Checks `rel_file_path` as well as any secondary `.ts`/`.tsx` files touched in `edited_files`,
+/// returning exact filtered compiler error lines so failed AI attempts can be rolled back and retried with real diagnostics.
+async fn verify_single_file_detail(
     proj_dir: &std::path::Path,
     rel_file_path: &str,
+    edited_files: &[String],
     category: &str,
     error_code: Option<&str>,
-) -> SingleFileVerifyOutcome {
-    let lower_rel = rel_file_path.replace('\\', "/").to_lowercase();
+) -> VerifyDetail {
+    let lower_rel = normalize_rel_path_str(rel_file_path).to_lowercase();
     let node_exe = resolve_local_node_executable();
 
-    if lower_rel.ends_with(".prisma") {
+    let includes_prisma = lower_rel.ends_with(".prisma")
+        || edited_files.iter().any(|p| p.to_lowercase().ends_with(".prisma"));
+    if includes_prisma {
         let local_prisma_js = proj_dir.join("node_modules").join("prisma").join("build").join("index.js");
         if !local_prisma_js.exists() {
-            return SingleFileVerifyOutcome::Inconclusive;
+            return VerifyDetail {
+                outcome: SingleFileVerifyOutcome::Inconclusive,
+                raw_output: String::new(),
+                file_errors: Vec::new(),
+            };
         }
         let mut cmd = tokio::process::Command::new(&node_exe);
         cmd.arg(&local_prisma_js).arg("validate").current_dir(proj_dir);
@@ -1213,10 +1639,41 @@ async fn verify_single_file_after_heal(
         #[cfg(target_os = "windows")]
         cmd.creation_flags(0x08000000);
 
-        return match tokio::time::timeout(std::time::Duration::from_secs(12), cmd.output()).await {
-            Ok(Ok(out)) if out.status.success() => SingleFileVerifyOutcome::Passed("prisma_validate"),
-            Ok(Ok(_)) => SingleFileVerifyOutcome::Failed("prisma_validate"),
-            _ => SingleFileVerifyOutcome::Inconclusive,
+        return match tokio::time::timeout(std::time::Duration::from_secs(15), cmd.output()).await {
+            Ok(Ok(out)) if out.status.success() => VerifyDetail {
+                outcome: SingleFileVerifyOutcome::Passed("prisma_validate"),
+                raw_output: String::from_utf8_lossy(&out.stdout).to_string(),
+                file_errors: Vec::new(),
+            },
+            Ok(Ok(out)) => {
+                let raw_output = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let file_errors: Vec<String> = raw_output
+                    .lines()
+                    .map(|l| l.trim())
+                    .filter(|l| {
+                        !l.is_empty()
+                            && !l.starts_with("Environment variables loaded")
+                            && !l.starts_with("Prisma schema loaded")
+                            && !l.starts_with("Datasource ")
+                    })
+                    .take(15)
+                    .map(|l| l.to_string())
+                    .collect();
+                VerifyDetail {
+                    outcome: SingleFileVerifyOutcome::Failed("prisma_validate"),
+                    raw_output,
+                    file_errors,
+                }
+            }
+            _ => VerifyDetail {
+                outcome: SingleFileVerifyOutcome::Inconclusive,
+                raw_output: String::new(),
+                file_errors: Vec::new(),
+            },
         };
     }
 
@@ -1224,23 +1681,43 @@ async fn verify_single_file_after_heal(
     if error_code == Some("NEXT_USE_CLIENT")
         || (category == "runtime" && error_code != Some("ReferenceError"))
     {
-        return SingleFileVerifyOutcome::Inconclusive;
+        return VerifyDetail {
+            outcome: SingleFileVerifyOutcome::Inconclusive,
+            raw_output: String::new(),
+            file_errors: Vec::new(),
+        };
     }
 
-    let is_ts_file = lower_rel.ends_with(".ts") || lower_rel.ends_with(".tsx");
+    let mut target_ts_paths: Vec<String> = Vec::new();
+    if lower_rel.ends_with(".ts") || lower_rel.ends_with(".tsx") {
+        target_ts_paths.push(lower_rel.clone());
+    }
+    for ef in edited_files {
+        let norm_ef = normalize_rel_path_str(ef).to_lowercase();
+        if (norm_ef.ends_with(".ts") || norm_ef.ends_with(".tsx")) && !target_ts_paths.contains(&norm_ef) {
+            target_ts_paths.push(norm_ef);
+        }
+    }
+
     let local_tsc_js = proj_dir.join("node_modules").join("typescript").join("bin").join("tsc");
     let has_local_env = proj_dir.join("tsconfig.json").exists()
         && local_tsc_js.exists()
         && proj_dir.join("node_modules").join("react").exists()
         && proj_dir.join("node_modules").join("next").exists();
 
-    if !is_ts_file || !has_local_env {
-        return SingleFileVerifyOutcome::Inconclusive;
+    if target_ts_paths.is_empty() || !has_local_env {
+        return VerifyDetail {
+            outcome: SingleFileVerifyOutcome::Inconclusive,
+            raw_output: String::new(),
+            file_errors: Vec::new(),
+        };
     }
 
     let mut cmd = tokio::process::Command::new(&node_exe);
     cmd.arg(&local_tsc_js)
         .arg("--noEmit")
+        .arg("--incremental")
+        .arg("false")
         .arg("--pretty")
         .arg("false")
         .current_dir(proj_dir);
@@ -1248,35 +1725,169 @@ async fn verify_single_file_after_heal(
     #[cfg(target_os = "windows")]
     cmd.creation_flags(0x08000000);
 
-    match tokio::time::timeout(std::time::Duration::from_secs(15), cmd.output()).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(20), cmd.output()).await {
         Ok(Ok(out)) => {
-            if out.status.success() {
-                return SingleFileVerifyOutcome::Passed("tsc_noemit");
-            }
-            let combined = format!(
+            let raw_output = format!(
                 "{}\n{}",
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
-            )
-            .replace('\\', "/")
-            .to_lowercase();
-
-            if combined.contains("ts18003") || combined.contains("cannot find type definition file") {
-                return SingleFileVerifyOutcome::Inconclusive;
+            );
+            if out.status.success() {
+                return VerifyDetail {
+                    outcome: SingleFileVerifyOutcome::Passed("tsc_noemit"),
+                    raw_output,
+                    file_errors: Vec::new(),
+                };
             }
 
-            let file_still_fails = combined.lines().any(|line| {
-                let l = line.trim();
-                (l.starts_with(&lower_rel) || l.contains(&format!("/{}", lower_rel)))
-                    && l.contains("error ts")
-            });
-            if file_still_fails {
-                SingleFileVerifyOutcome::Failed("tsc_noemit")
+            let combined_lower = raw_output.replace('\\', "/").to_lowercase();
+            if combined_lower.contains("ts18003")
+                || combined_lower.contains("cannot find type definition file")
+            {
+                return VerifyDetail {
+                    outcome: SingleFileVerifyOutcome::Inconclusive,
+                    raw_output,
+                    file_errors: Vec::new(),
+                };
+            }
+
+            let mut matched_errors: Vec<String> = Vec::new();
+            for raw_line in raw_output.lines() {
+                let norm_line = raw_line.trim().replace('\\', "/").to_lowercase();
+                if !norm_line.contains("error ts") {
+                    continue;
+                }
+                let hits_target = target_ts_paths.iter().any(|tp| {
+                    norm_line.starts_with(tp)
+                        || norm_line.contains(&format!("/{}", tp))
+                        || norm_line.contains(&format!("{}(", tp))
+                        || norm_line.contains(&format!("{}:", tp))
+                });
+                if hits_target {
+                    matched_errors.push(raw_line.trim().to_string());
+                }
+            }
+
+            if !matched_errors.is_empty() {
+                VerifyDetail {
+                    outcome: SingleFileVerifyOutcome::Failed("tsc_noemit"),
+                    raw_output,
+                    file_errors: matched_errors,
+                }
             } else {
-                SingleFileVerifyOutcome::Passed("error_disappeared")
+                VerifyDetail {
+                    outcome: SingleFileVerifyOutcome::Passed("error_disappeared"),
+                    raw_output,
+                    file_errors: Vec::new(),
+                }
             }
         }
-        _ => SingleFileVerifyOutcome::Inconclusive,
+        _ => VerifyDetail {
+            outcome: SingleFileVerifyOutcome::Inconclusive,
+            raw_output: String::new(),
+            file_errors: Vec::new(),
+        },
+    }
+}
+
+fn list_project_src_modules(proj_dir: &std::path::Path, max_items: usize) -> Vec<String> {
+    let mut files = Vec::new();
+    let src_root = proj_dir.join("src");
+    let scan_root = if src_root.exists() { &src_root } else { proj_dir };
+    let mut stack = vec![scan_root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if p.is_dir() {
+                    if name != "node_modules" && name != ".next" && name != ".git" && name != "dist" && name != "build" {
+                        stack.push(p);
+                    }
+                } else if p.is_file() {
+                    let lower = name.to_lowercase();
+                    if lower.ends_with(".ts")
+                        || lower.ends_with(".tsx")
+                        || lower.ends_with(".js")
+                        || lower.ends_with(".jsx")
+                    {
+                        if let Ok(rel) = p.strip_prefix(proj_dir) {
+                            files.push(rel.to_string_lossy().replace('\\', "/"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    files.sort();
+    files.truncate(max_items);
+    files
+}
+
+fn truncate_context_snippet(content: &str, max_chars: usize) -> String {
+    if content.chars().count() <= max_chars {
+        content.to_string()
+    } else {
+        let clipped: String = content.chars().take(max_chars).collect();
+        format!("{}\n/* ...[truncated for context budget]... */", clipped)
+    }
+}
+
+fn apply_single_targeted_edit_with_quote_fallback(
+    content: &str,
+    target: &str,
+    replacement: &str,
+) -> Result<String, String> {
+    match apply_targeted_edit(content, target, replacement) {
+        Ok(res) => Ok(res),
+        Err(orig_err) => {
+            if !target.contains('\n')
+                && target.starts_with('\'')
+                && target.ends_with('\'')
+                && !target.contains('"')
+                && replacement.starts_with('\'')
+                && replacement.ends_with('\'')
+                && !replacement.contains('"')
+            {
+                let t_dq = format!("\"{}\"", &target[1..target.len() - 1]);
+                let r_dq = format!("\"{}\"", &replacement[1..replacement.len() - 1]);
+                if let Ok(res) = apply_targeted_edit(content, &t_dq, &r_dq) {
+                    return Ok(res);
+                }
+            }
+            if !target.contains('\n')
+                && target.starts_with('"')
+                && target.ends_with('"')
+                && !target.contains('\'')
+                && replacement.starts_with('"')
+                && replacement.ends_with('"')
+                && !replacement.contains('\'')
+            {
+                let t_sq = format!("'{}'", &target[1..target.len() - 1]);
+                let r_sq = format!("'{}'", &replacement[1..replacement.len() - 1]);
+                if let Ok(res) = apply_targeted_edit(content, &t_sq, &r_sq) {
+                    return Ok(res);
+                }
+            }
+            Err(orig_err)
+        }
+    }
+}
+
+fn restore_attempt_snapshots(
+    proj_dir: &std::path::Path,
+    snapshots: &std::collections::HashMap<String, Option<String>>,
+) {
+    for (rel_p, orig_opt) in snapshots {
+        let disk_p = proj_dir.join(rel_p);
+        match orig_opt {
+            Some(prev_content) => {
+                let _ = std::fs::write(&disk_p, prev_content);
+            }
+            None => {
+                let _ = std::fs::remove_file(&disk_p);
+            }
+        }
     }
 }
 
@@ -1296,23 +1907,30 @@ pub async fn project_heal_compile_error(
     }));
 
     let proj_dir = get_project_path(&project_id);
+    if !proj_dir.exists() {
+        let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Greška: Projekat ne postoji" }));
+        return Err("Direktorijum projekta ne postoji.".to_string());
+    }
+    crate::sanitizer::ensure_valid_tsconfig(&proj_dir);
     ensure_directory_barrel_files(&proj_dir);
+
     let file_path = resolve_project_file_candidate(&proj_dir, &file_path)
-        .unwrap_or_else(|| file_path.replace('\\', "/"));
+        .map(|p| normalize_rel_path_str(&p))
+        .unwrap_or_else(|| normalize_rel_path_str(&file_path));
     let full_path = proj_dir.join(&file_path);
-    if !full_path.exists() {
+    if !full_path.exists() || !full_path.is_file() || !full_path.starts_with(&proj_dir) {
         let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Greška: Fajl ne postoji" }));
         return Err(format!("Fajl {} ne postoji.", file_path));
     }
 
-    let rel_file_path = if let Ok(stripped) = std::path::Path::new(&file_path).strip_prefix(&proj_dir) {
-        stripped.to_str().unwrap_or("").replace('\\', "/")
+    let rel_file_path = if let Ok(stripped) = full_path.strip_prefix(&proj_dir) {
+        normalize_rel_path_str(&stripped.to_string_lossy())
     } else {
-        file_path.replace('\\', "/")
+        normalize_rel_path_str(&file_path)
     };
 
     let settings = get_axiom_settings();
-    let model = settings.get("modelId")
+    let requested_model = settings.get("modelId")
         .and_then(|m| m.as_str())
         .unwrap_or("qwen2.5-coder:7b")
         .to_string();
@@ -1322,7 +1940,7 @@ pub async fn project_heal_compile_error(
         &project_id,
         &rel_file_path,
         &sig_info.error_signature,
-        &model,
+        &requested_model,
     );
     if !failed_prev_ids.is_empty() {
         debug_log_to_file(format!(
@@ -1338,16 +1956,32 @@ pub async fn project_heal_compile_error(
         })?;
 
     let raw_clean = strip_axiom_inspector_script(&raw_file_content);
+    let has_tailwind = proj_dir.join("tailwind.config.js").exists() || proj_dir.join("tailwind.config.ts").exists();
 
-    // Fast deterministic pre-heal pass (rewrites barrel imports, missing react-icons subpaths, useEffect deps, etc.)
-    let pre_sanitized = post_process_generated_file(&file_path, &raw_file_content, &serde_json::json!({}), true);
-    let active_clean_content = strip_axiom_inspector_script(&pre_sanitized);
-    if pre_sanitized != raw_file_content {
-        let _ = std::fs::write(&full_path, &pre_sanitized);
+    let mut active_file_content = raw_file_content.clone();
+    let mut active_clean_content = raw_clean.clone();
+    let mut current_error_context = error_msg.clone();
+
+    // Fast deterministic pre-heal pass (rewrites bare `src/...` imports, barrel imports, missing react-icons subpaths, useEffect deps, etc.)
+    let mut pre_sanitized = post_process_generated_file(&rel_file_path, &raw_file_content, &serde_json::json!({}), has_tailwind);
+    let pre_routes = get_project_routes_from_dir(&proj_dir);
+    let pre_routes_list: Vec<String> = pre_routes.into_iter().map(|(r, _)| r).collect();
+    if !pre_routes_list.is_empty() {
+        pre_sanitized = sanitize_app_router_links_with_routes(&pre_sanitized, &pre_routes_list);
+    }
+    pre_sanitized = sanitize_unhandled_session_loading(&pre_sanitized);
+
+    if pre_sanitized != raw_file_content
+        && crate::orchestrator::validate_file_with_abstract_rules(&rel_file_path, &pre_sanitized, &requested_model)
+            .await
+            .is_ok()
+        && std::fs::write(&full_path, &pre_sanitized).is_ok()
+    {
+        let pre_clean = strip_axiom_inspector_script(&pre_sanitized);
         let atomic_patch = crate::katastar::extract_safe_atomic_patch(
             &rel_file_path,
             &raw_clean,
-            &active_clean_content,
+            &pre_clean,
         );
         let eid = crate::katastar::register_repair_attempt(
             &sig_info.category,
@@ -1356,17 +1990,18 @@ pub async fn project_heal_compile_error(
             "deterministic",
             "deterministic_sanitizer",
             atomic_patch.clone(),
-            "Deterministic sanitizer pre-heal (imports, hooks, client directives, schema)",
+            "Deterministic sanitizer pre-heal (imports, aliases, hooks, client directives, schema)",
             "",
         );
-        let verify_res = verify_single_file_after_heal(
+        let verify_detail = verify_single_file_detail(
             &proj_dir,
             &rel_file_path,
+            &[],
             &sig_info.category,
             sig_info.error_code.as_deref(),
         )
         .await;
-        match verify_res {
+        match verify_detail.outcome {
             SingleFileVerifyOutcome::Passed(vkind) => {
                 crate::katastar::finalize_katastar_outcome(
                     &eid,
@@ -1380,7 +2015,7 @@ pub async fn project_heal_compile_error(
                 ensure_axiom_inspector_injected(&proj_dir);
                 let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Uspešno popravljeno!" }));
                 let _ = window.emit("server:log", serde_json::json!({
-                    "text": format!("> [AI Auto-Healing] Deterministički saniran i verifikovan ({}) fajl: {}\n", vkind, file_path),
+                    "text": format!("> [AI Auto-Healing] Deterministički saniran i verifikovan ({}) fajl: {}\n", vkind, rel_file_path),
                     "type": "info"
                 }));
                 return Ok(true);
@@ -1396,7 +2031,7 @@ pub async fn project_heal_compile_error(
                 ensure_axiom_inspector_injected(&proj_dir);
                 let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Uspešno popravljeno!" }));
                 let _ = window.emit("server:log", serde_json::json!({
-                    "text": format!("> [AI Auto-Healing] Deterministički saniran kod i zavisnosti u: {}\n", file_path),
+                    "text": format!("> [AI Auto-Healing] Deterministički saniran kod i zavisnosti u: {}\n", rel_file_path),
                     "type": "info"
                 }));
                 return Ok(true);
@@ -1411,8 +2046,17 @@ pub async fn project_heal_compile_error(
                     None,
                     "",
                 );
+                active_file_content = pre_sanitized;
+                active_clean_content = pre_clean;
+                if !verify_detail.file_errors.is_empty() {
+                    current_error_context = format!(
+                        "{}\n\n[Live compiler diagnostics after deterministic import cleanup]:\n{}",
+                        error_msg,
+                        verify_detail.file_errors.join("\n")
+                    );
+                }
                 let _ = window.emit("server:log", serde_json::json!({
-                    "text": format!("> [AI Auto-Healing] Deterministički prolaz je očistio import/sintaksu, ali '{}' i dalje ima greške ({}); nastavljam sa Katastrom i AI popravkom...\n", file_path, vkind),
+                    "text": format!("> [AI Auto-Healing] Deterministički prolaz je sredio lokalne importe/sintaksu, ali '{}' i dalje ima greške ({}); nastavljam sa Katastrom i verifikovanom AI petljom...\n", rel_file_path, vkind),
                     "type": "info"
                 }));
             }
@@ -1420,32 +2064,47 @@ pub async fn project_heal_compile_error(
     }
 
     // Phase A (Before calling AI): Consult Local Error Katastar for verified auto-patches & past hints
-    let katastar_lookup = crate::katastar::lookup_katastar(
+    let mut katastar_lookup = crate::katastar::lookup_katastar(
         &sig_info.category,
-        &error_msg,
+        &current_error_context,
         &rel_file_path,
         &active_clean_content,
         &failed_prev_ids,
     );
-    let has_tailwind_pre = proj_dir.join("tailwind.config.js").exists() || proj_dir.join("tailwind.config.ts").exists();
+    if katastar_lookup.applicable_patches.is_empty() && current_error_context != error_msg {
+        katastar_lookup = crate::katastar::lookup_katastar(
+            &sig_info.category,
+            &error_msg,
+            &rel_file_path,
+            &active_clean_content,
+            &failed_prev_ids,
+        );
+    }
+
     if let Some(best) = katastar_lookup.applicable_patches.first() {
         let candidate = active_clean_content.replace(&best.patch.search, &best.patch.replace);
-        let mut processed = post_process_generated_file(&rel_file_path, &candidate, &serde_json::json!({}), has_tailwind_pre);
+        let mut processed = post_process_generated_file(&rel_file_path, &candidate, &serde_json::json!({}), has_tailwind);
         let project_routes = get_project_routes_from_dir(&proj_dir);
         let routes_list: Vec<String> = project_routes.into_iter().map(|(r, _)| r).collect();
         if !routes_list.is_empty() {
             processed = sanitize_app_router_links_with_routes(&processed, &routes_list);
         }
         processed = sanitize_unhandled_session_loading(&processed);
-        if processed != active_clean_content && std::fs::write(&full_path, &processed).is_ok() {
-            let verify_res = verify_single_file_after_heal(
+        if processed != active_clean_content
+            && crate::orchestrator::validate_file_with_abstract_rules(&rel_file_path, &processed, &requested_model)
+                .await
+                .is_ok()
+            && std::fs::write(&full_path, &processed).is_ok()
+        {
+            let verify_detail = verify_single_file_detail(
                 &proj_dir,
                 &rel_file_path,
+                &[],
                 &sig_info.category,
                 sig_info.error_code.as_deref(),
             )
             .await;
-            match verify_res {
+            match verify_detail.outcome {
                 SingleFileVerifyOutcome::Failed(vkind) => {
                     crate::katastar::finalize_katastar_outcome(
                         &best.entry_id,
@@ -1454,9 +2113,16 @@ pub async fn project_heal_compile_error(
                         vkind,
                         None,
                         None,
-                        &model,
+                        &requested_model,
                     );
-                    let _ = std::fs::write(&full_path, &pre_sanitized);
+                    let _ = std::fs::write(&full_path, &active_file_content);
+                    if !verify_detail.file_errors.is_empty() {
+                        current_error_context = format!(
+                            "{}\n\n[Live compiler diagnostics]:\n{}",
+                            error_msg,
+                            verify_detail.file_errors.join("\n")
+                        );
+                    }
                     let _ = window.emit("server:log", serde_json::json!({
                         "text": format!("> [Katastar] Pravilo '{}' nije rešilo '{}' ({}), vraćam prethodno stanje i pozivam AI...\n", best.entry_id, rel_file_path, vkind),
                         "type": "warning"
@@ -1470,7 +2136,7 @@ pub async fn project_heal_compile_error(
                         vkind,
                         None,
                         None,
-                        &model,
+                        &requested_model,
                     );
                     ensure_axiom_inspector_injected(&proj_dir);
                     let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Uspešno popravljeno!" }));
@@ -1500,42 +2166,45 @@ pub async fn project_heal_compile_error(
         }
     }
 
+    // Phase B: Brutal Verified 3-Attempt AI Repair Loop
+    let _ = ollama_start_server().await;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let model = resolve_valid_ollama_model(&client, &requested_model).await;
+
     let file_content = active_clean_content.clone();
 
-    let _ = window.emit("server:heal-status", serde_json::json!({
-        "status": format!("Pozivanje AI modela ({}) u toku...", model)
-    }));
-    let _ = window.emit("server:log", serde_json::json!({
-        "text": format!("> [AI Auto-Healing] Pozivam model '{}' sa opisom greške...\n", model),
-        "type": "info"
-    }));
-
-    let client = reqwest::Client::new();
-    let mut system_prompt = "You are a Senior Next.js App Router Developer. A file in the project failed with an error. \
-        Instead of rewriting the entire file, you must identify the exact lines causing the error and provide a list of target replacements in JSON format.\
+    let mut system_prompt = "You are a Senior Next.js App Router Developer and TypeScript Compiler Surgeon. A file in the project failed with an error. \
+        Instead of rewriting the entire file unnecessarily, you must identify the exact cause and provide valid target/replacement edits in JSON format.\
         \n\n\
         CRITICAL RULES:\n\
         1. Respond ONLY with a valid JSON object matching the format described below. Do not write any explanations, introductory text, or markdown code blocks (do not wrap in ```json). Just the raw JSON.\n\
-        2. In the JSON structure, under 'edits', each 'target' block must exactly match (character-for-character, including leading whitespace and indentation) a unique substring in the original file.\n\
+        2. In the JSON structure, under 'edits', each 'target' block must exactly match (character-for-character, including leading whitespace and indentation) a unique substring in the target file. To create a missing local module file, set 'path' to its full path with extension (e.g. 'src/models/MaintenanceAlert.ts') and 'target' to \"\".\n\
         3. Do NOT include placeholders in 'replacement'. The code must be complete and ready to run.\n\
-        4. Focus only on resolving the reported error. Do not make unrelated changes.\n\
-        5. DATABASE RESILIENCY: If a database query (like a Prisma call `findMany`) throws a database connection error, wrap the query in try-catch and fall back to returning a mock array containing 10 realistic mockup items so the application remains previewable even if the database server is offline.\n\
-        6. NEVER declare unquoted 'data-axiom-component' or 'data-axiom-file' inside TypeScript interfaces or type definitions. If 'data-axiom-component' or 'data-axiom-file' already exists as an HTML attribute on a JSX tag, it is valid and you MUST leave it untouched.\n\
-        7. STRICT UI & DESIGN PRESERVATION: NEVER delete or strip UI components, hero sections, product grids, forms, tables, or buttons to bypass a compilation error. Fix the underlying TypeScript, import, export, or syntax error in place. The page richness and intent MUST remain 100% intact.\n\
+        4. Focus on resolving the reported error cleanly. Do not make unrelated changes.\n\
+        5. DATABASE RESILIENCY: Domain models under 'src/models/' MUST be pure TypeScript interfaces/types ONLY (never import '@/lib/prisma' or 'new PrismaClient()'). If a server route or Prisma query fails at runtime, handle errors safely without importing Prisma into 'use client' files.\n\
+        6. NEVER declare unquoted 'data-axiom-component' or 'data-axiom-file' inside TypeScript interfaces or type definitions. Leave existing HTML attributes on JSX tags untouched.\n\
+        7. STRICT UI & DESIGN PRESERVATION: NEVER delete or strip UI components, hero sections, product grids, forms, tables, or buttons to bypass a compilation error. Fix the underlying TypeScript, import, export, or syntax error in place.\n\
         8. MANDATORY TAILWIND CSS: All JSX elements MUST continue to use comprehensive Tailwind CSS utility classes. NEVER degrade styled elements into raw, unstyled HTML.\n\
+        9. STRICTLY NO PROSE IN CODE: NEVER put natural-language sentences, explanations, 'The error indicates...', or numbered lists ('1. Ensure...', '2. Verify...') inside 'replacement' or source code!\n\
+        10. VALID PATHS & ALIASES ONLY: Local Next.js imports MUST use '@/' alias without file extension (e.g. `import { X } from '@/models/MaintenanceAlert'`, NEVER bare `'src/models/...'`). Every JSON edit `'path'` MUST include its proper file extension (e.g. `.ts`, `.tsx`, `.css`, `.prisma`), NEVER an extensionless module path.\n\
         \n\n\
         JSON FORMAT:\n\
         {\n\
           \"explanation\": \"Brief explanation of the compile error and how to fix it\",\n\
           \"edits\": [\n\
             {\n\
-              \"target\": \"exact string of lines in original file to be replaced\",\n\
-              \"replacement\": \"the new code to put in its place\"\n\
+              \"path\": \"relative/path/to/file.ts\",\n\
+              \"target\": \"exact string of lines in file to be replaced (or empty string ONLY when creating a new file)\",\n\
+              \"replacement\": \"the valid source code to put in its place\"\n\
             }\n\
           ]\n\
         }".to_string();
-    system_prompt.push_str(&get_packages_db_summary());
-    let rulepacks = get_stack_rulepacks(&file_path, &file_content, Some(&error_msg));
+    let pkg_ctx = format!("{}\n{}\n{}", rel_file_path, current_error_context, file_content);
+    system_prompt.push_str(&crate::packages::get_relevant_packages_db_summary(Some(&proj_dir), &pkg_ctx));
+    let rulepacks = get_stack_rulepacks(&rel_file_path, &file_content, Some(&current_error_context));
     if !rulepacks.is_empty() {
         system_prompt.push_str(&rulepacks);
     }
@@ -1546,15 +2215,20 @@ pub async fn project_heal_compile_error(
         }
     }
 
+    let runtime_cfg = get_ollama_runtime_config(&model);
+    let compact_ctx = runtime_cfg.num_ctx <= 6144;
+    let max_aux_total_chars: usize = if compact_ctx { 6500 } else { 14000 };
+    let max_snippet_chars: usize = if compact_ctx { 1800 } else { 3200 };
+
     let path_lower = rel_file_path.to_lowercase();
-    let is_nav_or_link = path_lower.contains("navbar") 
-        || path_lower.contains("sidebar") 
-        || path_lower.contains("footer") 
-        || path_lower.contains("header") 
+    let is_nav_or_link = path_lower.contains("navbar")
+        || path_lower.contains("sidebar")
+        || path_lower.contains("footer")
+        || path_lower.contains("header")
         || path_lower.contains("nav")
-        || file_content.contains("<Link") 
+        || file_content.contains("<Link")
         || file_content.contains("next/link")
-        || error_msg.to_lowercase().contains("404");
+        || current_error_context.to_lowercase().contains("404");
 
     if is_nav_or_link {
         let project_routes = get_project_routes_from_dir(&proj_dir);
@@ -1565,6 +2239,9 @@ pub async fn project_heal_compile_error(
     }
 
     let mut project_context = String::new();
+    let mut seen_ctx_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen_ctx_files.insert(rel_file_path.to_lowercase());
+
     let features_path = proj_dir.join("axiom-features.json");
     if features_path.exists() {
         if let Ok(features_content) = std::fs::read_to_string(&features_path) {
@@ -1589,21 +2266,62 @@ pub async fn project_heal_compile_error(
         }
     }
 
-    let metadata_path = proj_dir.join(".axiom").join("metadata.json");
+    let contracts_prompt = crate::orchestrator::format_axiom_contracts_prompt(&proj_dir, &rel_file_path);
+    if !contracts_prompt.is_empty() && project_context.len() < max_aux_total_chars {
+        let capped_contracts = truncate_context_snippet(&contracts_prompt, if compact_ctx { 2000 } else { 4000 });
+        project_context.push_str(&format!("\n{}\n", capped_contracts));
+    }
 
-    if metadata_path.exists() {
+    let related_files = extract_related_project_files_for_error(&proj_dir, &file_content, &rel_file_path, &current_error_context);
+    let mut multi_file_candidates: Vec<String> = Vec::new();
+    for (rel_dep_path, dep_content) in related_files {
+        if project_context.len() >= max_aux_total_chars {
+            break;
+        }
+        let norm_key = normalize_rel_path_str(&rel_dep_path).to_lowercase();
+        if seen_ctx_files.insert(norm_key) {
+            let dep_snippet = truncate_context_snippet(&dep_content, max_snippet_chars);
+            project_context.push_str(&format!(
+                "\n--- Related Dependency / Exporter File: {} ---\n{}\n----------------------------------------------------\n",
+                rel_dep_path, dep_snippet
+            ));
+            multi_file_candidates.push(rel_dep_path);
+        }
+    }
+    if !multi_file_candidates.is_empty() {
+        let dep_list = multi_file_candidates.join(", ");
+        system_prompt.push_str(&format!(
+            "\n\nCRITICAL MULTI-FILE EDIT RULE:\n\
+             The error in '{}' may be caused by missing or incorrect exports/definitions in related files ({}).\n\
+             You are allowed to propose edits targeting those dependency files (set 'path' to their exact relative path) OR modify '{}'.",
+            rel_file_path, dep_list, rel_file_path
+        ));
+    }
+
+    let metadata_path = proj_dir.join(".axiom").join("metadata.json");
+    if metadata_path.exists() && project_context.len() < max_aux_total_chars {
         if let Ok(meta_content) = std::fs::read_to_string(&metadata_path) {
             if let Ok(meta_json) = serde_json::from_str::<serde_json::Value>(&meta_content) {
                 if let Some(deps) = meta_json.get("dependencies").and_then(|d| d.get(&rel_file_path)).and_then(|a| a.as_array()) {
+                    let mut meta_added = 0usize;
                     for dep_val in deps {
+                        if meta_added >= 3 || project_context.len() >= max_aux_total_chars {
+                            break;
+                        }
                         if let Some(dep_path_str) = dep_val.as_str() {
+                            let norm_key = normalize_rel_path_str(dep_path_str).to_lowercase();
+                            if !seen_ctx_files.insert(norm_key) {
+                                continue;
+                            }
                             let dep_full_path = proj_dir.join(dep_path_str);
                             if dep_full_path.exists() {
                                 if let Ok(dep_content) = std::fs::read_to_string(&dep_full_path) {
+                                    let dep_snippet = truncate_context_snippet(&dep_content, max_snippet_chars);
                                     project_context.push_str(&format!(
                                         "\n--- Related File Context: {} ---\n{}\n-----------------------------------\n",
-                                        dep_path_str, dep_content
+                                        dep_path_str, dep_snippet
                                     ));
+                                    meta_added += 1;
                                 }
                             }
                         }
@@ -1613,463 +2331,604 @@ pub async fn project_heal_compile_error(
         }
     }
 
-    // Proactively include layout.tsx if healing page.tsx (important for next-auth provider issues)
-    if rel_file_path.ends_with("page.tsx") || rel_file_path.ends_with("page.js") {
-        for layout_name in &["src/app/layout.tsx", "src/app/layout.jsx", "src/app/layout.js", "layout.tsx"] {
+    if (rel_file_path.ends_with("page.tsx") || rel_file_path.ends_with("page.js")) && project_context.len() < max_aux_total_chars {
+        for layout_name in &[
+            "src/app/layout.tsx",
+            "src/app/layout.jsx",
+            "src/app/layout.js",
+            "app/layout.tsx",
+            "app/layout.jsx",
+            "layout.tsx",
+        ] {
+            let norm_key = layout_name.to_lowercase();
+            if seen_ctx_files.contains(&norm_key) {
+                continue;
+            }
             let layout_full_path = proj_dir.join(layout_name);
             if layout_full_path.exists() {
                 if let Ok(layout_content) = std::fs::read_to_string(&layout_full_path) {
-                    if !project_context.contains(layout_name) {
-                        let clean_layout = strip_axiom_inspector_script(&layout_content);
-                        project_context.push_str(&format!(
-                            "\n--- Project Layout File: {} ---\n{}\n-------------------------------------\n",
-                            layout_name, clean_layout
-                        ));
-                    }
+                    seen_ctx_files.insert(norm_key);
+                    let clean_layout = strip_axiom_inspector_script(&layout_content);
+                    let layout_snippet = truncate_context_snippet(&clean_layout, max_snippet_chars);
+                    project_context.push_str(&format!(
+                        "\n--- Project Layout File: {} ---\n{}\n-------------------------------------\n",
+                        layout_name, layout_snippet
+                    ));
+                    break;
                 }
             }
         }
     }
 
-    // Abstractly extract and inject all related exporter/dependency files based on error message, tokens, and imports
-    let related_files = extract_related_project_files_for_error(&proj_dir, &file_content, &rel_file_path, &error_msg);
-    for (rel_dep_path, dep_content) in related_files {
-        if !project_context.contains(&rel_dep_path) {
-            project_context.push_str(&format!(
-                "\n--- Related Dependency / Exporter File: {} ---\n{}\n----------------------------------------------------\n",
-                rel_dep_path, dep_content
-            ));
-            system_prompt.push_str(&format!(
-                "\n\nCRITICAL MULTI-FILE EDIT RULE:\n\
-                 The error in '{}' may be caused by missing or incorrect exports/definitions in '{}'.\n\
-                 You are allowed to propose edits for '{}' (set 'path' to '{}' in edits) to fix/add exports or declarations, OR modify '{}'.",
-                rel_file_path, rel_dep_path, rel_dep_path, rel_dep_path, rel_file_path
-            ));
-        }
-    }
-
-    let user_prompt = format!(
-        "File: {}\n\nCompilation Error Details:\n{}\n\nFile Current Content:\n{}\n{}{}\n\nPlease analyze the error and output the required JSON edits to fix it.",
-        file_path,
-        error_msg,
-        file_content,
-        if project_context.is_empty() { "" } else { "\nAdditional Project Context:" },
-        project_context
-    );
-
-    let ollama_req = serde_json::json!({
-        "model": model,
-        "format": "json",
-        "messages": [
-            { "role": "system", "content": system_prompt },
-            { "role": "user", "content": user_prompt }
-        ],
-        "stream": false,
-        "options": build_ollama_options(&model, 0.1, Some(4096))
-    });
-
-    match client.post("http://127.0.0.1:11434/api/chat")
-        .json(&ollama_req)
-        .send()
-        .await 
+    if current_error_context.contains("Can't resolve")
+        || current_error_context.contains("Cannot find module")
+        || current_error_context.contains("Module not found")
+        || current_error_context.contains("TS2307")
     {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                if let Ok(resp_json) = resp.json::<serde_json::Value>().await {
-                    if let Some(ai_msg) = resp_json.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
-                        let _ = window.emit("server:heal-status", serde_json::json!({
-                            "status": "Ispravljanje koda i post-processing..."
-                        }));
-                        let _ = window.emit("server:log", serde_json::json!({
-                            "text": "> [AI Auto-Healing] AI je vratio ispravku. Primjenjujem post-processing...\n".to_string(),
-                            "type": "info"
-                        }));
+        let existing_mods = list_project_src_modules(&proj_dir, if compact_ctx { 40 } else { 80 });
+        if !existing_mods.is_empty() {
+            project_context.push_str(&format!(
+                "\n--- Existing Project Source Files (import via `@/...` without extension) ---\n{}\n--------------------------------------------------------------------------\n",
+                existing_mods.join("\n")
+            ));
+        }
+    }
 
-                        debug_log_to_file(format!("[AI Auto-Healing] Raw AI response:\n{}", ai_msg));
-                        let clean_content = extract_code_content(ai_msg);
-                        
-                        let mut resolved_edits = Vec::new();
-                        let mut explanation = "Popravka generisana od strane AI modela".to_string();
+    const MAX_AI_ATTEMPTS: usize = 3;
+    let mut attempt_feedback = String::new();
+    let mut last_failure_reason = "Model nije uspeo da proizvede verifikovanu ispravku.".to_string();
+    let mut recorded_any_failure_in_katastar = false;
 
-                        // Try parsing as JSON first
-                        let maybe_json: Option<serde_json::Value> = serde_json::from_str(&clean_content).ok()
-                            .or_else(|| {
-                                if let Some(start_json) = clean_content.find('{') {
-                                    if let Some(end_json) = clean_content.rfind('}') {
-                                        let json_str = &clean_content[start_json..=end_json];
-                                        serde_json::from_str(json_str).ok()
-                                    } else {
-                                        None
-                                    }
-                                } else if let Some(start_arr) = clean_content.find('[') {
-                                    if let Some(end_arr) = clean_content.rfind(']') {
-                                        let json_str = &clean_content[start_arr..=end_arr];
-                                        serde_json::from_str(json_str).ok()
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                }
-                            });
+    for ai_attempt in 1..=MAX_AI_ATTEMPTS {
+        let _ = window.emit("server:heal-status", serde_json::json!({
+            "status": format!("Pozivanje AI modela ({}, pokušaj {}/{})...", model, ai_attempt, MAX_AI_ATTEMPTS)
+        }));
+        let _ = window.emit("server:log", serde_json::json!({
+            "text": format!("> [AI Auto-Healing] Pozivam model '{}' (pokušaj {}/{}) sa opisom greške...\n", model, ai_attempt, MAX_AI_ATTEMPTS),
+            "type": "info"
+        }));
 
-                        if let Some(ref parsed_json) = maybe_json {
-                            if let Some(exp) = parsed_json.get("explanation").or_else(|| parsed_json.get("reason")).and_then(|e| e.as_str()) {
-                                explanation = exp.to_string();
-                            }
+        let feedback_block = if attempt_feedback.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nPREVIOUS ATTEMPT FAILED VERIFICATION — FIX THIS CAREFULLY:\n{}\nDo NOT repeat this mistake!\n",
+                attempt_feedback
+            )
+        };
 
-                            resolved_edits = extract_edits_from_json(parsed_json, &rel_file_path);
+        let user_prompt = format!(
+            "File: {}\n\nCompilation Error Details:\n{}\n\nFile Current Content:\n{}\n{}{}{}\n\nPlease analyze the error and output ONLY valid JSON edits matching the required format.",
+            rel_file_path,
+            current_error_context,
+            file_content,
+            if project_context.is_empty() { "" } else { "\nAdditional Project Context:" },
+            project_context,
+            feedback_block
+        );
+
+        let temp = if ai_attempt == 1 { 0.1 } else { 0.2 };
+        let ollama_req = serde_json::json!({
+            "model": model,
+            "format": "json",
+            "messages": [
+                { "role": "system", "content": system_prompt },
+                { "role": "user", "content": user_prompt }
+            ],
+            "stream": false,
+            "options": build_ollama_options(&model, temp, Some(4096))
+        });
+
+        let resp = match client.post("http://127.0.0.1:11434/api/chat").json(&ollama_req).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_failure_reason = format!("Greška u komunikaciji sa Ollama serverom: {}", e);
+                attempt_feedback = last_failure_reason.clone();
+                let _ = window.emit("server:log", serde_json::json!({
+                    "text": format!("> [AI Auto-Healing] Pokušaj {}/{}: {}\n", ai_attempt, MAX_AI_ATTEMPTS, last_failure_reason),
+                    "type": "warning"
+                }));
+                let _ = ollama_start_server().await;
+                continue;
+            }
+        };
+
+        if !resp.status().is_success() {
+            last_failure_reason = format!("Ollama HTTP status {}", resp.status());
+            attempt_feedback = last_failure_reason.clone();
+            continue;
+        }
+
+        let Ok(resp_json) = resp.json::<serde_json::Value>().await else {
+            last_failure_reason = "Neispravan JSON odgovor sa Ollama servera.".to_string();
+            attempt_feedback = last_failure_reason.clone();
+            continue;
+        };
+
+        let Some(ai_msg) = resp_json.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) else {
+            last_failure_reason = "Model je vratio prazan odgovor.".to_string();
+            attempt_feedback = last_failure_reason.clone();
+            continue;
+        };
+
+        let _ = window.emit("server:heal-status", serde_json::json!({
+            "status": format!("Validacija i provera koda (pokušaj {}/{})...", ai_attempt, MAX_AI_ATTEMPTS)
+        }));
+        debug_log_to_file(format!("[AI Auto-Healing Attempt {}/{}] Raw AI response:\n{}", ai_attempt, MAX_AI_ATTEMPTS, ai_msg));
+        let clean_content = extract_code_content(ai_msg);
+
+        let mut resolved_edits: Vec<Value> = Vec::new();
+        let mut explanation = "Popravka generisana od strane AI modela".to_string();
+
+        let maybe_json: Option<serde_json::Value> = serde_json::from_str(&clean_content).ok().or_else(|| {
+            if let (Some(s), Some(e)) = (clean_content.find('{'), clean_content.rfind('}')) {
+                if e > s {
+                    return serde_json::from_str(&clean_content[s..=e]).ok();
+                }
+            }
+            if let (Some(s), Some(e)) = (clean_content.find('['), clean_content.rfind(']')) {
+                if e > s {
+                    return serde_json::from_str(&clean_content[s..=e]).ok();
+                }
+            }
+            None
+        });
+
+        if let Some(ref parsed_json) = maybe_json {
+            if let Some(exp) = parsed_json.get("explanation").or_else(|| parsed_json.get("reason")).and_then(|e| e.as_str()) {
+                explanation = exp.to_string();
+            }
+            resolved_edits = extract_edits_from_json(parsed_json, &rel_file_path);
+        }
+
+        resolved_edits.retain(|e| {
+            let t = e.get("target").and_then(|v| v.as_str()).unwrap_or("");
+            let unquoted = t.trim_matches('\'').trim_matches('"').trim();
+            t.is_empty() || !unquoted.chars().all(|c| c.is_ascii_digit())
+        });
+
+        if resolved_edits.is_empty() {
+            if let Some(malformed_edits) = extract_code_from_malformed_json_response(&clean_content, &rel_file_path) {
+                debug_log_to_file(format!("[AI Auto-Healing] Extracted embedded code from malformed JSON for: {}", rel_file_path));
+                resolved_edits = malformed_edits;
+                explanation = "Izvučen popravljen kod iz AI odgovora".to_string();
+            }
+        }
+
+        if resolved_edits.is_empty() {
+            let trimmed = clean_content.trim();
+            let is_raw_json = (trimmed.starts_with('{') && trimmed.ends_with('}'))
+                || (trimmed.starts_with('[') && trimmed.ends_with(']'));
+            let is_json_envelope = trimmed.contains("\"files\":")
+                || trimmed.contains("\"content\":")
+                || trimmed.contains("\"edits\":")
+                || trimmed.contains("\"target\":")
+                || trimmed.contains("\"replacement\":")
+                || trimmed.contains("\"response\":");
+
+            if !is_raw_json && !is_json_envelope && looks_like_code_payload(&clean_content) {
+                let existing_line_count = file_content.lines().count();
+                let new_line_count = trimmed.lines().count();
+                let is_tiny_snippet = new_line_count < 4 && existing_line_count > 6;
+                if !is_tiny_snippet || trimmed.starts_with("import ") || trimmed.starts_with("export ") {
+                    debug_log_to_file(format!("[AI Auto-Healing] Whole-file code fallback activated for: {}", rel_file_path));
+                    resolved_edits.push(serde_json::json!({
+                        "path": rel_file_path.clone(),
+                        "target": "",
+                        "replacement": if is_tiny_snippet { trimmed.to_string() } else { clean_content.clone() }
+                    }));
+                    explanation = "Primenjen kompletan popravljen kod iz AI odgovora".to_string();
+                }
+            }
+        }
+
+        resolved_edits.retain(|e| {
+            let t = e.get("target").and_then(|v| v.as_str()).unwrap_or("");
+            let unquoted = t.trim_matches('\'').trim_matches('"').trim();
+            t.is_empty() || !unquoted.chars().all(|c| c.is_ascii_digit())
+        });
+
+        if resolved_edits.is_empty() {
+            last_failure_reason = "AI odgovor nije sadržao validan kod ili ciljanu izmenu (odbijena proza, neispravna putanja bez ekstenzije ili nevažeći JSON).".to_string();
+            attempt_feedback = last_failure_reason.clone();
+            let _ = window.emit("server:log", serde_json::json!({
+                "text": format!("> [AI Auto-Healing] Pokušaj {}/{} odbijen: {}\n", ai_attempt, MAX_AI_ATTEMPTS, last_failure_reason),
+                "type": "warning"
+            }));
+            continue;
+        }
+
+        // Apply all edits in memory and validate BEFORE touching disk
+        let mut modified_files: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut before_contents: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut attempt_snapshots: std::collections::HashMap<String, Option<String>> = std::collections::HashMap::new();
+        let mut edit_reject_reason: Option<String> = None;
+
+        for edit in resolved_edits {
+            let raw_edit_path = edit
+                .get("path")
+                .and_then(|p| p.as_str())
+                .map(|p| normalize_rel_path_str(p))
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| rel_file_path.clone());
+
+            let edit_path = resolve_project_file_candidate(&proj_dir, &raw_edit_path)
+                .map(|p| normalize_rel_path_str(&p))
+                .unwrap_or(raw_edit_path);
+
+            if !is_valid_file_path(&edit_path) {
+                edit_reject_reason = Some(format!(
+                    "Neispravna ciljana putanja fajla '{}' (putanja mora imati ekstenziju npr. .ts/.tsx i ne sme biti go import specifer).",
+                    edit_path
+                ));
+                break;
+            }
+
+            let target_full_path = proj_dir.join(&edit_path);
+            if !target_full_path.starts_with(&proj_dir) {
+                edit_reject_reason = Some(format!("Putanja '{}' izlazi van direktorijuma projekta.", edit_path));
+                break;
+            }
+
+            let Some(target) = edit.get("target").and_then(|t| t.as_str()) else {
+                edit_reject_reason = Some("Editu nedostaje polje 'target'.".to_string());
+                break;
+            };
+            let Some(replacement) = edit.get("replacement").and_then(|r| r.as_str()) else {
+                edit_reject_reason = Some("Editu nedostaje polje 'replacement'.".to_string());
+                break;
+            };
+
+            let edit_lower = edit_path.to_lowercase();
+            let is_md = edit_lower.ends_with(".md") || edit_lower.ends_with(".mdx");
+            let is_json = edit_lower.ends_with(".json");
+            if !is_md && has_prose_leak_in_code(replacement) {
+                edit_reject_reason = Some(format!(
+                    "Odbijena izmena za '{}': model je ubacio prozu/objašnjenje u polje 'replacement'.",
+                    edit_path
+                ));
+                break;
+            }
+
+            if !modified_files.contains_key(&edit_path) {
+                if !target_full_path.exists() {
+                    attempt_snapshots.insert(edit_path.clone(), None);
+                    modified_files.insert(edit_path.clone(), String::new());
+                    before_contents.insert(edit_path.clone(), String::new());
+                } else {
+                    match std::fs::read_to_string(&target_full_path) {
+                        Ok(content) => {
+                            attempt_snapshots.insert(edit_path.clone(), Some(content.clone()));
+                            before_contents.insert(edit_path.clone(), strip_axiom_inspector_script(&content));
+                            modified_files.insert(edit_path.clone(), content);
                         }
-
-                        // Try extracting code payload if the model returned malformed/partially-formatted JSON with backticks
-                        resolved_edits.retain(|e| {
-                            let t = e.get("target").and_then(|v| v.as_str()).unwrap_or("");
-                            let unquoted = t.trim_matches('\'').trim_matches('"').trim();
-                            t.is_empty() || !unquoted.chars().all(|c| c.is_ascii_digit())
-                        });
-
-                        if resolved_edits.is_empty() {
-                            if let Some(malformed_edits) = extract_code_from_malformed_json_response(&clean_content, &rel_file_path) {
-                                debug_log_to_file(format!("[AI Auto-Healing] Extracted embedded code from malformed JSON for: {}", rel_file_path));
-                                let _ = window.emit("server:log", serde_json::json!({
-                                    "text": format!("> [AI Auto-Healing] Prepoznat kod unutar odgovora modela. Primenjujem na: {}\n", rel_file_path),
-                                    "type": "info"
-                                }));
-                                resolved_edits = malformed_edits;
-                                explanation = "Izvučen popravljen kod iz AI odgovora".to_string();
-                            }
+                        Err(e) => {
+                            edit_reject_reason = Some(format!("Greška pri čitanju fajla {}: {}", edit_path, e));
+                            break;
                         }
-
-                        // Whole-File Code Fallback: If no valid JSON edits were resolved, but clean_content is strictly raw code (NOT a JSON dictionary)
-                        resolved_edits.retain(|e| {
-                            let t = e.get("target").and_then(|v| v.as_str()).unwrap_or("");
-                            let unquoted = t.trim_matches('\'').trim_matches('"').trim();
-                            t.is_empty() || !unquoted.chars().all(|c| c.is_ascii_digit())
-                        });
-
-                        if resolved_edits.is_empty() {
-                            let trimmed = clean_content.trim();
-                            let is_raw_json = (trimmed.starts_with('{') && trimmed.ends_with('}'))
-                                || (trimmed.starts_with('[') && trimmed.ends_with(']'));
-                            let is_json_envelope = trimmed.contains("\"files\":") 
-                                || trimmed.contains("\"content\":") 
-                                || trimmed.contains("\"edits\":") 
-                                || trimmed.contains("\"target\":") 
-                                || trimmed.contains("\"replacement\":");
-
-                            if !is_raw_json && !is_json_envelope {
-                                let existing_line_count = file_content.lines().count();
-                            let new_line_count = trimmed.lines().count();
-                            let is_tiny_snippet = new_line_count < 4 && existing_line_count > 6;
-
-                            let looks_like_code = clean_content.contains("import ") 
-                                    || clean_content.contains("export ") 
-                                    || clean_content.contains("const ") 
-                                    || clean_content.contains("function ") 
-                                    || clean_content.contains("class ") 
-                                    || clean_content.contains("interface ") 
-                                    || clean_content.contains("type ") 
-                                    || clean_content.contains("return ") 
-                                    || clean_content.contains("<");
-
-                                if looks_like_code && !trimmed.is_empty() && !is_tiny_snippet {
-                                    debug_log_to_file(format!("[AI Auto-Healing] Whole-file code fallback activated for: {}", rel_file_path));
-                                    let _ = window.emit("server:log", serde_json::json!({
-                                        "text": format!("> [AI Auto-Healing] Prepoznat direktan kod celog fajla (Whole-File Fallback). Primenjujem na: {}\n", rel_file_path),
-                                        "type": "info"
-                                    }));
-                                    resolved_edits.push(serde_json::json!({
-                                        "path": rel_file_path.clone(),
-                                        "target": "",
-                                        "replacement": clean_content
-                                    }));
-                                    explanation = "Primenjen kompletan popravljen kod iz AI odgovora".to_string();
-                                } else if is_tiny_snippet && (trimmed.starts_with("import ") || trimmed.starts_with("export ")) {
-                                    resolved_edits.push(serde_json::json!({
-                                        "path": rel_file_path.clone(),
-                                        "target": "",
-                                        "replacement": trimmed
-                                    }));
-                                    explanation = "Primenjena dopuna koda u fajl".to_string();
-                                }
-                            }
-                        }
-
-                        resolved_edits.retain(|e| {
-                            let t = e.get("target").and_then(|v| v.as_str()).unwrap_or("");
-                            let unquoted = t.trim_matches('\'').trim_matches('"').trim();
-                            t.is_empty() || !unquoted.chars().all(|c| c.is_ascii_digit())
-                        });
-
-                        if resolved_edits.is_empty() {
-                            let has_tw = proj_dir.join("tailwind.config.js").exists() || proj_dir.join("tailwind.config.ts").exists();
-                            let sanitized_fallback = post_process_generated_file(&rel_file_path, &file_content, &serde_json::json!({}), has_tw);
-                            if sanitized_fallback != file_content {
-                                resolved_edits.push(serde_json::json!({
-                                    "path": rel_file_path.clone(),
-                                    "target": "",
-                                    "replacement": sanitized_fallback
-                                }));
-                                explanation = "Primenjen deterministički sanitizer koda i uvoza (React hooks, Next.js, Zod)".to_string();
-                            }
-                        }
-
-                        resolved_edits.retain(|e| {
-                            let t = e.get("target").and_then(|v| v.as_str()).unwrap_or("");
-                            let unquoted = t.trim_matches('\'').trim_matches('"').trim();
-                            t.is_empty() || !unquoted.chars().all(|c| c.is_ascii_digit())
-                        });
-
-                        if resolved_edits.is_empty() {
-                            let err_msg = "Model response could not be parsed as targeted JSON edits or valid whole-file code replacement.".to_string();
-                            debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
-                            let _ = window.emit("server:log", serde_json::json!({
-                                "text": format!("> [AI Auto-Healing Error] {}\n", err_msg),
-                                "type": "error"
-                            }));
-                            let _ = window.emit("server:heal-status", serde_json::json!({
-                                "status": format!("Greška: {}", err_msg)
-                            }));
-                            return Err(err_msg);
-                        }
-
-                        let _ = window.emit("server:log", serde_json::json!({
-                            "text": format!("> [AI Auto-Healing] AI analiza: {}\n", explanation),
-                            "type": "info"
-                        }));
-
-                        let edits = resolved_edits;
-
-                        use std::collections::HashMap;
-                        let mut modified_files: HashMap<String, String> = HashMap::new();
-                        let mut before_contents: HashMap<String, String> = HashMap::new();
-                        
-                        for edit in edits {
-                            let edit_path = match edit.get("path").and_then(|p| p.as_str()) {
-                                Some(p) => p.to_string().replace('\\', "/"),
-                                None => rel_file_path.clone(),
-                            };
-                            
-                            let target = match edit.get("target").and_then(|t| t.as_str()) {
-                                Some(t) => t,
-                                None => {
-                                    let err_msg = "An edit is missing its 'target' field.".to_string();
-                                    debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
-                                    return Err(err_msg);
-                                }
-                            };
-                            let replacement = match edit.get("replacement").and_then(|r| r.as_str()) {
-                                Some(r) => r,
-                                None => {
-                                    let err_msg = "An edit is missing its 'replacement' field.".to_string();
-                                    debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
-                                    return Err(err_msg);
-                                }
-                            };
-
-                            // Load the file content if it is not already loaded
-                            if !modified_files.contains_key(&edit_path) {
-                                let target_full_path = proj_dir.join(&edit_path);
-                                if !target_full_path.exists() {
-                                    modified_files.insert(edit_path.clone(), String::new());
-                                    before_contents.insert(edit_path.clone(), String::new());
-                                } else {
-                                    let content = std::fs::read_to_string(&target_full_path)
-                                        .map_err(|e| {
-                                            let err_msg = format!("Greška pri čitanju fajla {}: {}", edit_path, e);
-                                            debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
-                                            err_msg
-                                        })?;
-                                    before_contents.insert(edit_path.clone(), strip_axiom_inspector_script(&content));
-                                    modified_files.insert(edit_path.clone(), content);
-                                }
-                            }
-
-                            let file_content_mut = modified_files.get_mut(&edit_path).unwrap();
-
-                            if target.is_empty() {
-                                let repl_trimmed = replacement.trim();
-                                let is_just_import = (repl_trimmed.starts_with("import ") || repl_trimmed.starts_with("import{") || repl_trimmed.starts_with("import type"))
-                                    && !repl_trimmed.contains("export ")
-                                    && !repl_trimmed.contains("function ")
-                                    && !repl_trimmed.contains("const ")
-                                    && !repl_trimmed.contains("default ")
-                                    && !repl_trimmed.contains("class ");
-
-                                let is_just_export = (repl_trimmed.starts_with("export ") || repl_trimmed.starts_with("export default"))
-                                    && !repl_trimmed.contains("function ")
-                                    && !repl_trimmed.contains("class ")
-                                    && !repl_trimmed.contains("const ")
-                                    && !repl_trimmed.contains("let ")
-                                    && !repl_trimmed.contains("var ")
-                                    && !repl_trimmed.contains("return ")
-                                    && !repl_trimmed.contains("<");
-
-                                let is_partial_helper_snippet = !file_content_mut.is_empty()
-                                    && file_content_mut.contains("export default")
-                                    && !repl_trimmed.contains("export default")
-                                    && repl_trimmed.lines().count() <= 10;
-
-                                if is_just_import && !file_content_mut.is_empty() {
-                                    if !file_content_mut.contains(repl_trimmed) {
-                                        *file_content_mut = insert_import_after_use_client(file_content_mut, repl_trimmed);
-                                        *file_content_mut = hoist_use_client_directive(file_content_mut);
-                                    }
-                                } else if is_just_export && !file_content_mut.is_empty() {
-                                    if !file_content_mut.contains(repl_trimmed) {
-                                        file_content_mut.push_str(&format!("\n{}\n", repl_trimmed));
-                                    }
-                                } else if is_partial_helper_snippet {
-                                    // Do not wipe out a full React page with a 1-10 line helper declaration
-                                    if !file_content_mut.contains(repl_trimmed) {
-                                        if let Some(idx) = file_content_mut.find("export default") {
-                                            file_content_mut.insert_str(idx, &format!("{}\n\n", repl_trimmed));
-                                        }
-                                    }
-                                } else {
-                                    *file_content_mut = replacement.to_string();
-                                }
-                            } else {
-                                match apply_targeted_edit(file_content_mut, target, replacement) {
-                                    Ok(new_content) => {
-                                        *file_content_mut = new_content;
-                                    },
-                                    Err(err) => {
-                                        let has_tw = proj_dir.join("tailwind.config.js").exists() || proj_dir.join("tailwind.config.ts").exists();
-                                        let sanitized_fallback = post_process_generated_file(&edit_path, file_content_mut, &serde_json::json!({}), has_tw);
-                                        if sanitized_fallback != *file_content_mut {
-                                            *file_content_mut = sanitized_fallback;
-                                        } else {
-                                            let err_msg = format!("Greška pri primeni ispravke u fajlu {}: {}", edit_path, err);
-                                            debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
-                                            return Err(err_msg);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        let has_tailwind = proj_dir.join("tailwind.config.js").exists() || proj_dir.join("tailwind.config.ts").exists();
-                        
-                        let _ = window.emit("server:heal-status", serde_json::json!({
-                            "status": "Upisivanje ispravki na disk..."
-                        }));
-
-                        let mut written_changes: Vec<(String, String, String)> = Vec::new();
-                        for (edit_path, processed_content) in modified_files {
-                            let mut processed = post_process_generated_file(&edit_path, &processed_content, &serde_json::json!({}), has_tailwind);
-                            let project_routes = get_project_routes_from_dir(&proj_dir);
-                            let routes_list: Vec<String> = project_routes.into_iter().map(|(r, _)| r).collect();
-                            if !routes_list.is_empty() {
-                                processed = sanitize_app_router_links_with_routes(&processed, &routes_list);
-                            }
-                            processed = sanitize_unhandled_session_loading(&processed);
-                            let target_full_path = proj_dir.join(&edit_path);
-                            if let Some(parent) = target_full_path.parent() {
-                                let _ = std::fs::create_dir_all(parent);
-                            }
-                            std::fs::write(&target_full_path, &processed)
-                                .map_err(|e| {
-                                    let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Greška pri upisu" }));
-                                    let err_msg = format!("Greška pri upisu fajla {} na disk: {}", edit_path, e);
-                                    debug_log_to_file(format!("[AI Auto-Healing Error] {}", err_msg));
-                                    err_msg
-                                })?;
-
-                            let before_clean = before_contents.get(&edit_path).cloned().unwrap_or_default();
-                            let after_clean = strip_axiom_inspector_script(&processed);
-                            if before_clean != after_clean && !before_clean.is_empty() {
-                                written_changes.push((edit_path.clone(), before_clean, after_clean));
-                            }
-                            
-                            let _ = window.emit("server:log", serde_json::json!({
-                                "text": format!("> [AI Auto-Healing] Uspešno popravljen fajl: {}\n", edit_path),
-                                "type": "info"
-                            }));
-                            debug_log_to_file(format!("[AI Auto-Healing] Successfully healed file: {}", edit_path));
-                        }
-
-                        if !written_changes.is_empty() {
-                            let verify_res = verify_single_file_after_heal(
-                                &proj_dir,
-                                &rel_file_path,
-                                &sig_info.category,
-                                sig_info.error_code.as_deref(),
-                            )
-                            .await;
-                            for (edit_path, before_clean, after_clean) in written_changes {
-                                let atomic_patch = crate::katastar::extract_safe_atomic_patch(
-                                    &edit_path,
-                                    &before_clean,
-                                    &after_clean,
-                                );
-                                let strategy_name = if atomic_patch.is_some() { "search_replace" } else { "ai_edit" };
-                                let eid = crate::katastar::register_repair_attempt(
-                                    &sig_info.category,
-                                    &error_msg,
-                                    &edit_path,
-                                    "ai",
-                                    strategy_name,
-                                    atomic_patch.clone(),
-                                    &explanation,
-                                    &model,
-                                );
-                                match verify_res {
-                                    SingleFileVerifyOutcome::Passed(vkind)
-                                        if edit_path == rel_file_path || vkind == "tsc_noemit" || vkind == "prisma_validate" =>
-                                    {
-                                        crate::katastar::finalize_katastar_outcome(
-                                            &eid,
-                                            true,
-                                            "ai",
-                                            vkind,
-                                            atomic_patch,
-                                            Some(&explanation),
-                                            &model,
-                                        );
-                                    }
-                                    SingleFileVerifyOutcome::Failed(vkind) if edit_path == rel_file_path => {
-                                        crate::katastar::finalize_katastar_outcome(
-                                            &eid,
-                                            false,
-                                            "ai",
-                                            vkind,
-                                            None,
-                                            None,
-                                            &model,
-                                        );
-                                    }
-                                    _ => {
-                                        crate::katastar::track_pending_project_repair(
-                                            &project_id,
-                                            &edit_path,
-                                            &sig_info.error_signature,
-                                            &eid,
-                                            "ai",
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                        ensure_axiom_inspector_injected(&proj_dir);
-
-                        let _ = window.emit("server:heal-status", serde_json::json!({
-                            "status": "Završeno!"
-                        }));
-
-                        return Ok(true);
                     }
                 }
             }
-            let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Greška: Prazan odgovor modela" }));
-            Err("Model nije vratio ispravan odgovor.".to_string())
+
+            let file_content_mut = modified_files.get_mut(&edit_path).unwrap();
+
+            if target.is_empty() {
+                let repl_trimmed = replacement.trim();
+                let payload_ok = if repl_trimmed.is_empty() {
+                    false
+                } else if is_json {
+                    serde_json::from_str::<Value>(repl_trimmed).is_ok()
+                } else if is_md {
+                    true
+                } else {
+                    looks_like_code_payload(repl_trimmed)
+                };
+                if !payload_ok {
+                    edit_reject_reason = Some(format!(
+                        "Odbijena puna zamena za '{}': sadržaj nije validan kod ili JSON.",
+                        edit_path
+                    ));
+                    break;
+                }
+
+                let is_just_import = (repl_trimmed.starts_with("import ") || repl_trimmed.starts_with("import{") || repl_trimmed.starts_with("import type"))
+                    && !repl_trimmed.contains("export ")
+                    && !repl_trimmed.contains("function ")
+                    && !repl_trimmed.contains("const ")
+                    && !repl_trimmed.contains("default ")
+                    && !repl_trimmed.contains("class ");
+
+                let is_just_export = (repl_trimmed.starts_with("export ") || repl_trimmed.starts_with("export default"))
+                    && !repl_trimmed.contains("function ")
+                    && !repl_trimmed.contains("class ")
+                    && !repl_trimmed.contains("const ")
+                    && !repl_trimmed.contains("let ")
+                    && !repl_trimmed.contains("var ")
+                    && !repl_trimmed.contains("return ")
+                    && !repl_trimmed.contains('<');
+
+                let is_partial_helper_snippet = !file_content_mut.is_empty()
+                    && file_content_mut.contains("export default")
+                    && !repl_trimmed.contains("export default")
+                    && repl_trimmed.lines().count() <= 10;
+
+                if is_just_import && !file_content_mut.is_empty() {
+                    if !file_content_mut.contains(repl_trimmed) {
+                        *file_content_mut = insert_import_after_use_client(file_content_mut, repl_trimmed);
+                        *file_content_mut = hoist_use_client_directive(file_content_mut);
+                    }
+                } else if is_just_export && !file_content_mut.is_empty() {
+                    if !file_content_mut.contains(repl_trimmed) {
+                        file_content_mut.push_str(&format!("\n{}\n", repl_trimmed));
+                    }
+                } else if is_partial_helper_snippet {
+                    if !file_content_mut.contains(repl_trimmed) {
+                        if let Some(idx) = file_content_mut.find("export default") {
+                            file_content_mut.insert_str(idx, &format!("{}\n\n", repl_trimmed));
+                        }
+                    }
+                } else {
+                    *file_content_mut = replacement.to_string();
+                }
+            } else {
+                match apply_single_targeted_edit_with_quote_fallback(file_content_mut, target, replacement) {
+                    Ok(new_content) => {
+                        *file_content_mut = new_content;
+                    }
+                    Err(err) => {
+                        edit_reject_reason = Some(format!(
+                            "Ciljani 'target' blok nije pronađen u '{}': {}. Proveri tačan tekst linija iz fajla.",
+                            edit_path, err
+                        ));
+                        break;
+                    }
+                }
+            }
         }
-        Err(e) => {
-            let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Greška u komunikaciji sa AI" }));
-            Err(format!("Greška u komunikaciji sa Ollama serverom: {}", e))
+
+        if let Some(reason) = edit_reject_reason {
+            last_failure_reason = reason.clone();
+            attempt_feedback = reason;
+            let _ = window.emit("server:log", serde_json::json!({
+                "text": format!("> [AI Auto-Healing] Pokušaj {}/{} odbijen pre upisa: {}\n", ai_attempt, MAX_AI_ATTEMPTS, last_failure_reason),
+                "type": "warning"
+            }));
+            continue;
+        }
+
+        // Run post-processing & static validation gate in memory before writing to disk
+        let project_routes = get_project_routes_from_dir(&proj_dir);
+        let routes_list: Vec<String> = project_routes.into_iter().map(|(r, _)| r).collect();
+        let mut prepared_writes: Vec<(String, String, String, String)> = Vec::new();
+        let mut validation_reject: Option<String> = None;
+        let mut any_effective_change = false;
+
+        for (edit_path, modified_content) in modified_files {
+            let mut processed = post_process_generated_file(&edit_path, &modified_content, &serde_json::json!({}), has_tailwind);
+            if !routes_list.is_empty() {
+                processed = sanitize_app_router_links_with_routes(&processed, &routes_list);
+            }
+            processed = sanitize_unhandled_session_loading(&processed);
+
+            if let Err(val_err) = crate::orchestrator::validate_file_with_abstract_rules(&edit_path, &processed, &model).await {
+                validation_reject = Some(format!("Statička validacija odbila kandidat za '{}': {}", edit_path, val_err));
+                break;
+            }
+
+            let before_clean = before_contents.get(&edit_path).cloned().unwrap_or_default();
+            let after_clean = strip_axiom_inspector_script(&processed);
+            if !before_clean.is_empty() {
+                if let Some(drop_reason) = detect_destructive_code_drop(&edit_path, &before_clean, &after_clean) {
+                    validation_reject = Some(drop_reason);
+                    break;
+                }
+            }
+            let orig_disk = attempt_snapshots.get(&edit_path).and_then(|o| o.as_ref()).map(|s| s.as_str()).unwrap_or("");
+            if processed != orig_disk && before_clean != after_clean {
+                any_effective_change = true;
+            }
+            prepared_writes.push((edit_path, processed, before_clean, after_clean));
+        }
+
+        if let Some(reason) = validation_reject {
+            last_failure_reason = reason.clone();
+            attempt_feedback = reason;
+            let _ = window.emit("server:log", serde_json::json!({
+                "text": format!("> [AI Auto-Healing] Pokušaj {}/{} pao statičku kontrolu: {}\n", ai_attempt, MAX_AI_ATTEMPTS, last_failure_reason),
+                "type": "warning"
+            }));
+            continue;
+        }
+
+        if !any_effective_change {
+            last_failure_reason = "AI predložena izmena nije promenila sadržaj fajla.".to_string();
+            attempt_feedback = last_failure_reason.clone();
+            let _ = window.emit("server:log", serde_json::json!({
+                "text": format!("> [AI Auto-Healing] Pokušaj {}/{} nije doneo efektivnu promenu koda.\n", ai_attempt, MAX_AI_ATTEMPTS),
+                "type": "warning"
+            }));
+            continue;
+        }
+
+        let _ = window.emit("server:heal-status", serde_json::json!({
+            "status": format!("Upisivanje i verifikacija popravke (pokušaj {}/{})...", ai_attempt, MAX_AI_ATTEMPTS)
+        }));
+
+        let mut written_changes: Vec<(String, String, String)> = Vec::new();
+        let mut edited_paths: Vec<String> = Vec::new();
+        for (edit_path, processed, before_clean, after_clean) in prepared_writes {
+            let target_full_path = proj_dir.join(&edit_path);
+            if let Some(parent) = target_full_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = std::fs::write(&target_full_path, &processed) {
+                restore_attempt_snapshots(&proj_dir, &attempt_snapshots);
+                let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Greška pri upisu" }));
+                return Err(format!("Greška pri upisu fajla {} na disk: {}", edit_path, e));
+            }
+            if before_clean != after_clean && !after_clean.trim().is_empty() {
+                written_changes.push((edit_path.clone(), before_clean, after_clean));
+            }
+            edited_paths.push(edit_path);
+        }
+
+        let verify_detail = verify_single_file_detail(
+            &proj_dir,
+            &rel_file_path,
+            &edited_paths,
+            &sig_info.category,
+            sig_info.error_code.as_deref(),
+        )
+        .await;
+
+        let mut registered_entries: Vec<(String, String, Option<crate::katastar::KatastarPatch>)> = Vec::new();
+        for (edit_path, before_clean, after_clean) in &written_changes {
+            let atomic_patch = if !before_clean.is_empty() {
+                crate::katastar::extract_safe_atomic_patch(edit_path, before_clean, after_clean)
+            } else {
+                None
+            };
+            let strategy_name = if atomic_patch.is_some() {
+                "search_replace"
+            } else if before_clean.is_empty() {
+                "ai_create_file"
+            } else {
+                "ai_edit"
+            };
+            let eid = crate::katastar::register_repair_attempt(
+                &sig_info.category,
+                &error_msg,
+                edit_path,
+                "ai",
+                strategy_name,
+                atomic_patch.clone(),
+                &explanation,
+                &model,
+            );
+            registered_entries.push((edit_path.clone(), eid, atomic_patch));
+        }
+
+        match verify_detail.outcome {
+            SingleFileVerifyOutcome::Passed(vkind) => {
+                for (_, eid, atomic_patch) in registered_entries {
+                    crate::katastar::finalize_katastar_outcome(
+                        &eid,
+                        true,
+                        "ai",
+                        vkind,
+                        atomic_patch,
+                        Some(&explanation),
+                        &model,
+                    );
+                }
+                ensure_axiom_inspector_injected(&proj_dir);
+                for ep in &edited_paths {
+                    let _ = window.emit("server:log", serde_json::json!({
+                        "text": format!("> [AI Auto-Healing] Uspešno popravljen i verifikovan ({}) fajl: {}\n", vkind, ep),
+                        "type": "info"
+                    }));
+                    debug_log_to_file(format!("[AI Auto-Healing] Verified ({}) heal on file: {}", vkind, ep));
+                }
+                let _ = window.emit("server:heal-status", serde_json::json!({
+                    "status": "Završeno!"
+                }));
+                return Ok(true);
+            }
+            SingleFileVerifyOutcome::Inconclusive => {
+                for (edit_path, eid, _) in registered_entries {
+                    crate::katastar::track_pending_project_repair(
+                        &project_id,
+                        &edit_path,
+                        &sig_info.error_signature,
+                        &eid,
+                        "ai",
+                    );
+                }
+                ensure_axiom_inspector_injected(&proj_dir);
+                for ep in &edited_paths {
+                    let _ = window.emit("server:log", serde_json::json!({
+                        "text": format!("> [AI Auto-Healing] Primenjena AI analiza ({}) na fajl: {}\n", explanation, ep),
+                        "type": "info"
+                    }));
+                }
+                let _ = window.emit("server:heal-status", serde_json::json!({
+                    "status": "Završeno!"
+                }));
+                return Ok(true);
+            }
+            SingleFileVerifyOutcome::Failed(vkind) => {
+                for (_, eid, _) in registered_entries {
+                    recorded_any_failure_in_katastar = true;
+                    crate::katastar::finalize_katastar_outcome(
+                        &eid,
+                        false,
+                        "ai",
+                        vkind,
+                        None,
+                        None,
+                        &model,
+                    );
+                }
+                restore_attempt_snapshots(&proj_dir, &attempt_snapshots);
+
+                let err_summary = if !verify_detail.file_errors.is_empty() {
+                    verify_detail.file_errors.iter().take(6).cloned().collect::<Vec<String>>().join("\n")
+                } else {
+                    verify_detail.raw_output.lines().take(6).collect::<Vec<&str>>().join("\n")
+                };
+                last_failure_reason = format!("Verifikacija ({}) pala: {}", vkind, err_summary);
+                attempt_feedback = format!(
+                    "Previous AI edit failed {} check and was ROLLED BACK. Exact compiler errors:\n{}",
+                    vkind, err_summary
+                );
+                if !verify_detail.file_errors.is_empty() {
+                    current_error_context = format!(
+                        "{}\n\n[Live compiler diagnostics]:\n{}",
+                        error_msg, err_summary
+                    );
+                }
+                let _ = window.emit("server:log", serde_json::json!({
+                    "text": format!("> [AI Auto-Healing] Pokušaj {}/{} nije prošao verifikaciju ({}). Vraćam fajl na prethodno stanje i pokušavam ponovo...\n", ai_attempt, MAX_AI_ATTEMPTS, vkind),
+                    "type": "warning"
+                }));
+                debug_log_to_file(format!(
+                    "[AI Auto-Healing] Rolled back attempt {}/{} on '{}' ({}): {}",
+                    ai_attempt, MAX_AI_ATTEMPTS, rel_file_path, vkind, err_summary
+                ));
+            }
         }
     }
+
+    if !recorded_any_failure_in_katastar {
+        let eid = crate::katastar::register_repair_attempt(
+            &sig_info.category,
+            &error_msg,
+            &rel_file_path,
+            "ai",
+            "ai_edit",
+            None,
+            &last_failure_reason,
+            &model,
+        );
+        crate::katastar::finalize_katastar_outcome(
+            &eid,
+            false,
+            "ai",
+            "validation_rejected",
+            None,
+            None,
+            &model,
+        );
+    }
+
+    let _ = window.emit("server:heal-status", serde_json::json!({
+        "status": "Greška: Popravka nije uspela"
+    }));
+    let _ = window.emit("server:log", serde_json::json!({
+        "text": format!("> [AI Auto-Healing Error] Nije uspela verifikovana popravka fajla '{}' posle {} pokušaja: {}\n", rel_file_path, MAX_AI_ATTEMPTS, last_failure_reason),
+        "type": "error"
+    }));
+    Err(format!("Nije uspela popravka fajla {} posle {} pokušaja: {}", rel_file_path, MAX_AI_ATTEMPTS, last_failure_reason))
 }
 
 #[tauri::command]
@@ -2078,11 +2937,51 @@ pub async fn project_install_package(
     package_name: String,
     window: tauri::Window,
 ) -> Result<bool, String> {
+    let raw_pkg = package_name.trim();
+    let lower_pkg = raw_pkg.to_lowercase();
+    let looks_like_file_or_local = crate::packages::is_local_import_specifier(raw_pkg)
+        || raw_pkg.contains('\\')
+        || raw_pkg.contains(' ')
+        || lower_pkg == "package.json"
+        || lower_pkg.ends_with(".ts")
+        || lower_pkg.ends_with(".tsx")
+        || lower_pkg.ends_with(".js")
+        || lower_pkg.ends_with(".jsx")
+        || lower_pkg.ends_with(".css")
+        || lower_pkg.ends_with(".scss")
+        || lower_pkg.ends_with(".prisma")
+        || lower_pkg.ends_with(".json");
+
+    if looks_like_file_or_local {
+        let msg = format!(
+            "'{}' je lokalna putanja modula u projektu, a ne npm paket. Koristi 'Popravi sa AI' za ispravku importa ili kreiranje fajla.",
+            raw_pkg
+        );
+        let _ = window.emit("server:heal-status", serde_json::json!({
+            "status": "Nije npm paket"
+        }));
+        let _ = window.emit("server:log", serde_json::json!({
+            "text": format!("> [Self-Healing Guard] {}\n", msg),
+            "type": "warning"
+        }));
+        return Err(msg);
+    }
+
+    // Normalize subpath specifiers (e.g. `next-auth/providers/credentials` -> `next-auth`, `@mui/material/Button` -> `@mui/material`)
+    let root_pkg = {
+        let parts: Vec<&str> = raw_pkg.split('/').collect();
+        if raw_pkg.starts_with('@') && parts.len() >= 2 {
+            format!("{}/{}", parts[0], parts[1])
+        } else {
+            parts.first().copied().unwrap_or(raw_pkg).to_string()
+        }
+    };
+
     let _ = window.emit("server:heal-status", serde_json::json!({
-        "status": format!("Instalacija paketa {}...", package_name)
+        "status": format!("Instalacija paketa {}...", root_pkg)
     }));
     let _ = window.emit("server:log", serde_json::json!({
-        "text": format!("> [AI Auto-Healing] Detektovan nedostajući paket. Pokrećem instalaciju: {}\n", package_name),
+        "text": format!("> [AI Auto-Healing] Detektovan nedostajući paket. Pokrećem instalaciju: {}\n", root_pkg),
         "type": "info"
     }));
 
@@ -2105,14 +3004,15 @@ pub async fn project_install_package(
         "type": "info"
     }));
 
-    let mut pkgs_to_install = vec![package_name.clone()];
-    if package_name == "@emotion/styled" || package_name == "@mui/material" {
+    let mut pkgs_to_install = vec![root_pkg.clone()];
+    if root_pkg == "@emotion/styled" || root_pkg == "@mui/material" {
         pkgs_to_install.push("@emotion/react".to_string());
-    } else if package_name == "@emotion/react" {
+    } else if root_pkg == "@emotion/react" {
         pkgs_to_install.push("@emotion/styled".to_string());
     }
 
     let mut last_err: Option<String> = None;
+    let mut last_raw_npm_err = String::new();
     let mut prefer_offline = true;
     for _attempt in 1..=4 {
         #[cfg(target_os = "windows")]
@@ -2152,11 +3052,30 @@ pub async fn project_install_package(
             Ok(output) => {
                 if output.status.success() {
                     lock_installed_dependencies(&pkg_json_path);
+                    let eid = crate::katastar::register_repair_attempt(
+                        "npm",
+                        &format!("missing package '{}'", root_pkg),
+                        "package.json",
+                        "npm",
+                        "npm_action",
+                        None,
+                        &format!("Installed missing npm package(s): {}", pkgs_to_install.join(", ")),
+                        "",
+                    );
+                    crate::katastar::finalize_katastar_outcome(
+                        &eid,
+                        true,
+                        "npm",
+                        "npm_install",
+                        None,
+                        None,
+                        "",
+                    );
                     let _ = window.emit("server:heal-status", serde_json::json!({
                         "status": "Instalirano!"
                     }));
                     let _ = window.emit("server:log", serde_json::json!({
-                        "text": format!("> [AI Auto-Healing] Uspešno instaliran paket {}.\n", package_name),
+                        "text": format!("> [AI Auto-Healing] Uspešno instaliran paket {}.\n", root_pkg),
                         "type": "info"
                     }));
                     return Ok(true);
@@ -2164,12 +3083,13 @@ pub async fn project_install_package(
                     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
                     let combined_err = format!("{}\n{}", stdout, stderr);
+                    last_raw_npm_err = combined_err.clone();
                     last_err = Some(format!("npm install failed: {}", stderr));
 
                     if is_npm_network_error(&combined_err) {
                         let offline_msg = format!(
                             "Nema internet konekcije ili je npm registar nedostupan — nastavljamo sa instalacijom paketa '{}' kada budemo ponovo online.",
-                            package_name
+                            root_pkg
                         );
                         last_err = Some(offline_msg.clone());
                         let _ = window.emit("server:log", serde_json::json!({
@@ -2182,7 +3102,7 @@ pub async fn project_install_package(
                     if prefer_offline {
                         prefer_offline = false;
                         let _ = window.emit("server:log", serde_json::json!({
-                            "text": format!("> [AI Auto-Healing] Offline npm cache nije uspeo za {}, prelazim na online instalaciju...\n", package_name),
+                            "text": format!("> [AI Auto-Healing] Offline npm cache nije uspeo za {}, prelazim na online instalaciju...\n", root_pkg),
                             "type": "info"
                         }));
                         continue;
@@ -2194,26 +3114,26 @@ pub async fn project_install_package(
                             NpmFailureAction::SetWildcard(conflict_pkg) => {
                                 if is_core_framework_package(&conflict_pkg) {
                                     let _ = window.emit("server:log", serde_json::json!({
-                                        "text": format!("> [Core Lock] Paket '{}' je zaključani core framework paket i neće biti spušten na '*' tokom instalacije '{}'.\n", conflict_pkg, package_name),
+                                        "text": format!("> [Core Lock] Paket '{}' je zaključani core framework paket i neće biti spušten na '*' tokom instalacije '{}'.\n", conflict_pkg, root_pkg),
                                         "type": "error"
                                     }));
                                 } else if apply_npm_etarget_heal(&pkg_json_path, &conflict_pkg, Some(&combined_err)) {
                                     let _ = window.emit("server:log", serde_json::json!({
-                                        "text": format!("> [Self-Healing] Primenjen bezbedan dependency/parent-scoped override za konfliktan paket '{}' tokom instalacije '{}'. Ponovo pokušavam...\n", conflict_pkg, package_name),
+                                        "text": format!("> [Self-Healing] Primenjen bezbedan dependency/parent-scoped override za konfliktan paket '{}' tokom instalacije '{}'. Ponovo pokušavam...\n", conflict_pkg, root_pkg),
                                         "type": "info"
                                     }));
                                     healed_conflict = true;
                                 }
                             }
-                            NpmFailureAction::Remove(conflict_pkg) if conflict_pkg != package_name => {
+                            NpmFailureAction::Remove(conflict_pkg) if conflict_pkg != root_pkg => {
                                 if is_core_framework_package(&conflict_pkg) {
                                     let _ = window.emit("server:log", serde_json::json!({
-                                        "text": format!("> [Core Lock] Paket '{}' je zaključani core framework paket i neće biti uklonjen tokom instalacije '{}'.\n", conflict_pkg, package_name),
+                                        "text": format!("> [Core Lock] Paket '{}' je zaključani core framework paket i neće biti uklonjen tokom instalacije '{}'.\n", conflict_pkg, root_pkg),
                                         "type": "error"
                                     }));
                                 } else if remove_package_from_json(&pkg_json_path, &conflict_pkg) {
                                     let _ = window.emit("server:log", serde_json::json!({
-                                        "text": format!("> [Self-Healing] Uklonjen nepostojeći/nevažeći paket '{}' iz package.json tokom instalacije '{}'. Ponovo pokušavam...\n", conflict_pkg, package_name),
+                                        "text": format!("> [Self-Healing] Uklonjen nepostojeći/nevažeći paket '{}' iz package.json tokom instalacije '{}'. Ponovo pokušavam...\n", conflict_pkg, root_pkg),
                                         "type": "info"
                                     }));
                                     healed_conflict = true;
@@ -2228,9 +3148,63 @@ pub async fn project_install_package(
                     }
                 }
             }
-            Err(e) => return Err(format!("Failed to run npm install command: {}", e)),
+            Err(e) => {
+                let err_msg = format!("Failed to run npm install command: {}", e);
+                let eid = crate::katastar::register_repair_attempt(
+                    "npm",
+                    &format!("missing package '{}': {}", root_pkg, err_msg),
+                    "package.json",
+                    "npm",
+                    "npm_action",
+                    None,
+                    &format!("npm install execution failed for {}", root_pkg),
+                    "",
+                );
+                crate::katastar::finalize_katastar_outcome(
+                    &eid,
+                    false,
+                    "npm",
+                    "npm_install",
+                    None,
+                    None,
+                    "",
+                );
+                return Err(err_msg);
+            }
         }
     }
+
+    let final_err_sample: String = format!(
+        "missing package '{}'\n{}",
+        root_pkg,
+        if last_raw_npm_err.is_empty() {
+            last_err.as_deref().unwrap_or("npm install failed")
+        } else {
+            &last_raw_npm_err
+        }
+    )
+    .chars()
+    .take(650)
+    .collect();
+    let eid = crate::katastar::register_repair_attempt(
+        "npm",
+        &final_err_sample,
+        "package.json",
+        "npm",
+        "npm_action",
+        None,
+        last_err.as_deref().unwrap_or("npm install failed"),
+        "",
+    );
+    crate::katastar::finalize_katastar_outcome(
+        &eid,
+        false,
+        "npm",
+        "npm_install",
+        None,
+        None,
+        "",
+    );
 
     let _ = window.emit("server:heal-status", serde_json::json!({
         "status": "Greška pri instalaciji"

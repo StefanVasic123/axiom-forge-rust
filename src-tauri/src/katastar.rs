@@ -260,13 +260,29 @@ pub fn normalize_error_signature(category_hint: &str, raw_error: &str, file_path
         let core_line = cleaned
             .lines()
             .map(|l| l.trim())
+            .filter(|l| {
+                !l.is_empty()
+                    && !l.starts_with("Environment variables loaded")
+                    && !l.starts_with("Prisma schema loaded")
+                    && !l.starts_with("Datasource ")
+            })
             .find(|l| {
                 l.starts_with("error:")
                     || l.contains("Error validating:")
                     || l.contains("Error parsing")
                     || l.contains("Validation Error")
             })
-            .or_else(|| cleaned.lines().map(|l| l.trim()).find(|l| !l.is_empty()))
+            .or_else(|| {
+                cleaned
+                    .lines()
+                    .map(|l| l.trim())
+                    .find(|l| {
+                        !l.is_empty()
+                            && !l.starts_with("Environment variables loaded")
+                            && !l.starts_with("Prisma schema loaded")
+                            && !l.starts_with("Datasource ")
+                    })
+            })
             .unwrap_or("prisma validation error");
 
         let mut normalized = core_line.to_string();
@@ -292,17 +308,39 @@ pub fn normalize_error_signature(category_hint: &str, raw_error: &str, file_path
     }
 
     if category == "npm" {
-        let error_code = ["ETARGET", "E404", "ERESOLVE", "EPERM", "EACCES", "ENOTCACHED"]
-            .iter()
-            .find(|code| cleaned.contains(**code))
-            .map(|s| (*s).to_string());
+        let error_code = [
+            "ETARGET",
+            "E404",
+            "ERESOLVE",
+            "EPERM",
+            "EACCES",
+            "ENOTCACHED",
+            "ENOENT",
+            "ENOTFOUND",
+            "ETIMEDOUT",
+            "ECONNREFUSED",
+        ]
+        .iter()
+        .find(|code| cleaned.contains(**code))
+        .map(|s| (*s).to_string());
 
         let pkg_hint = if let Some(idx) = cleaned.find("No matching version found for ") {
             let tok = cleaned[idx + 30..].split_whitespace().next().unwrap_or("");
-            tok.rsplit_once('@').map(|(name, _)| name).unwrap_or(tok).trim_matches(|c| c == '.' || c == '\'' || c == '"').to_string()
+            tok.rsplit_once('@')
+                .map(|(name, _)| name)
+                .unwrap_or(tok)
+                .trim_matches(|c| c == '.' || c == '\'' || c == '"')
+                .to_string()
         } else if let Some(idx) = cleaned.find("requested resource '") {
             let inner = cleaned[idx + 20..].split('\'').next().unwrap_or("");
             inner.rsplit_once('@').map(|(name, _)| name).unwrap_or(inner).to_string()
+        } else if let Some(idx) = cleaned.find("missing package '") {
+            let inner = cleaned[idx + 17..].split('\'').next().unwrap_or("");
+            to_slug(inner, 48)
+        } else if let Some(idx) = cleaned.find("registry.npmjs.org/") {
+            let after = &cleaned[idx + 19..];
+            let raw_pkg = after.split_whitespace().next().unwrap_or("");
+            to_slug(raw_pkg, 48)
         } else {
             String::new()
         };
@@ -316,7 +354,13 @@ pub fn normalize_error_signature(category_hint: &str, raw_error: &str, file_path
         let first_err_line = cleaned
             .lines()
             .map(|l| l.trim())
-            .find(|l| l.contains("npm error") || l.contains("npm ERR!") || l.contains("notarget") || !l.is_empty())
+            .find(|l| {
+                l.contains("npm error")
+                    || l.contains("npm ERR!")
+                    || l.contains("notarget")
+                    || l.contains("missing package")
+                    || !l.is_empty()
+            })
             .unwrap_or("npm install error");
         return ErrorSignatureInfo {
             category,
@@ -363,7 +407,7 @@ pub fn normalize_error_signature(category_hint: &str, raw_error: &str, file_path
             .unwrap_or_default();
 
         let code = if cleaned.contains("TS2307") { "TS2307" } else { "MODULE_NOT_FOUND" };
-        let sig = if missing_mod.starts_with('.') || missing_mod.starts_with("@/") {
+        let sig = if is_local_import_specifier(&missing_mod) {
             format!("compile:{}:local-import", code)
         } else if !missing_mod.is_empty() {
             format!("compile:{}:{}", code, to_slug(&missing_mod, 48))

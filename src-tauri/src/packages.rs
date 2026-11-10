@@ -20,7 +20,7 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
     let mut needs_write = !db_path.exists();
     if db_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&db_path) {
-            if !content.contains("\"dbVersion\": 2") {
+            if !content.contains("\"dbVersion\": 3") {
                 needs_write = true;
             }
         }
@@ -28,7 +28,7 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
     
     if needs_write {
         let default_db = serde_json::json!({
-            "dbVersion": 2,
+            "dbVersion": 3,
             "packages": [
                 {
                     "name": "resend",
@@ -48,7 +48,13 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
                     "importExamples": [
                         "import { getServerSession } from 'next-auth';",
                         "import NextAuth from 'next-auth';",
-                        "import { useSession } from 'next-auth/react';"
+                        "import { useSession } from 'next-auth/react';",
+                        "import CredentialsProvider from 'next-auth/providers/credentials';",
+                        "import GitHubProvider from 'next-auth/providers/github';",
+                        "import GoogleProvider from 'next-auth/providers/google';",
+                        "import EmailProvider from 'next-auth/providers/email';",
+                        "import { getServerSession } from 'next-auth/next';",
+                        "export { default } from 'next-auth/middleware';"
                     ],
                     "compatibility": {
                         "node": ">=16.0.0",
@@ -311,6 +317,46 @@ pub fn load_packages_db() -> Vec<PackageMeta> {
     Vec::new()
 }
 
+pub fn is_local_import_specifier(spec: &str) -> bool {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if trimmed.starts_with('.')
+        || trimmed.starts_with('/')
+        || trimmed.starts_with('\\')
+        || trimmed.starts_with("@/")
+        || trimmed.starts_with("~/")
+        || trimmed == "@"
+        || trimmed == "~"
+        || trimmed.contains(":\\")
+        || trimmed.contains(":/")
+    {
+        return true;
+    }
+    let lower = trimmed.to_lowercase();
+    const LOCAL_PATH_PREFIXES: &[&str] = &[
+        "src/",
+        "app/",
+        "components/",
+        "hooks/",
+        "lib/",
+        "utils/",
+        "models/",
+        "styles/",
+        "pages/",
+        "types/",
+        "services/",
+        "context/",
+        "contexts/",
+        "providers/",
+        "config/",
+        "constants/",
+        "prisma/",
+    ];
+    LOCAL_PATH_PREFIXES.iter().any(|p| lower.starts_with(p))
+}
+
 pub fn resolve_and_rewrite_import(imported_path: &str, packages_db: &[PackageMeta]) -> Option<String> {
     let imported_path_trimmed = imported_path.trim();
     if imported_path_trimmed.is_empty() {
@@ -327,11 +373,22 @@ pub fn resolve_and_rewrite_import(imported_path: &str, packages_db: &[PackageMet
         return Some("sass".to_string());
     }
     
-    // 1. Check if it's a relative import or absolute path in the project
-    if imported_path_trimmed.starts_with('.') || imported_path_trimmed.starts_with('/') || imported_path_trimmed.starts_with("@/") {
+    // 1. Check if it's a relative import, absolute path, or bare local src/app path in the project
+    if is_local_import_specifier(imported_path_trimmed) {
         return None;
     }
     
+    // Preserve valid official NextAuth v4 subpaths even against older cached DB entries
+    if imported_path_trimmed.starts_with("next-auth/providers/")
+        || imported_path_trimmed == "next-auth/react"
+        || imported_path_trimmed == "next-auth/next"
+        || imported_path_trimmed == "next-auth/middleware"
+        || imported_path_trimmed == "next-auth/jwt"
+        || imported_path_trimmed == "next-auth/adapters"
+    {
+        return None;
+    }
+
     // We also skip common local aliases that nextjs/react uses
     let local_aliases = ["@components", "@hooks", "@utils", "@lib", "@styles", "@services", "@context", "@types", "@pages", "@app", "@assets", "@config"];
     for &la in &local_aliases {
@@ -436,6 +493,96 @@ pub fn get_packages_db_summary() -> String {
     pkg_db_summary
 }
 
+pub fn format_relevant_packages_db_summary(
+    packages_db: &[PackageMeta],
+    pkg_json_deps: &[String],
+    context_text: &str,
+) -> String {
+    let ctx_lower = context_text.to_lowercase();
+    let baseline_pkgs = ["next-auth", "@prisma/client", "react-icons", "zod", "lucide-react"];
+
+    let mut direct_hits: Vec<&PackageMeta> = Vec::new();
+    let mut project_hits: Vec<&PackageMeta> = Vec::new();
+
+    for pkg in packages_db {
+        let name_lower = pkg.name.to_lowercase();
+        let in_ctx = ctx_lower.contains(&name_lower)
+            || pkg.aliases.iter().any(|a| ctx_lower.contains(&a.to_lowercase()));
+        let in_pkg_json = pkg_json_deps.iter().any(|d| d.eq_ignore_ascii_case(&pkg.name));
+
+        if in_ctx {
+            direct_hits.push(pkg);
+        } else if in_pkg_json || baseline_pkgs.contains(&pkg.name.as_str()) {
+            project_hits.push(pkg);
+        }
+    }
+
+    let mut selected: Vec<(&PackageMeta, bool)> = Vec::new();
+    for pkg in direct_hits {
+        if selected.len() >= 8 {
+            break;
+        }
+        selected.push((pkg, true));
+    }
+    for pkg in project_hits {
+        if selected.len() >= 8 {
+            break;
+        }
+        if !selected.iter().any(|(p, _)| p.name == pkg.name) {
+            selected.push((pkg, false));
+        }
+    }
+
+    if selected.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from(
+        "\nRelevant NPM packages for this file (use exact package names and import syntaxes):\n",
+    );
+    for (pkg, is_direct) in selected {
+        out.push_str(&format!("- '{}' ({})", pkg.name, pkg.version));
+        if let Some(first_ex) = pkg.import_examples.first() {
+            out.push_str(&format!(": {}", first_ex));
+        }
+        out.push('\n');
+        if is_direct {
+            for ex in pkg.import_examples.iter().skip(1).take(3) {
+                out.push_str(&format!("  * {}\n", ex));
+            }
+            if !pkg.best_practices.is_empty() {
+                out.push_str(&format!("  * Note: {}\n", pkg.best_practices));
+            }
+        }
+    }
+    out
+}
+
+pub fn get_relevant_packages_db_summary(
+    proj_dir: Option<&std::path::Path>,
+    context_text: &str,
+) -> String {
+    let packages_db = load_packages_db();
+    let mut pkg_json_deps: Vec<String> = Vec::new();
+    if let Some(dir) = proj_dir {
+        let pkg_path = dir.join("package.json");
+        if let Ok(content) = std::fs::read_to_string(pkg_path) {
+            if let Ok(val) = serde_json::from_str::<Value>(&content) {
+                for key in &["dependencies", "devDependencies"] {
+                    if let Some(obj) = val.get(*key).and_then(|d| d.as_object()) {
+                        for k in obj.keys() {
+                            if !pkg_json_deps.contains(k) {
+                                pkg_json_deps.push(k.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    format_relevant_packages_db_summary(&packages_db, &pkg_json_deps, context_text)
+}
+
 pub fn repair_package_json_dependencies(proj_dir: &std::path::Path) {
     let pkg_path = proj_dir.join("package.json");
     if !pkg_path.exists() {
@@ -443,6 +590,7 @@ pub fn repair_package_json_dependencies(proj_dir: &std::path::Path) {
     }
     
     let packages_db = load_packages_db();
+    let has_src_dir = proj_dir.join("src").exists();
     let mut imports_found = std::collections::HashSet::new();
     
     // Scan directory and perform alias rewriting inline
@@ -483,8 +631,21 @@ pub fn repair_package_json_dependencies(proj_dir: &std::path::Path) {
                                                     let literal: String = chars[start..i].iter().collect();
                                                     let literal = literal.trim();
                                                     
-                                                    // Check if it's an import we should rewrite
-                                                    if let Some(correct_path) = resolve_and_rewrite_import(&literal, &packages_db) {
+                                                    // Rewrite bare `src/...` imports to `@/...` when project uses `src/`
+                                                    if has_src_dir && literal.starts_with("src/") {
+                                                        let target_alias = format!("@/{}", &literal["src/".len()..]);
+                                                        let old_quote = format!("{}{}{}", quote, literal, quote);
+                                                        let new_quote = format!("{}{}{}", quote, target_alias, quote);
+                                                        *line = line.replace(&old_quote, &new_quote);
+                                                        file_changed = true;
+                                                    } else if has_src_dir && literal.starts_with("~/") {
+                                                        let target_alias = format!("@/{}", &literal["~/".len()..]);
+                                                        let old_quote = format!("{}{}{}", quote, literal, quote);
+                                                        let new_quote = format!("{}{}{}", quote, target_alias, quote);
+                                                        *line = line.replace(&old_quote, &new_quote);
+                                                        file_changed = true;
+                                                    } else if let Some(correct_path) = resolve_and_rewrite_import(&literal, &packages_db) {
+                                                        // Check if it's an npm alias we should rewrite
                                                         let old_quote = format!("{}{}{}", quote, literal, quote);
                                                         let new_quote = format!("{}{}{}", quote, correct_path, quote);
                                                         *line = line.replace(&old_quote, &new_quote);
@@ -522,7 +683,7 @@ pub fn repair_package_json_dependencies(proj_dir: &std::path::Path) {
                                                 if i < chars.len() {
                                                     let literal: String = chars[start..i].iter().collect();
                                                     let literal = literal.trim();
-                                                    if !literal.is_empty() && !literal.starts_with('.') && !literal.starts_with('/') && !literal.starts_with("@/") {
+                                                    if !is_local_import_specifier(literal) {
                                                         let parts: Vec<&str> = literal.split('/').collect();
                                                         if !parts.is_empty() {
                                                             let local_aliases = ["@components", "@hooks", "@utils", "@lib", "@styles", "@services", "@context", "@types", "@pages", "@app", "@assets", "@config"];
@@ -533,7 +694,13 @@ pub fn repair_package_json_dependencies(proj_dir: &std::path::Path) {
                                                                     parts[0].to_string()
                                                                 };
                                                                 let node_builtins = ["fs", "path", "http", "https", "os", "crypto", "stream", "util", "events", "assert", "dns", "net", "tls", "querystring", "url", "zlib", "buffer", "child_process", "cluster", "dgram", "process", "readline", "vm"];
-                                                                if !node_builtins.contains(&pkg.as_str()) && pkg != "react" && pkg != "react-dom" && pkg != "next" {
+                                                                if !pkg.starts_with("node:")
+                                                                    && !node_builtins.contains(&pkg.as_str())
+                                                                    && pkg != "react"
+                                                                    && pkg != "react-dom"
+                                                                    && pkg != "next"
+                                                                    && !pkg.contains(' ')
+                                                                {
                                                                     // Map to correct package if it matches an alias
                                                                     let mut mapped_pkg = pkg.clone();
                                                                     for db_pkg in &packages_db {
@@ -640,12 +807,23 @@ pub fn repair_package_json_dependencies(proj_dir: &std::path::Path) {
                             }
                         }
 
-                        // Remove unused Express or misplaced devDependencies from Next.js dependencies
+                        // Remove unused Express or misplaced devDependencies / local dir names from Next.js dependencies
                         if !imports_found.contains("express") && deps_obj.remove("express").is_some() {
                             changed = true;
                         }
                         if deps_obj.remove("tailwindcss").is_some() {
                             changed = true;
+                        }
+                        for bogus_local in ["src", "prisma"] {
+                            if deps_obj.remove(bogus_local).is_some() {
+                                changed = true;
+                            }
+                        }
+                        for dir_pkg in ["app", "components", "hooks", "lib", "utils", "models", "styles", "pages", "context", "contexts", "providers"] {
+                            if deps_obj.get(dir_pkg).and_then(|v| v.as_str()) == Some("*") {
+                                deps_obj.remove(dir_pkg);
+                                changed = true;
+                            }
                         }
                     }
 

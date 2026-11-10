@@ -132,20 +132,38 @@ pub fn extract_package_name_from_error(line: &str) -> Option<String> {
 
     if let Some(p) = pkg {
         let trimmed = p.trim();
-        // Filtriraj lokalne relativne, apsolutne i TypeScript alias putanje (@/..., ~/...)
-        if trimmed.starts_with('.')
-            || trimmed.starts_with('/')
-            || trimmed.starts_with('\\')
-            || trimmed.starts_with("@/")
-            || trimmed.starts_with("~/")
-            || trimmed == "@"
-            || trimmed == "~"
-            || trimmed.contains(":\\")
-            || trimmed.contains(":/")
+        // Filtriraj lokalne relativne, apsolutne, TS alias i gole lokalne putanje (npr. 'src/models/...')
+        if is_local_import_specifier(trimmed) || trimmed.contains(' ') {
+            return None;
+        }
+        let local_aliases = ["@components", "@hooks", "@utils", "@lib", "@styles", "@services", "@context", "@pages", "@app", "@assets", "@config"];
+        for la in &local_aliases {
+            if trimmed == *la || trimmed.starts_with(&format!("{}/", la)) {
+                return None;
+            }
+        }
+        // Svedi subpath import (npr. 'next-auth/providers/credentials' ili '@mui/material/Button') na koren npm paketa
+        let parts: Vec<&str> = trimmed.split('/').collect();
+        let root_pkg = if trimmed.starts_with('@') && parts.len() >= 2 {
+            format!("{}/{}", parts[0], parts[1])
+        } else {
+            parts.first().copied().unwrap_or(trimmed).to_string()
+        };
+        let node_builtins = [
+            "fs", "path", "http", "https", "os", "crypto", "stream", "util", "events", "assert",
+            "dns", "net", "tls", "querystring", "url", "zlib", "buffer", "child_process",
+            "cluster", "dgram", "process", "readline", "vm",
+        ];
+        if root_pkg.starts_with("node:")
+            || node_builtins.contains(&root_pkg.as_str())
+            || root_pkg == "react"
+            || root_pkg == "react-dom"
+            || root_pkg == "next"
+            || root_pkg.is_empty()
         {
             return None;
         }
-        return Some(trimmed.to_string());
+        return Some(root_pkg);
     }
     None
 }
@@ -266,14 +284,14 @@ impl CompileErrorDetector {
     fn process_line(&mut self, line: &str, window: &tauri::Window, project_id: &str) {
         let clean_line = clean_cli_output_for_llm(line);
 
-        if clean_line.contains("Cannot find module") || clean_line.contains("Module not found") {
+        if clean_line.contains("Cannot find module") || clean_line.contains("Module not found") || clean_line.contains("Can't resolve") {
             if let Some(pkg_name) = extract_package_name_from_error(&clean_line) {
                 let _ = window.emit("server:missing-package", serde_json::json!({
                     "projectId": project_id,
                     "packageName": pkg_name
                 }));
-                return;
             }
+            // Do NOT return early here — preserve Module not found / Can't resolve context in `error_lines` for Popravi sa AI & Katastar!
         }
 
         let trimmed = clean_line.trim();
@@ -294,6 +312,8 @@ impl CompileErrorDetector {
 
         let has_error_marker = clean_line.contains('⨯') 
             || clean_line.contains("Failed to compile") 
+            || clean_line.contains("Module not found")
+            || clean_line.contains("Cannot find module")
             || clean_line.contains("Error:")
             || clean_line.contains("ReferenceError:")
             || clean_line.contains("TypeError:")

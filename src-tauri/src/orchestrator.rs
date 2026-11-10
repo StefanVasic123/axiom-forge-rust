@@ -189,7 +189,7 @@ pub fn get_context_files_for(file_path: &str, proj_dir: &std::path::Path) -> Str
             None
         };
         if let Some(pl_path) = actual_prisma_lib {
-            if !path_lower.contains("prisma") {
+            if !path_lower.contains("prisma") && !path_lower.contains("/models/") && !path_lower.starts_with("models/") {
                 if let Ok(content) = std::fs::read_to_string(&pl_path) {
                     context.push_str(&format!(
                         "\nReference: Prisma client export (src/lib/prisma.ts):\n```typescript\n{}\n```\n",
@@ -255,56 +255,138 @@ pub fn get_context_files_for(file_path: &str, proj_dir: &std::path::Path) -> Str
 pub async fn validate_file_with_abstract_rules(
     file_path: &str,
     content: &str,
-    model_id: &str,
+    _model_id: &str,
 ) -> Result<(), String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(45))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-        
-    let system_prompt = "You are a strict code quality validator. Analyze the provided file path and code content for critical syntax errors, truncated code, or severe architectural violations. Rules:\n\
-1. ONLY root layout files (`layout.tsx` / `layout.jsx`) import `globals.css`. Regular pages (`page.tsx`) and components do NOT need to import `globals.css`.\n\
-2. In Next.js projects, `src/middleware.ts` or `middleware.ts` MUST use `NextRequest` and `NextResponse` from `'next/server'` and export `function middleware(request: NextRequest)`. It must NEVER use Express (`from 'express'`, `NextFunction`, or `(req, res, next)`).\n\
-3. If NextAuth is used, ensure there are no invalid imports for Prisma or NextAuth.\n\
-Respond ONLY with a JSON object in this format: { \"valid\": true } or { \"valid\": false, \"reason\": \"Detailed description of the issue\" }.";
-    
-    let user_prompt = format!("File Path: {}\n\nCode Content:\n```\n{}\n```", file_path, content);
-    
-    let ollama_req = serde_json::json!({
-        "model": model_id,
-        "messages": [
-            { "role": "system", "content": system_prompt },
-            { "role": "user", "content": &user_prompt }
-        ],
-        "stream": false,
-        "options": build_ollama_options(model_id, 0.1, Some(512))
-    });
-    
-    let res = client.post("http://127.0.0.1:11434/api/chat")
-        .json(&ollama_req)
-        .send()
-        .await;
-        
-    if let Ok(resp) = res {
-        if resp.status().is_success() {
-            if let Ok(resp_json) = resp.json::<Value>().await {
-                if let Some(content_str) = resp_json.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
-                    let cleaned = extract_code_content(content_str);
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&cleaned) {
-                        if let Some(valid) = parsed.get("valid").and_then(|v| v.as_bool()) {
-                            if valid {
-                                return Ok(());
-                            } else {
-                                let reason = parsed.get("reason").and_then(|r| r.as_str()).unwrap_or("Unknown validation issue");
-                                return Err(reason.to_string());
-                            }
-                        }
-                    }
-                }
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Err("Generated file content is empty.".to_string());
+    }
+
+    let path_lower = file_path.replace('\\', "/").to_lowercase();
+    let is_code_file = path_lower.ends_with(".ts")
+        || path_lower.ends_with(".tsx")
+        || path_lower.ends_with(".js")
+        || path_lower.ends_with(".jsx");
+    let is_css_file = path_lower.ends_with(".css") || path_lower.ends_with(".scss");
+    let is_prisma_file = path_lower.ends_with(".prisma");
+
+    // 1. Reject residual markdown fences or prose explanations outside JSON/Markdown
+    if (is_code_file || is_css_file || is_prisma_file) && trimmed.starts_with("```") {
+        return Err("File contains raw markdown code fences instead of pure source code.".to_string());
+    }
+
+    if is_code_file || is_css_file {
+        let lower_sample = trimmed.chars().take(1500).collect::<String>().to_lowercase();
+        let has_prose_leak = trimmed.contains("The error indicates")
+            || trimmed.contains("Here is the corrected")
+            || trimmed.contains("To fix this")
+            || (lower_sample.contains("1. ensure") && lower_sample.contains("2. "));
+        if has_prose_leak {
+            return Err("Output contains explanatory prose or numbered steps mixed into code.".to_string());
+        }
+    }
+
+    // 2. Repeating CSS block loop check
+    if is_css_file {
+        let deduped = crate::sanitizer::deduplicate_repeated_css_blocks(trimmed);
+        if trimmed.len() > 256 && deduped.len() * 2 < trimmed.len() {
+            return Err("CSS file contains repeating duplicate rule blocks (generation loop).".to_string());
+        }
+        return Ok(());
+    }
+
+    if !is_code_file {
+        return Ok(());
+    }
+
+    // 3. Domain model isolation: never instantiate PrismaClient or import @/lib/prisma in src/models/*
+    if (path_lower.contains("/models/") || path_lower.starts_with("models/")) && !path_lower.contains("/api/") {
+        if trimmed.contains("new PrismaClient") || trimmed.contains("@/lib/prisma") {
+            return Err("Files under src/models/ must define pure TypeScript types/interfaces ONLY. Do NOT import @/lib/prisma or instantiate new PrismaClient().".to_string());
+        }
+        if (trimmed.contains("'@prisma/client'") || trimmed.contains("\"@prisma/client\""))
+            && !trimmed.contains("import type")
+        {
+            return Err("Files under src/models/ must NOT import runtime symbols from '@prisma/client'. Use pure TypeScript interfaces.".to_string());
+        }
+    }
+
+    // 4. Next.js Edge Middleware validation
+    if path_lower.ends_with("middleware.ts") || path_lower.ends_with("middleware.js") {
+        if trimmed.contains("'express'") || trimmed.contains("\"express\"") || trimmed.contains("NextFunction") {
+            return Err("Next.js middleware must use NextRequest/NextResponse from 'next/server', never Express.".to_string());
+        }
+        let has_valid_export = trimmed.contains("export function middleware")
+            || trimmed.contains("export async function middleware")
+            || trimmed.contains("export default")
+            || trimmed.contains("withAuth");
+        if !has_valid_export {
+            return Err("Next.js middleware must export function `middleware` or default middleware.".to_string());
+        }
+    }
+
+    // 5. Client component boundary validation
+    let is_client_file = trimmed.starts_with("\"use client\"")
+        || trimmed.starts_with("'use client'")
+        || trimmed.lines().take(5).any(|l| {
+            let t = l.trim();
+            t == "\"use client\";" || t == "\"use client\"" || t == "'use client';" || t == "'use client'"
+        });
+    if is_client_file && !path_lower.ends_with("route.ts") && !path_lower.ends_with("route.js") {
+        if trimmed.contains("export default async function") {
+            return Err("Client Component ('use client') cannot be declared as `export default async function`.".to_string());
+        }
+        if trimmed.contains("'@/lib/prisma'") || trimmed.contains("\"@/lib/prisma\"") || trimmed.contains("new PrismaClient") {
+            return Err("Client Component ('use client') must NOT import @/lib/prisma or instantiate PrismaClient.".to_string());
+        }
+    }
+
+    // 6. globals.css restriction & bare imports check
+    let is_layout = path_lower.ends_with("layout.tsx") || path_lower.ends_with("layout.jsx") || path_lower.ends_with("_app.tsx") || path_lower.ends_with("_app.jsx");
+    if !is_layout && (trimmed.contains("globals.css'") || trimmed.contains("globals.css\"")) {
+        return Err("Only root layout files may import globals.css.".to_string());
+    }
+    if trimmed.contains("from 'react-icons'") || trimmed.contains("from \"react-icons\"") {
+        return Err("Never import from bare 'react-icons'; use a family subpath like 'react-icons/hi'.".to_string());
+    }
+    if trimmed.contains("from 'src/") || trimmed.contains("from \"src/") {
+        return Err("Never use bare 'src/...' module specifiers; always use '@/...' alias.".to_string());
+    }
+
+    // 7. Basic bracket balance check to catch mid-stream truncation
+    let mut open_curly = 0isize;
+    let mut close_curly = 0isize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_tick = false;
+    let mut escape = false;
+    for ch in trimmed.chars() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if ch == '\\' && (in_single || in_double || in_tick) {
+            escape = true;
+            continue;
+        }
+        if ch == '\'' && !in_double && !in_tick {
+            in_single = !in_single;
+        } else if ch == '"' && !in_single && !in_tick {
+            in_double = !in_double;
+        } else if ch == '`' && !in_single && !in_double {
+            in_tick = !in_tick;
+        } else if !in_single && !in_double && !in_tick {
+            if ch == '{' {
+                open_curly += 1;
+            } else if ch == '}' {
+                close_curly += 1;
             }
         }
     }
-    
+    if open_curly > close_curly + 2 {
+        return Err(format!("Generated code appears truncated: {} unclosed '{{' block(s).", open_curly - close_curly));
+    }
+
     Ok(())
 }
 
@@ -1253,15 +1335,34 @@ pub fn get_stack_rulepacks(file_path: &str, file_content: &str, error_msg: Optio
     }
 
     // 5. MERN Stack (Express Backend + Vite / React Router)
-    let is_mern = path_lower.contains("server.js")
-        || path_lower.contains("/routes/")
-        || path_lower.contains("/models/")
-        || content_lower.contains("express()")
+    let is_nextjs_signal = (path_lower.starts_with("src/") && (path_lower.ends_with(".ts") || path_lower.ends_with(".tsx")))
+        || path_lower.starts_with("app/")
+        || path_lower.contains("/app/")
+        || content_lower.contains("from 'next/")
+        || content_lower.contains("from \"next/")
+        || content_lower.contains("@prisma/client")
+        || content_lower.contains("@/lib/prisma")
+        || content_lower.contains("'use client'")
+        || content_lower.contains("\"use client\"")
+        || content_lower.contains("export interface ");
+
+    let has_express_or_mongoose = content_lower.contains("express()")
         || content_lower.contains("from 'express'")
+        || content_lower.contains("from \"express\"")
         || content_lower.contains("require('express')")
+        || content_lower.contains("require(\"express\")")
+        || content_lower.contains("from 'mongoose'")
+        || content_lower.contains("require('mongoose')")
+        || content_lower.contains("mongoose.schema")
         || content_lower.contains("from 'react-router-dom'")
         || content_lower.contains("from \"react-router-dom\"")
         || err_lower.contains("cannot set headers");
+
+    let is_mern = has_express_or_mongoose
+        || (!is_nextjs_signal
+            && (path_lower.ends_with("server.js")
+                || ((path_lower.contains("/routes/") || path_lower.contains("/models/"))
+                    && (path_lower.ends_with(".js") || path_lower.ends_with(".jsx")))));
 
     if is_mern {
         rules.push(MERN_STACK_RULEPACK);
@@ -1296,9 +1397,20 @@ pub fn get_stack_rulepacks(file_path: &str, file_content: &str, error_msg: Optio
     }
 
     // 8. Configuration & Project Config Rules
+    let config_basename = path_lower.rsplit('/').next().unwrap_or(path_lower.as_str());
     let is_config = path_lower.ends_with(".json")
-        || path_lower.contains("config")
-        || path_lower.ends_with("tsconfig.json")
+        || matches!(
+            config_basename,
+            "tsconfig.json"
+                | "next.config.js"
+                | "next.config.mjs"
+                | "next.config.ts"
+                | "tailwind.config.js"
+                | "tailwind.config.ts"
+                | "postcss.config.js"
+                | "postcss.config.mjs"
+                | "package.json"
+        )
         || err_lower.contains("tsconfig")
         || err_lower.contains("debug failure");
 
@@ -1541,6 +1653,100 @@ pub fn harvest_file_contract_to_lbg(proj_dir: &std::path::Path, file_path: &str,
 /// 4. Declared UI states (useState hooks with inferred/declared types and default initializers).
 /// 5. Consumed capabilities (API routes fetched, custom hooks called, Prisma models queried).
 /// 6. Connected UI routes (<Link href="..."> or router.push(...)).
+fn extract_use_state_contracts(content: &str) -> serde_json::Map<String, Value> {
+    let mut state_contracts = serde_json::Map::new();
+    let Ok(header_re) = regex::Regex::new(
+        r#"const\s*\[\s*([a-zA-Z0-9_]+)\s*,\s*([a-zA-Z0-9_]+)\s*\]\s*=\s*useState(?:<([\s\S]*?)>)?\s*\("#,
+    ) else {
+        return state_contracts;
+    };
+
+    let bytes = content.as_bytes();
+    for cap in header_re.captures_iter(content) {
+        let Some(full_m) = cap.get(0) else { continue };
+        let (Some(state_name), Some(setter_name)) = (cap.get(1), cap.get(2)) else { continue };
+        let open_paren_end = full_m.end();
+
+        // Walk balanced parentheses from the opening `(` of useState(...)
+        let mut depth: i32 = 1;
+        let mut i = open_paren_end;
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut in_tick = false;
+        let mut close_idx = open_paren_end;
+        while i < bytes.len() && depth > 0 {
+            let ch = bytes[i] as char;
+            let prev = if i > 0 { bytes[i - 1] as char } else { '\0' };
+            if prev != '\\' {
+                if ch == '\'' && !in_double && !in_tick {
+                    in_single = !in_single;
+                } else if ch == '"' && !in_single && !in_tick {
+                    in_double = !in_double;
+                } else if ch == '`' && !in_single && !in_double {
+                    in_tick = !in_tick;
+                }
+            }
+            if !in_single && !in_double && !in_tick {
+                if ch == '(' {
+                    depth += 1;
+                } else if ch == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_idx = i;
+                        break;
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        let default_raw = if close_idx >= open_paren_end && close_idx <= content.len() {
+            content[open_paren_end..close_idx].trim()
+        } else {
+            ""
+        };
+        let default_val = if default_raw.chars().count() > 160 {
+            format!("{}...", default_raw.chars().take(157).collect::<String>())
+        } else {
+            default_raw.to_string()
+        };
+
+        let type_param = cap
+            .get(3)
+            .map(|m| m.as_str().trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let inferred_type = if let Some(tp) = type_param {
+            tp
+        } else if default_raw == "false" || default_raw == "true" {
+            "boolean".to_string()
+        } else if default_raw.starts_with('[') || default_raw.ends_with(']') {
+            "array".to_string()
+        } else if default_raw.starts_with('{') && default_raw.ends_with('}') {
+            "object".to_string()
+        } else if default_raw.starts_with('"') || default_raw.starts_with('\'') || default_raw.starts_with('`') {
+            "string".to_string()
+        } else if default_raw.parse::<f64>().is_ok() {
+            "number".to_string()
+        } else if default_raw == "null" {
+            "nullable-object".to_string()
+        } else {
+            "any".to_string()
+        };
+
+        state_contracts.insert(
+            state_name.as_str().to_string(),
+            serde_json::json!({
+                "setter": setter_name.as_str(),
+                "type": inferred_type,
+                "defaultValue": default_val
+            }),
+        );
+    }
+
+    state_contracts
+}
+
 fn ensure_axiom_contracts_root(contracts_root: &mut Value, project_id: &str) {
     if !contracts_root.is_object() {
         *contracts_root = serde_json::json!({});
@@ -1585,6 +1791,10 @@ fn upsert_file_contract_into_root(
         "page-route"
     } else if path_lower.contains("/components/") || path_lower.starts_with("components/") {
         "ui-component"
+    } else if path_lower.contains("/models/") || path_lower.starts_with("models/") || path_lower.contains("/types/") || path_lower.starts_with("types/") {
+        "domain-model"
+    } else if path_lower.ends_with(".css") || path_lower.ends_with(".scss") {
+        "stylesheet"
     } else if path_lower.ends_with(".config.js")
         || path_lower.ends_with(".config.mjs")
         || path_lower.ends_with(".config.ts")
@@ -1602,7 +1812,7 @@ fn upsert_file_contract_into_root(
 
     let node_builtins = [
         "fs", "path", "http", "https", "os", "crypto", "stream", "util", "events", "assert",
-        "dns", "net", "tls", "querystring", "url", "zlib", "buffer",
+        "dns", "net", "tls", "querystring", "url", "zlib", "buffer", "child_process",
     ];
 
     if path_lower == "package.json" {
@@ -1610,7 +1820,7 @@ fn upsert_file_contract_into_root(
             for sec in ["dependencies", "devDependencies"] {
                 if let Some(deps_obj) = pkg_val.get(sec).and_then(|d| d.as_object()) {
                     for dep_name in deps_obj.keys() {
-                        if !external_deps.contains(dep_name) {
+                        if !crate::packages::is_local_import_specifier(dep_name) && !external_deps.contains(dep_name) {
                             external_deps.push(dep_name.clone());
                         }
                     }
@@ -1623,30 +1833,34 @@ fn upsert_file_contract_into_root(
         for cap in import_re.captures_iter(content) {
             if let Some(m) = cap.get(1) {
                 let specifier = m.as_str().trim();
-                if specifier.starts_with('.') || specifier.starts_with("@/") || specifier.starts_with("~/") {
+                if crate::packages::is_local_import_specifier(specifier) {
                     let resolved = if let Some(stripped) = specifier.strip_prefix("@/") {
                         format!("src/{}", stripped)
                     } else if let Some(stripped) = specifier.strip_prefix("~/") {
                         format!("src/{}", stripped)
-                    } else if let Some(parent) = std::path::Path::new(&norm_path).parent() {
-                        let res = parent.join(specifier);
-                        let mut normalized_parts = Vec::new();
-                        for comp in res.components() {
-                            match comp {
-                                std::path::Component::Normal(c) => {
-                                    if let Some(cs) = c.to_str() {
-                                        normalized_parts.push(cs);
+                    } else if specifier.starts_with('.') {
+                        if let Some(parent) = std::path::Path::new(&norm_path).parent() {
+                            let res = parent.join(specifier);
+                            let mut normalized_parts = Vec::new();
+                            for comp in res.components() {
+                                match comp {
+                                    std::path::Component::Normal(c) => {
+                                        if let Some(cs) = c.to_str() {
+                                            normalized_parts.push(cs);
+                                        }
                                     }
+                                    std::path::Component::ParentDir => {
+                                        normalized_parts.pop();
+                                    }
+                                    _ => {}
                                 }
-                                std::path::Component::ParentDir => {
-                                    normalized_parts.pop();
-                                }
-                                _ => {}
                             }
+                            normalized_parts.join("/")
+                        } else {
+                            specifier.to_string()
                         }
-                        normalized_parts.join("/")
                     } else {
-                        specifier.to_string()
+                        specifier.trim_start_matches('/').to_string()
                     };
 
                     let mut matched_target = resolved.clone();
@@ -1659,6 +1873,8 @@ fn upsert_file_contract_into_root(
                                 || p_no_ext_str == resolved
                                 || p_norm == format!("{}.tsx", resolved)
                                 || p_norm == format!("{}.ts", resolved)
+                                || p_norm == format!("src/{}.tsx", resolved)
+                                || p_norm == format!("src/{}.ts", resolved)
                             {
                                 matched_target = p_norm;
                                 break;
@@ -1669,9 +1885,10 @@ fn upsert_file_contract_into_root(
                         internal_deps.push(matched_target);
                     }
                 } else {
-                    let pkg_name = specifier.split('/').next().unwrap_or(specifier).to_string();
-                    let full_pkg = if specifier.starts_with('@') {
-                        let parts: Vec<&str> = specifier.split('/').collect();
+                    let clean_spec = specifier.strip_prefix("node:").unwrap_or(specifier);
+                    let pkg_name = clean_spec.split('/').next().unwrap_or(clean_spec).to_string();
+                    let full_pkg = if clean_spec.starts_with('@') {
+                        let parts: Vec<&str> = clean_spec.split('/').collect();
                         if parts.len() > 1 {
                             format!("{}/{}", parts[0], parts[1])
                         } else {
@@ -1680,7 +1897,10 @@ fn upsert_file_contract_into_root(
                     } else {
                         pkg_name
                     };
-                    if !node_builtins.contains(&full_pkg.as_str()) && !external_deps.contains(&full_pkg) {
+                    if !node_builtins.contains(&full_pkg.as_str())
+                        && !specifier.starts_with("node:")
+                        && !external_deps.contains(&full_pkg)
+                    {
                         external_deps.push(full_pkg);
                     }
                 }
@@ -1688,43 +1908,21 @@ fn upsert_file_contract_into_root(
         }
     }
 
-    // Extract client/UI states (useState hooks)
-    let mut state_contracts = serde_json::Map::new();
-    if role == "ui-component" || role == "page-route" || role == "layout" || role == "client-hook" {
-        if let Ok(state_re) = regex::Regex::new(
-            r#"const\s*\[\s*([a-zA-Z0-9_]+)\s*,\s*([a-zA-Z0-9_]+)\s*\]\s*=\s*useState(?:<([^>]+)>)?\s*\(([^)]*)\)"#,
-        ) {
-            for cap in state_re.captures_iter(content) {
-                if let (Some(state_name), Some(setter_name)) = (cap.get(1), cap.get(2)) {
-                    let s_name = state_name.as_str();
-                    let set_name = setter_name.as_str();
-                    let type_param = cap.get(3).map(|m| m.as_str().trim().to_string());
-                    let default_val = cap.get(4).map(|m| m.as_str().trim().to_string()).unwrap_or_default();
+    // Extract client/UI states (useState hooks) using balanced parentheses scanner
+    let state_contracts = if role == "ui-component" || role == "page-route" || role == "layout" || role == "client-hook" {
+        extract_use_state_contracts(content)
+    } else {
+        serde_json::Map::new()
+    };
 
-                    let inferred_type = if let Some(tp) = type_param {
-                        tp
-                    } else if default_val == "false" || default_val == "true" {
-                        "boolean".to_string()
-                    } else if default_val.starts_with('[') || default_val.ends_with(']') {
-                        "array".to_string()
-                    } else if default_val.starts_with('"') || default_val.starts_with('\'') {
-                        "string".to_string()
-                    } else if default_val.parse::<f64>().is_ok() {
-                        "number".to_string()
-                    } else if default_val == "null" {
-                        "nullable-object".to_string()
-                    } else {
-                        "any".to_string()
-                    };
-
-                    state_contracts.insert(
-                        s_name.to_string(),
-                        serde_json::json!({
-                            "setter": set_name,
-                            "type": inferred_type,
-                            "defaultValue": default_val
-                        }),
-                    );
+    // Extract called hooks (useXxx(...))
+    let mut hook_calls = Vec::new();
+    if let Ok(hook_call_re) = regex::Regex::new(r"\b(use[A-Z][a-zA-Z0-9_]*)\s*(?:<[^>]+>)?\s*\(") {
+        for cap in hook_call_re.captures_iter(content) {
+            if let Some(m) = cap.get(1) {
+                let h = m.as_str().to_string();
+                if !hook_calls.contains(&h) {
+                    hook_calls.push(h);
                 }
             }
         }
@@ -1831,7 +2029,8 @@ fn upsert_file_contract_into_root(
             "enums": prisma_enums
         },
         "consumedContracts": {
-            "apiCalls": api_calls
+            "apiCalls": api_calls,
+            "hookCalls": hook_calls
         },
         "connectedRoutes": connected_routes
     });
@@ -1926,9 +2125,13 @@ pub fn refresh_axiom_contracts_for_project(
                         || lower.ends_with(".tsx")
                         || lower.ends_with(".js")
                         || lower.ends_with(".jsx")
+                        || lower.ends_with(".css")
+                        || lower.ends_with(".scss")
                         || lower.ends_with(".prisma")
                         || lower == "package.json"
                         || lower == "tsconfig.json"
+                        || lower.starts_with("next.config.")
+                        || lower.starts_with("tailwind.config.")
                     {
                         out.push(path);
                     }
@@ -2380,6 +2583,39 @@ pub fn get_expert_system_prompt(
         return prompt;
     }
 
+    // 7d. FILE-SCOPED PROMPT: Domain Models & Types (src/models/**, src/types/**)
+    let is_model_or_type_file = (path_lower.contains("/models/") || path_lower.starts_with("models/") || path_lower.contains("/types/") || path_lower.starts_with("types/"))
+        && (path_lower.ends_with(".ts") || path_lower.ends_with(".tsx"))
+        && !path_lower.contains("/api/");
+    if is_model_or_type_file {
+        let mut prompt = format!(
+            "You are a Senior TypeScript Domain Architect. Write only clean, pure TypeScript domain types, interfaces, enums, and lightweight helper types wrapped in markdown code blocks. No explanations.\n\n\
+             DOMAIN MODEL & TYPE RULES:\n\
+             - Define clean, exported TypeScript interfaces, types, and enums matching the project's database entities.\n\
+             - STRICTLY FORBIDDEN: NEVER import `'@prisma/client'`, NEVER import `'@/lib/prisma'`, and NEVER instantiate `new PrismaClient()` inside `src/models/` or `src/types/`. Database access belongs strictly inside API route handlers (`src/app/api/**/route.ts`).\n\
+             - PATH ALIASES: Always import other local project modules using `'@/...'` (e.g. `import ... from '@/types/...'`), NEVER bare `'src/...'`.\n\
+             - Export symbols both cleanly as named exports (`export interface ...`, `export type ...`, `export function ...`).\n\
+             FILE: {}\n",
+            file_path
+        );
+        if let Some(ref lbg) = lbg_val {
+            if let Some(db_contracts) = lbg.get("sharedContracts").and_then(|c| c.get("database")) {
+                let fmt_db = format_database_contract_prompt(db_contracts);
+                if !fmt_db.is_empty() {
+                    prompt.push_str(&format!("\n{}\n", fmt_db));
+                }
+            }
+        }
+        let contracts_prompt = format_axiom_contracts_prompt(proj_dir, file_path);
+        if !contracts_prompt.is_empty() {
+            prompt.push_str(&format!("\n{}\n", contracts_prompt));
+        }
+        if !context_ref.is_empty() {
+            prompt.push_str(context_ref);
+        }
+        return prompt;
+    }
+
     // 8. FILE-SCOPED PROMPT: Web Client UI Components, Pages & Layouts (.tsx, .jsx)
     // Strictly isolated from backend Prisma schemas and NextAuth server internals!
     let is_react_frontend = (path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx")) && !is_custom_hook;
@@ -2514,7 +2750,7 @@ pub fn get_expert_system_prompt(
     } else if proj_type_lower == "flutter" {
         prompt.push_str(&format!("ROLE: Senior Flutter & Dart Mobile Developer\nFILE: {}\n", file_path));
     } else {
-        prompt.push_str(&format!("ROLE: Expert TypeScript / JavaScript Developer\nFILE: {}\n", file_path));
+        prompt.push_str(&format!("ROLE: Expert TypeScript / JavaScript Developer\nFILE: {}\n- Always import local modules using the '@/...' alias (never bare 'src/...').\n- Never clone new PrismaClient() outside src/lib/prisma.ts.\n", file_path));
     }
     if !context_ref.is_empty() {
         prompt.push_str(context_ref);
@@ -4405,7 +4641,7 @@ export default function RootLayout({
     ensure_directory_barrel_files(&proj_dir);
 
     // Run self-healing compiler loop to automatically correct any compilation or syntax errors
-    perform_self_healing_loop(&proj_dir, &model_id, &files_to_generate).await;
+    let heal_warnings = perform_self_healing_loop(&proj_dir, &model_id, &files_to_generate).await;
 
     // Run automated post-generation static, import, hook, and Prisma checks
     let auto_test_warnings = crate::self_healing::run_generation_auto_test_suite(&proj_dir, &window, &model_id).await;
@@ -4457,6 +4693,11 @@ export default function RootLayout({
     }
     if let Some(ref p_err) = prisma_heal_err {
         completion_warnings.push(format!("Prisma validation/generation failed ({})", p_err));
+    }
+    for w in &heal_warnings {
+        if !completion_warnings.iter().any(|cw| cw == w || cw.contains(w)) {
+            completion_warnings.push(w.clone());
+        }
     }
     for w in &auto_test_warnings {
         if !completion_warnings.iter().any(|cw| cw.contains(w)) {

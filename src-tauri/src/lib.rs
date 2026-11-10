@@ -734,9 +734,9 @@ export const config = {
         let resolved = resolve_import_path(&temp_dir, "@/app/components/ProductCard", "src/app/page.tsx");
         assert_eq!(resolved, Some("src/app/components/ProductCard.tsx".to_string()));
         
-        // Test relative resolve
+        // Test relative resolve (canonical path collapses `..` segments cleanly)
         let resolved_rel = resolve_import_path(&temp_dir, "../components/ProductCard", "src/app/pages/page.tsx");
-        assert_eq!(resolved_rel, Some("src/app/pages/../components/ProductCard.tsx".to_string()));
+        assert_eq!(resolved_rel, Some("src/app/components/ProductCard.tsx".to_string()));
         
         // Clean up
         let _ = std::fs::remove_file(card_file);
@@ -2545,6 +2545,630 @@ model Analytics {
         let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&pkg_path).unwrap()).unwrap();
         assert_eq!(saved["overrides"]["some-legacy-tool"]["shell-quote"], serde_json::json!("*"));
         assert!(saved["overrides"].get("decentral-grid").is_none());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_local_import_guard_and_package_repair_v47() {
+        // 1. Bare local specifiers must never be mistaken for npm packages
+        assert!(crate::packages::is_local_import_specifier("src/models/MaintenanceAlert"));
+        assert!(crate::packages::is_local_import_specifier("app/dashboard/page"));
+        assert!(crate::packages::is_local_import_specifier("components/Navbar"));
+        assert!(crate::packages::is_local_import_specifier("@/hooks/useMaintenanceAlerts"));
+        assert!(crate::packages::is_local_import_specifier("~/lib/prisma"));
+        assert!(!crate::packages::is_local_import_specifier("lucide-react"));
+        assert!(!crate::packages::is_local_import_specifier("next-auth/providers/credentials"));
+
+        // 2. Official next-auth v4 subpaths must not be mangled even against incomplete cached DBs
+        let mock_db = vec![PackageMeta {
+            name: "next-auth".to_string(),
+            version: "^4.24.7".to_string(),
+            aliases: vec![],
+            import_examples: vec!["import NextAuth from 'next-auth';".to_string()],
+            compatibility: serde_json::Map::new(),
+            best_practices: String::new(),
+        }];
+        assert_eq!(resolve_and_rewrite_import("next-auth/providers/credentials", &mock_db), None);
+        assert_eq!(resolve_and_rewrite_import("next-auth/react", &mock_db), None);
+        assert_eq!(resolve_and_rewrite_import("next-auth/next", &mock_db), None);
+        assert_eq!(resolve_and_rewrite_import("next-auth/middleware", &mock_db), None);
+        assert_eq!(resolve_and_rewrite_import("src/models/MaintenanceAlert", &mock_db), None);
+
+        // 3. Server log package extractor must ignore local paths & builtins, and normalize scoped/subpath packages
+        assert_eq!(
+            crate::server::extract_package_name_from_error("Module not found: Can't resolve 'src/models/MaintenanceAlert'"),
+            None
+        );
+        assert_eq!(
+            crate::server::extract_package_name_from_error("Cannot find module '@/hooks/useMaintenanceAlerts'"),
+            None
+        );
+        assert_eq!(
+            crate::server::extract_package_name_from_error("Can't resolve '@components/Button'"),
+            None
+        );
+        assert_eq!(
+            crate::server::extract_package_name_from_error("Cannot find module 'node:fs'"),
+            None
+        );
+        assert_eq!(
+            crate::server::extract_package_name_from_error("Cannot find module 'fs'"),
+            None
+        );
+        assert_eq!(
+            crate::server::extract_package_name_from_error("Can't resolve 'next/navigation'"),
+            None
+        );
+        assert_eq!(
+            crate::server::extract_package_name_from_error("Can't resolve 'react'"),
+            None
+        );
+        assert_eq!(
+            crate::server::extract_package_name_from_error("Can't resolve 'next-auth/providers/credentials'"),
+            Some("next-auth".to_string())
+        );
+        assert_eq!(
+            crate::server::extract_package_name_from_error("Can't resolve '@mui/material/Button'"),
+            Some("@mui/material".to_string())
+        );
+
+        // 4. repair_package_json_dependencies rewrites src/... and ~/... imports to @/... and scrubs bogus local deps
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_pkg_repair_v47_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("src/app")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/hooks")).unwrap();
+        std::fs::write(temp_dir.join("src/app/page.tsx"), "export default function Home() { return null; }").unwrap();
+        std::fs::write(
+            temp_dir.join("src/hooks/useMaintenanceAlerts.ts"),
+            "import { MaintenanceAlert } from 'src/models/MaintenanceAlert';\nimport { cn } from '~/lib/utils';\nimport { z } from 'zod';\nimport { Wrench } from 'lucide-react';\nexport { MaintenanceAlert, cn, z, Wrench };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.join("package.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "name": "shoecraft-test",
+                "dependencies": {
+                    "next": "14.2.35",
+                    "react": "^18.2.0",
+                    "src": "*",
+                    "models": "*"
+                },
+                "devDependencies": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        crate::packages::repair_package_json_dependencies(&temp_dir);
+
+        let updated_hook = std::fs::read_to_string(temp_dir.join("src/hooks/useMaintenanceAlerts.ts")).unwrap();
+        assert!(updated_hook.contains("from '@/models/MaintenanceAlert'"));
+        assert!(updated_hook.contains("from '@/lib/utils'"));
+        assert!(!updated_hook.contains("'src/models/MaintenanceAlert'"));
+
+        let updated_pkg: Value = serde_json::from_str(&std::fs::read_to_string(temp_dir.join("package.json")).unwrap()).unwrap();
+        let deps = updated_pkg["dependencies"].as_object().unwrap();
+        assert!(!deps.contains_key("src"));
+        assert!(!deps.contains_key("models"));
+        assert!(!deps.contains_key("app"));
+        assert!(deps.contains_key("zod"));
+        assert!(deps.contains_key("lucide-react"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_katastar_prisma_preamble_local_import_and_npm_errors_v47() {
+        // 1. Prisma CLI preambles must be stripped so real P1012 error produces clean signature
+        let prisma_raw = "Environment variables loaded from .env\nPrisma schema loaded from prisma\\schema.prisma\nDatasource \"db\": PostgreSQL\nError code: P1012\nerror: Error parsing attribute \"@relation\": Invalid referential action: `SET_NULL`";
+        let prisma_sig = crate::katastar::normalize_error_signature("prisma", prisma_raw, Some("prisma/schema.prisma"));
+        assert_eq!(prisma_sig.category, "prisma");
+        assert_eq!(prisma_sig.error_code.as_deref(), Some("P1012"));
+        assert!(prisma_sig.error_signature.starts_with("prisma:P1012:"));
+        assert!(!prisma_sig.normalized_sample.contains("Environment variables loaded"));
+        assert!(!prisma_sig.normalized_sample.contains("Prisma schema loaded"));
+
+        // 2. Local import specifiers produce canonical :local-import signature
+        let ts_local = crate::katastar::normalize_error_signature(
+            "",
+            "TS2307: Cannot find module 'src/models/MaintenanceAlert' or its corresponding type declarations.",
+            Some("src/hooks/useMaintenanceAlerts.ts"),
+        );
+        assert_eq!(ts_local.category, "compile");
+        assert_eq!(ts_local.error_code.as_deref(), Some("TS2307"));
+        assert_eq!(ts_local.error_signature, "compile:TS2307:local-import");
+
+        let wp_local = crate::katastar::normalize_error_signature(
+            "",
+            "Module not found: Can't resolve 'app/components/Missing'",
+            Some("src/app/page.tsx"),
+        );
+        assert_eq!(wp_local.error_signature, "compile:MODULE_NOT_FOUND:local-import");
+
+        // 3. npm ENOENT / ENOTFOUND / missing package normalization
+        let enoent_sig = crate::katastar::normalize_error_signature(
+            "npm",
+            "npm error code ENOENT\nmissing package 'foo'",
+            None,
+        );
+        assert_eq!(enoent_sig.error_signature, "npm:ENOENT:foo");
+
+        let net_sig = crate::katastar::normalize_error_signature(
+            "npm",
+            "npm error code ENOTFOUND\nnpm error request to https://registry.npmjs.org/zod failed",
+            None,
+        );
+        assert_eq!(net_sig.error_signature, "npm:ENOTFOUND:zod");
+    }
+
+    #[test]
+    fn test_sanitizer_tsconfig_client_prisma_css_exports_and_ui_v47() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_san_v47_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("src/app/dashboard")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/components")).unwrap();
+
+        // 1. ensure_valid_tsconfig adds baseUrl and @/* -> ["./src/*"]
+        std::fs::write(
+            temp_dir.join("tsconfig.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "compilerOptions": { "strict": true }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        crate::sanitizer::ensure_valid_tsconfig(&temp_dir);
+        let ts_val: Value = serde_json::from_str(&std::fs::read_to_string(temp_dir.join("tsconfig.json")).unwrap()).unwrap();
+        assert_eq!(ts_val["compilerOptions"]["baseUrl"], ".");
+        assert_eq!(ts_val["compilerOptions"]["paths"]["@/*"], serde_json::json!(["./src/*"]));
+
+        // 2. has_named_export_symbol respects word boundaries; dual-export adds missing `export { Card }`
+        assert!(!crate::sanitizer::has_named_export_symbol("export const CardHeader = () => null;", "Card"));
+        assert!(crate::sanitizer::has_named_export_symbol("export const CardHeader = () => null;", "CardHeader"));
+        let card_src = "export const CardHeader = () => null;\nconst Card = () => null;\nexport default Card;";
+        let card_post = post_process_generated_file("src/components/Card.tsx", card_src, &serde_json::json!({}), false);
+        assert!(card_post.contains("export { Card };"));
+
+        // 3. deduplicate_repeated_css_blocks collapses repeated CSS rule loops
+        let mut looped_css = String::from("body { margin: 0; }\n");
+        for _ in 0..8 {
+            looped_css.push_str(".table-responsive { display: block; width: 100%; overflow-x: auto; }\n");
+        }
+        let deduped_css = crate::sanitizer::deduplicate_repeated_css_blocks(&looped_css);
+        assert_eq!(deduped_css.matches(".table-responsive").count(), 1);
+        assert_eq!(deduped_css.matches("body { margin: 0; }").count(), 1);
+
+        // 4. ensure_next_server_imports fixes default NextResponse import and injects missing imports
+        let bad_mw = "import NextResponse from 'next/server';\nexport function middleware(req: NextRequest) { return NextResponse.next(); }\n";
+        let fixed_mw = crate::sanitizer::ensure_next_server_imports(bad_mw, "middleware.ts");
+        assert!(fixed_mw.contains("NextResponse"));
+        assert!(fixed_mw.contains("NextRequest"));
+        assert!(!fixed_mw.contains("import NextResponse from"));
+        assert!(fixed_mw.contains("{ NextResponse") && fixed_mw.contains("NextRequest }"));
+
+        // 5. Client hook preserves `import type` from @prisma/client while stripping value @prisma/client & ../lib/prisma
+        let hook_src = r#"import { useState } from 'react';
+import { prisma } from '../lib/prisma';
+import { PrismaClient } from '@prisma/client';
+import type { MaintenanceAlert } from '@prisma/client';
+
+export function useMaintenanceAlerts() {
+  const [alerts, setAlerts] = useState<MaintenanceAlert[]>([]);
+  return { alerts, setAlerts };
+}
+"#;
+        let processed_hook = post_process_generated_file("src/hooks/useMaintenanceAlerts.ts", hook_src, &serde_json::json!({}), false);
+        assert!(processed_hook.trim_start().starts_with("\"use client\";"));
+        assert!(!processed_hook.contains("../lib/prisma"));
+        assert!(!processed_hook.contains("@/lib/prisma"));
+        assert!(!processed_hook.contains("PrismaClient"));
+        assert!(processed_hook.contains("import type { MaintenanceAlert } from '@prisma/client';"));
+
+        // 6. sanitize_root_layout_direct_use_session neutralizes direct calls & prunes unused useSession import
+        let root_with_session = "import { useSession, signOut } from 'next-auth/react';\nexport default function RootLayout({ children }: any) {\n  const { data: sess, status } = useSession();\n  return <html><body data-status={status}>{children}</body></html>;\n}\n";
+        let neutralized = crate::sanitizer::sanitize_root_layout_direct_use_session(root_with_session);
+        assert!(!neutralized.contains("useSession("));
+        assert!(neutralized.contains("const sess: any = null;"));
+        assert!(neutralized.contains("const status = 'unauthenticated';"));
+        assert!(!neutralized.contains("useSession,"));
+        assert!(neutralized.contains("{ signOut }"));
+
+        // 7. ensure_ui_primitives_reconciled relaxes strict unions & appends missing Card / MetricCard / Option
+        std::fs::write(
+            temp_dir.join("src/components/ui.tsx"),
+            "import React from 'react';\nexport interface ButtonProps {\n  variant?: 'primary' | 'secondary';\n  size?: 'sm' | 'md';\n}\nexport const CardHeader = ({ children }: any) => <div>{children}</div>;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.join("src/app/dashboard/page.tsx"),
+            "import { Card, CardHeader, MetricCard, Option } from '@/components/ui';\nexport default function Dashboard() { return <Card><CardHeader>Hi</CardHeader><MetricCard value={1} /><select><Option value='1'>One</Option></select></Card>; }\n",
+        )
+        .unwrap();
+
+        crate::sanitizer::ensure_ui_primitives_reconciled(&temp_dir);
+        let ui_after = std::fs::read_to_string(temp_dir.join("src/components/ui.tsx")).unwrap();
+        assert!(ui_after.contains("| (string & {})"));
+        assert!(ui_after.contains("export const Card ="));
+        assert!(ui_after.contains("export const MetricCard ="));
+        assert!(ui_after.contains("export const Option ="));
+        assert_eq!(ui_after.matches("export const CardHeader").count(), 1);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_healer_guards_import_rewrite_and_prose_rejection_v47() {
+        // 1. Path validation rejects extensionless module specifiers, absolute paths, and spaces
+        assert!(!is_valid_file_path("src/models/MaintenanceAlert"));
+        assert!(!is_valid_file_path("/abs/path/file.ts"));
+        assert!(!is_valid_file_path("src/components/My Card.tsx"));
+        assert!(is_valid_file_path("src/models/MaintenanceAlert.ts"));
+        assert!(is_valid_file_path(".env.local"));
+
+        // 2. Prose & JSON payload rejection
+        assert!(!looks_like_code_payload("The error indicates that the module 'src/models/MaintenanceAlert' cannot be found."));
+        assert!(!looks_like_code_payload("1. Ensure the file exists at src/models/MaintenanceAlert.ts\n2. Verify the import path in tsconfig.json"));
+        assert!(!looks_like_code_payload("{\"edits\":[]}"));
+        assert!(looks_like_code_payload("import type { MaintenanceAlert } from '@/models/MaintenanceAlert';\nexport const x = 1;"));
+        assert!(looks_like_code_payload(".btn { color: red; }"));
+        assert!(looks_like_code_payload("model Alert {\n  id String @id\n}"));
+
+        // 3. `type: "import"` swap edits must target the consumer file and rewrite `'src/...'` -> `'@/...'`, never creating an extensionless file
+        let import_swap_json = serde_json::json!({
+            "response": "1. Ensure src/models/MaintenanceAlert.ts exists\n2. Update import",
+            "steps": "Check tsconfig.json",
+            "edits": [
+                {
+                    "type": "import",
+                    "path": "src/models/MaintenanceAlert",
+                    "newPath": "src/models/MaintenanceAlert.ts"
+                }
+            ]
+        });
+        let extracted = extract_edits_from_json(&import_swap_json, "src/hooks/useMaintenanceAlerts.ts");
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0]["path"], "src/hooks/useMaintenanceAlerts.ts");
+        assert_eq!(extracted[0]["target"], "'src/models/MaintenanceAlert'");
+        assert_eq!(extracted[0]["replacement"], "'@/models/MaintenanceAlert'");
+    }
+
+    #[test]
+    fn test_orchestrator_validator_contracts_and_self_healing_v47() {
+        // 1. Deterministic validate_file_with_abstract_rules checks
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let clean_model = "export interface MaintenanceAlert {\n  id: string;\n  severity: 'LOW' | 'HIGH';\n}\n";
+            assert!(crate::orchestrator::validate_file_with_abstract_rules("src/models/MaintenanceAlert.ts", clean_model, "qwen").await.is_ok());
+
+            let bad_model = "import { PrismaClient } from '@prisma/client';\nexport const db = new PrismaClient();\n";
+            assert!(crate::orchestrator::validate_file_with_abstract_rules("src/models/MaintenanceAlert.ts", bad_model, "qwen").await.is_err());
+
+            let bad_mw = "import { NextFunction } from 'express';\nexport function middleware() {}\n";
+            assert!(crate::orchestrator::validate_file_with_abstract_rules("middleware.ts", bad_mw, "qwen").await.is_err());
+
+            let bad_client = "\"use client\";\nimport prisma from '@/lib/prisma';\nexport function Panel() { return <div />; }\n";
+            assert!(crate::orchestrator::validate_file_with_abstract_rules("src/components/Panel.tsx", bad_client, "qwen").await.is_err());
+
+            let prose_leak = "export const a = 1;\nThe error indicates that something is wrong.\n";
+            assert!(crate::orchestrator::validate_file_with_abstract_rules("src/utils/a.ts", prose_leak, "qwen").await.is_err());
+
+            let mut repeating_css = String::new();
+            for _ in 0..12 {
+                repeating_css.push_str(".loop-card { padding: 12px; border: 1px solid #ccc; }\n");
+            }
+            assert!(crate::orchestrator::validate_file_with_abstract_rules("src/app/globals.css", &repeating_css, "qwen").await.is_err());
+
+            let unclosed = "export function broken() {\n  if (true) {\n    const obj = {\n      a: 1\n";
+            assert!(crate::orchestrator::validate_file_with_abstract_rules("src/utils/broken.ts", unclosed, "qwen").await.is_err());
+        });
+
+        // 2. Contract harvester: multiline useState, hookCalls, src/ internal deps, and CSS inclusion on refresh
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_orch_sh_v47_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("src/models")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/hooks")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/utils")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/components")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/app")).unwrap();
+
+        let hook_code = r#""use client";
+import { useState, useCallback } from 'react';
+import type { MaintenanceAlert } from 'src/models/MaintenanceAlert';
+import { useAuth } from '@/hooks/useAuth';
+
+export function useMaintenanceAlerts() {
+  const [alerts, setAlerts] = useState<MaintenanceAlert[]>(
+    []
+  );
+  const { user } = useAuth();
+  const reload = useCallback(() => {
+    fetch('/api/maintenance');
+  }, []);
+  return { alerts, setAlerts, user, reload };
+}
+"#;
+        std::fs::write(temp_dir.join("src/models/MaintenanceAlert.ts"), "export interface MaintenanceAlert { id: string; }\n").unwrap();
+        std::fs::write(temp_dir.join("src/hooks/useMaintenanceAlerts.ts"), hook_code).unwrap();
+        std::fs::write(temp_dir.join("src/app/globals.css"), "@tailwind base;\nbody { color: #111; }\n").unwrap();
+
+        crate::orchestrator::harvest_file_to_axiom_contracts(
+            &temp_dir,
+            "proj-v47",
+            "src/hooks/useMaintenanceAlerts.ts",
+            hook_code,
+            &[serde_json::json!({ "path": "src/models/MaintenanceAlert.ts" })],
+        );
+        crate::orchestrator::refresh_axiom_contracts_for_project(&temp_dir, "proj-v47", &[]);
+
+        let contracts_val: Value = serde_json::from_str(
+            &std::fs::read_to_string(temp_dir.join(".axiom/axiom-contracts.json")).unwrap(),
+        )
+        .unwrap();
+        let files_arr = contracts_val["files"].as_array().unwrap();
+        let hook_entry = files_arr.iter().find(|f| f["path"] == "src/hooks/useMaintenanceAlerts.ts").unwrap();
+        assert_eq!(hook_entry["capabilities"]["states"]["alerts"]["type"], "MaintenanceAlert[]");
+        assert!(hook_entry["consumedContracts"]["hookCalls"].as_array().unwrap().iter().any(|h| h == "useAuth"));
+        assert!(hook_entry["dependencies"]["internal"].as_array().unwrap().iter().any(|d| d == "src/models/MaintenanceAlert.ts"));
+        assert!(files_arr.iter().any(|f| f["path"] == "src/app/globals.css"));
+
+        // 3. scan_and_fix_imports must NOT self-import `src/utils/iot.ts` -> `@/utils/iot`, while fixing unique non-self matches
+        std::fs::write(
+            temp_dir.join("src/utils/iot.ts"),
+            "import { missing } from './nonexistent/iot';\nexport const ok = true;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.join("src/components/ProductCard.tsx"),
+            "export const ProductCard = () => null;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.join("src/app/page.tsx"),
+            "import { ProductCard } from './wrong/ProductCard';\nexport default function Home() { return <ProductCard />; }\n",
+        )
+        .unwrap();
+
+        let mut mod_index = std::collections::HashMap::new();
+        let src_root = temp_dir.join("src");
+        crate::self_healing::index_modules(&src_root, &src_root, &mut mod_index);
+        crate::self_healing::scan_and_fix_imports(&src_root, &src_root, &mod_index);
+
+        let iot_after = std::fs::read_to_string(temp_dir.join("src/utils/iot.ts")).unwrap();
+        assert!(!iot_after.contains("@/utils/iot"));
+        let page_after = std::fs::read_to_string(temp_dir.join("src/app/page.tsx")).unwrap();
+        assert!(page_after.contains("@/components/ProductCard"));
+
+        // 4. parse_tsc_diagnostics & file_dependency_layer_priority
+        let tsc_out = "src\\hooks\\useMaintenanceAlerts.ts(4,5): error TS2307: Cannot find module 'src/models/MaintenanceAlert'.\r\nsrc/app/page.tsx(10,12): error TS2322: Type 'string' is not assignable.";
+        let diags = crate::self_healing::parse_tsc_diagnostics(tsc_out);
+        assert_eq!(diags.len(), 2);
+        assert_eq!(diags[0].file, "src/hooks/useMaintenanceAlerts.ts");
+        assert_eq!(diags[0].line, 4);
+        assert_eq!(diags[0].col, 5);
+        assert_eq!(diags[0].code, "TS2307");
+
+        assert!(crate::self_healing::file_dependency_layer_priority("prisma/schema.prisma")
+            < crate::self_healing::file_dependency_layer_priority("src/models/Alert.ts"));
+        assert!(crate::self_healing::file_dependency_layer_priority("src/models/Alert.ts")
+            < crate::self_healing::file_dependency_layer_priority("src/lib/prisma.ts"));
+        assert!(crate::self_healing::file_dependency_layer_priority("src/lib/prisma.ts")
+            < crate::self_healing::file_dependency_layer_priority("src/components/ui.tsx"));
+        assert!(crate::self_healing::file_dependency_layer_priority("src/components/ui.tsx")
+            < crate::self_healing::file_dependency_layer_priority("src/hooks/useAlerts.ts"));
+        assert!(crate::self_healing::file_dependency_layer_priority("src/hooks/useAlerts.ts")
+            < crate::self_healing::file_dependency_layer_priority("src/app/api/alerts/route.ts"));
+        assert!(crate::self_healing::file_dependency_layer_priority("src/app/api/alerts/route.ts")
+            < crate::self_healing::file_dependency_layer_priority("src/components/Navbar.tsx"));
+        assert!(crate::self_healing::file_dependency_layer_priority("src/components/Navbar.tsx")
+            < crate::self_healing::file_dependency_layer_priority("src/app/page.tsx"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_destructive_code_drop_guard_blocks_wiped_ui() {
+        let mut full_tsx = String::from("\"use client\";\nimport React from 'react';\nexport default function DashboardPage() {\n  const title = 'Overview';\n  return (\n    <div className=\"p-6 space-y-4\">\n      <h1>{title}</h1>\n");
+        for idx in 0..18 {
+            full_tsx.push_str(&format!("      <div className=\"card-{}\"><span className=\"label\">Row {}</span></div>\n", idx, idx));
+        }
+        full_tsx.push_str("    </div>\n  );\n}\n");
+
+        // 1. Replacing the full component with a minimal stub must be blocked
+        let wiped_tsx = "\"use client\";\nexport default function DashboardPage() {\n  return <div className=\"p-4\">Fixed</div>;\n}\n";
+        assert!(crate::healer::detect_destructive_code_drop("src/app/dashboard/page.tsx", &full_tsx, wiped_tsx).is_some());
+
+        // 2. Keeping >20 lines of boilerplate while stripping >66% of JSX tags must also be blocked
+        let mut stripped_jsx = String::from("\"use client\";\nimport React from 'react';\n");
+        for idx in 0..20 {
+            stripped_jsx.push_str(&format!("type UnusedHelper{} = string;\n", idx));
+        }
+        stripped_jsx.push_str("export default function DashboardPage() {\n  return <div>Stub</div>;\n}\n");
+        assert!(crate::healer::detect_destructive_code_drop("src/app/dashboard/page.tsx", &full_tsx, &stripped_jsx).is_some());
+
+        // 3. Surgical single-line fix must be allowed
+        let surgical_tsx = full_tsx.replace("const title = 'Overview';", "const title: string = 'Overview';");
+        assert!(crate::healer::detect_destructive_code_drop("src/app/dashboard/page.tsx", &full_tsx, &surgical_tsx).is_none());
+
+        // 4. Creating a brand-new file (empty before) or editing non-JS files is allowed
+        assert!(crate::healer::detect_destructive_code_drop("src/models/NewModel.ts", "", "export interface NewModel { id: string; }\n").is_none());
+        assert!(crate::healer::detect_destructive_code_drop("src/app/globals.css", &full_tsx, "body { margin: 0; }").is_none());
+    }
+
+    #[test]
+    fn test_stack_rulepacks_narrowing_no_false_mern_or_config() {
+        let model_rules = get_stack_rulepacks(
+            "src/models/MaintenanceAlert.ts",
+            "export interface MaintenanceAlert {\n  id: string;\n  severity: string;\n}\n",
+            None,
+        );
+        assert!(!model_rules.contains("MERN STACK"));
+        assert!(!model_rules.contains("CONFIGURATION & TSCONFIG RULES"));
+
+        let root_model_rules = get_stack_rulepacks(
+            "models/Invoice.ts",
+            "export interface Invoice { total: number; }",
+            None,
+        );
+        assert!(!root_model_rules.contains("MERN STACK"));
+
+        let config_modal_rules = get_stack_rulepacks(
+            "src/components/ConfigModal.tsx",
+            "import React from 'react'; export function ConfigModal() { return <div />; }",
+            None,
+        );
+        assert!(!config_modal_rules.contains("CONFIGURATION & TSCONFIG RULES"));
+
+        let next_cfg_rules = get_stack_rulepacks("next.config.js", "module.exports = {};", None);
+        assert!(next_cfg_rules.contains("CONFIGURATION & TSCONFIG RULES"));
+    }
+
+    #[test]
+    fn test_healer_import_rewrite_respects_explicit_path_with_from_to() {
+        let cross_file_import_fix = serde_json::json!({
+            "edits": [
+                {
+                    "type": "import",
+                    "path": "src/components/Chart.tsx",
+                    "from": "react-icons",
+                    "to": "react-icons/hi"
+                }
+            ]
+        });
+        let edits = extract_edits_from_json(&cross_file_import_fix, "src/app/page.tsx");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0]["path"], "src/components/Chart.tsx");
+        assert_eq!(edits[0]["target"], "'react-icons'");
+        assert_eq!(edits[0]["replacement"], "'react-icons/hi'");
+    }
+
+    #[test]
+    fn test_relevant_packages_db_summary_scoping() {
+        let make_pkg = |name: &str, ex: &str| crate::packages::PackageMeta {
+            name: name.to_string(),
+            version: "^1.0.0".to_string(),
+            aliases: vec![],
+            import_examples: vec![ex.to_string()],
+            compatibility: serde_json::Map::new(),
+            best_practices: format!("Use {} safely", name),
+        };
+        let db = vec![
+            make_pkg("next-auth", "import { getServerSession } from 'next-auth';"),
+            make_pkg("@prisma/client", "import { PrismaClient } from '@prisma/client';"),
+            make_pkg("zod", "import { z } from 'zod';"),
+            make_pkg("lucide-react", "import { Home } from 'lucide-react';"),
+            make_pkg("react-icons", "import { HiHome } from 'react-icons/hi';"),
+            make_pkg("stripe", "import Stripe from 'stripe';"),
+            make_pkg("ioredis", "import Redis from 'ioredis';"),
+            make_pkg("bullmq", "import { Queue } from 'bullmq';"),
+            make_pkg("phaser", "import Phaser from 'phaser';"),
+        ];
+        let pkg_deps = vec!["next".to_string(), "react".to_string(), "stripe".to_string()];
+        let ctx = "Error in src/app/api/auth/route.ts: Cannot find module 'zod' when using getServerSession";
+        let summary = crate::packages::format_relevant_packages_db_summary(&db, &pkg_deps, ctx);
+
+        assert!(summary.contains("zod"));
+        assert!(summary.contains("next-auth"));
+        assert!(summary.contains("stripe"));
+        assert!(!summary.contains("phaser"));
+        assert!(!summary.contains("ioredis"));
+        assert!(!summary.contains("bullmq"));
+    }
+
+    #[test]
+    fn test_parse_batch_file_fixes_response_variants() {
+        let obj_envelope = r#"{"files": [{"path": "./src/a.ts", "content": "export const a = 1;"}]}"#;
+        let res1 = crate::self_healing::parse_batch_file_fixes_response(obj_envelope, &["src/a.ts".to_string()]);
+        assert_eq!(res1, vec![("src/a.ts".to_string(), "export const a = 1;".to_string())]);
+
+        let arr_envelope = r#"[{"path": "src/b.tsx", "content": "export const B = () => <div />;"}]"#;
+        let res2 = crate::self_healing::parse_batch_file_fixes_response(arr_envelope, &[]);
+        assert_eq!(res2.len(), 1);
+        assert_eq!(res2[0].0, "src/b.tsx");
+
+        let edits_envelope = r#"{"edits": [{"file": "src/c.ts", "code": "export type C = string;"}]}"#;
+        let res3 = crate::self_healing::parse_batch_file_fixes_response(edits_envelope, &[]);
+        assert_eq!(res3, vec![("src/c.ts".to_string(), "export type C = string;".to_string())]);
+
+        let map_envelope = r#"{"src/d.ts": "export const d = 4;"}"#;
+        let res4 = crate::self_healing::parse_batch_file_fixes_response(map_envelope, &[]);
+        assert_eq!(res4, vec![("src/d.ts".to_string(), "export const d = 4;".to_string())]);
+
+        let raw_single = "export const e = 5;\n";
+        let res5 = crate::self_healing::parse_batch_file_fixes_response(raw_single, &["src/e.ts".to_string()]);
+        assert_eq!(res5.len(), 1);
+        assert_eq!(res5[0].0, "src/e.ts");
+
+        // Multi-file batch must NOT assign single raw blob blindly to multiple expected files
+        let res6 = crate::self_healing::parse_batch_file_fixes_response(
+            raw_single,
+            &["src/e.ts".to_string(), "src/f.ts".to_string()],
+        );
+        assert!(res6.is_empty());
+    }
+
+    #[test]
+    fn test_root_app_layout_hygiene_and_tsconfig() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_root_app_hygiene_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("app")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("components")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("lib")).unwrap();
+
+        std::fs::write(
+            temp_dir.join("tsconfig.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "compilerOptions": {
+                    "baseUrl": ".",
+                    "paths": { "@/*": ["./src/*"] }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.join("app/page.tsx"),
+            "import { Card } from '~/components/ui';\nimport { cn } from '~/lib/utils';\nexport default function Page() { return <Card className={cn('p-4')}>Hi</Card>; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.join("app/globals.css"),
+            "body { margin: 0; }\n.dup { color: red; }\n.dup { color: red; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.join("components/ui.tsx"),
+            "import React from 'react';\nexport const Badge = ({ children }: any) => <span>{children}</span>;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.join("lib/utils.ts"),
+            "export const cn = (...a: string[]) => a.join(' ');\n",
+        )
+        .unwrap();
+
+        crate::self_healing::run_hygiene_pass_on_project(&temp_dir);
+
+        let ts_val: Value = serde_json::from_str(&std::fs::read_to_string(temp_dir.join("tsconfig.json")).unwrap()).unwrap();
+        assert_eq!(ts_val["compilerOptions"]["paths"]["@/*"], serde_json::json!(["./*"]));
+
+        let page_after = std::fs::read_to_string(temp_dir.join("app/page.tsx")).unwrap();
+        assert!(page_after.contains("from '@/components/ui'"));
+        assert!(page_after.contains("from '@/lib/utils'"));
+
+        let css_after = std::fs::read_to_string(temp_dir.join("app/globals.css")).unwrap();
+        assert_eq!(css_after.matches(".dup { color: red; }").count(), 1);
+
+        let ui_after = std::fs::read_to_string(temp_dir.join("components/ui.tsx")).unwrap();
+        assert!(ui_after.contains("export const Card ="));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
