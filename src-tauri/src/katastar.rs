@@ -242,6 +242,14 @@ pub fn normalize_error_signature(category_hint: &str, raw_error: &str, file_path
         "npm".to_string()
     } else if category_hint == "runtime"
         || lower.contains("referenceerror:")
+        || lower.contains("typeerror:")
+        || lower.contains("syntaxerror:")
+        || lower.contains("rangeerror:")
+        || lower.contains("cannot read properties of null")
+        || lower.contains("cannot read properties of undefined")
+        || lower.contains("cannot read property ")
+        || lower.contains("is not a function")
+        || lower.contains("objects are not valid as a react child")
         || lower.contains("hydration failed")
         || lower.contains("unhandled runtime error")
     {
@@ -414,6 +422,36 @@ pub fn normalize_error_signature(category_hint: &str, raw_error: &str, file_path
             error_code: Some("ReferenceError".to_string()),
             error_signature: "runtime:ReferenceError:identifier-not-defined".to_string(),
             normalized_sample: truncate_chars(ident_sample, 220),
+        };
+    }
+
+    if lower.contains("typeerror:")
+        || lower.contains("cannot read properties of null")
+        || lower.contains("cannot read properties of undefined")
+        || lower.contains("cannot read property ")
+        || lower.contains("is not a function")
+    {
+        let err_line = cleaned
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| {
+                let ll = l.to_lowercase();
+                ll.contains("typeerror:")
+                    || ll.contains("cannot read propert")
+                    || ll.contains("is not a function")
+            })
+            .unwrap_or("TypeError: runtime null/undefined dereference");
+        let slug = to_slug(err_line, 64);
+        let sig = if slug.is_empty() {
+            "runtime:TypeError".to_string()
+        } else {
+            format!("runtime:TypeError:{}", slug)
+        };
+        return ErrorSignatureInfo {
+            category: "runtime".to_string(),
+            error_code: Some("TypeError".to_string()),
+            error_signature: sig,
+            normalized_sample: truncate_chars(err_line, 220),
         };
     }
 

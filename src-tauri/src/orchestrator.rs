@@ -433,13 +433,35 @@ pub async fn validate_file_with_project_context(
     validate_file_with_abstract_rules(file_path, content, model_id).await?;
 
     let path_lower = file_path.replace('\\', "/").to_lowercase();
+    let is_ts_js = path_lower.ends_with(".ts")
+        || path_lower.ends_with(".tsx")
+        || path_lower.ends_with(".js")
+        || path_lower.ends_with(".jsx");
+    if !is_ts_js {
+        return Ok(());
+    }
+
     let is_api_route = (path_lower.contains("/api/") || path_lower.starts_with("api/"))
         && (path_lower.ends_with("/route.ts")
             || path_lower.ends_with("/route.js")
             || path_lower == "route.ts"
             || path_lower == "route.js");
 
-    if !is_api_route {
+    let trimmed = content.trim_start();
+    let is_client_file = trimmed.starts_with("\"use client\"")
+        || trimmed.starts_with("'use client'")
+        || trimmed.lines().take(5).any(|l| {
+            let t = l.trim();
+            t == "\"use client\";" || t == "\"use client\"" || t == "'use client';" || t == "'use client'"
+        });
+    let is_hook_file = (path_lower.contains("/hooks/") || path_lower.starts_with("hooks/")) && !path_lower.contains("/api/");
+    let uses_server_prisma = !is_client_file
+        && !is_hook_file
+        && (content.contains("prisma.")
+            || content.contains("@prisma/client")
+            || content.contains("/lib/prisma"));
+
+    if !is_api_route && !uses_server_prisma {
         return Ok(());
     }
 
@@ -485,6 +507,14 @@ pub async fn validate_file_with_project_context(
 
             if let Some(enums_obj) = contract.get("enums").and_then(|e| e.as_object()) {
                 for enum_name in enums_obj.keys() {
+                    let prisma_ns_pat = format!(r"\bPrisma\s*\.\s*{}\b", regex::escape(enum_name));
+                    if regex::Regex::new(&prisma_ns_pat).ok().map_or(false, |re| re.is_match(&clean_code)) {
+                        return Err(format!(
+                            "Invalid Prisma v5 enum reference `Prisma.{}` in {}: import `{}` directly from '@prisma/client' instead of `Prisma.{}`.",
+                            enum_name, file_path, enum_name, enum_name
+                        ));
+                    }
+
                     let usage_pat = format!(r"\b{}\.[A-Z][A-Z0-9_]*\b", regex::escape(enum_name));
                     let used = regex::Regex::new(&usage_pat)
                         .ok()
@@ -507,8 +537,30 @@ pub async fn validate_file_with_project_context(
                         }
                     }
                 }
+
+                // Reject fabricated `Prisma.<UnknownEnum>.<UPPER_MEMBER>` namespace lookups
+                if let Ok(phantom_ns_re) = regex::Regex::new(r"\bPrisma\s*\.\s*([A-Z][A-Za-z0-9_]*)\s*\.\s*([A-Z][A-Z0-9_]+)\b") {
+                    for cap in phantom_ns_re.captures_iter(&clean_code) {
+                        if let (Some(ns_m), Some(mem_m)) = (cap.get(1), cap.get(2)) {
+                            let ns_name = ns_m.as_str();
+                            let mem_name = mem_m.as_str();
+                            let declared_list: Vec<&str> = enums_obj.keys().map(|s| s.as_str()).collect();
+                            return Err(format!(
+                                "Invalid Prisma namespace enum `Prisma.{}.{}` in {}. In Prisma v5+, enums are imported directly from '@prisma/client' (declared enums: {}).",
+                                ns_name,
+                                mem_name,
+                                file_path,
+                                if declared_list.is_empty() { "none".to_string() } else { declared_list.join(", ") }
+                            ));
+                        }
+                    }
+                }
             }
         }
+    }
+
+    if !is_api_route {
+        return Ok(());
     }
 
     // 2. Validate URLSearchParams property access (`searchParams.id` instead of `searchParams.get('id')`)
@@ -804,6 +856,36 @@ pub async fn validate_file_with_abstract_rules(
         || trimmed.contains("from \"next-auth/client\"")
     {
         return Err("Deprecated NextAuth v3 import (`next-auth/providers` or `next-auth/client`). Use NextAuth v4 subpaths (e.g. `CredentialsProvider` from `'next-auth/providers/credentials'`, `useSession` from `'next-auth/react'`).".to_string());
+    }
+
+    // Reject foreign frontend frameworks and invalid Next.js/NextAuth named imports in TS/JS files
+    let foreign_import_re = regex::Regex::new(
+        r#"(?m)^\s*import\s+[\s\S]*?\s+from\s+['"](vue|vue-i18n|vue-router|pinia|vuex|nuxt|svelte|@sveltejs/kit|@angular/core|@angular/common)(?:/[^'"]*)?['"]"#,
+    );
+    if let Ok(re_foreign) = foreign_import_re {
+        if let Some(cap) = re_foreign.captures(trimmed) {
+            let pkg = cap.get(1).map_or("unknown", |m| m.as_str());
+            return Err(format!(
+                "Foreign framework package `{}` cannot be imported in a Next.js / React project. Implement with React/Next.js primitives only.",
+                pkg
+            ));
+        }
+    }
+    if let Ok(re_named_link) = regex::Regex::new(r#"(?m)^\s*import\s+\{[^}]*\bLink\b[^}]*\}\s+from\s+['"]next/link['"]"#) {
+        if re_named_link.is_match(trimmed) {
+            return Err("`next/link` has NO named export `{ Link }`; use default import `import Link from 'next/link';`.".to_string());
+        }
+    }
+    if let Ok(re_na_prov_named) = regex::Regex::new(
+        r#"(?m)^\s*import\s+(?:[A-Za-z_$][A-Za-z0-9_$]*\s*,\s*)?\{[^}]*\b(CredentialsProvider|GoogleProvider|GitHubProvider|GithubProvider|EmailProvider|DiscordProvider)\b[^}]*\}\s+from\s+['"]next-auth['"]"#,
+    ) {
+        if let Some(cap) = re_na_prov_named.captures(trimmed) {
+            let prov = cap.get(1).map_or("CredentialsProvider", |m| m.as_str());
+            return Err(format!(
+                "`{}` is NOT a named export of `'next-auth'`; import it via its provider subpath (e.g. `import CredentialsProvider from 'next-auth/providers/credentials';`).",
+                prov
+            ));
+        }
     }
 
     // 7. Basic bracket balance check to catch mid-stream truncation
@@ -1691,14 +1773,18 @@ pub const API_ROUTE_CHAIN_OF_THOUGHT: &str = r#"BACKEND API GENERATION CHAIN-OF-
 Step 1 [Imports & Core Bindings]:
        - Import { NextResponse, NextRequest } from 'next/server'.
        - Import { prisma } from '@/lib/prisma'.
+       - Import Prisma Enum types/values actually used by the model from '@prisma/client' (when schema defines enums).
        - If validating request bodies, ALWAYS import { z } from 'zod'.
 Step 2 [Schema Validation & Safe Defaults]:
-       - Define Zod schema matching the target model's scalar fields.
-       - Make optional and secondary fields (description, status, priority, tags, dates) .optional().default(...) so quick-create requests from the UI succeed without throwing 400 validation errors.
+       - Define Zod schema matching the target model's scalar fields (use ONLY fields present in ACTIVE DATABASE MODELS).
+       - For Prisma enum fields, validate with `z.nativeEnum(EnumName)` (NEVER bare `z.string()`, which causes TS2322 against Prisma enum types).
+       - For Prisma `DateTime` fields, use `z.coerce.date().optional().default(() => new Date())` so JSON ISO strings and missing dates both coerce cleanly.
+       - Make optional/secondary fields `.optional().default(...)` so quick-create UI requests succeed without unnecessary 400 errors.
 Step 3 [Typed Relational Queries]:
        - Target ONLY models declared in ACTIVE DATABASE MODELS.
+       - Under tsconfig `"strict": false`, `z.infer<typeof schema>` produces optional properties (`{ field?: T }`), so passing `validatedBody` directly into `prisma.<model>.create({ data: validatedBody })` causes `TS2322` errors.
+       - ALWAYS construct an EXPLICIT typed `data: { requiredField: parsed.requiredField, ... }` object in `.create(...)` / `.update(...)` (explicitly checking required inputs or providing safe defaults / `new Date(...)` / `parsed.enumField as EnumName`).
        - In GET handlers, call `prisma.<model>.findMany({ include: { ... } })` matching the exact relation names from the contract.
-       - In POST handlers, extract validated body and call `prisma.<model>.create({ data: { ... } })`.
 Step 4 [Local Resilience & Status Gate]:
        - Always wrap Prisma queries in try/catch blocks.
        - In GET catch (or if findMany returns [] in local preview), return a fallback array of 4-6 realistic domain mockup items with status 200 so the UI immediately renders with data.
@@ -4930,6 +5016,11 @@ export default function RootLayout({
          Identify all missing files, routes, state management, components, configuration files, or database schemas needed to make this project complete.\n\
          CRITICAL DOMAIN RULE: Ensure the pages, dashboard, API routes, and Prisma schema models directly implement the core business features described in the Project Idea (not just generic user authentication).\n\
          IMPORTANT ARCHITECTURAL RULE: If the project uses next-auth (NextAuth) for authentication, you MUST always include 'src/app/api/register/route.ts' in the expanded files list to handle new user registration (creating user record using bcryptjs), since NextAuth does not natively provide a user registration route.\n\
+         STRICT SCOPE & STACK GUARDRAILS:\n\
+         - Stick strictly to Next.js + React + TypeScript. NEVER add Vue, Svelte, or Angular files (`.vue`, `.svelte`, `vue-i18n`, `vue-router`).\n\
+         - NEVER expand a matrix of dozens of regional locale/translation JSON files (`translations/*.json`, `locales/*.json`); keep at most 1-2 locale files if localization is needed.\n\
+         - NEVER duplicate shared folders inside `src/app/` (`src/app/components/...`, `src/app/utils/...`, `src/app/config/...`); keep shared code in `src/components/`, `src/lib/`, `src/hooks/`, `src/utils/`.\n\
+         - Keep the expanded file list cohesive and lean (~15-30 essential files total).\n\
          Output a JSON array containing the expanded, complete list of files. For each file, provide 'path', 'description' (concise, 1-2 sentences), and 'language'.\n\
          Keep each file description concise (1-2 sentences) so the manifest generates quickly.\n\
          Ensure all files from the original list are preserved.\n\
@@ -5131,7 +5222,7 @@ export default function RootLayout({
                                 }
                             }
                         }
-                        files_to_generate = merged;
+                        files_to_generate = crate::sanitizer::filter_runaway_manifest_expansion(&files, merged, &project_type);
                         crate::sanitizer::deduplicate_manifest_files(&mut files_to_generate);
                         debug_log_to_file(format!(
                             "[Orchestrator] Expanded and merged file list from {} to {} files using local Ollama (Attempt {}).",
@@ -5636,6 +5727,7 @@ export default function RootLayout({
                 cleaned
             };
             processed_content = post_process_generated_file(file_path, &pre_processed, &metamanifest, has_tailwind);
+            processed_content = crate::sanitizer::reconcile_server_prisma_enum_usage(&proj_dir, file_path, &processed_content);
             
             // Run project-aware validation agent
             match validate_file_with_project_context(&proj_dir, file_path, &processed_content, &model_id).await {
@@ -5770,8 +5862,10 @@ export default function RootLayout({
         }
     }
 
-    // Ensure theme file exists if imported in layout files
+    // Ensure theme file, UI primitives & directory barrels exist BEFORE local import repair scans missing modules
     ensure_theme_file_exists(&proj_dir);
+    crate::sanitizer::ensure_ui_primitives_reconciled(&proj_dir);
+    ensure_directory_barrel_files(&proj_dir);
 
     // Resolve any broken local imports in generated JS/TS code
     repair_broken_imports(&proj_dir, &model_id).await;

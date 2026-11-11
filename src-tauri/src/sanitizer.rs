@@ -353,6 +353,98 @@ pub fn deduplicate_manifest_files(files: &mut Vec<Value>) {
     *files = out;
 }
 
+/// Prevents runaway local LLM manifest expansion bloat while preserving every file
+/// originally requested in `original_files`:
+/// - Drops foreign framework files (`.vue`, `.svelte`) in Next.js projects
+/// - Canonicalizes expansion-only `src/app/{components,utils,config,hooks,lib,types,models,styles}/...`
+///   paths back to `src/...` when the original manifest did not use `src/app/<folder>/`
+/// - Caps expansion-added translation/locale JSON bundles so Ollama cannot spend 20 minutes
+///   generating dozens of regional locale matrices (e.g. `zh-AT.json` .. `zh-VN.json`).
+pub fn filter_runaway_manifest_expansion(
+    original_files: &[Value],
+    expanded_files: Vec<Value>,
+    project_type: &str,
+) -> Vec<Value> {
+    let mut orig_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut orig_nested_app_folders: std::collections::HashSet<String> = std::collections::HashSet::new();
+    const NON_ROUTE_FOLDERS: &[&str] = &[
+        "components", "utils", "config", "hooks", "lib", "types", "models", "styles",
+    ];
+
+    for f in original_files {
+        if let Some(p) = f.get("path").and_then(|v| v.as_str()) {
+            let norm = p.trim().replace('\\', "/").trim_start_matches("./").to_lowercase();
+            if !norm.is_empty() {
+                for folder in NON_ROUTE_FOLDERS {
+                    let prefix = format!("src/app/{}/", folder);
+                    if norm.starts_with(&prefix) {
+                        orig_nested_app_folders.insert((*folder).to_string());
+                    }
+                }
+                orig_paths.insert(norm);
+            }
+        }
+    }
+
+    let mut out: Vec<Value> = Vec::with_capacity(expanded_files.len());
+    let mut added_locale_json_count = 0usize;
+
+    for mut item in expanded_files {
+        let Some(raw_path) = item.get("path").and_then(|v| v.as_str()).map(|s| s.to_string()) else {
+            out.push(item);
+            continue;
+        };
+        let mut clean = raw_path.trim().replace('\\', "/").trim_start_matches("./").to_string();
+        let norm_low = clean.to_lowercase();
+        if norm_low.is_empty() {
+            continue;
+        }
+
+        if orig_paths.contains(&norm_low) {
+            out.push(item);
+            continue;
+        }
+
+        if project_type == "nextjs" {
+            if norm_low.ends_with(".vue") || norm_low.ends_with(".svelte") {
+                continue;
+            }
+
+            let is_locale_json = norm_low.ends_with(".json")
+                && (norm_low.contains("/translations/")
+                    || norm_low.starts_with("translations/")
+                    || norm_low.contains("/locales/")
+                    || norm_low.starts_with("locales/")
+                    || norm_low.contains("/messages/")
+                    || norm_low.starts_with("messages/")
+                    || norm_low.contains("/i18n/"));
+            if is_locale_json {
+                added_locale_json_count += 1;
+                if added_locale_json_count > 2 {
+                    continue;
+                }
+            }
+
+            for folder in NON_ROUTE_FOLDERS {
+                if !orig_nested_app_folders.contains(*folder) {
+                    let bad_prefix = format!("src/app/{}/", folder);
+                    if clean.len() >= bad_prefix.len() && norm_low.starts_with(&bad_prefix) {
+                        clean = format!("src/{}/{}", folder, &clean[bad_prefix.len()..]);
+                        if let Some(obj) = item.as_object_mut() {
+                            obj.insert("path".to_string(), serde_json::json!(clean));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        out.push(item);
+    }
+
+    out
+}
+
 pub fn get_axiom_inspector_script() -> &'static str {
     "      <script dangerouslySetInnerHTML={{ __html: `\n        if (!window.__axiom_inspect_injected) {\n          window.__axiom_inspect_injected = true;\n          let isInspectActive = false;\n          let lastReportedOverlaySig = '';\n          function extractNextjsOverlay() {\n            try {\n              const portal = document.querySelector('nextjs-portal');\n              const root = (portal && portal.shadowRoot) ? portal.shadowRoot : document;\n              const dialog = root.querySelector('[data-nextjs-dialog], [role=\"dialog\"], #nextjs__container_errors_label');\n              let rawText = dialog ? (dialog.innerText || dialog.textContent || '').trim() : '';\n              if (!rawText && root !== document) {\n                rawText = Array.from(root.children || []).filter(el => el.tagName !== 'STYLE' && el.tagName !== 'SCRIPT').map(el => el.innerText || el.textContent || '').join(String.fromCharCode(10)).trim();\n              }\n              if (!rawText || (!rawText.includes('Error') && !rawText.includes('Failed to compile') && !rawText.includes('Module not found'))) return null;\n              const normText = rawText.split(String.fromCharCode(92)).join('/');\n              const fileMatch = normText.match(new RegExp('(?:src/|app/|pages/|components/)[A-Za-z0-9_/.+-]+[.](?:tsx|ts|jsx|js)'));\n              const sourceFile = fileMatch ? fileMatch[0] : null;\n              const lines = normText.split(String.fromCharCode(10)).map(l => l.trim()).filter(l => l && !l.startsWith(':host') && !l.startsWith('/*!'));\n              const errLine = lines.find(l => l.includes('Module not found:') || l.includes('Error:') || l.includes('Failed to compile')) || lines[0] || '';\n              const message = errLine.substring(0, 220);\n              return { hasError: true, message, sourceFile, rawText: rawText.substring(0, 1200) };\n            } catch (e) { return null; }\n          }\n          function collectAxiomUiSnapshot() {\n            try {\n              const isVis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };\n              const headings = Array.from(document.querySelectorAll('h1, h2, h3')).slice(0, 20).map(h => ({ tag: h.tagName.toLowerCase(), text: (h.innerText || '').trim().substring(0, 120) })).filter(h => h.text);\n              const buttons = Array.from(document.querySelectorAll('button, [role=\"button\"]')).slice(0, 35).map(b => ({ text: (b.innerText || '').trim().substring(0, 80), ariaLabel: b.getAttribute('aria-label') || '', disabled: !!b.disabled, visible: isVis(b) }));\n              const links = Array.from(document.querySelectorAll('a')).slice(0, 35).map(a => ({ text: (a.innerText || '').trim().substring(0, 80), href: a.getAttribute('href') || '', visible: isVis(a) }));\n              const inputs = Array.from(document.querySelectorAll('input, select, textarea')).slice(0, 25).map(i => ({ tag: i.tagName.toLowerCase(), type: i.getAttribute('type') || '', name: i.getAttribute('name') || '', placeholder: i.getAttribute('placeholder') || '', value: (i.value || '').substring(0, 80) }));\n              const overlay = extractNextjsOverlay();\n              const bodyText = (document.body ? document.body.innerText : '').trim();\n              return {\n                url: window.location.href,\n                pathname: window.location.pathname,\n                title: document.title || '',\n                nextjsOverlay: overlay,\n                headings,\n                buttons,\n                links,\n                inputs,\n                layout: {\n                  viewportWidth: window.innerWidth,\n                  viewportHeight: window.innerHeight,\n                  scrollWidth: document.documentElement ? document.documentElement.scrollWidth : 0,\n                  scrollHeight: document.documentElement ? document.documentElement.scrollHeight : 0,\n                  hasHorizontalOverflow: (document.documentElement ? document.documentElement.scrollWidth : 0) > window.innerWidth + 4,\n                  hasNavbar: !!document.querySelector('nav, header'),\n                  hasFooter: !!document.querySelector('footer'),\n                  visibleTextPreview: bodyText.substring(0, 600)\n                }\n              };\n            } catch (e) { return { error: String(e) }; }\n          }\n          function reportAxiomRoute() {\n            try {\n              const overlay = extractNextjsOverlay();\n              if (overlay && overlay.hasError) {\n                const sig = (overlay.sourceFile || '') + '::' + overlay.message;\n                if (sig !== lastReportedOverlaySig) {\n                  lastReportedOverlaySig = sig;\n                  window.parent.postMessage({ channel: 'axiom-preview-error', message: overlay.message, sourceFile: overlay.sourceFile, details: overlay.rawText, path: window.location.pathname }, '*');\n                }\n              }\n              window.parent.postMessage({ channel: 'axiom-preview-route', pathname: window.location.pathname, url: window.location.href, snapshot: collectAxiomUiSnapshot() }, '*');\n            } catch(e) {}\n          }\n          setTimeout(reportAxiomRoute, 400);\n          window.addEventListener('popstate', reportAxiomRoute);\n          setInterval(reportAxiomRoute, 2000);\n          window.addEventListener('error', function(e) { try { window.parent.postMessage({ channel: 'axiom-preview-error', message: e.message || 'Unknown runtime error', sourceFile: e.filename || null, path: window.location.pathname }, '*'); } catch(err) {} });\n          window.addEventListener('unhandledrejection', function(e) { try { window.parent.postMessage({ channel: 'axiom-preview-error', message: e.reason?.message || String(e.reason || 'Unhandled promise rejection'), path: window.location.pathname }, '*'); } catch(err) {} });\n          window.addEventListener('message', (e) => {\n            if (e.data && e.data.channel === 'axiom-toggle-inspect') {\n              isInspectActive = !!e.data.enabled;\n              if (!isInspectActive && highlightedElement) {\n                highlightedElement.classList.remove('axiom-inspect-highlight');\n                highlightedElement = null;\n              }\n            }\n            if (e.data && e.data.channel === 'axiom-agent-dom-cmd') {\n              const cmd = e.data;\n              try {\n                if (cmd.action === 'snapshot') {\n                  window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'ok', snapshot: collectAxiomUiSnapshot() }, '*');\n                } else if (cmd.action === 'click') {\n                  let el = cmd.selector ? document.querySelector(cmd.selector) : null;\n                  if (!el && cmd.text) {\n                    const needle = cmd.text.toLowerCase();\n                    const candidates = Array.from(document.querySelectorAll('button, a, [role=\"button\"], li, span'));\n                    el = candidates.find(c => ((c.innerText || '').trim().toLowerCase().includes(needle)) || ((c.getAttribute('aria-label') || '').toLowerCase().includes(needle)));\n                  }\n                  if (el) {\n                    el.click();\n                    setTimeout(() => {\n                      window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'clicked: ' + (el.innerText || el.tagName).trim().substring(0, 50), snapshot: collectAxiomUiSnapshot() }, '*');\n                    }, 600);\n                  } else {\n                    window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'element_not_found', snapshot: collectAxiomUiSnapshot() }, '*');\n                  }\n                } else if (cmd.action === 'type') {\n                  let el = cmd.selector ? document.querySelector(cmd.selector) : null;\n                  if (!el && cmd.placeholder) {\n                    const needle = cmd.placeholder.toLowerCase();\n                    el = Array.from(document.querySelectorAll('input, textarea')).find(i => (i.getAttribute('placeholder') || '').toLowerCase().includes(needle) || (i.getAttribute('name') || '').toLowerCase().includes(needle));\n                  }\n                  if (el) {\n                    const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;\n                    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;\n                    if (setter) setter.call(el, cmd.value || ''); else el.value = cmd.value || '';\n                    el.dispatchEvent(new Event('input', { bubbles: true }));\n                    el.dispatchEvent(new Event('change', { bubbles: true }));\n                    setTimeout(() => {\n                      window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'typed', snapshot: collectAxiomUiSnapshot() }, '*');\n                    }, 300);\n                  } else {\n                    window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'input_not_found', snapshot: collectAxiomUiSnapshot() }, '*');\n                  }\n                } else if (cmd.action === 'navigate' && cmd.route) {\n                  window.location.href = cmd.route;\n                }\n              } catch (err) {\n                window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'error: ' + String(err), snapshot: collectAxiomUiSnapshot() }, '*');\n              }\n            }\n          });\n          const styleEl = document.createElement('style');\n          styleEl.textContent = '.axiom-inspect-highlight { outline: 2px solid #6366f1 !important; outline-offset: -2px !important; cursor: crosshair !important; background-color: rgba(99, 102, 241, 0.12) !important; transition: all 0.1s ease; }';\n          document.head.appendChild(styleEl);\n          let highlightedElement = null;\n          function findAxiomTarget(el) {\n            if (!el || el === document.body || el === document.documentElement) return null;\n            let cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              if (cur.dataset && (cur.dataset.axiomFile || cur.dataset.axiomComponent)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            const validTags = ['h1','h2','h3','h4','h5','h6','p','button','a','input','textarea','select','header','footer','nav','section','article','aside','li'];\n            cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              const tag = cur.tagName.toLowerCase();\n              if (validTags.includes(tag) || (cur.innerText && cur.innerText.trim().length > 0 && cur.children.length === 0)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            return el !== document.body && el !== document.documentElement ? el : null;\n          }\n          document.addEventListener('mouseover', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (highlightedElement && highlightedElement !== target) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n            }\n            if (target) {\n              target.classList.add('axiom-inspect-highlight');\n              highlightedElement = target;\n            }\n          }, true);\n          document.addEventListener('mouseout', (e) => {\n            if (highlightedElement) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n              highlightedElement = null;\n            }\n          }, true);\n          document.addEventListener('click', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (target) {\n              e.preventDefault();\n              e.stopPropagation();\n              const payload = {\n                file: target.dataset?.axiomFile || null,\n                component: target.dataset?.axiomComponent || null,\n                tagName: target.tagName.toLowerCase(),\n                text: (target.innerText || target.value || '').trim().substring(0, 80),\n                path: window.location.pathname\n              };\n              window.parent.postMessage({ channel: 'axiom-inspect-click', payload }, '*');\n            }\n          }, true);\n        }\n      ` }} />"
 }
@@ -425,13 +517,28 @@ pub fn ensure_directory_barrel_files(proj_dir: &std::path::Path) {
     }
     let alias_root = if has_src { src_dir.clone() } else { proj_dir.to_path_buf() };
 
-    // Demand-driven scan: find any local import specifier (`@/...` or `./...` or `../...`) that resolves to an existing directory lacking an index file
-    let import_re = match regex::Regex::new(r#"(?m)import\s+(?:type\s+)?(?:\{([^}]+)\}|[A-Za-z0-9_$*,\s]+)\s+from\s+['"](@/[^'"]+|\.\.?/[^'"]+)['"]"#) {
+    // Demand-driven scan: find any local import or re-export specifier (`@/...`, `./...`, `../...`)
+    // that resolves to a barrel directory (either missing index.* or having a broken index.* re-export)
+    let import_re = match regex::Regex::new(
+        r#"(?ms)(?:^|[;\n])[ \t]*(?:import|export)\s+(?:type\s+)?(?:(?:[A-Za-z0-9_$]+\s*,\s*)?\{([^}]+)\}|[A-Za-z0-9_$*\s]+)\s+from\s+['"](@/[^'"]+|\.\.?/[^'"]+)['"]"#
+    ) {
         Ok(r) => r,
         Err(_) => return,
     };
 
     let mut demanded_dirs: std::collections::BTreeMap<std::path::PathBuf, std::collections::BTreeSet<String>> = std::collections::BTreeMap::new();
+
+    // Seed standard existing directories if they already have an index.* file so dead re-exports are repaired even if unreferenced
+    for std_dir_name in ["components", "hooks", "types", "utils", "lib", "models", "services", "context", "contexts"] {
+        let candidate_dir = alias_root.join(std_dir_name);
+        if candidate_dir.is_dir()
+            && (candidate_dir.join("index.ts").is_file()
+                || candidate_dir.join("index.tsx").is_file()
+                || candidate_dir.join("index.js").is_file())
+        {
+            demanded_dirs.entry(normalize_rel_fs_components(&candidate_dir)).or_default();
+        }
+    }
 
     fn scan_demanded_barrels(
         dir: &std::path::Path,
@@ -454,9 +561,9 @@ pub fn ensure_directory_barrel_files(proj_dir: &std::path::Path) {
                             for cap in re.captures_iter(&content) {
                                 let spec = cap.get(2).map(|m| m.as_str()).unwrap_or("");
                                 let target_dir = if let Some(sub) = spec.strip_prefix("@/") {
-                                    src_root.join(sub)
+                                    normalize_rel_fs_components(&src_root.join(sub))
                                 } else if let Some(parent) = p.parent() {
-                                    parent.join(spec)
+                                    normalize_rel_fs_components(&parent.join(spec))
                                 } else {
                                     continue;
                                 };
@@ -514,15 +621,17 @@ pub fn ensure_directory_barrel_files(proj_dir: &std::path::Path) {
         }
     }
 
+    let barrel_reexport_re = regex::Regex::new(
+        r#"(?ms)(?:^|\n)[ \t]*(?:export|import)\s+(?:type\s+)?(?:\*\s*(?:as\s+[A-Za-z0-9_$]+\s*)?|\{([^}]+)\}|[A-Za-z0-9_$]+(?:\s*,\s*\{([^}]+)\})?)\s+from\s+['"](\.\.?/[^'"]+)['"]\s*;?"#
+    ).ok();
+
     for (dir_path, demanded_symbols) in demanded_dirs {
         let index_ts = dir_path.join("index.ts");
         let index_tsx = dir_path.join("index.tsx");
         let index_js = dir_path.join("index.js");
-        if index_ts.is_file() || index_tsx.is_file() || index_js.is_file() {
-            continue;
-        }
 
         let mut stems: Vec<String> = Vec::new();
+        let mut siblings: Vec<(String, String)> = Vec::new();
         let mut combined_existing_content = String::new();
         if let Ok(entries) = std::fs::read_dir(&dir_path) {
             for entry in entries.flatten() {
@@ -533,16 +642,35 @@ pub fn ensure_directory_barrel_files(proj_dir: &std::path::Path) {
                             && !fname.starts_with("index.")
                             && !fname.ends_with(".d.ts")
                         {
-                            if let Ok(c) = std::fs::read_to_string(&p) {
-                                combined_existing_content.push_str(&c);
-                                combined_existing_content.push('\n');
-                            }
                             let stem = fname
                                 .trim_end_matches(".tsx")
                                 .trim_end_matches(".ts")
                                 .to_string();
+                            let c = std::fs::read_to_string(&p).unwrap_or_default();
+                            combined_existing_content.push_str(&c);
+                            combined_existing_content.push('\n');
                             if !stem.is_empty() {
-                                stems.push(stem);
+                                stems.push(stem.clone());
+                                siblings.push((stem, c));
+                            }
+                        }
+                    }
+                } else if p.is_dir() {
+                    if let Some(dname) = p.file_name().and_then(|n| n.to_str()) {
+                        if dname != "node_modules" && dname != ".next" {
+                            let sub_idx = if p.join("index.tsx").is_file() {
+                                Some(p.join("index.tsx"))
+                            } else if p.join("index.ts").is_file() {
+                                Some(p.join("index.ts"))
+                            } else {
+                                None
+                            };
+                            if let Some(sub_p) = sub_idx {
+                                let c = std::fs::read_to_string(&sub_p).unwrap_or_default();
+                                combined_existing_content.push_str(&c);
+                                combined_existing_content.push('\n');
+                                stems.push(dname.to_string());
+                                siblings.push((dname.to_string(), c));
                             }
                         }
                     }
@@ -550,25 +678,213 @@ pub fn ensure_directory_barrel_files(proj_dir: &std::path::Path) {
             }
         }
         stems.sort();
+        siblings.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let existing_index_path = if index_ts.is_file() {
+            Some(index_ts.clone())
+        } else if index_tsx.is_file() {
+            Some(index_tsx.clone())
+        } else if index_js.is_file() {
+            Some(index_js.clone())
+        } else {
+            None
+        };
+
+        let dir_name = dir_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let is_component_dir = dir_name.eq_ignore_ascii_case("components") || dir_name.eq_ignore_ascii_case("ui");
+
+        if let Some(existing_path) = existing_index_path {
+            let Ok(existing_content) = std::fs::read_to_string(&existing_path) else {
+                continue;
+            };
+            let mut repaired = existing_content.clone();
+            let mut had_broken = false;
+            let mut dead_spans: Vec<(usize, usize)> = Vec::new();
+            let mut broken_syms: Vec<String> = Vec::new();
+            let mut active_reexport_specs: Vec<String> = Vec::new();
+
+            if let Some(ref re) = barrel_reexport_re {
+                for cap in re.captures_iter(&existing_content) {
+                    let Some(full_m) = cap.get(0) else { continue };
+                    let spec = cap.get(3).map(|m| m.as_str()).unwrap_or("");
+                    let target_abs = normalize_rel_fs_components(&dir_path.join(spec));
+                    let resolves = target_abs.is_file()
+                        || target_abs.with_extension("ts").is_file()
+                        || target_abs.with_extension("tsx").is_file()
+                        || target_abs.with_extension("js").is_file()
+                        || target_abs.with_extension("jsx").is_file()
+                        || target_abs.join("index.ts").is_file()
+                        || target_abs.join("index.tsx").is_file()
+                        || target_abs.join("index.js").is_file()
+                        || target_abs.join("index.jsx").is_file();
+
+                    if resolves {
+                        active_reexport_specs.push(spec.trim_start_matches("./").to_string());
+                    } else {
+                        had_broken = true;
+                        dead_spans.push((full_m.start(), full_m.end()));
+                        if let Some(braced) = cap.get(1).or_else(|| cap.get(2)) {
+                            for raw in braced.as_str().split(',') {
+                                let part = raw.trim().trim_start_matches("type ").trim();
+                                if let Some((_, alias)) = part.split_once(" as ") {
+                                    let a = alias.trim();
+                                    if !a.is_empty() && !broken_syms.contains(&a.to_string()) {
+                                        broken_syms.push(a.to_string());
+                                    }
+                                } else {
+                                    let clean = part.split_whitespace().next().unwrap_or("");
+                                    if !clean.is_empty() && !broken_syms.contains(&clean.to_string()) {
+                                        broken_syms.push(clean.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !dead_spans.is_empty() {
+                dead_spans.sort_by_key(|(s, _)| *s);
+                let mut rebuilt = String::with_capacity(existing_content.len());
+                let mut cursor = 0usize;
+                for (s, e) in dead_spans {
+                    if s >= cursor && e <= existing_content.len() {
+                        rebuilt.push_str(&existing_content[cursor..s]);
+                        cursor = e;
+                    }
+                }
+                if cursor < existing_content.len() {
+                    rebuilt.push_str(&existing_content[cursor..]);
+                }
+                repaired = rebuilt.trim().to_string();
+            }
+
+            // Collect needed symbols: both demanded external imports AND any symbols rescued from broken lines
+            let mut needed_syms: std::collections::BTreeSet<String> = demanded_symbols.clone();
+            for bs in broken_syms {
+                needed_syms.insert(bs);
+            }
+
+            // Check whether each needed symbol is already covered by valid lines or active sibling wildcard re-exports
+            let mut uncovered_syms: Vec<String> = Vec::new();
+            for sym in &needed_syms {
+                let covered_inline = has_named_export_symbol(&repaired, sym);
+                let covered_via_active = active_reexport_specs.iter().any(|stem| {
+                    siblings
+                        .iter()
+                        .find(|(s, _)| s == stem)
+                        .map_or(false, |(_, content)| has_named_export_symbol(content, sym))
+                });
+                if !covered_inline && !covered_via_active {
+                    uncovered_syms.push(sym.clone());
+                }
+            }
+
+            if had_broken || !uncovered_syms.is_empty() {
+                let mut appended_lines: Vec<String> = Vec::new();
+                let mut handled_stems: std::collections::BTreeSet<String> = active_reexport_specs.into_iter().collect();
+
+                // Match uncovered symbols to real sibling files in this directory
+                let mut still_missing_syms: Vec<String> = Vec::new();
+                for sym in uncovered_syms {
+                    if let Some((sib_stem, sib_content)) = siblings
+                        .iter()
+                        .find(|(s, content)| s == &sym || has_named_export_symbol(content, &sym))
+                    {
+                        if handled_stems.insert(sib_stem.clone()) {
+                            let has_named_or_types = has_named_export_symbol(sib_content, sib_stem)
+                                || sib_content.contains("export const ")
+                                || sib_content.contains("export function ")
+                                || sib_content.contains("export interface ")
+                                || sib_content.contains("export type ")
+                                || sib_content.contains("export {");
+                            if !has_named_export_symbol(sib_content, sib_stem)
+                                && !has_named_or_types
+                                && sib_content.contains("export default")
+                            {
+                                appended_lines.push(format!("export {{ default as {} }} from './{}';", sib_stem, sib_stem));
+                            }
+                            let star_line = format!("export * from './{}';", sib_stem);
+                            if !repaired.contains(&star_line) && !appended_lines.contains(&star_line) {
+                                appended_lines.push(star_line);
+                            }
+                        }
+                    } else {
+                        still_missing_syms.push(sym);
+                    }
+                }
+
+                // If the barrel had broken lines and now looks sparse, also re-export existing siblings
+                if had_broken {
+                    for (sib_stem, sib_content) in &siblings {
+                        if handled_stems.insert(sib_stem.clone()) {
+                            let has_named = has_named_export_symbol(sib_content, sib_stem)
+                                || sib_content.contains("export interface ")
+                                || sib_content.contains("export type ");
+                            if !has_named && sib_content.contains("export default") {
+                                let def_line = format!("export {{ default as {} }} from './{}';", sib_stem, sib_stem);
+                                if !repaired.contains(&def_line) && !appended_lines.contains(&def_line) {
+                                    appended_lines.push(def_line);
+                                }
+                            }
+                            let star_line = format!("export * from './{}';", sib_stem);
+                            if !repaired.contains(&star_line) && !appended_lines.contains(&star_line) {
+                                appended_lines.push(star_line);
+                            }
+                        }
+                    }
+                }
+
+                for sym in still_missing_syms {
+                    if !has_named_export_symbol(&repaired, &sym) && !stems.contains(&sym) {
+                        let stub = if is_component_dir && sym.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
+                            format!("export const {}: any = () => null;", sym)
+                        } else if sym.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
+                            format!("export type {} = any;", sym)
+                        } else {
+                            format!("export const {}: any = () => ({{}} as any);", sym)
+                        };
+                        appended_lines.push(stub);
+                    }
+                }
+
+                if !appended_lines.is_empty() {
+                    if !repaired.is_empty() && !repaired.ends_with('\n') {
+                        repaired.push('\n');
+                    }
+                    repaired.push_str(&appended_lines.join("\n"));
+                }
+
+                if repaired.trim().is_empty() {
+                    repaired = "export {};".to_string();
+                }
+
+                if repaired != existing_content {
+                    let out = if repaired.ends_with('\n') {
+                        repaired
+                    } else {
+                        format!("{}\n", repaired)
+                    };
+                    let _ = std::fs::write(&existing_path, out);
+                }
+            }
+            continue;
+        }
 
         let mut lines = Vec::new();
-        for stem in &stems {
-            let ts_file = dir_path.join(format!("{}.ts", stem));
-            let tsx_file = dir_path.join(format!("{}.tsx", stem));
-            let target_file = if ts_file.exists() { ts_file } else { tsx_file };
-            if let Ok(file_content) = std::fs::read_to_string(&target_file) {
-                let has_named = has_named_export_symbol(&file_content, stem)
-                    || file_content.contains("export interface ")
-                    || file_content.contains("export type ");
-                if !has_named && file_content.contains("export default") {
-                    lines.push(format!("export {{ default as {} }} from './{}';", stem, stem));
-                }
+        for (stem, file_content) in &siblings {
+            let has_named = has_named_export_symbol(file_content, stem)
+                || file_content.contains("export interface ")
+                || file_content.contains("export type ");
+            if !has_named && file_content.contains("export default") {
+                lines.push(format!("export {{ default as {} }} from './{}';", stem, stem));
             }
             lines.push(format!("export * from './{}';", stem));
         }
 
         // For any demanded symbol not exported in any of its files:
-        // PascalCase -> safe type alias (`export type Foo = any;`)
+        // PascalCase in components -> safe null component (`export const Foo: any = () => null;`)
+        // PascalCase in types/other -> safe type alias (`export type Foo = any;`)
         // camelCase / other -> safe stub hook or function (`export const useFoo: any = () => ({} as any);`)
         for sym in demanded_symbols {
             if stems.contains(&sym) {
@@ -582,7 +898,9 @@ pub fn ensure_directory_barrel_files(proj_dir: &std::path::Path) {
                 || combined_existing_content.contains(&format!("function {}", sym))
                 || combined_existing_content.contains(&format!("class {}", sym));
             if !is_defined {
-                if sym.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
+                if is_component_dir && sym.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
+                    lines.push(format!("export const {}: any = () => null;", sym));
+                } else if sym.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
                     lines.push(format!("export type {} = any;", sym));
                 } else {
                     lines.push(format!("export const {}: any = () => ({{}} as any);", sym));
@@ -743,6 +1061,290 @@ pub fn ensure_next_server_imports(content: &str, path_lower: &str) -> String {
     }
 
     result
+}
+
+/// Converts accidental named `{ Link }` imports from `'next/link'` to the required default `import Link from 'next/link'`.
+pub fn sanitize_next_link_named_import(content: &str) -> String {
+    if !content.contains("next/link") {
+        return content.to_string();
+    }
+    let Ok(re_named_link) = regex::Regex::new(
+        r#"(?m)^(\s*)import\s+\{([^}]*)\}\s+from\s+(['"]next/link['"]\s*;?)"#,
+    ) else {
+        return content.to_string();
+    };
+    re_named_link
+        .replace_all(content, |caps: &regex::Captures| {
+            let indent = &caps[1];
+            let inner = &caps[2];
+            let mod_tail = &caps[3];
+            let mut local_link_name: Option<String> = None;
+            let mut remaining: Vec<String> = Vec::new();
+            for raw_item in inner.split(',') {
+                let it = raw_item.trim();
+                if it.is_empty() {
+                    continue;
+                }
+                if !it.starts_with("type ") {
+                    if let Some((orig, alias)) = it.split_once(" as ") {
+                        if orig.trim() == "Link" {
+                            local_link_name = Some(alias.trim().to_string());
+                            continue;
+                        }
+                    } else if it == "Link" {
+                        local_link_name = Some("Link".to_string());
+                        continue;
+                    }
+                }
+                remaining.push(it.to_string());
+            }
+            if let Some(link_ident) = local_link_name {
+                if remaining.is_empty() {
+                    format!("{}import {} from {}", indent, link_ident, mod_tail)
+                } else {
+                    format!(
+                        "{}import {}, {{ {} }} from {}",
+                        indent,
+                        link_ident,
+                        remaining.join(", "),
+                        mod_tail
+                    )
+                }
+            } else {
+                caps[0].to_string()
+            }
+        })
+        .to_string()
+}
+
+/// Repairs common NextAuth v4 import mistakes outside the canonical `[...nextauth]` route handler:
+/// - Moves provider factories (`CredentialsProvider`, `GoogleProvider`, etc.) out of `'next-auth'`
+///   braced imports into `'next-auth/providers/<provider>'` default imports.
+/// - Ensures default `NextAuth` is imported from `'next-auth'` when `NextAuth(` is called.
+pub fn sanitize_nextauth_imports(content: &str) -> String {
+    if !content.contains("next-auth") && !content.contains("NextAuth(") {
+        return content.to_string();
+    }
+    const PROVIDER_MAP: &[(&str, &str)] = &[
+        ("CredentialsProvider", "next-auth/providers/credentials"),
+        ("GoogleProvider", "next-auth/providers/google"),
+        ("GitHubProvider", "next-auth/providers/github"),
+        ("GithubProvider", "next-auth/providers/github"),
+        ("EmailProvider", "next-auth/providers/email"),
+        ("DiscordProvider", "next-auth/providers/discord"),
+    ];
+
+    let mut out = content.to_string();
+    let mut extracted_providers: Vec<(String, &'static str)> = Vec::new();
+
+    if let Ok(re_na_named) = regex::Regex::new(
+        r#"(?m)^(\s*)import\s+(?:([A-Za-z_$][A-Za-z0-9_$]*)\s*,\s*)?\{([^}]*)\}\s*from\s+(['"]next-auth(?:/providers)?['"]\s*;?)"#,
+    ) {
+        out = re_na_named
+            .replace_all(&out, |caps: &regex::Captures| {
+                let indent = &caps[1];
+                let def_ident = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                let inner = &caps[3];
+                let mod_tail = &caps[4];
+                let mut kept: Vec<String> = Vec::new();
+                for raw_item in inner.split(',') {
+                    let it = raw_item.trim();
+                    if it.is_empty() {
+                        continue;
+                    }
+                    let base_name = it
+                        .strip_prefix("type ")
+                        .unwrap_or(it)
+                        .split(" as ")
+                        .next()
+                        .unwrap_or("")
+                        .trim();
+                    if let Some((_, prov_path)) = PROVIDER_MAP.iter().find(|(p, _)| *p == base_name) {
+                        let local_name = it
+                            .split_once(" as ")
+                            .map(|(_, a)| a.trim().to_string())
+                            .unwrap_or_else(|| base_name.to_string());
+                        if !extracted_providers.iter().any(|(n, _)| n == &local_name) {
+                            extracted_providers.push((local_name, *prov_path));
+                        }
+                    } else {
+                        kept.push(it.to_string());
+                    }
+                }
+                if kept.len() == inner.split(',').filter(|s| !s.trim().is_empty()).count() {
+                    return caps[0].to_string();
+                }
+                let q = if mod_tail.trim_start().starts_with('"') { "\"" } else { "'" };
+                let has_semi = mod_tail.trim_end().ends_with(';');
+                let semi = if has_semi { ";" } else { "" };
+                if def_ident.is_empty() && kept.is_empty() {
+                    String::new()
+                } else if kept.is_empty() {
+                    format!("{}import {} from {}next-auth{}{}", indent, def_ident, q, q, semi)
+                } else if def_ident.is_empty() {
+                    format!("{}import {{ {} }} from {}next-auth{}{}", indent, kept.join(", "), q, q, semi)
+                } else {
+                    format!(
+                        "{}import {}, {{ {} }} from {}next-auth{}{}",
+                        indent,
+                        def_ident,
+                        kept.join(", "),
+                        q,
+                        q,
+                        semi
+                    )
+                }
+            })
+            .to_string();
+    }
+
+    let mut extra_imports = String::new();
+    for (local_name, prov_path) in extracted_providers {
+        if !out.contains(prov_path) {
+            extra_imports.push_str(&format!("import {} from '{}';\n", local_name, prov_path));
+        }
+    }
+
+    let calls_nextauth = regex::Regex::new(r"\bNextAuth\s*\(")
+        .map(|re| re.is_match(&out))
+        .unwrap_or(false);
+    let imports_default_nextauth = regex::Regex::new(
+        r#"(?m)^\s*import\s+NextAuth(?:\s*,|\s+from\b)"#,
+    )
+    .map(|re| re.is_match(&out))
+    .unwrap_or(false);
+    let declares_nextauth = regex::Regex::new(
+        r#"(?m)\b(?:function|const|let|var)\s+NextAuth\b"#,
+    )
+    .map(|re| re.is_match(&out))
+    .unwrap_or(false);
+
+    if calls_nextauth && !imports_default_nextauth && !declares_nextauth {
+        extra_imports.push_str("import NextAuth from 'next-auth';\n");
+    }
+
+    if !extra_imports.is_empty() {
+        out = out.trim_start_matches('\n').to_string();
+        out = format!("{}{}", extra_imports, out);
+    }
+    out
+}
+
+/// Deterministically repairs declared Prisma Enum usage in server-side files using `prisma/schema.prisma`:
+/// - Rewrites Prisma v4 `Prisma.<DeclaredEnum>` references into top-level `<DeclaredEnum>` (required in Prisma v5+)
+/// - Ensures any referenced declared enum (`EnumName.MEMBER` or `: EnumName`) is imported from `'@prisma/client'`.
+pub fn reconcile_server_prisma_enum_usage(
+    proj_dir: &std::path::Path,
+    file_path: &str,
+    content: &str,
+) -> String {
+    let path_low = file_path.replace('\\', "/").to_lowercase();
+    if !(path_low.ends_with(".ts") || path_low.ends_with(".tsx") || path_low.ends_with(".js") || path_low.ends_with(".jsx")) {
+        return content.to_string();
+    }
+    let trimmed = content.trim_start();
+    let is_client_file = trimmed.starts_with("\"use client\"")
+        || trimmed.starts_with("'use client'")
+        || content.lines().take(5).any(|l| {
+            let t = l.trim();
+            t == "\"use client\";" || t == "\"use client\"" || t == "'use client';" || t == "'use client'"
+        });
+    let is_hook_file = (path_low.contains("/hooks/") || path_low.starts_with("hooks/")) && !path_low.contains("/api/");
+    if is_client_file || is_hook_file {
+        return content.to_string();
+    }
+
+    let Some(schema_path) = [
+        proj_dir.join("prisma/schema.prisma"),
+        proj_dir.join("schema.prisma"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file()) else {
+        return content.to_string();
+    };
+    let Ok(schema_src) = std::fs::read_to_string(&schema_path) else {
+        return content.to_string();
+    };
+    let contract = crate::orchestrator::extract_prisma_schema_contract(&schema_src);
+    let Some(enums_obj) = contract.get("enums").and_then(|e| e.as_object()) else {
+        return content.to_string();
+    };
+    if enums_obj.is_empty() {
+        return content.to_string();
+    }
+
+    let mut out = content.to_string();
+    let mut enums_to_import: Vec<String> = Vec::new();
+
+    for enum_name in enums_obj.keys() {
+        let esc = regex::escape(enum_name);
+        // Strip legacy `Prisma.<EnumName>` namespace prefix (Prisma v5 exports enums at top level)
+        if let Ok(re_ns) = regex::Regex::new(&format!(r"\bPrisma\s*\.\s*{}\b", esc)) {
+            if re_ns.is_match(&out) {
+                out = re_ns.replace_all(&out, enum_name.as_str()).to_string();
+            }
+        }
+
+        let used_member = regex::Regex::new(&format!(r"\b{}\.[A-Z][A-Z0-9_]*\b", esc))
+            .map(|r| r.is_match(&out))
+            .unwrap_or(false);
+        let used_type_or_z = regex::Regex::new(&format!(
+            r"(?::\s*{}|\bz\.nativeEnum\s*\(\s*{}\s*\))",
+            esc, esc
+        ))
+        .map(|r| r.is_match(&out))
+        .unwrap_or(false);
+        if !used_member && !used_type_or_z {
+            continue;
+        }
+
+        let already_bound = regex::Regex::new(&format!(
+            r#"(?s)(?:\bimport\s+(?:type\s+)?(?:\{{[^}}]*\b{}\b[^}}]*\}}|{}\b)|\b(?:enum|const|let|var|type|interface)\s+{}\b)"#,
+            esc, esc, esc
+        ))
+        .map(|r| r.is_match(&out))
+        .unwrap_or(false);
+        if !already_bound {
+            enums_to_import.push(enum_name.clone());
+        }
+    }
+
+    if enums_to_import.is_empty() {
+        return out;
+    }
+
+    // Merge into an existing runtime `@prisma/client` import if present
+    if let Ok(re_prisma_val_imp) = regex::Regex::new(
+        r#"(?m)^(\s*import\s+)\{([^}]*)\}(\s*from\s*['"]@prisma/client['"]\s*;?)"#,
+    ) {
+        if re_prisma_val_imp.is_match(&out) {
+            let mut merged_once = false;
+            out = re_prisma_val_imp
+                .replace(&out, |caps: &regex::Captures| {
+                    merged_once = true;
+                    let prefix = &caps[1];
+                    let existing = caps[2].trim().trim_end_matches(',');
+                    let suffix = &caps[3];
+                    if existing.is_empty() {
+                        format!("{}{{ {} }}{}", prefix, enums_to_import.join(", "), suffix)
+                    } else {
+                        format!(
+                            "{}{{ {}, {} }}{}",
+                            prefix,
+                            existing,
+                            enums_to_import.join(", "),
+                            suffix
+                        )
+                    }
+                })
+                .to_string();
+            if merged_once {
+                return out;
+            }
+        }
+    }
+
+    format!("import {{ {} }} from '@prisma/client';\n{}", enums_to_import.join(", "), out)
 }
 
 pub fn deduplicate_repeated_css_blocks(css: &str) -> String {
@@ -937,6 +1539,284 @@ pub fn widen_narrow_ui_props_interfaces(content: &str) -> String {
     out
 }
 
+fn find_balanced_delimiter_bytes(src: &str, open_idx: usize, open_b: u8, close_b: u8) -> Option<usize> {
+    let bytes = src.as_bytes();
+    if bytes.get(open_idx) != Some(&open_b) {
+        return None;
+    }
+    let mut depth = 0isize;
+    let mut i = open_idx;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_tick = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let mut escaped = false;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_line_comment {
+            if b == b'\n' {
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_block_comment {
+            if b == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                in_block_comment = false;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if (in_single || in_double || in_tick) && b == b'\\' {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if !in_double && !in_tick && b == b'\'' {
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+        if !in_single && !in_tick && b == b'"' {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+        if !in_single && !in_double && b == b'`' {
+            in_tick = !in_tick;
+            i += 1;
+            continue;
+        }
+        if !in_single && !in_double && !in_tick {
+            if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+                in_line_comment = true;
+                i += 2;
+                continue;
+            }
+            if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                in_block_comment = true;
+                i += 2;
+                continue;
+            }
+            if b == open_b {
+                depth += 1;
+            } else if b == close_b {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Upgrades bare `React.FC =` / `React.FunctionComponent =` (missing `<Props>` generic, which defaults
+/// to `{}` under React 18 and rejects `children`, `className`, `onClick`, etc.) to `React.FC<any> =`
+/// whenever props are destructured `({ ... })` or inside a UI component module (`force_ui_module`).
+pub fn repair_bare_react_fc_signatures(content: &str, force_ui_module: bool) -> String {
+    let pat = if force_ui_module {
+        r"React\.(FC|FunctionComponent)\s*="
+    } else {
+        r"React\.(FC|FunctionComponent)\s*=\s*(?:async\s*)?\(\s*\{"
+    };
+    let Ok(re) = regex::Regex::new(pat) else {
+        return content.to_string();
+    };
+    if !re.is_match(content) {
+        return content.to_string();
+    }
+    if force_ui_module {
+        re.replace_all(content, "React.${1}<any> =").to_string()
+    } else {
+        let Ok(re_destr) = regex::Regex::new(r"(React\.(?:FC|FunctionComponent))(\s*=\s*(?:async\s*)?\(\s*\{)") else {
+            return content.to_string();
+        };
+        re_destr.replace_all(content, "${1}<any>${2}").to_string()
+    }
+}
+
+/// Repairs React UI primitive components (e.g. `export const Select: React.FC<{...}> = ({ name, value }) => (<select>{children}</select>)`)
+/// that reference `{children}` inside JSX without declaring `children` in their inline props type or destructuring `children` in parameters.
+pub fn repair_ui_fc_missing_children_prop(content: &str) -> String {
+    let upgraded = repair_bare_react_fc_signatures(content, false);
+    let content = upgraded.as_str();
+    let Ok(fc_header_re) = regex::Regex::new(r#"(?m)React\.FC\s*<"#) else {
+        return content.to_string();
+    };
+    let Ok(children_ident_re) = regex::Regex::new(r#"\bchildren\b"#) else {
+        return content.to_string();
+    };
+
+    let bytes = content.as_bytes();
+    let mut edits: Vec<(usize, String)> = Vec::new();
+
+    for m in fc_header_re.find_iter(content) {
+        let mut cursor = m.end();
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+
+        // Track optional inline `{ ... }` right after `React.FC<`
+        let inline_type_span = if bytes.get(cursor) == Some(&b'{') {
+            find_balanced_delimiter_bytes(content, cursor, b'{', b'}').map(|end| (cursor, end))
+        } else {
+            None
+        };
+
+        // Find closing `>` of `React.FC<...>` by tracking nested braces/parens/brackets
+        let mut angle_depth = 1isize;
+        let mut brace_d = 0isize;
+        let mut paren_d = 0isize;
+        let mut i = cursor;
+        let mut generic_close = None;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == b'{' {
+                brace_d += 1;
+            } else if b == b'}' {
+                brace_d = (brace_d - 1).max(0);
+            } else if b == b'(' {
+                paren_d += 1;
+            } else if b == b')' {
+                paren_d = (paren_d - 1).max(0);
+            } else if brace_d == 0 && paren_d == 0 {
+                if b == b'<' {
+                    angle_depth += 1;
+                } else if b == b'>' && (i == 0 || bytes[i - 1] != b'=') {
+                    angle_depth -= 1;
+                    if angle_depth == 0 {
+                        generic_close = Some(i);
+                        break;
+                    }
+                }
+            }
+            i += 1;
+        }
+        let Some(gt_idx) = generic_close else {
+            continue;
+        };
+
+        // Expect `= ({ ... }) =>`
+        let mut p = gt_idx + 1;
+        while p < bytes.len() && bytes[p].is_ascii_whitespace() {
+            p += 1;
+        }
+        if bytes.get(p) != Some(&b'=') {
+            continue;
+        }
+        p += 1;
+        while p < bytes.len() && bytes[p].is_ascii_whitespace() {
+            p += 1;
+        }
+        if bytes.get(p) != Some(&b'(') {
+            continue;
+        }
+        let Some(paren_close) = find_balanced_delimiter_bytes(content, p, b'(', b')') else {
+            continue;
+        };
+        let mut inner_param = p + 1;
+        while inner_param < paren_close && bytes[inner_param].is_ascii_whitespace() {
+            inner_param += 1;
+        }
+        if bytes.get(inner_param) != Some(&b'{') {
+            continue;
+        }
+        let Some(destructure_close) = find_balanced_delimiter_bytes(content, inner_param, b'{', b'}') else {
+            continue;
+        };
+
+        // Expect `=>` after `)`
+        let mut after_paren = paren_close + 1;
+        while after_paren < bytes.len() && bytes[after_paren].is_ascii_whitespace() {
+            after_paren += 1;
+        }
+        if bytes.get(after_paren) != Some(&b'=') || bytes.get(after_paren + 1) != Some(&b'>') {
+            continue;
+        }
+        let mut body_start = after_paren + 2;
+        while body_start < bytes.len() && bytes[body_start].is_ascii_whitespace() {
+            body_start += 1;
+        }
+        let body_end = if bytes.get(body_start) == Some(&b'{') {
+            find_balanced_delimiter_bytes(content, body_start, b'{', b'}').unwrap_or(bytes.len() - 1)
+        } else if bytes.get(body_start) == Some(&b'(') {
+            find_balanced_delimiter_bytes(content, body_start, b'(', b')').unwrap_or(bytes.len() - 1)
+        } else {
+            content[body_start..].find(';').map(|off| body_start + off).unwrap_or(bytes.len())
+        };
+        if body_end <= body_start {
+            continue;
+        }
+        let body_slice = &content[body_start..=body_end.min(bytes.len() - 1)];
+
+        // Check standalone `{children}` / `children` reference not preceded by `.`
+        let uses_children = children_ident_re.find_iter(body_slice).any(|cm| {
+            let before = body_slice[..cm.start()].trim_end();
+            !before.ends_with('.') && !before.ends_with("const") && !before.ends_with("let") && !before.ends_with("var")
+        });
+        if !uses_children {
+            continue;
+        }
+
+        let params_slice = &content[inner_param + 1..destructure_close];
+        if !children_ident_re.is_match(params_slice) {
+            if let Some(rest_off) = params_slice.find("...") {
+                edits.push((inner_param + 1 + rest_off, "children, ".to_string()));
+            } else {
+                let trimmed_end = params_slice.trim_end();
+                let insert_pos = inner_param + 1 + trimmed_end.len();
+                let patch = if trimmed_end.is_empty() {
+                    " children "
+                } else if trimmed_end.ends_with(',') {
+                    " children "
+                } else {
+                    ", children "
+                };
+                edits.push((insert_pos, patch.to_string()));
+            }
+        }
+
+        if let Some((t_open, t_close)) = inline_type_span {
+            let type_slice = &content[t_open + 1..t_close];
+            if !children_ident_re.is_match(type_slice) {
+                let trimmed_end = type_slice.trim_end();
+                let insert_pos = t_open + 1 + trimmed_end.len();
+                let patch = if trimmed_end.is_empty() {
+                    " children?: React.ReactNode "
+                } else if trimmed_end.ends_with(';') {
+                    " children?: React.ReactNode;"
+                } else {
+                    "; children?: React.ReactNode"
+                };
+                edits.push((insert_pos, patch.to_string()));
+            }
+        }
+    }
+
+    if edits.is_empty() {
+        return content.to_string();
+    }
+    edits.sort_by_key(|(pos, _)| *pos);
+    let mut out = content.to_string();
+    for (pos, patch) in edits.into_iter().rev() {
+        if pos <= out.len() && out.is_char_boundary(pos) {
+            out.insert_str(pos, &patch);
+        }
+    }
+    out
+}
+
 pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
     let raw_src_dir = proj_dir.join("src");
     let has_src = raw_src_dir.exists();
@@ -952,15 +1832,63 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
     let ui_dir = components_dir.join("ui");
 
     // 1. Collect all named imports referencing `@/components/ui`, `@/components/ui/<subpath>`,
+    //    `@/components` (for standard UI primitive names when `ui.tsx` exists or primitive file is absent),
     //    or relative `'./...'` / `'../...'` UI module imports inside `components/**`.
     let ui_import_re = match regex::Regex::new(
-        r#"(?ms)import\s+(?:type\s+)?\{([^}]+)\}\s+from\s+['"]((?:@/components/ui(?:/[^'"]+)?|\.\.?/[^'"]+))['"]"#
+        r#"(?ms)import\s+(?:type\s+)?\{([^}]+)\}\s+from\s+['"]((?:@/components(?:/ui(?:/[^'"]+)?)?|\.\.?/[^'"]+))['"]"#
     ) {
         Ok(r) => r,
         Err(_) => return,
     };
 
+    let is_standard_ui_primitive = |sym: &str| -> bool {
+        matches!(
+            sym,
+            "Button"
+                | "Input"
+                | "Textarea"
+                | "Select"
+                | "Option"
+                | "Card"
+                | "CardHeader"
+                | "CardTitle"
+                | "CardDescription"
+                | "CardContent"
+                | "CardFooter"
+                | "Badge"
+                | "Label"
+                | "Checkbox"
+                | "Switch"
+                | "Tabs"
+                | "TabsList"
+                | "TabsTrigger"
+                | "TabsContent"
+                | "Modal"
+                | "Dialog"
+                | "DialogContent"
+                | "DialogHeader"
+                | "DialogTitle"
+                | "DialogDescription"
+                | "Alert"
+                | "Avatar"
+                | "Spinner"
+                | "Skeleton"
+                | "MetricCard"
+                | "Table"
+        )
+    };
+
     let mut demanded: std::collections::BTreeMap<std::path::PathBuf, std::collections::BTreeSet<String>> = std::collections::BTreeMap::new();
+    let mut compound_demands: std::collections::BTreeMap<
+        std::path::PathBuf,
+        std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    > = std::collections::BTreeMap::new();
+    let ui_default_import_re = regex::Regex::new(
+        r#"(?m)import\s+([A-Z][A-Za-z0-9_]*)\s+from\s+['"]((?:@/components(?:/ui(?:/[^'"]+)?)?|\.\.?/[^'"]+))['"]"#,
+    )
+    .ok();
+    let compound_jsx_re = regex::Regex::new(r"<([A-Z][A-Za-z0-9_]*)\.([A-Z][A-Za-z0-9_]*)\b").ok();
+
     let mut stack = vec![src_dir.clone()];
     while let Some(dir) = stack.pop() {
         if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -976,6 +1904,71 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
                     if matches!(ext, "ts" | "tsx" | "js" | "jsx") {
                         if let Ok(content) = std::fs::read_to_string(&p) {
                             let is_inside_components = p.starts_with(&components_dir);
+                            let resolve_ui_spec = |spec: &str, only_existing: bool| -> Option<std::path::PathBuf> {
+                                if spec == "@/components" {
+                                    let ui_tsx = src_dir.join("components/ui.tsx");
+                                    if !ui_tsx.is_file() && !ui_dir.is_dir() {
+                                        return None;
+                                    }
+                                    return Some(if ui_tsx.is_file() {
+                                        ui_tsx
+                                    } else if ui_dir.join("index.tsx").is_file() {
+                                        ui_dir.join("index.tsx")
+                                    } else if ui_dir.join("index.ts").is_file() {
+                                        ui_dir.join("index.ts")
+                                    } else {
+                                        ui_tsx
+                                    });
+                                }
+                                let base = if spec.starts_with("@/") {
+                                    src_dir.join(spec.trim_start_matches("@/"))
+                                } else if is_inside_components {
+                                    let parent = p.parent()?;
+                                    let joined = normalize_rel_fs_components(&parent.join(spec));
+                                    if !(joined.starts_with(&ui_dir) || joined == ui_dir) {
+                                        return None;
+                                    }
+                                    joined
+                                } else {
+                                    return None;
+                                };
+                                let existing_target = if base.is_file() {
+                                    Some(base.clone())
+                                } else if base.with_extension("tsx").is_file() {
+                                    Some(base.with_extension("tsx"))
+                                } else if base.with_extension("ts").is_file() {
+                                    Some(base.with_extension("ts"))
+                                } else if base.is_dir() && base.join("index.tsx").is_file() {
+                                    Some(base.join("index.tsx"))
+                                } else if base.is_dir() && base.join("index.ts").is_file() {
+                                    Some(base.join("index.ts"))
+                                } else if (spec == "@/components/ui" || base == ui_dir)
+                                    && src_dir.join("components/ui.tsx").is_file()
+                                {
+                                    Some(src_dir.join("components/ui.tsx"))
+                                } else {
+                                    None
+                                };
+                                if let Some(found) = existing_target {
+                                    Some(found)
+                                } else if only_existing {
+                                    None
+                                } else if base == ui_dir {
+                                    Some(src_dir.join("components/ui.tsx"))
+                                } else if base.starts_with(&ui_dir) {
+                                    Some(if base.extension().is_some() {
+                                        base
+                                    } else {
+                                        base.with_extension("tsx")
+                                    })
+                                } else {
+                                    None
+                                }
+                            };
+
+                            let mut file_imported_targets: std::collections::HashMap<String, std::path::PathBuf> =
+                                std::collections::HashMap::new();
+
                             for cap in ui_import_re.captures_iter(&content) {
                                 let names = cap.get(1).map(|m| m.as_str()).unwrap_or("");
                                 let spec = cap.get(2).map(|m| m.as_str()).unwrap_or("");
@@ -995,52 +1988,53 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
                                     continue;
                                 }
 
-                                let base = if spec.starts_with("@/") {
-                                    src_dir.join(spec.trim_start_matches("@/"))
-                                } else if is_inside_components {
-                                    let Some(parent) = p.parent() else { continue };
-                                    let joined = normalize_rel_fs_components(&parent.join(spec));
-                                    if !(joined.starts_with(&ui_dir) || joined == ui_dir) {
-                                        continue;
-                                    }
-                                    joined
-                                } else {
+                                let Some(target) = resolve_ui_spec(spec, false) else {
                                     continue;
                                 };
-
-                                let existing_target = if base.is_file() {
-                                    Some(base.clone())
-                                } else if base.with_extension("tsx").is_file() {
-                                    Some(base.with_extension("tsx"))
-                                } else if base.with_extension("ts").is_file() {
-                                    Some(base.with_extension("ts"))
-                                } else if base.is_dir() && base.join("index.tsx").is_file() {
-                                    Some(base.join("index.tsx"))
-                                } else if base.is_dir() && base.join("index.ts").is_file() {
-                                    Some(base.join("index.ts"))
-                                } else if (spec == "@/components/ui" || base == ui_dir) && src_dir.join("components/ui.tsx").is_file() {
-                                    Some(src_dir.join("components/ui.tsx"))
-                                } else {
-                                    None
-                                };
-
-                                let target = if let Some(found) = existing_target {
-                                    found
-                                } else if base == ui_dir {
-                                    src_dir.join("components/ui.tsx")
-                                } else if base.starts_with(&ui_dir) {
-                                    if base.extension().is_some() {
-                                        base.clone()
-                                    } else {
-                                        base.with_extension("tsx")
+                                if spec == "@/components" {
+                                    for sym in parsed_pascal {
+                                        if is_standard_ui_primitive(&sym)
+                                            && !components_dir.join(format!("{}.tsx", sym)).is_file()
+                                            && !components_dir.join(format!("{}.ts", sym)).is_file()
+                                        {
+                                            file_imported_targets.insert(sym.clone(), target.clone());
+                                            demanded.entry(target.clone()).or_default().insert(sym);
+                                        }
                                     }
-                                } else {
                                     continue;
-                                };
+                                }
 
-                                let set = demanded.entry(target).or_default();
+                                let set = demanded.entry(target.clone()).or_default();
                                 for sym in parsed_pascal {
+                                    file_imported_targets.insert(sym.clone(), target.clone());
                                     set.insert(sym);
+                                }
+                            }
+
+                            if let Some(ref def_re) = ui_default_import_re {
+                                for cap in def_re.captures_iter(&content) {
+                                    let def_sym = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+                                    let spec = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+                                    if let Some(target) = resolve_ui_spec(spec, true) {
+                                        file_imported_targets.entry(def_sym.to_string()).or_insert(target);
+                                    }
+                                }
+                            }
+
+                            if matches!(ext, "tsx" | "jsx") && !file_imported_targets.is_empty() {
+                                if let Some(ref cj_re) = compound_jsx_re {
+                                    for cap in cj_re.captures_iter(&content) {
+                                        let parent = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+                                        let sub = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+                                        if let Some(target) = file_imported_targets.get(parent) {
+                                            compound_demands
+                                                .entry(target.clone())
+                                                .or_default()
+                                                .entry(parent.to_string())
+                                                .or_default()
+                                                .insert(sub.to_string());
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1052,6 +2046,9 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
 
     // 2. Also inspect existing `src/components/ui.tsx` and `src/components/ui/*.tsx` to relax strict props & unions
     let mut ui_files: std::collections::BTreeSet<std::path::PathBuf> = demanded.keys().cloned().collect();
+    for k in compound_demands.keys() {
+        ui_files.insert(k.clone());
+    }
     if src_dir.join("components/ui.tsx").is_file() {
         ui_files.insert(src_dir.join("components/ui.tsx"));
     }
@@ -1064,7 +2061,9 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
         }
     }
 
-    let union_prop_re = regex::Regex::new(r#"(?m)^(\s*(?:variant|size|color)\??:\s*)((?:['"][^'"]+['"]\s*\|\s*)+['"][^'"]+['"])(\s*;?)"#).ok();
+    // Idempotent full-line match for literal unions on variant/size/color props
+    let union_prop_re = regex::Regex::new(r#"(?m)^(\s*(?:variant|size|color)\??:\s*)([^;\r\n]+?)(\s*;?\r?)$"#).ok();
+    let literal_union_rhs_re = regex::Regex::new(r#"^\s*(?:['"][^'"]+['"]\s*\|\s*)+['"][^'"]+['"]\s*$"#).ok();
 
     for ui_file in ui_files {
         let existed_before = ui_file.is_file();
@@ -1081,21 +2080,46 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
         if existed_before {
             if let Some(ref re) = union_prop_re {
                 content = re.replace_all(&content, |caps: &regex::Captures| {
-                    let full = &caps[0];
-                    if full.contains("(string & {})") {
-                        full.to_string()
+                    let prefix = &caps[1];
+                    let rhs = caps[2].trim_end();
+                    let suffix = &caps[3];
+                    let is_literal_union = literal_union_rhs_re
+                        .as_ref()
+                        .map(|lr| lr.is_match(rhs))
+                        .unwrap_or(false);
+                    if !rhs.contains("(string & {})") && is_literal_union {
+                        format!("{}{} | (string & {{}}){}", prefix, rhs, suffix)
                     } else {
-                        format!("{}{} | (string & {{}}){}", &caps[1], &caps[2], &caps[3])
+                        caps[0].to_string()
                     }
                 }).to_string();
             }
             content = widen_narrow_ui_props_interfaces(&content);
+            content = repair_bare_react_fc_signatures(&content, true);
+            content = repair_ui_fc_missing_children_prop(&content);
         }
 
-        if let Some(missing_syms) = demanded.get(&ui_file) {
+        // Ensure compound sub-components (`<Tabs.List>` -> `TabsList` + `(Tabs as any).List = TabsList`)
+        let mut combined_demands: std::collections::BTreeSet<String> =
+            demanded.get(&ui_file).cloned().unwrap_or_default();
+        if let Some(comp_map) = compound_demands.get(&ui_file) {
+            for (parent, subs) in comp_map {
+                combined_demands.insert(parent.clone());
+                for sub in subs {
+                    let sub_sym = format!("{}{}", parent, sub);
+                    let plain_exists = has_named_export_symbol(&content, sub);
+                    let combined_exists = has_named_export_symbol(&content, &sub_sym);
+                    if !combined_exists && !plain_exists {
+                        combined_demands.insert(sub_sym);
+                    }
+                }
+            }
+        }
+
+        if !combined_demands.is_empty() {
             let mut appended = String::new();
             let mut added_syms: Vec<String> = Vec::new();
-            for sym in missing_syms {
+            for sym in &combined_demands {
                 if !has_named_export_symbol(&content, sym) {
                     let fallback = match sym.as_str() {
                         "Option" => "export const Option = ({ children, ...props }: any) => <option {...props}>{children}</option>;\n".to_string(),
@@ -1107,6 +2131,9 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
                         "Input" => "export const Input = ({ label, error, className = '', ...props }: any) => <input className={`w-full rounded-lg border border-slate-300 px-3 py-2 text-sm ${className}`} {...props} />;\n".to_string(),
                         "Textarea" => "export const Textarea = ({ label, error, className = '', ...props }: any) => <textarea className={`w-full rounded-lg border border-slate-300 px-3 py-2 text-sm ${className}`} {...props} />;\n".to_string(),
                         "Select" => "export const Select = ({ children, options, label, className = '', ...props }: any) => <select className={`w-full rounded-lg border border-slate-300 px-3 py-2 text-sm ${className}`} {...props}>{Array.isArray(options) ? options.map((opt: any, idx: number) => <option key={idx} value={opt?.value ?? opt}>{opt?.label ?? opt}</option>) : children}</select>;\n".to_string(),
+                        "TabsList" => "export const TabsList = ({ children, className = '', ...props }: any) => <div role=\"tablist\" className={`inline-flex items-center gap-1 rounded-lg bg-slate-100 p-1 ${className}`} {...props}>{children}</div>;\n".to_string(),
+                        "TabsTrigger" => "export const TabsTrigger = ({ children, value, className = '', ...props }: any) => <button type=\"button\" role=\"tab\" data-value={value} className={`rounded-md px-3 py-1.5 text-sm font-medium transition-colors hover:bg-white ${className}`} {...props}>{children}</button>;\n".to_string(),
+                        "TabsContent" => "export const TabsContent = ({ children, value, className = '', ...props }: any) => <div role=\"tabpanel\" data-value={value} className={className} {...props}>{children}</div>;\n".to_string(),
                         "MetricCard" => "export const MetricCard = ({ title, label, value, subtitle, trend, className = '', children, ...props }: any) => <div className={`rounded-xl border border-slate-200 bg-white p-4 shadow-sm ${className}`} {...props}><div className=\"text-xs font-medium text-slate-500\">{title || label}</div><div className=\"mt-1 text-2xl font-bold text-slate-900\">{value}</div>{subtitle ? <div className=\"mt-1 text-xs text-slate-500\">{subtitle}</div> : null}{children}</div>;\n".to_string(),
                         "Modal" => "export const Modal = ({ isOpen = true, open = true, onClose, title, children, className = '', ...props }: any) => (!isOpen && !open) ? null : <div className=\"fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4\"><div className={`w-full max-w-lg rounded-xl bg-white p-6 shadow-xl ${className}`} {...props}>{title ? <div className=\"mb-4 flex items-center justify-between\"><h3 className=\"text-lg font-semibold\">{title}</h3>{onClose ? <button type=\"button\" onClick={onClose} className=\"text-slate-400 hover:text-slate-600\">×</button> : null}</div> : null}{children}</div></div>;\n".to_string(),
                         _ => format!("export const {} = ({{ children, className = '', ...props }}: any) => <div className={{className}} {{...props}}>{{children}}</div>;\n", sym),
@@ -1137,6 +2164,97 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
                         }
                     }
                 }
+            }
+        }
+
+        // Attach runtime sub-properties (`Tabs.List = TabsList`) and allow TypeScript dot-access (`& Record<string, any>`)
+        if let Some(comp_map) = compound_demands.get(&ui_file) {
+            let mut attach_lines = String::new();
+            for (parent, subs) in comp_map {
+                let esc_p = regex::escape(parent);
+                // Widen exported symbol annotation to allow compound `.Sub` JSX access in TypeScript
+                if let Ok(re_fn) = regex::Regex::new(&format!(r#"(?m)^export\s+function\s+{}\b"#, esc_p)) {
+                    if re_fn.is_match(&content) {
+                        content = re_fn.replace(&content, format!("function {}", parent).as_str()).to_string();
+                        if let Ok(re_def) = regex::Regex::new(&format!(r#"(?m)^export\s+default\s+{}\s*;?"#, esc_p)) {
+                            content = re_def.replace(&content, "").to_string();
+                        }
+                        let mut prop_pairs: Vec<String> = Vec::new();
+                        for sub in subs {
+                            let combined = format!("{}{}", parent, sub);
+                            let child_ref = if has_named_export_symbol(&content, &combined) {
+                                combined
+                            } else if has_named_export_symbol(&content, sub) {
+                                sub.clone()
+                            } else {
+                                continue;
+                            };
+                            prop_pairs.push(format!("{}: {}", sub, child_ref));
+                        }
+                        if !prop_pairs.is_empty() && !content.contains(&format!("const __AxiomCompound{}", parent)) {
+                            attach_lines.push_str(&format!(
+                                "const __AxiomCompound{}: React.FC<any> & Record<string, any> = Object.assign({}, {{ {} }});\nexport {{ __AxiomCompound{} as {} }};\n",
+                                parent, parent, prop_pairs.join(", "), parent, parent
+                            ));
+                            if !content.contains("export default") {
+                                attach_lines.push_str(&format!("export default __AxiomCompound{};\n", parent));
+                            }
+                        }
+                        continue;
+                    }
+                }
+
+                // For `export const Tabs...` / `const Tabs...`, ensure TS type allows `& Record<string, any>`
+                let has_record_on_parent = regex::Regex::new(&format!(
+                    r#"(?m)^(?:export\s+)?const\s+{}\b[^\n=]*Record<string,\s*any>"#,
+                    esc_p
+                ))
+                .map(|r| r.is_match(&content))
+                .unwrap_or(false);
+                if !has_record_on_parent {
+                    if let Ok(re_fc_ann) = regex::Regex::new(&format!(
+                        r#"(?m)^((?:export\s+)?const\s+{}\s*:\s*React\.(?:FC|FunctionComponent)(?:<[^>\n]+>)?)\s*="#,
+                        esc_p
+                    )) {
+                        if re_fc_ann.is_match(&content) {
+                            content = re_fc_ann.replace(&content, "${1} & Record<string, any> =").to_string();
+                        } else if let Ok(re_untyped) = regex::Regex::new(&format!(
+                            r#"(?m)^((?:export\s+)?const\s+{})\s*="#,
+                            esc_p
+                        )) {
+                            content = re_untyped
+                                .replace(&content, "${1}: React.FC<any> & Record<string, any> =")
+                                .to_string();
+                        }
+                    }
+                }
+
+                for sub in subs {
+                    let already_attached = content.contains(&format!("({}).{} =", parent, sub))
+                        || content.contains(&format!("{}.{} =", parent, sub))
+                        || content.contains(&format!("Object.assign({},", parent));
+                    if already_attached {
+                        continue;
+                    }
+                    let combined = format!("{}{}", parent, sub);
+                    let child_ref = if has_named_export_symbol(&content, &combined) {
+                        combined
+                    } else if has_named_export_symbol(&content, sub) {
+                        sub.clone()
+                    } else {
+                        continue;
+                    };
+                    attach_lines.push_str(&format!(
+                        "if (typeof {} === 'function' || (typeof {} === 'object' && {} !== null)) {{ ({} as any).{} = {}; }}\n",
+                        parent, parent, parent, parent, sub, child_ref
+                    ));
+                }
+            }
+            if !attach_lines.is_empty() {
+                if !content.ends_with('\n') {
+                    content.push('\n');
+                }
+                content.push_str(&attach_lines);
             }
         }
 
@@ -3277,6 +4395,12 @@ export default function Home() {
         // Apply across all TS/TSX/JS/JSX files (hooks, components, pages, API routes):
         if processed.contains("react-icons") || processed.contains("-icons-react") {
             processed = sanitize_react_icons_imports(&processed);
+        }
+        processed = sanitize_next_link_named_import(&processed);
+        processed = sanitize_nextauth_imports(&processed);
+        if path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx") {
+            let is_ui_mod = path_lower.contains("/components/ui") || path_lower.ends_with("/ui.tsx") || path_lower.ends_with("/ui.jsx");
+            processed = repair_bare_react_fc_signatures(&processed, is_ui_mod);
         }
 
         // Expand barrel hook imports `import { useA, useB } from '@/hooks'` into individual `import { useA } from '@/hooks/useA'`

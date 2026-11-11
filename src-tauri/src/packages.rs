@@ -20,7 +20,7 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
     let mut needs_write = !db_path.exists();
     if db_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&db_path) {
-            if !content.contains("\"dbVersion\": 3") {
+            if !content.contains("\"dbVersion\": 4") {
                 needs_write = true;
             }
         }
@@ -28,7 +28,7 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
     
     if needs_write {
         let default_db = serde_json::json!({
-            "dbVersion": 3,
+            "dbVersion": 4,
             "packages": [
                 {
                     "name": "resend",
@@ -291,6 +291,16 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
                         "@prisma/client": "5.22.0"
                     },
                     "bestPractices": "Use local prisma CLI from node_modules/prisma/build/index.js."
+                },
+                {
+                    "name": "stripe",
+                    "version": "*",
+                    "aliases": ["@stripe/stripe-node"],
+                    "importExamples": ["import Stripe from 'stripe';"],
+                    "compatibility": {
+                        "node": ">=18.0.0"
+                    },
+                    "bestPractices": "Instantiate `new Stripe(process.env.STRIPE_SECRET_KEY || 'sk_test_dummy')` WITHOUT hardcoding an outdated `apiVersion` literal (let the installed SDK use its default `apiVersion`). Cancel subscriptions via `await stripe.subscriptions.cancel(id)` (NEVER `.del(...)`, removed in Stripe v17+). When reading webhook `Stripe.Invoice` / `Stripe.Subscription` legacy fields or constructing `PaymentIntentCreateParams`, match the installed SDK `.d.ts` contract without specifying both `automatic_payment_methods` and `payment_method_types`."
                 }
             ]
         });
@@ -767,6 +777,7 @@ pub fn repair_package_json_dependencies(proj_dir: &std::path::Path) {
     let has_tsconfig = proj_dir.join("tsconfig.json").exists();
     let is_nextjs_proj = proj_dir.join("next.config.js").exists()
         || proj_dir.join("next.config.mjs").exists()
+        || proj_dir.join("next.config.ts").exists()
         || proj_dir.join("src/app").exists()
         || proj_dir.join("app").exists();
     let has_prisma_schema = proj_dir.join("prisma/schema.prisma").exists()
@@ -815,6 +826,12 @@ pub fn repair_package_json_dependencies(proj_dir: &std::path::Path) {
                 pkg_obj.entry("dependencies").or_insert(serde_json::json!({}));
                 pkg_obj.entry("devDependencies").or_insert(serde_json::json!({}));
 
+                let has_next_dep = pkg_obj
+                    .get("dependencies")
+                    .and_then(|d| d.as_object())
+                    .map_or(false, |d| d.contains_key("next"));
+                let is_nextjs_proj = is_nextjs_proj || has_next_dep;
+
                 if is_nextjs_proj {
                     let scripts = pkg_obj.entry("scripts").or_insert(serde_json::json!({}));
                     if let Some(scripts_obj) = scripts.as_object_mut() {
@@ -860,6 +877,24 @@ pub fn repair_package_json_dependencies(proj_dir: &std::path::Path) {
                                 deps_obj.remove(dir_pkg);
                                 changed = true;
                             }
+                        }
+                        // Reject foreign frontend framework packages leaked into a Next.js/React project
+                        for foreign_pkg in [
+                            "vue",
+                            "vue-i18n",
+                            "vue-router",
+                            "pinia",
+                            "vuex",
+                            "nuxt",
+                            "svelte",
+                            "@sveltejs/kit",
+                            "@angular/core",
+                            "@angular/common",
+                        ] {
+                            if deps_obj.remove(foreign_pkg).is_some() {
+                                changed = true;
+                            }
+                            imports_found.remove(foreign_pkg);
                         }
                     }
 
@@ -944,7 +979,7 @@ pub fn repair_package_json_dependencies(proj_dir: &std::path::Path) {
                 // Standardize versions for all known packages already in dependencies
                 if let Some(deps_obj) = pkg_obj.get_mut("dependencies").and_then(|d| d.as_object_mut()) {
                     for pkg in &packages_db {
-                        if pkg.name == "prisma" {
+                        if pkg.name == "prisma" || pkg.version.is_empty() || pkg.version == "*" || pkg.version == "latest" {
                             continue;
                         }
                         if deps_obj.contains_key(&pkg.name) {

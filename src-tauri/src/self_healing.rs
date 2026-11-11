@@ -167,7 +167,8 @@ pub fn scan_and_fix_imports(dir: &std::path::Path, src_root: &std::path::Path, i
                         let mut lines: Vec<String> = normalized_first.lines().map(|s| s.to_string()).collect();
                         
                         for line in lines.iter_mut() {
-                            if (line.contains("import ") || line.contains("import{") || line.contains("require(")) &&
+                            let is_reexport_from = line.trim_start().starts_with("export ") && line.contains(" from ");
+                            if (line.contains("import ") || line.contains("import{") || is_reexport_from || line.contains("require(")) &&
                                (line.contains('\'') || line.contains('"') || line.contains('`')) {
                                 
                                 let quotes = ['\'', '"', '`'];
@@ -289,6 +290,7 @@ pub struct MissingImport {
     pub target_path: std::path::PathBuf,
     pub importing_file_path: std::path::PathBuf,
     pub import_line: String,
+    pub callers: Vec<(std::path::PathBuf, String)>,
 }
 
 pub fn collect_missing_imports(
@@ -309,7 +311,8 @@ pub fn collect_missing_imports(
                 if ext == "ts" || ext == "tsx" || ext == "js" || ext == "jsx" {
                     if let Ok(content) = std::fs::read_to_string(&path) {
                         for line in content.lines() {
-                            if (line.contains("import ") || line.contains("import{") || line.contains("require(")) &&
+                            let is_reexport_from = line.trim_start().starts_with("export ") && line.contains(" from ");
+                            if (line.contains("import ") || line.contains("import{") || is_reexport_from || line.contains("require(")) &&
                                (line.contains('\'') || line.contains('"') || line.contains('`')) {
                                 
                                 let quotes = ['\'', '"', '`'];
@@ -388,11 +391,18 @@ pub fn collect_missing_imports(
                                             target_abs.with_extension(ext_str)
                                         };
                                         
-                                        if !missing.iter().any(|m| m.target_path == target_file_path) {
+                                        if let Some(existing) = missing.iter_mut().find(|m| m.target_path == target_file_path) {
+                                            if existing.callers.len() < 12
+                                                && !existing.callers.iter().any(|(p, l)| p == &path && l == line)
+                                            {
+                                                existing.callers.push((path.clone(), line.to_string()));
+                                            }
+                                        } else {
                                             missing.push(MissingImport {
                                                 target_path: target_file_path,
                                                 importing_file_path: path.clone(),
                                                 import_line: line.to_string(),
+                                                callers: vec![(path.clone(), line.to_string())],
                                             });
                                         }
                                     }
@@ -422,6 +432,8 @@ pub async fn repair_broken_imports(proj_dir: &std::path::Path, model: &str) {
     if scan_roots.is_empty() {
         return;
     }
+    crate::sanitizer::ensure_ui_primitives_reconciled(proj_dir);
+    crate::sanitizer::ensure_directory_barrel_files(proj_dir);
     let alias_root = if has_src { src_dir } else { proj_dir.to_path_buf() };
 
     let mut module_index = std::collections::HashMap::new();
@@ -441,6 +453,7 @@ pub async fn repair_broken_imports(proj_dir: &std::path::Path, model: &str) {
         debug_log_to_file(format!("[Import Fixer] Found {} missing modules that need generation.", missing_imports.len()));
 
         let client = reqwest::Client::new();
+        let compound_re = regex::Regex::new(r"<([A-Z][A-Za-z0-9_]*)\.([A-Z][A-Za-z0-9_]*)\b").ok();
 
         for item in missing_imports {
             let relative_target = item.target_path.strip_prefix(proj_dir)
@@ -456,29 +469,115 @@ pub async fn repair_broken_imports(proj_dir: &std::path::Path, model: &str) {
                 continue;
             }
 
-            let importing_content = std::fs::read_to_string(&item.importing_file_path).unwrap_or_default();
-            let importing_snippet: String = importing_content.chars().take(4500).collect();
+            let all_callers: Vec<(std::path::PathBuf, String)> = if item.callers.is_empty() {
+                vec![(item.importing_file_path.clone(), item.import_line.clone())]
+            } else {
+                item.callers.clone()
+            };
+
+            let mut all_import_lines = Vec::new();
+            let mut caller_snippets = String::new();
+            let mut compound_usages: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            let mut snippet_budget = 6000usize;
+            let mut seen_caller_files = std::collections::HashSet::new();
+
+            for (caller_path, caller_imp_line) in &all_callers {
+                let rel_caller = caller_path
+                    .strip_prefix(proj_dir)
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| caller_path.to_string_lossy().replace('\\', "/"));
+                all_import_lines.push(format!("- `{}`: `{}`", rel_caller, caller_imp_line.trim()));
+
+                if let Ok(caller_src) = std::fs::read_to_string(caller_path) {
+                    if let Some(ref c_re) = compound_re {
+                        for cap in c_re.captures_iter(&caller_src) {
+                            let parent = cap.get(1).map_or("", |m| m.as_str());
+                            let sub = cap.get(2).map_or("", |m| m.as_str());
+                            if caller_imp_line.contains(parent) {
+                                compound_usages.insert(format!("<{}.{}>", parent, sub));
+                            }
+                        }
+                    }
+
+                    if seen_caller_files.insert(rel_caller.clone()) && snippet_budget > 200 && seen_caller_files.len() <= 4 {
+                        let per_file_cap = snippet_budget.min(2200);
+                        let snippet: String = caller_src.chars().take(per_file_cap).collect();
+                        snippet_budget = snippet_budget.saturating_sub(snippet.chars().count());
+                        caller_snippets.push_str(&format!(
+                            "Caller `{}`:\n```\n{}\n```\n\n",
+                            rel_caller, snippet
+                        ));
+                    }
+                }
+            }
+
             let relative_importing = item.importing_file_path.strip_prefix(proj_dir)
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| item.importing_file_path.to_string_lossy().to_string());
 
             debug_log_to_file(format!(
-                "[Import Fixer] Generating missing file: {} (imported in {} via: {})",
-                relative_target_norm, relative_importing, item.import_line.trim()
+                "[Import Fixer] Generating missing file: {} (imported by {} caller(s), primary {} via: {})",
+                relative_target_norm,
+                all_callers.len(),
+                relative_importing,
+                item.import_line.trim()
             ));
+
+            let mut sibling_note = String::new();
+            if relative_target_norm.ends_with("/index.ts") || relative_target_norm.ends_with("/index.tsx") {
+                if let Some(parent_dir) = item.target_path.parent() {
+                    if let Ok(entries) = std::fs::read_dir(parent_dir) {
+                        let mut sibs: Vec<String> = entries
+                            .flatten()
+                            .filter_map(|e| e.file_name().into_string().ok())
+                            .filter(|n| !n.starts_with("index."))
+                            .collect();
+                        sibs.sort();
+                        if !sibs.is_empty() {
+                            sibling_note = format!(
+                                "\nIMPORTANT: This file is a directory barrel index. ONLY re-export files that actually exist in the same folder: [{}]. NEVER re-export non-existent filenames!\n",
+                                sibs.join(", ")
+                            );
+                        }
+                    }
+                }
+            }
+
+            let target_lower = relative_target_norm.to_lowercase();
+            let ui_rules = if target_lower.ends_with(".tsx") || target_lower.ends_with(".jsx") {
+                let mut r = String::from(
+                    "\nREACT 18 / UI MODULE RULES:\n\
+                     - Add `\"use client\";` as line 1 if any component uses React hooks, event handlers, or interactive UI primitives.\n\
+                     - NEVER write bare `React.FC = ({ ... }) =>` without a props generic (in React 18, `React.FC` defaults to `{}` and rejects `children`, `className`, `onClick`, `variant`). ALWAYS use `React.FC<any> =` or an explicit props interface with `children?: React.ReactNode; className?: string; [key: string]: any;`.\n\
+                     - Export EVERY symbol requested across ALL caller import lines listed above (matching exact named vs default imports).\n"
+                );
+                if !compound_usages.is_empty() {
+                    let compound_list: Vec<String> = compound_usages.into_iter().collect();
+                    r.push_str(&format!(
+                        "- CRITICAL COMPOUND JSX REQUIREMENT: Callers render `[{}]`. Do NOT leave subcomponents undefined! Define every subcomponent cleanly (e.g. `TabsList`, `TabsTrigger`, `TabsContent`), attach them on the parent with runtime properties (e.g. `(Tabs as any).List = TabsList;`) AND type the parent with `React.FC<any> & Record<string, any>` (or `Object.assign`) so `<Parent.Sub>` works both in TypeScript AND at runtime SSR.\n",
+                        compound_list.join(", ")
+                    ));
+                }
+                r
+            } else {
+                String::new()
+            };
 
             let system_prompt = "You are a Senior Next.js/React Developer. Respond with ONLY the raw, complete file content. Do not include markdown code block formatting (like ```tsx), explanations, introduction, or outro. Respond with clean source code only.";
             let user_prompt = format!(
                 "The project is missing an imported module/file.\n\
                  Missing File path to generate: {}\n\
-                 Imported in file: {}\n\
-                 Import line: {}\n\n\
-                 Here is the contents of the importing file ({}):\n\
-                 ```\n\
-                 {}\n\
-                 ```\n\n\
-                 Generate a suitable mock/boilerplate content for the missing file ({}) that defines and exports everything expected by the importing file so that the project compiles without errors.",
-                relative_target_norm, relative_importing, item.import_line.trim(), relative_importing, importing_snippet, relative_target_norm
+                 All caller import statements referencing this module:\n\
+                 {}\n{}{}\n\
+                 Caller file contents:\n\
+                 {}\
+                 Generate the complete implementation for `{}` so that it exports EVERY symbol, type, prop, and compound subcomponent expected by ALL callers above and compiles cleanly with zero TypeScript errors.",
+                relative_target_norm,
+                all_import_lines.join("\n"),
+                sibling_note,
+                ui_rules,
+                caller_snippets,
+                relative_target_norm
             );
 
             let ollama_req = serde_json::json!({
@@ -532,6 +631,11 @@ pub async fn repair_broken_imports(proj_dir: &std::path::Path, model: &str) {
                 }
             }
         }
+
+        // Re-run deterministic UI & barrel reconcilers after generating missing modules so freshly
+        // created UI files inherit React 18 props, compound `<Parent.Sub>` properties, and clean barrels.
+        crate::sanitizer::ensure_ui_primitives_reconciled(proj_dir);
+        crate::sanitizer::ensure_directory_barrel_files(proj_dir);
     }
 }
 
@@ -996,6 +1100,13 @@ pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
                             if next.contains("react-icons") || next.contains("-icons-react") {
                                 next = crate::sanitizer::sanitize_react_icons_imports(&next);
                             }
+                            next = crate::sanitizer::sanitize_next_link_named_import(&next);
+                            next = crate::sanitizer::sanitize_nextauth_imports(&next);
+                            if rel_lower.ends_with(".tsx") || rel_lower.ends_with(".jsx") {
+                                let is_ui_mod = rel_lower.contains("/components/ui") || rel_lower.ends_with("/ui.tsx") || rel_lower.ends_with("/ui.jsx");
+                                next = crate::sanitizer::repair_bare_react_fc_signatures(&next, is_ui_mod);
+                            }
+                            next = crate::sanitizer::reconcile_server_prisma_enum_usage(proj_dir, &rel, &next);
                             if crate::sanitizer::is_app_router_route_file(&rel) {
                                 next = crate::sanitizer::sanitize_app_router_route_exports(&next, &rel);
                             }
@@ -1033,10 +1144,87 @@ pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
     }
 
     crate::apply_ast_sanity_pass_to_project(proj_dir);
-    crate::sanitizer::ensure_directory_barrel_files(proj_dir);
     crate::sanitizer::ensure_ui_primitives_reconciled(proj_dir);
+    crate::sanitizer::ensure_directory_barrel_files(proj_dir);
     let _ = auto_import_missing_symbols_in_project(proj_dir);
 }
+
+pub fn extract_prisma_schema_summary_for_healing(proj_dir: &std::path::Path) -> String {
+    let schema_path = [
+        proj_dir.join("prisma/schema.prisma"),
+        proj_dir.join("schema.prisma"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file());
+    let Some(sp) = schema_path else {
+        return String::new();
+    };
+    let Ok(src) = std::fs::read_to_string(&sp) else {
+        return String::new();
+    };
+    let contract = crate::orchestrator::extract_prisma_schema_contract(&src);
+    let mut out = String::new();
+    if let Some(enums_obj) = contract.get("enums").and_then(|e| e.as_object()) {
+        if !enums_obj.is_empty() {
+            out.push_str("Prisma Enums (import from '@prisma/client' when typing or validating with z.nativeEnum):\n");
+            for (ename, evals) in enums_obj {
+                let vals: Vec<&str> = evals
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                if !vals.is_empty() {
+                    out.push_str(&format!("- {}: {}\n", ename, vals.join(" | ")));
+                }
+            }
+        }
+    }
+    if let Some(models_obj) = contract.get("models").and_then(|m| m.as_object()) {
+        if !models_obj.is_empty() {
+            out.push_str("Prisma Models (use ONLY declared delegate names and fields below):\n");
+            for (mname, mval) in models_obj {
+                let delegate = mval.get("delegate").and_then(|v| v.as_str()).unwrap_or("");
+                let typed: Vec<&str> = mval
+                    .get("typedFields")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                    .unwrap_or_default();
+                let req: Vec<&str> = mval
+                    .get("requiredFields")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                    .unwrap_or_default();
+                let rels: Vec<&str> = mval
+                    .get("relations")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "- {} (prisma.{}) | fields: [{}]{}{}\n",
+                    mname,
+                    delegate,
+                    typed.join(", "),
+                    if req.is_empty() { String::new() } else { format!(" | required: [{}]", req.join(", ")) },
+                    if rels.is_empty() { String::new() } else { format!(" | relations: [{}]", rels.join(", ")) },
+                ));
+            }
+        }
+    }
+    if out.is_empty() {
+        return String::new();
+    }
+    let capped: String = out.chars().take(2600).collect();
+    format!(
+        "\n--- ACTUAL PRISMA SCHEMA CONTRACT (prisma/schema.prisma) ---\n{}\n------------------------------------------------------------\n",
+        capped.trim_end()
+    )
+}
+
+pub const ZOD_PRISMA_TS2322_HEAL_GUIDE: &str = "\nTS2322 / ZOD-VS-PRISMA HEALING GUIDE (tsconfig uses \"strict\": false):\n\
+- Under \"strict\": false, `z.infer<typeof schema>` makes properties optional (`{ field?: T }`), so `prisma.<model>.create({ data: validatedBody })` fails with TS2322 on required fields!\n\
+- NEVER pass `validatedBody` directly into `.create({ data: validatedBody })`: build an EXPLICIT typed `data: { requiredField: parsed.requiredField, ... }` object (guaranteeing every required field is defined via guard/default).\n\
+- For Prisma Enum fields: import the Enum from '@prisma/client' and use `z.nativeEnum(EnumName)` (or cast `parsed.status as EnumName`), NEVER bare `z.string()`.\n\
+- For DateTime fields: use `z.coerce.date()` or `new Date(parsed.date)`.\n\
+- Use ONLY exact delegates, field names, and relation names from ACTUAL PRISMA SCHEMA CONTRACT.\n";
 
 fn collect_exporter_context_for_file(proj_dir: &std::path::Path, rel_path: &str, content: &str) -> String {
     let mut ctx = String::new();
@@ -2174,7 +2362,20 @@ pub fn inspect_dts_exports_for_file(proj_dir: &std::path::Path, file_content: &s
         || err_lower.contains("module not found")
         || err_lower.contains("is not defined")
         || err_lower.contains("cannot find name");
-    if !has_symbol_or_mod_err || !proj_dir.join("node_modules").is_dir() {
+    let mentions_stripe = file_content.contains("'stripe'")
+        || file_content.contains("\"stripe\"")
+        || err_lower.contains("stripe")
+        || err_lower.contains("latestapiversion");
+    let has_stripe_api_err = mentions_stripe && (
+        has_symbol_or_mod_err
+        || error_context.contains("TS2322")
+        || error_context.contains("TS2345")
+        || error_context.contains("TS2561")
+        || error_context.contains("TS2769")
+        || err_lower.contains("apiversion")
+        || err_lower.contains("latestapiversion")
+    );
+    if !(has_symbol_or_mod_err || has_stripe_api_err) || !proj_dir.join("node_modules").is_dir() {
         return String::new();
     }
 
@@ -2203,7 +2404,7 @@ pub fn inspect_dts_exports_for_file(proj_dir: &std::path::Path, file_content: &s
     }
 
     let mut lines: Vec<String> = Vec::new();
-    if !specs.is_empty() {
+    if has_symbol_or_mod_err && !specs.is_empty() {
         // Prioritize external specifiers directly mentioned in `error_context`
         let mentioned: Vec<String> = specs
             .iter()
@@ -2255,14 +2456,84 @@ pub fn inspect_dts_exports_for_file(proj_dir: &std::path::Path, file_content: &s
         }
     }
 
+    // Dynamic installed Stripe SDK inspection from `node_modules/stripe`
+    let stripe_root = proj_dir.join("node_modules/stripe");
+    if (has_stripe_api_err || specs.iter().any(|s| s == "stripe" || s.starts_with("stripe/"))) && stripe_root.is_dir() {
+        let mut detected_api_version: Option<String> = None;
+        if let Ok(ver_re) = regex::Regex::new(r#"(?:LatestApiVersion|ApiVersion)\s*=\s*['"]([^'"]+)['"]"#) {
+            for rel_candidate in [
+                "esm/apiVersion.d.ts",
+                "cjs/apiVersion.d.ts",
+                "types/apiVersion.d.ts",
+                "types/index.d.ts",
+            ] {
+                let cand = stripe_root.join(rel_candidate);
+                if cand.is_file() {
+                    if let Ok(dts_src) = std::fs::read_to_string(&cand) {
+                        if let Some(cap) = ver_re.captures(&dts_src) {
+                            if let Some(m) = cap.get(1) {
+                                detected_api_version = Some(m.as_str().to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        match detected_api_version {
+            Some(ver) => lines.push(format!(
+                "- `stripe` installed `.d.ts` contract: `LatestApiVersion` on disk is `'{}'`. Recommended: instantiate `new Stripe(process.env.STRIPE_SECRET_KEY || '')` WITHOUT hardcoding an outdated `apiVersion`, or set `apiVersion: '{}' as any` only if explicitly required.",
+                ver, ver
+            )),
+            None => lines.push(
+                "- `stripe` installed `.d.ts` contract: instantiate `new Stripe(process.env.STRIPE_SECRET_KEY || '')` WITHOUT hardcoding a stale `apiVersion` string literal.".to_string(),
+            ),
+        }
+
+        if err_lower.contains("subscriptions") || err_lower.contains("'del'") || file_content.contains("subscriptions.del") {
+            let mut has_cancel_in_dts = false;
+            let mut has_del_in_dts = false;
+            for rel_sub in [
+                "esm/resources/Subscriptions.d.ts",
+                "cjs/resources/Subscriptions.d.ts",
+                "types/SubscriptionsResource.d.ts",
+            ] {
+                let cand = stripe_root.join(rel_sub);
+                if cand.is_file() {
+                    if let Ok(sub_src) = std::fs::read_to_string(&cand) {
+                        if sub_src.contains("cancel(") {
+                            has_cancel_in_dts = true;
+                        }
+                        if sub_src.contains("del(") {
+                            has_del_in_dts = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            if has_cancel_in_dts && !has_del_in_dts {
+                lines.push(
+                    "- `stripe.subscriptions` (verified in `node_modules/stripe/.../Subscriptions.d.ts`): use `stripe.subscriptions.cancel(subscriptionId)` instead of `.del(...)` (`.del` does not exist).".to_string(),
+                );
+            }
+        }
+        if file_content.contains("payment_method_types") && file_content.contains("automatic_payment_methods") {
+            lines.push(
+                "- `stripe.paymentIntents.create`: do NOT pass both `payment_method_types` and `automatic_payment_methods` together (Stripe rejects conflicting parameters).".to_string(),
+            );
+        }
+    }
+
     // Resolve concrete installed package subpath for missing TS2304 / ReferenceError symbols
-    let missing_idents = extract_missing_ident_candidates_from_error(error_context);
-    for ident in missing_idents.into_iter().take(4) {
-        if let Some(resolved_spec) = find_installed_dts_package_for_symbol(proj_dir, &specs, &ident) {
-            lines.push(format!(
-                "- Verified symbol on disk for `{}`: `import {{ {} }} from '{}';`",
-                ident, ident, resolved_spec
-            ));
+    if has_symbol_or_mod_err {
+        let missing_idents = extract_missing_ident_candidates_from_error(error_context);
+        for ident in missing_idents.into_iter().take(4) {
+            if let Some(resolved_spec) = find_installed_dts_package_for_symbol(proj_dir, &specs, &ident) {
+                lines.push(format!(
+                    "- Verified symbol on disk for `{}`: `import {{ {} }} from '{}';`",
+                    ident, ident, resolved_spec
+                ));
+            }
         }
     }
 
@@ -2409,6 +2680,7 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
         let mut pending_tsc_fixes: Vec<PendingBuildFix> = Vec::new();
         let mut prev_total_tsc_errors: Option<usize> = None;
         let mut rollback_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut stagnant_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
         for round in 1..=(MAX_TSC_ROUNDS + 1) {
             let Ok((tsc_ok, tsc_log, diags)) = run_tsc_check(proj_dir, &local_tsc_js, &enriched_path) else {
@@ -2575,22 +2847,27 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                 break;
             }
 
+            let attempts_failed_for = |path_key: &str| -> usize {
+                let k = path_key.to_lowercase();
+                rollback_counts.get(&k).copied().unwrap_or(0) + stagnant_counts.get(&k).copied().unwrap_or(0)
+            };
+
             let mut sorted_files: Vec<(String, Vec<&TscDiagnostic>)> = per_file_diags.into_iter().collect();
             sorted_files.sort_by_key(|(path_str, _)| {
-                let rb = *rollback_counts.get(&path_str.to_lowercase()).unwrap_or(&0);
-                (rb >= 2, rb, file_dependency_layer_priority(path_str), path_str.clone())
+                let af = attempts_failed_for(path_str);
+                (af >= 2, af, file_dependency_layer_priority(path_str), path_str.clone())
             });
-            if sorted_files.iter().all(|(p, _)| *rollback_counts.get(&p.to_lowercase()).unwrap_or(&0) >= 2) {
+            if sorted_files.iter().all(|(p, _)| attempts_failed_for(p) >= 2) {
                 let sample: Vec<String> = diags
                     .iter()
                     .take(4)
                     .map(|d| format!("{}:{} {} ({})", d.file, d.line, d.code, d.message.chars().take(70).collect::<String>()))
                     .collect();
                 unresolved_warnings.push(format!("TypeScript greške ({}): {}", diags.len(), sample.join(" | ")));
-                debug_log_to_file("[Self-Healing] Stopping Tier 1 tsc loop: all remaining failing files reached max rollback threshold (2).".to_string());
+                debug_log_to_file("[Self-Healing] Stopping Tier 1 tsc loop: all remaining failing files reached max failure/stagnation threshold (2).".to_string());
                 break;
             }
-            sorted_files.retain(|(p, _)| *rollback_counts.get(&p.to_lowercase()).unwrap_or(&0) < 2);
+            sorted_files.retain(|(p, _)| attempts_failed_for(p) < 2);
             sorted_files.truncate(4);
 
             // Try Katastar verified patches first
@@ -2649,14 +2926,42 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
             let mut expected_paths: Vec<String> = Vec::new();
             let mut pkg_ctx = String::new();
             let heal_ledger = crate::katastar::load_project_heal_ledger(proj_dir);
+            let mut batch_needs_prisma_contract = false;
+            let mut batch_has_prior_stagnation = false;
 
             for (path_str, file_diags) in &sorted_files {
                 let full_path = proj_dir.join(path_str);
                 let Ok(orig_content) = std::fs::read_to_string(&full_path) else { continue };
+                let prior_fails = rollback_counts.get(&path_str.to_lowercase()).copied().unwrap_or(0)
+                    + stagnant_counts.get(&path_str.to_lowercase()).copied().unwrap_or(0);
+                if prior_fails >= 1 {
+                    batch_has_prior_stagnation = true;
+                }
+                let path_low = path_str.to_lowercase().replace('\\', "/");
+                if path_low.contains("/api/")
+                    || path_low.ends_with("route.ts")
+                    || path_low.ends_with("route.js")
+                    || orig_content.contains("@prisma/client")
+                    || orig_content.contains("@/lib/prisma")
+                    || file_diags.iter().any(|d| matches!(d.code.as_str(), "TS2322" | "TS2353" | "TS2339" | "TS2305") || d.message.to_lowercase().contains("prisma"))
+                {
+                    batch_needs_prisma_contract = true;
+                }
+
                 expected_paths.push(path_str.clone());
+                let file_lines: Vec<&str> = orig_content.lines().collect();
                 diag_summary.push_str(&format!("\n--- {} ({} errors) ---\n", path_str, file_diags.len()));
-                for d in file_diags.iter().take(12) {
+                if prior_fails >= 1 {
+                    diag_summary.push_str("  [WARNING: Previous AI repair attempt for this file made NO valid progress or was rejected. You MUST apply a concrete different code fix now!]\n");
+                }
+                for (d_idx, d) in file_diags.iter().take(12).enumerate() {
                     diag_summary.push_str(&format!("  Line {}, Col {}: [{}] {}\n", d.line, d.col, d.code, d.message));
+                    if d_idx < 5 && d.line > 0 {
+                        if let Some(src_line) = file_lines.get(d.line - 1) {
+                            let clipped: String = src_line.chars().take(160).collect();
+                            diag_summary.push_str(&format!("    -> Line {}: {}\n", d.line, clipped));
+                        }
+                    }
                 }
                 let norm_ledger_key = path_str.trim().replace('\\', "/").trim_start_matches("./").to_string();
                 if heal_ledger.files.get(&norm_ledger_key).map_or(false, |e| !e.attempts.is_empty() || !e.resolved.is_empty()) {
@@ -2694,6 +2999,19 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
             }
             pkg_ctx.push_str(&diag_summary);
 
+            let prisma_contract_ctx = if batch_needs_prisma_contract {
+                extract_prisma_schema_summary_for_healing(proj_dir)
+            } else {
+                String::new()
+            };
+            let zod_prisma_guide = if batch_needs_prisma_contract
+                && (diag_summary.contains("TS2322") || diag_summary.contains("TS2353"))
+            {
+                ZOD_PRISMA_TS2322_HEAL_GUIDE
+            } else {
+                ""
+            };
+
             let contracts_ctx = crate::orchestrator::format_axiom_contracts_prompt(
                 proj_dir,
                 sorted_files[0].0.as_str(),
@@ -2708,8 +3026,9 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                  2. All local project imports MUST use `@/...` alias (never bare `src/...`). Only import modules/symbols that actually exist in the project.\n\
                  3. Domain models in `src/models/*.ts` must be pure TypeScript interfaces/types (NEVER import `@/lib/prisma` or instantiate `new PrismaClient()`).\n\
                  4. Files starting with `\"use client\"` MUST NEVER import `@/lib/prisma` or `@prisma/client` value symbols.\n\
-                 Respond ONLY with a valid JSON object matching: `{{\"files\": [{{\"path\": \"...\", \"content\": \"complete fixed file source\"}}]}}`.",
-                category_stack_info
+                 Respond ONLY with a valid JSON object matching: `{{\"files\": [{{\"path\": \"...\", \"content\": \"complete fixed file source\"}}]}}`.{}",
+                category_stack_info,
+                zod_prisma_guide
             );
             system_prompt.push_str(&crate::packages::get_relevant_packages_db_summary(Some(proj_dir), &pkg_ctx));
             if !katastar_hints.is_empty() {
@@ -2723,14 +3042,16 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
             }
 
             let user_prompt = format!(
-                "TypeScript Diagnostics:{}\n\n{}{}{}\nFiles to fix (JSON):\n{}\n\nReturn ONLY a JSON object `{{\"files\": [{{\"path\": \"...\", \"content\": \"...\"}}]}}` containing the complete repaired files.",
+                "TypeScript Diagnostics:{}\n\n{}{}{}{}\nFiles to fix (JSON):\n{}\n\nReturn ONLY a JSON object `{{\"files\": [{{\"path\": \"...\", \"content\": \"...\"}}]}}` containing the complete repaired files.",
                 diag_summary,
                 exporter_context,
+                prisma_contract_ctx,
                 contracts_ctx,
                 chain_ctx,
                 serde_json::to_string_pretty(&batch_payload).unwrap_or_default()
             );
 
+            let tier1_temp = if batch_has_prior_stagnation { 0.28 } else { 0.15 };
             let ollama_req = serde_json::json!({
                 "model": model,
                 "format": "json",
@@ -2739,9 +3060,10 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                     { "role": "user", "content": user_prompt }
                 ],
                 "stream": false,
-                "options": build_ollama_options(model, 0.15, Some(4096))
+                "options": build_ollama_options(model, tier1_temp, Some(4096))
             });
 
+            let mut handled_or_counted: std::collections::HashSet<String> = std::collections::HashSet::new();
             if let Ok(resp) = client.post("http://127.0.0.1:11434/api/chat").json(&ollama_req).send().await {
                 if resp.status().is_success() {
                     if let Ok(resp_json) = resp.json::<Value>().await {
@@ -2756,13 +3078,16 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                                 if !full_path.starts_with(proj_dir) {
                                     continue;
                                 }
+                                let path_key_low = path_str.to_lowercase();
                                 let before = std::fs::read_to_string(&full_path).unwrap_or_default();
                                 let processed = post_process_generated_file(&path_str, &content_str, &serde_json::json!({}), has_tailwind);
                                 let prev_diags = per_file_diag_lines
-                                    .get(&path_str.to_lowercase())
+                                    .get(&path_key_low)
                                     .cloned()
                                     .unwrap_or_default();
                                 if processed == before {
+                                    handled_or_counted.insert(path_key_low.clone());
+                                    *stagnant_counts.entry(path_key_low).or_insert(0) += 1;
                                     crate::katastar::record_project_heal_round(
                                         proj_dir,
                                         &path_str,
@@ -2777,6 +3102,8 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                                 }
                                 if !before.is_empty() {
                                     if let Some(drop_reason) = crate::healer::detect_destructive_code_drop(&path_str, &before, &processed) {
+                                        handled_or_counted.insert(path_key_low.clone());
+                                        *stagnant_counts.entry(path_key_low).or_insert(0) += 1;
                                         debug_log_to_file(format!("[Self-Healing] {}", drop_reason));
                                         crate::katastar::record_project_heal_round(
                                             proj_dir,
@@ -2792,6 +3119,8 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                                     }
                                 }
                                 if let Err(val_err) = crate::orchestrator::validate_file_with_project_context(proj_dir, &path_str, &processed, model).await {
+                                    handled_or_counted.insert(path_key_low.clone());
+                                    *stagnant_counts.entry(path_key_low).or_insert(0) += 1;
                                     debug_log_to_file(format!("[Self-Healing] Rejected Tier 1 candidate for '{}': {}", path_str, val_err));
                                     crate::katastar::record_project_heal_round(
                                         proj_dir,
@@ -2809,13 +3138,14 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                                     let _ = std::fs::create_dir_all(parent);
                                 }
                                 if std::fs::write(&full_path, &processed).is_ok() {
+                                    handled_or_counted.insert(path_key_low.clone());
                                     let prev_err = sorted_files
                                         .iter()
                                         .find(|(p, _)| p.eq_ignore_ascii_case(&path_str))
                                         .map(|(_, d)| d.len())
                                         .unwrap_or(1);
                                     let file_diag_raw = per_file_diag_blocks
-                                        .get(&path_str.to_lowercase())
+                                        .get(&path_key_low)
                                         .map(|s| s.as_str())
                                         .unwrap_or(&diag_summary);
                                     let atomic_patch = crate::katastar::extract_safe_atomic_patch(&path_str, &before, &processed);
@@ -2843,6 +3173,12 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                             }
                         }
                     }
+                }
+            }
+            for ep in &expected_paths {
+                let ep_low = ep.to_lowercase();
+                if !handled_or_counted.contains(&ep_low) {
+                    *stagnant_counts.entry(ep_low).or_insert(0) += 1;
                 }
             }
         }
@@ -2983,37 +3319,74 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
             break;
         }
 
-        // Map errors in build log to files
-        let mut files_with_errors = Vec::new();
-        let mut matched_paths = std::collections::HashSet::new();
+        // Map errors in build log to files, prioritizing direct error targets over `Import trace for requested module:` callers
+        let mut tier2_priority_paths: Vec<String> = Vec::new();
+        let mut secondary_extracted_paths: Vec<String> = Vec::new();
+        let mut trace_paths: Vec<String> = Vec::new();
+        let build_lines: Vec<&str> = build_output.lines().collect();
+        let mut in_import_trace = false;
+
+        for (idx, line) in build_lines.iter().enumerate() {
+            let t = line.trim();
+            if t.is_empty() {
+                in_import_trace = false;
+                continue;
+            }
+            if t.starts_with("Import trace for requested module") {
+                in_import_trace = true;
+                continue;
+            }
+            if let Some(extracted) = extract_file_path_from_line(t) {
+                let norm = extracted.replace('\\', "/");
+                if let Some(resolved) = resolve_project_file_candidate(proj_dir, &norm) {
+                    if in_import_trace {
+                        if !trace_paths.contains(&resolved) {
+                            trace_paths.push(resolved);
+                        }
+                    } else {
+                        let next_line = build_lines.get(idx + 1).map(|s| s.trim()).unwrap_or("");
+                        let is_direct_header = t.contains("Module not found")
+                            || t.contains("Type error:")
+                            || t.contains("SyntaxError")
+                            || next_line.starts_with("Module not found")
+                            || next_line.starts_with("Attempted import error")
+                            || next_line.starts_with("Type error:")
+                            || next_line.starts_with("SyntaxError")
+                            || next_line.contains("Can't resolve");
+                        if is_direct_header {
+                            if !tier2_priority_paths.contains(&resolved) {
+                                tier2_priority_paths.push(resolved);
+                            }
+                        } else if !secondary_extracted_paths.contains(&resolved) {
+                            secondary_extracted_paths.push(resolved);
+                        }
+                    }
+                }
+            }
+        }
+        for p in secondary_extracted_paths.into_iter().chain(trace_paths.into_iter()) {
+            if !tier2_priority_paths.contains(&p) {
+                tier2_priority_paths.push(p);
+            }
+        }
         for path_str in &candidate_paths {
             let path_lower = path_str.to_lowercase().replace('\\', "/");
-            if build_lower.contains(&path_lower) && matched_paths.insert(path_str.clone()) {
-                let file_path = proj_dir.join(path_str);
+            if build_lower.contains(&path_lower) && !tier2_priority_paths.contains(path_str) {
+                tier2_priority_paths.push(path_str.clone());
+            }
+        }
+
+        let mut files_with_errors = Vec::new();
+        let mut matched_paths = std::collections::HashSet::new();
+        for path_str in tier2_priority_paths {
+            if matched_paths.insert(path_str.clone()) {
+                let file_path = proj_dir.join(&path_str);
                 if file_path.exists() {
                     if let Ok(content) = std::fs::read_to_string(&file_path) {
                         files_with_errors.push(serde_json::json!({
                             "path": path_str,
                             "content": content
                         }));
-                    }
-                }
-            }
-        }
-        for line in build_output.lines() {
-            if let Some(extracted) = extract_file_path_from_line(line) {
-                let norm = extracted.replace('\\', "/");
-                if let Some(resolved) = resolve_project_file_candidate(proj_dir, &norm) {
-                    if matched_paths.insert(resolved.clone()) {
-                        let file_path = proj_dir.join(&resolved);
-                        if file_path.exists() {
-                            if let Ok(content) = std::fs::read_to_string(&file_path) {
-                                files_with_errors.push(serde_json::json!({
-                                    "path": resolved,
-                                    "content": content
-                                }));
-                            }
-                        }
                     }
                 }
             }
@@ -3100,6 +3473,21 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
         pkg_ctx.push('\n');
         pkg_ctx.push_str(&truncated_log);
 
+        let needs_prisma_ctx = expected_paths.iter().any(|p| p.contains("/api/") || p.ends_with("route.ts") || p.ends_with("route.js"))
+            || build_lower.contains("prisma")
+            || build_output.contains("TS2322")
+            || build_output.contains("TS2353");
+        let prisma_contract_ctx = if needs_prisma_ctx {
+            extract_prisma_schema_summary_for_healing(proj_dir)
+        } else {
+            String::new()
+        };
+        let zod_guide = if needs_prisma_ctx && (build_output.contains("TS2322") || build_output.contains("TS2353")) {
+            ZOD_PRISMA_TS2322_HEAL_GUIDE
+        } else {
+            ""
+        };
+
         let mut system_prompt = format!(
             "You are a Senior Next.js Developer fixing compilation and bundling errors.\n\
              Project Architecture: {}\n{}\n\
@@ -3107,8 +3495,8 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
              1. STRICT UI & DESIGN PRESERVATION: Fix COMPILATION errors without deleting UI layout or features.\n\
              2. SURGICAL REPAIR & ALIASES: Always import local modules via `@/...` (never bare `src/...`).\n\
              3. CLIENT BOUNDARY: `'use client'` files MUST NOT import `@/lib/prisma` or `@prisma/client` values.\n\
-             4. Respond ONLY with a valid JSON object `{{\"files\": [{{\"path\": \"...\", \"content\": \"...\"}}]}}`. No prose or markdown explanations.",
-            category_stack_info, targeted_specs
+             4. Respond ONLY with a valid JSON object `{{\"files\": [{{\"path\": \"...\", \"content\": \"...\"}}]}}`. No prose or markdown explanations.{}",
+            category_stack_info, targeted_specs, zod_guide
         );
         system_prompt.push_str(&crate::packages::get_relevant_packages_db_summary(Some(proj_dir), &pkg_ctx));
         if !katastar_hints.is_empty() {
@@ -3128,9 +3516,10 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
         }
 
         let user_prompt = format!(
-            "Build log with error details:\n{}\n\n{}Files with errors current contents:\n{}\n\nReturn ONLY a JSON object `{{\"files\": [{{\"path\": \"...\", \"content\": \"...\"}}]}}` containing the repaired files.",
+            "Build log with error details:\n{}\n\n{}{}Files with errors current contents:\n{}\n\nReturn ONLY a JSON object `{{\"files\": [{{\"path\": \"...\", \"content\": \"...\"}}]}}` containing the repaired files.",
             truncated_log,
             exporter_context,
+            prisma_contract_ctx,
             serde_json::to_string_pretty(&files_with_errors).unwrap_or_default()
         );
 

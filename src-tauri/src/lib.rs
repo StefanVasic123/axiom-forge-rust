@@ -4339,4 +4339,471 @@ model Account {\n\
         assert_eq!(pkg_val["overrides"]["other-pkg"].as_str(), Some("1.2.3"));
     }
 
+    #[test]
+    fn test_rejects_line_range_edits_v51() {
+        // 1. startLine/endLine without verbatim target must be rejected rather than producing empty target ""
+        let coord_lines_payload = serde_json::json!({
+            "explanation": "Guard nullable array before .map()",
+            "edits": [
+                {
+                    "path": "src/app/board/page.tsx",
+                    "startLine": 30,
+                    "endLine": 30,
+                    "replacement": "{(items ?? []).map(item => ("
+                }
+            ]
+        });
+        assert!(
+            extract_edits_from_json(&coord_lines_payload, "src/app/board/page.tsx").is_empty(),
+            "Line-range coordinate edit without 'target' must be rejected"
+        );
+
+        // 2. start/end object/range and bare line+fragment without target must also be rejected
+        let coord_range_payload = serde_json::json!({
+            "file": "src/app/board/page.tsx",
+            "line": 30,
+            "start": { "line": 30, "column": 12 },
+            "end": { "line": 30, "column": 30 },
+            "replacement": "{(items ?? []).map(item => ("
+        });
+        assert!(
+            extract_edits_from_json(&coord_range_payload, "src/app/board/page.tsx").is_empty(),
+            "Object coordinate edit without 'target' must be rejected"
+        );
+        let bare_line_fragment_payload = serde_json::json!({
+            "file": "src/app/board/page.tsx",
+            "line": 30,
+            "replacement": "{(items ?? []).map(item => ("
+        });
+        assert!(
+            extract_edits_from_json(&bare_line_fragment_payload, "src/app/board/page.tsx").is_empty(),
+            "Bare line-numbered fragment without 'target' must be rejected"
+        );
+
+        // 3. Explicit verbatim target + replacement (even alongside line metadata) & semantic import/deletion edits remain valid
+        let mixed_valid_payload = serde_json::json!({
+            "edits": [
+                {
+                    "path": "src/app/board/page.tsx",
+                    "line": 30,
+                    "target": "{items.map(item => (",
+                    "replacement": "{(Array.isArray(items) ? items : []).map(item => ("
+                },
+                {
+                    "path": "src/app/board/page.tsx",
+                    "type": "import",
+                    "module": "react-icons/hi2",
+                    "namedImports": ["HiOutlineCheck"]
+                },
+                {
+                    "path": "src/components/Widget.tsx",
+                    "target": "export default Unused;",
+                    "replacement": ""
+                }
+            ]
+        });
+        let valid_edits = extract_edits_from_json(&mixed_valid_payload, "src/app/board/page.tsx");
+        assert_eq!(valid_edits.len(), 3, "Expected all 3 valid edits preserved: {:?}", valid_edits);
+
+        // 4. Complete top-level decl helper distinguishes complete declarations from partial JSX/expression snippets
+        assert!(crate::healer::is_complete_top_level_decl("interface TicketRow {\n  id: string;\n}"));
+        assert!(crate::healer::is_complete_top_level_decl("type TicketState = 'OPEN' | 'CLOSED';"));
+        assert!(!crate::healer::is_complete_top_level_decl("{(items ?? []).map(item => ("));
+        assert!(!crate::healer::is_complete_top_level_decl("<div className=\"p-4\">{title}</div>"));
+    }
+
+    #[test]
+    fn test_katastar_classifies_runtime_typeerror_v51() {
+        let sig = crate::katastar::normalize_error_signature(
+            "",
+            "⨯ TypeError: Cannot read properties of null (reading 'map')\n  at BoardPage (./src/app/board/page.tsx:30:29)",
+            Some("src/app/board/page.tsx"),
+        );
+        assert_eq!(sig.category, "runtime");
+        assert_eq!(sig.error_code.as_deref(), Some("TypeError"));
+        assert!(
+            sig.error_signature.starts_with("runtime:TypeError:"),
+            "Unexpected runtime TypeError signature: {}",
+            sig.error_signature
+        );
+
+        // Related dependency extraction automatically pulls local hooks on runtime null/.map crash
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v51_rel_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("src/app/board")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/hooks")).unwrap();
+        let page_src = r#"'use client';
+import { useRecords } from '@/hooks/useRecords';
+export default function BoardPage() {
+  const { items } = useRecords();
+  return <ul>{items.map(r => <li key={r.id}>{r.title}</li>)}</ul>;
+}
+"#;
+        let hook_src = "'use client';\nimport { useState } from 'react';\nexport function useRecords() { const [items, setItems] = useState(null); return { items, setItems }; }\n";
+        std::fs::write(temp_dir.join("src/app/board/page.tsx"), page_src).unwrap();
+        std::fs::write(temp_dir.join("src/hooks/useRecords.ts"), hook_src).unwrap();
+
+        let related = crate::healer::extract_related_project_files_for_error(
+            &temp_dir,
+            page_src,
+            "src/app/board/page.tsx",
+            "TypeError: Cannot read properties of null (reading 'map')",
+        );
+        assert!(
+            related.iter().any(|(p, _)| p == "src/hooks/useRecords.ts"),
+            "Expected runtime crash to pull imported hook file, got: {:?}",
+            related.iter().map(|(p, _)| p).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_barrel_repair_and_ui_children_reconciliation_v51() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v51_barrel_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let src_dir = temp_dir.join("src");
+        std::fs::create_dir_all(src_dir.join("components")).unwrap();
+        std::fs::create_dir_all(src_dir.join("app/board")).unwrap();
+
+        std::fs::write(
+            src_dir.join("components/Navbar.tsx"),
+            "'use client';\nexport function Navbar() { return <nav />; }\nexport default Navbar;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src_dir.join("components/ui.tsx"),
+            "'use client';\nimport React from 'react';\nexport const Button: React.FC<{ onClick?: () => void; children?: React.ReactNode }> = ({ onClick, children }) => (<button onClick={onClick}>{children}</button>);\nexport const Select: React.FC<{ name: string; onChange: (e: any) => void }> = ({ name, onChange }) => (<select name={name} onChange={onChange}>{children}</select>);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src_dir.join("components/index.ts"),
+            "export { default as Navbar } from './Navbar';\nexport { default as Button } from './Button';\nexport { default as Input } from './Input';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src_dir.join("app/board/page.tsx"),
+            "import { Button, Select } from '@/components';\nexport default function Board() { return <Button><Select name='s' onChange={() => {}}><option>1</option></Select></Button>; }\n",
+        )
+        .unwrap();
+
+        crate::sanitizer::ensure_ui_primitives_reconciled(&temp_dir);
+        crate::sanitizer::ensure_directory_barrel_files(&temp_dir);
+
+        let updated_barrel = std::fs::read_to_string(src_dir.join("components/index.ts")).unwrap();
+        assert!(
+            !updated_barrel.contains("./Button") && !updated_barrel.contains("./Input"),
+            "Dead re-exports ./Button / ./Input must be stripped from barrel:\n{}",
+            updated_barrel
+        );
+        assert!(
+            updated_barrel.contains("export * from './ui';") || updated_barrel.contains("./ui"),
+            "Barrel must rescue UI symbols from sibling ui.tsx:\n{}",
+            updated_barrel
+        );
+        assert!(
+            updated_barrel.contains("Navbar"),
+            "Existing valid sibling export must remain:\n{}",
+            updated_barrel
+        );
+
+        let updated_ui = std::fs::read_to_string(src_dir.join("components/ui.tsx")).unwrap();
+        assert!(
+            updated_ui.contains("children?: React.ReactNode") && updated_ui.contains("{ name, onChange, children"),
+            "Select arrow component referencing {{children}} must gain children prop & param even with `=>` inside type:\n{}",
+            updated_ui
+        );
+
+        // Also ensure collect_missing_imports skips dead re-export targets only after barrel cleanup (zero missing)
+        let mut missing = Vec::new();
+        crate::self_healing::collect_missing_imports(&src_dir, &src_dir, &mut missing);
+        assert!(
+            !missing.iter().any(|m| m.target_path.to_string_lossy().ends_with("Button.ts") || m.target_path.to_string_lossy().ends_with("Input.ts")),
+            "Reconciled barrel must leave zero missing Button/Input targets"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_prisma_contract_summary_for_healing_v51() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v51_prisma_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("prisma")).unwrap();
+        std::fs::write(
+            temp_dir.join("prisma/schema.prisma"),
+            r#"
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum TicketState {
+  OPEN
+  CLOSED
+}
+
+model Ticket {
+  id        String      @id @default(cuid())
+  title     String
+  state     TicketState @default(OPEN)
+  createdAt DateTime    @default(now())
+}
+"#,
+        )
+        .unwrap();
+
+        let summary = crate::self_healing::extract_prisma_schema_summary_for_healing(&temp_dir);
+        assert!(summary.contains("Ticket (prisma.ticket)"), "Expected model/delegate in summary:\n{}", summary);
+        assert!(summary.contains("TicketState: OPEN | CLOSED"), "Expected enum variants in summary:\n{}", summary);
+        assert!(summary.contains("required: [title]"), "Expected required scalar field in summary:\n{}", summary);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_filter_runaway_manifest_expansion_v51() {
+        let orig = vec![
+            serde_json::json!({ "path": "src/app/page.tsx", "language": "typescript" }),
+            serde_json::json!({ "path": "src/components/Navbar.tsx", "language": "typescript" }),
+            serde_json::json!({ "path": "src/translations/en.json", "language": "json" }),
+        ];
+
+        let mut expanded = orig.clone();
+        // Foreign Vue/Svelte files added by hallucinating expansion
+        expanded.push(serde_json::json!({ "path": "src/components/Widget.vue", "language": "vue" }));
+        expanded.push(serde_json::json!({ "path": "src/components/Banner.svelte", "language": "svelte" }));
+        // Non-route folders accidentally duplicated inside src/app/
+        expanded.push(serde_json::json!({ "path": "src/app/components/Card.tsx", "language": "typescript" }));
+        expanded.push(serde_json::json!({ "path": "src/app/utils/format.ts", "language": "typescript" }));
+        // Runaway 20-locale translation matrix
+        for i in 0..20 {
+            expanded.push(serde_json::json!({
+                "path": format!("src/translations/locale-{}.json", i),
+                "language": "json"
+            }));
+        }
+
+        let filtered = crate::sanitizer::filter_runaway_manifest_expansion(&orig, expanded, "nextjs");
+        let paths: Vec<String> = filtered
+            .iter()
+            .filter_map(|v| v.get("path").and_then(|p| p.as_str()).map(|s| s.to_string()))
+            .collect();
+
+        assert!(paths.contains(&"src/app/page.tsx".to_string()));
+        assert!(paths.contains(&"src/components/Navbar.tsx".to_string()));
+        assert!(paths.contains(&"src/translations/en.json".to_string()));
+        assert!(!paths.iter().any(|p| p.ends_with(".vue") || p.ends_with(".svelte")), "Foreign framework files must be dropped: {:?}", paths);
+        assert!(paths.contains(&"src/components/Card.tsx".to_string()), "Expanded src/app/components/* must canonicalize to src/components/*: {:?}", paths);
+        assert!(paths.contains(&"src/utils/format.ts".to_string()), "Expanded src/app/utils/* must canonicalize to src/utils/*: {:?}", paths);
+        let extra_locales = paths.iter().filter(|p| p.starts_with("src/translations/locale-")).count();
+        assert_eq!(extra_locales, 2, "Runaway expanded locale JSONs must be capped at 2, got: {:?}", paths);
+    }
+
+    #[test]
+    fn test_ui_bare_fc_idempotent_union_and_compound_jsx_v51() {
+        // 1. Bare React.FC signatures
+        let ui_src = "export const Button: React.FC = ({ onClick, children }) => <button onClick={onClick}>{children}</button>;\nexport const IconBox: React.FC = (props) => <span {...props} />;\nconst Footer: React.FC = () => <footer />;\n";
+        let repaired_general = crate::sanitizer::repair_bare_react_fc_signatures(ui_src, false);
+        assert!(repaired_general.contains("Button: React.FC<any> = ({ onClick"));
+        assert!(repaired_general.contains("const Footer: React.FC = ()"), "Zero-arg Footer outside UI dir should remain untouched");
+
+        let repaired_ui = crate::sanitizer::repair_bare_react_fc_signatures(ui_src, true);
+        assert!(repaired_ui.contains("IconBox: React.FC<any> = (props)"));
+
+        // 2. Idempotent (string & {}) literal union widening + Compound Dot-JSX (<Tabs.List>, <Accordion.Item>)
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v51_ui_compound_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let src_dir = temp_dir.join("src");
+        std::fs::create_dir_all(src_dir.join("components/ui")).unwrap();
+        std::fs::create_dir_all(src_dir.join("app/dashboard")).unwrap();
+
+        std::fs::write(
+            src_dir.join("components/ui/badge.tsx"),
+            "\"use client\";\nimport React from 'react';\nexport interface BadgeProps {\n  variant?: 'default' | 'success' | 'danger';\n  children?: React.ReactNode;\n}\nexport const Badge: React.FC<BadgeProps> = ({ variant = 'default', children }) => <span data-v={variant}>{children}</span>;\n",
+        ).unwrap();
+
+        std::fs::write(
+            src_dir.join("components/ui.tsx"),
+            "\"use client\";\nimport React from 'react';\nexport const Tabs: React.FC = ({ children }) => <div>{children}</div>;\nexport const Accordion: React.FC = ({ children }) => <div>{children}</div>;\n",
+        ).unwrap();
+
+        std::fs::write(
+            src_dir.join("app/dashboard/page.tsx"),
+            "\"use client\";\nimport { Tabs, Accordion } from '@/components/ui';\nexport default function Dashboard() {\n  return (\n    <Tabs>\n      <Tabs.List><Tabs.Trigger value=\"a\">Tab A</Tabs.Trigger></Tabs.List>\n      <Tabs.Content value=\"a\"><Accordion><Accordion.Item>Hi</Accordion.Item></Accordion></Tabs.Content>\n    </Tabs>\n  );\n}\n",
+        ).unwrap();
+
+        crate::sanitizer::ensure_ui_primitives_reconciled(&temp_dir);
+        crate::sanitizer::ensure_ui_primitives_reconciled(&temp_dir);
+
+        let badge_out = std::fs::read_to_string(src_dir.join("components/ui/badge.tsx")).unwrap();
+        assert_eq!(
+            badge_out.matches("(string & {})").count(),
+            1,
+            "Re-running UI reconciler must be idempotent for union props:\n{}",
+            badge_out
+        );
+
+        let ui_out = std::fs::read_to_string(src_dir.join("components/ui.tsx")).unwrap();
+        assert!(ui_out.contains("export const TabsList"), "Missing synthesized TabsList:\n{}", ui_out);
+        assert!(ui_out.contains("export const TabsTrigger"), "Missing synthesized TabsTrigger:\n{}", ui_out);
+        assert!(ui_out.contains("export const TabsContent"), "Missing synthesized TabsContent:\n{}", ui_out);
+        assert!(ui_out.contains("export const AccordionItem"), "Missing synthesized AccordionItem:\n{}", ui_out);
+        assert!(ui_out.contains("(Tabs as any).List = TabsList;"), "Missing runtime Tabs.List assignment:\n{}", ui_out);
+        assert!(ui_out.contains("(Accordion as any).Item = AccordionItem;"), "Missing runtime Accordion.Item assignment:\n{}", ui_out);
+        assert!(ui_out.contains("Tabs: React.FC<any> & Record<string, any>"), "Missing Tabs Record<string, any> intersection:\n{}", ui_out);
+        assert!(ui_out.contains("Accordion: React.FC<any> & Record<string, any>"), "Missing Accordion Record<string, any> intersection:\n{}", ui_out);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_nextlink_nextauth_and_prisma_enum_reconciliation_v51() {
+        // 1. Named { Link } -> default Link
+        let bad_link = "import React from 'react';\nimport { Link } from 'next/link';\nexport default function Nav() { return <Link href=\"/\">Home</Link>; }\n";
+        let fixed_link = crate::sanitizer::sanitize_next_link_named_import(bad_link);
+        assert!(fixed_link.contains("import Link from 'next/link';"), "Expected default Link import:\n{}", fixed_link);
+        assert!(!fixed_link.contains("{ Link }"));
+
+        // 2. NextAuth provider named import & missing default NextAuth import
+        let bad_auth = "import { NextAuthOptions, CredentialsProvider } from \"next-auth\";\nexport const authOptions: NextAuthOptions = { providers: [CredentialsProvider({ name: 'cred', credentials: {}, async authorize() { return null; } })] };\nexport default NextAuth(authOptions);\n";
+        let fixed_auth = crate::sanitizer::sanitize_nextauth_imports(bad_auth);
+        assert!(fixed_auth.contains("import CredentialsProvider from 'next-auth/providers/credentials';"), "Expected provider subpath import:\n{}", fixed_auth);
+        assert!(fixed_auth.contains("import NextAuth from 'next-auth';"), "Expected default NextAuth import:\n{}", fixed_auth);
+        assert!(fixed_auth.contains("import { NextAuthOptions } from \"next-auth\";"), "Expected NextAuthOptions preserved:\n{}", fixed_auth);
+
+        // 3. Server Prisma.<Enum> stripping & @prisma/client import injection + project-context validator coverage
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v51_prisma_enum_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("prisma")).unwrap();
+        std::fs::write(
+            temp_dir.join("prisma/schema.prisma"),
+            "datasource db { provider = \"postgresql\" url = env(\"DATABASE_URL\") }\nenum PaymentMethod {\n  STRIPE\n  CREDIT_CARD\n}\nmodel Invoice {\n  id     String        @id @default(cuid())\n  method PaymentMethod @default(STRIPE)\n}\n",
+        ).unwrap();
+
+        let bad_prisma_util = "import type { PrismaClient } from '@prisma/client';\nexport function isCard(m: Prisma.PaymentMethod) {\n  return m === Prisma.PaymentMethod.CREDIT_CARD;\n}\n";
+        let fixed_prisma_util = crate::sanitizer::reconcile_server_prisma_enum_usage(&temp_dir, "src/utils/prisma.ts", bad_prisma_util);
+        assert!(!fixed_prisma_util.contains("Prisma.PaymentMethod"), "Expected Prisma.PaymentMethod rewritten to top-level enum:\n{}", fixed_prisma_util);
+        assert!(fixed_prisma_util.contains("import { PaymentMethod } from '@prisma/client';"), "Expected runtime enum import injected:\n{}", fixed_prisma_util);
+        assert!(fixed_prisma_util.contains("PaymentMethod.CREDIT_CARD"));
+
+        // 4. Abstract & project-context validators reject foreign frameworks, { Link }, { CredentialsProvider }, and non-API bad Prisma delegate
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        assert!(rt.block_on(crate::orchestrator::validate_file_with_abstract_rules(
+            "src/utils/i18n.ts",
+            "import { createI18n } from 'vue-i18n';\nexport const i18n = createI18n({});\n",
+            "qwen2.5-coder:7b"
+        )).is_err());
+        assert!(rt.block_on(crate::orchestrator::validate_file_with_abstract_rules(
+            "src/app/hardware/page.tsx",
+            bad_link,
+            "qwen2.5-coder:7b"
+        )).is_err());
+        assert!(rt.block_on(crate::orchestrator::validate_file_with_abstract_rules(
+            "src/utils/auth.ts",
+            bad_auth,
+            "qwen2.5-coder:7b"
+        )).is_err());
+        assert!(rt.block_on(crate::orchestrator::validate_file_with_project_context(
+            &temp_dir,
+            "src/utils/prisma.ts",
+            "import prisma from '@/lib/prisma';\nexport function load() { return prisma.ghostModel.findMany(); }\n",
+            "qwen2.5-coder:7b"
+        )).is_err());
+        assert!(rt.block_on(crate::orchestrator::validate_file_with_project_context(
+            &temp_dir,
+            "src/utils/prisma.ts",
+            &format!("import prisma from '@/lib/prisma';\n{}\n", fixed_prisma_util),
+            "qwen2.5-coder:7b"
+        )).is_ok());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_packages_foreign_cleanup_and_stripe_version_preservation_v51() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v51_pkgs_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("src/utils")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/app")).unwrap();
+        std::fs::write(
+            temp_dir.join("src/utils/stripe.ts"),
+            "import Stripe from 'stripe';\nexport const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '');\n",
+        ).unwrap();
+        std::fs::write(
+            temp_dir.join("src/utils/i18n.ts"),
+            "import { createI18n } from 'vue-i18n';\nexport const i18n = createI18n({});\n",
+        ).unwrap();
+        std::fs::write(
+            temp_dir.join("package.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "name": "test-app",
+                "dependencies": {
+                    "next": "14.2.35",
+                    "react": "^18.2.0",
+                    "react-dom": "^18.2.0",
+                    "stripe": "^23.1.0",
+                    "vue-i18n": "^9.0.0",
+                    "svelte": "^4.0.0"
+                },
+                "devDependencies": {}
+            })).unwrap(),
+        ).unwrap();
+
+        crate::packages::repair_package_json_dependencies(&temp_dir);
+
+        let updated_pkg: Value = serde_json::from_str(&std::fs::read_to_string(temp_dir.join("package.json")).unwrap()).unwrap();
+        let deps = updated_pkg["dependencies"].as_object().unwrap();
+        assert!(!deps.contains_key("vue-i18n"), "vue-i18n must be removed from Next.js package.json: {:?}", deps);
+        assert!(!deps.contains_key("svelte"), "svelte must be removed from Next.js package.json: {:?}", deps);
+        assert_eq!(
+            deps.get("stripe").and_then(|v| v.as_str()),
+            Some("^23.1.0"),
+            "Installed stripe semver lock must not be clobbered by wildcard DB entry: {:?}",
+            deps
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_inspect_dts_exports_stripe_dynamic_v51() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v51_stripe_dts_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("node_modules/stripe/esm/resources")).unwrap();
+        std::fs::write(
+            temp_dir.join("node_modules/stripe/package.json"),
+            r#"{"name":"stripe","version":"23.1.0","types":"types/index.d.ts"}"#,
+        ).unwrap();
+        std::fs::write(
+            temp_dir.join("node_modules/stripe/esm/apiVersion.d.ts"),
+            "export declare const ApiVersion = \"2026-10-28.endive\";\n",
+        ).unwrap();
+        std::fs::write(
+            temp_dir.join("node_modules/stripe/esm/resources/Subscriptions.d.ts"),
+            "export declare class SubscriptionResource {\n  cancel(id: string): Promise<any>;\n}\n",
+        ).unwrap();
+
+        let src = "import Stripe from 'stripe';\nexport const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2020-08-27' });\nexport async function killSub(id: string) { return stripe.subscriptions.del(id); }\n";
+        let err = "src/utils/stripe.ts(2,55): error TS2322: Type '\"2020-08-27\"' is not assignable to type 'LatestApiVersion'.\nsrc/utils/stripe.ts(3,64): error TS2339: Property 'del' does not exist on type 'SubscriptionResource'.";
+        let notes = crate::self_healing::inspect_dts_exports_for_file(&temp_dir, src, err);
+        assert!(notes.contains("2026-10-28.endive"), "Expected dynamic disk ApiVersion in notes:\n{}", notes);
+        assert!(notes.contains("stripe.subscriptions.cancel"), "Expected verified Subscriptions.cancel note:\n{}", notes);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
 }

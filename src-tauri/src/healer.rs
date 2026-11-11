@@ -67,7 +67,26 @@ pub fn extract_related_project_files_for_error(
 ) -> Vec<(String, String)> {
     use std::collections::HashSet;
     let mut resolved_paths = HashSet::new();
+    let mut ordered_paths = Vec::new();
     let mut results = Vec::new();
+
+    let mut insert_resolved = |path_str: String| {
+        if path_str != current_file && proj_dir.join(&path_str).is_file() && resolved_paths.insert(path_str.clone()) {
+            ordered_paths.push(path_str);
+        }
+    };
+
+    let err_lower = error_msg.to_lowercase();
+    let is_runtime_or_prop_crash = err_lower.contains("typeerror")
+        || err_lower.contains("cannot read propert")
+        || err_lower.contains("is not a function")
+        || err_lower.contains(".map")
+        || err_lower.contains("todatestring")
+        || err_lower.contains("tolocaledatestring")
+        || err_lower.contains("hydration")
+        || err_lower.contains("objects are not valid as a react child")
+        || err_lower.contains("null")
+        || err_lower.contains("undefined");
 
     // 1. Scan for all quoted tokens in error_msg ('...', "...", `...`)
     let mut quoted_tokens = Vec::new();
@@ -99,25 +118,31 @@ pub fn extract_related_project_files_for_error(
     for token in &quoted_tokens {
         if token.starts_with("@/") || token.starts_with("./") || token.starts_with("../") || token.contains('/') {
             if let Some(resolved) = resolve_import_path(proj_dir, token, current_file) {
-                if resolved != current_file && proj_dir.join(&resolved).is_file() {
-                    resolved_paths.insert(resolved);
-                }
+                insert_resolved(resolved);
             }
         }
     }
 
     // 2. Parse all imports declared in the failing file
-    // Matches: import ... from '...'; import '...'; const ... = require('...');
-    if let Ok(re) = regex::Regex::new(r#"(?m)(?:import\s+(?:(?:(\{[^}]+\})|([a-zA-Z0-9_$]+)|(?:\*\s+as\s+[a-zA-Z0-9_$]+))\s+from\s+)?['"]([^'"]+)['"]"#) {
+    if let Ok(re) = regex::Regex::new(
+        r#"(?m)import\s+(?:(?:type\s+)?(?:(?:([a-zA-Z0-9_$]+)\s*,\s*)?(?:(\{[^}]+\})|([a-zA-Z0-9_$]+)|(?:\*\s+as\s+[a-zA-Z0-9_$]+))\s+from\s+))?['"]([^'"]+)['"]"#,
+    ) {
+        let mut hook_candidates: Vec<String> = Vec::new();
         for cap in re.captures_iter(file_content) {
-            let import_specifier = cap.get(3).map(|m| m.as_str()).unwrap_or("");
+            let import_specifier = cap.get(4).map(|m| m.as_str()).unwrap_or("");
             if import_specifier.is_empty() {
                 continue;
             }
 
             // Extract imported symbols (e.g. named imports { A, B } or default import Navbar)
             let mut imported_symbols = Vec::new();
-            if let Some(named) = cap.get(1) {
+            if let Some(default_leading) = cap.get(1) {
+                let sym_clean = default_leading.as_str().trim();
+                if !sym_clean.is_empty() {
+                    imported_symbols.push(sym_clean.to_string());
+                }
+            }
+            if let Some(named) = cap.get(2) {
                 for sym in named.as_str().trim_matches(|c| c == '{' || c == '}').split(',') {
                     let sym_clean = sym.trim().split_whitespace().last().unwrap_or("").trim();
                     if !sym_clean.is_empty() {
@@ -125,7 +150,7 @@ pub fn extract_related_project_files_for_error(
                     }
                 }
             }
-            if let Some(default_sym) = cap.get(2) {
+            if let Some(default_sym) = cap.get(3) {
                 let sym_clean = default_sym.as_str().trim();
                 if !sym_clean.is_empty() {
                     imported_symbols.push(sym_clean.to_string());
@@ -135,14 +160,24 @@ pub fn extract_related_project_files_for_error(
             // Check if error_msg mentions the import specifier OR any of its imported symbols
             let mentions_specifier = !import_specifier.is_empty() && error_msg.contains(import_specifier);
             let mentions_symbol = imported_symbols.iter().any(|sym| error_msg.contains(sym));
+            let spec_lower = import_specifier.to_lowercase();
+            let is_data_provider_import = spec_lower.contains("/hooks")
+                || spec_lower.starts_with("hooks/")
+                || spec_lower.contains("/services")
+                || spec_lower.contains("/context");
 
             if mentions_specifier || mentions_symbol {
                 if let Some(resolved) = resolve_import_path(proj_dir, import_specifier, current_file) {
-                    if resolved != current_file && proj_dir.join(&resolved).is_file() {
-                        resolved_paths.insert(resolved);
-                    }
+                    insert_resolved(resolved);
+                }
+            } else if is_runtime_or_prop_crash && is_data_provider_import {
+                if let Some(resolved) = resolve_import_path(proj_dir, import_specifier, current_file) {
+                    hook_candidates.push(resolved);
                 }
             }
+        }
+        for hc in hook_candidates {
+            insert_resolved(hc);
         }
     }
 
@@ -160,16 +195,14 @@ pub fn extract_related_project_files_for_error(
             ] {
                 for ext in &["tsx", "ts", "jsx", "js"] {
                     let candidate = format!("{}/{}.{}", sub, token, ext);
-                    if proj_dir.join(&candidate).is_file() && candidate != current_file {
-                        resolved_paths.insert(candidate);
-                    }
+                    insert_resolved(candidate);
                 }
             }
         }
     }
 
     // 4. Read contents of all resolved related files
-    for path_str in resolved_paths {
+    for path_str in ordered_paths {
         let full_path = proj_dir.join(&path_str);
         if let Ok(content) = std::fs::read_to_string(&full_path) {
             results.push((path_str, content));
@@ -1346,6 +1379,32 @@ pub fn recursively_find_edits(value: &Value, current_path: &str, edits: &mut Vec
             let mut context_path = current_path.to_string();
 
             let is_move = map.get("type").and_then(|t| t.as_str()) == Some("move");
+            let has_range_coords = map.iter().any(|(k, _)| {
+                matches!(
+                    k.to_lowercase().as_str(),
+                    "startline"
+                        | "endline"
+                        | "startcolumn"
+                        | "endcolumn"
+                        | "start_line"
+                        | "end_line"
+                        | "start_column"
+                        | "end_column"
+                        | "linenumber"
+                        | "line_number"
+                        | "start"
+                        | "end"
+                        | "range"
+                )
+            });
+            let has_line_or_col_num = map.iter().any(|(k, v)| {
+                matches!(k.to_lowercase().as_str(), "line" | "column" | "col")
+                    && (v.is_number()
+                        || v.as_str().map_or(false, |s| {
+                            let ts = s.trim();
+                            !ts.is_empty() && ts.chars().all(|c| c.is_ascii_digit())
+                        }))
+            });
             let has_path_swap_keys = (map.contains_key("newPath") || map.contains_key("new_path"))
                 && (map.contains_key("path")
                     || map.contains_key("oldPath")
@@ -1616,6 +1675,22 @@ pub fn recursively_find_edits(value: &Value, current_path: &str, edits: &mut Vec
                         | "symbol"
                         | "line"
                         | "column"
+                        | "col"
+                        | "startline"
+                        | "endline"
+                        | "startcolumn"
+                        | "endcolumn"
+                        | "start_line"
+                        | "end_line"
+                        | "start_column"
+                        | "end_column"
+                        | "linenumber"
+                        | "line_number"
+                        | "start"
+                        | "end"
+                        | "range"
+                        | "location"
+                        | "position"
                         | "newpath"
                         | "new_path"
                         | "newfile"
@@ -1696,6 +1771,24 @@ pub fn recursively_find_edits(value: &Value, current_path: &str, edits: &mut Vec
                 let final_target = detected_target.unwrap_or_default();
                 let final_is_md = final_path.to_lowercase().ends_with(".md");
                 let final_is_json = final_path.to_lowercase().ends_with(".json");
+                let trimmed_code = code.trim();
+                let is_likely_full_module = final_is_md
+                    || final_is_json
+                    || (!trimmed_code.starts_with('<')
+                        && !trimmed_code.starts_with('{')
+                        && !trimmed_code.starts_with('(')
+                        && (trimmed_code.contains("export default")
+                            || trimmed_code.contains("export function ")
+                            || trimmed_code.contains("export async function ")
+                            || trimmed_code.contains("export const ")
+                            || trimmed_code.contains("export interface ")
+                            || trimmed_code.contains("export type ")
+                            || trimmed_code.starts_with("'use client'")
+                            || trimmed_code.starts_with("\"use client\"")
+                            || is_complete_top_level_decl(trimmed_code)));
+                if final_target.is_empty() && (has_range_coords || (has_line_or_col_num && !is_likely_full_module)) {
+                    return;
+                }
 
                 let code_ok = if !final_is_md && has_prose_leak_in_code(&code) {
                     false
@@ -1737,6 +1830,11 @@ pub fn recursively_find_edits(value: &Value, current_path: &str, edits: &mut Vec
                             | "steps"
                             | "instructions"
                             | "details"
+                            | "start"
+                            | "end"
+                            | "range"
+                            | "location"
+                            | "position"
                     )
                 {
                     let child_ctx = if is_valid_file_path(k) {
@@ -1947,10 +2045,10 @@ async fn verify_single_file_detail(
         };
     }
 
-    // `tsc` cannot detect Next.js missing `"use client"` or non-ReferenceError runtime errors
-    if error_code == Some("NEXT_USE_CLIENT")
-        || (category == "runtime" && error_code != Some("ReferenceError"))
-    {
+    // `tsc` cannot detect Next.js missing `"use client"`, whereas running `tsc --noEmit` on
+    // runtime errors catches broken JSX/TS syntax (`TS1xxx`) or missing identifiers immediately.
+    let _ = category;
+    if error_code == Some("NEXT_USE_CLIENT") {
         return VerifyDetail {
             outcome: SingleFileVerifyOutcome::Inconclusive,
             raw_output: String::new(),
@@ -2339,6 +2437,120 @@ pub fn apply_semantic_ensure_import_edit(
     Ok(out)
 }
 
+pub fn is_complete_top_level_decl(src: &str) -> bool {
+    let trimmed = src.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let starts_decl = trimmed.starts_with("interface ")
+        || trimmed.starts_with("type ")
+        || trimmed.starts_with("enum ")
+        || trimmed.starts_with("function ")
+        || trimmed.starts_with("async function ")
+        || trimmed.starts_with("class ")
+        || trimmed.starts_with("const ")
+        || trimmed.starts_with("let ")
+        || trimmed.starts_with("var ")
+        || trimmed.starts_with("export interface ")
+        || trimmed.starts_with("export type ")
+        || trimmed.starts_with("export enum ")
+        || trimmed.starts_with("export function ")
+        || trimmed.starts_with("export async function ")
+        || trimmed.starts_with("export class ")
+        || trimmed.starts_with("export const ");
+    if !starts_decl {
+        return false;
+    }
+    if !(trimmed.ends_with('}') || trimmed.ends_with(';')) {
+        return false;
+    }
+    let bytes = trimmed.as_bytes();
+    let mut brace_depth: i32 = 0;
+    let mut paren_depth: i32 = 0;
+    let mut bracket_depth: i32 = 0;
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_line_comment {
+            if b == b'\n' {
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_block_comment {
+            if b == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                in_block_comment = false;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if in_single || in_double || in_backtick {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if in_single && b == b'\'' {
+                in_single = false;
+            } else if in_double && b == b'"' {
+                in_double = false;
+            } else if in_backtick && b == b'`' {
+                in_backtick = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() {
+            if bytes[i + 1] == b'/' {
+                in_line_comment = true;
+                i += 2;
+                continue;
+            }
+            if bytes[i + 1] == b'*' {
+                in_block_comment = true;
+                i += 2;
+                continue;
+            }
+        }
+        match b {
+            b'\'' => in_single = true,
+            b'"' => in_double = true,
+            b'`' => in_backtick = true,
+            b'{' => brace_depth += 1,
+            b'}' => {
+                brace_depth -= 1;
+                if brace_depth < 0 {
+                    return false;
+                }
+            }
+            b'(' => paren_depth += 1,
+            b')' => {
+                paren_depth -= 1;
+                if paren_depth < 0 {
+                    return false;
+                }
+            }
+            b'[' => bracket_depth += 1,
+            b']' => {
+                bracket_depth -= 1;
+                if bracket_depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    !in_single && !in_double && !in_backtick && brace_depth == 0 && paren_depth == 0 && bracket_depth == 0
+}
+
 #[tauri::command]
 pub async fn project_heal_compile_error(
     project_id: String,
@@ -2384,6 +2596,8 @@ pub async fn project_heal_compile_error(
         .to_string();
 
     let sig_info = crate::katastar::normalize_error_signature("", &error_msg, Some(&rel_file_path));
+    let is_non_ref_runtime =
+        sig_info.category == "runtime" && sig_info.error_code.as_deref() != Some("ReferenceError");
     let failed_prev_ids = crate::katastar::resolve_reoccurred_pending_repair(
         &project_id,
         &rel_file_path,
@@ -2461,7 +2675,7 @@ pub async fn project_heal_compile_error(
         )
         .await;
         match verify_detail.outcome {
-            SingleFileVerifyOutcome::Passed(vkind) => {
+            SingleFileVerifyOutcome::Passed(vkind) if !is_non_ref_runtime => {
                 crate::katastar::finalize_katastar_outcome(
                     &eid,
                     true,
@@ -2489,7 +2703,7 @@ pub async fn project_heal_compile_error(
                 }));
                 return Ok(true);
             }
-            SingleFileVerifyOutcome::Inconclusive => {
+            SingleFileVerifyOutcome::Inconclusive if !is_non_ref_runtime => {
                 crate::katastar::track_pending_project_repair(
                     &project_id,
                     &rel_file_path,
@@ -2514,6 +2728,40 @@ pub async fn project_heal_compile_error(
                     "type": "info"
                 }));
                 return Ok(true);
+            }
+            SingleFileVerifyOutcome::Passed(_) | SingleFileVerifyOutcome::Inconclusive => {
+                // Non-ReferenceError runtime bugs (e.g. TypeError null `.map()`) require targeted AI/Katastar runtime guards;
+                // preserve any import/sanitization cleanup and proceed to Katastar + AI loop instead of stopping early.
+                let vlabel = match verify_detail.outcome {
+                    SingleFileVerifyOutcome::Passed(k) => k,
+                    _ => "inconclusive",
+                };
+                crate::katastar::finalize_katastar_outcome(
+                    &eid,
+                    false,
+                    "deterministic",
+                    "partial_progress",
+                    None,
+                    None,
+                    "",
+                );
+                active_file_content = pre_sanitized;
+                active_clean_content = pre_clean;
+                crate::katastar::record_project_heal_round(
+                    &proj_dir,
+                    &rel_file_path,
+                    1,
+                    "deterministic",
+                    "partial_progress",
+                    &[],
+                    std::slice::from_ref(&error_msg),
+                    &format!("Deterministic sanitizer cleaned imports/directives ({}); continuing to runtime repair", vlabel),
+                );
+                cached_baseline_verify = Some(verify_detail);
+                let _ = window.emit("server:log", serde_json::json!({
+                    "text": format!("> [AI Auto-Healing] Deterministički prolaz je očistio importe/direktive u '{}', nastavljam sa popravkom runtime greške...\n", rel_file_path),
+                    "type": "info"
+                }));
             }
             SingleFileVerifyOutcome::Failed(vkind) => {
                 crate::katastar::finalize_katastar_outcome(
@@ -2618,7 +2866,7 @@ pub async fn project_heal_compile_error(
                         "type": "warning"
                     }));
                 }
-                SingleFileVerifyOutcome::Passed(vkind) => {
+                SingleFileVerifyOutcome::Passed(vkind) if !is_non_ref_runtime => {
                     crate::katastar::finalize_katastar_outcome(
                         &best.entry_id,
                         true,
@@ -2646,7 +2894,7 @@ pub async fn project_heal_compile_error(
                     }));
                     return Ok(true);
                 }
-                SingleFileVerifyOutcome::Inconclusive => {
+                SingleFileVerifyOutcome::Inconclusive | SingleFileVerifyOutcome::Passed(_) => {
                     crate::katastar::track_pending_project_repair(
                         &project_id,
                         &rel_file_path,
@@ -2712,7 +2960,7 @@ pub async fn project_heal_compile_error(
         \n\n\
         CRITICAL RULES:\n\
         1. Respond ONLY with a valid JSON object matching the format described below. Do not write any explanations, introductory text, or markdown code blocks (do not wrap in ```json). Just the raw JSON.\n\
-        2. In the JSON structure, under 'edits', each 'target' block must exactly match (character-for-character, including leading whitespace and indentation) a unique substring in the target file. To create a missing local module file, set 'path' to its full path with extension (e.g. 'src/models/Entity.ts') and 'target' to \"\". For missing imports, you may also emit `{ \"path\": \"...\", \"type\": \"import\", \"module\": \"...\", \"namedImports\": [\"...\"] }`.\n\
+        2. In the JSON structure, under 'edits', each 'target' block must exactly match (character-for-character, including leading whitespace and indentation) a unique substring in the target file. NEVER use line numbers or coordinate ranges ('startLine', 'endLine', 'startColumn', 'endColumn', 'start', 'end', 'range', 'line', 'column') instead of verbatim 'target'. To create a brand-new missing file, set 'path' to its full path with extension (e.g. 'src/models/Entity.ts') and 'target' to \"\". For missing imports, you may also emit `{ \"path\": \"...\", \"type\": \"import\", \"module\": \"...\", \"namedImports\": [\"...\"] }`.\n\
         3. Do NOT include placeholders in 'replacement'. The code must be complete and ready to run.\n\
         4. Focus on resolving the reported error cleanly. Do not make unrelated changes.\n\
         5. DATABASE RESILIENCY: Domain models under 'src/models/' MUST be pure TypeScript interfaces/types ONLY (never import '@/lib/prisma' or 'new PrismaClient()'). If a server route or Prisma query fails at runtime, handle errors safely without importing Prisma into 'use client' files.\n\
@@ -2794,7 +3042,40 @@ pub async fn project_heal_compile_error(
         }
     }
 
+    let lower_err_prompt = current_error_context.to_lowercase();
+    let is_runtime_null_crash = is_non_ref_runtime
+        || lower_err_prompt.contains("typeerror")
+        || lower_err_prompt.contains("cannot read propert")
+        || lower_err_prompt.contains("is not a function")
+        || lower_err_prompt.contains(".map(")
+        || lower_err_prompt.contains("reading 'map'")
+        || lower_err_prompt.contains("todatestring");
+    if is_runtime_null_crash {
+        base_system_prompt.push_str(
+            "\n\nRUNTIME NULL/UNDEFINED SAFETY HINT:\n\
+             - Before calling `.map`, `.filter`, `.reduce`, `.slice`, or `.length` on state/props/fetched values that may be null/undefined or non-array error objects, guard safely with `(Array.isArray(items) ? items : []).map(...)` or `(items ?? []).map(...)`.\n\
+             - Before calling `.toDateString()`, `.toLocaleDateString()`, or date methods on serialized API values, guard cleanly with `val ? new Date(val).toLocaleDateString() : ''`.\n\
+             - Check related hook/service files provided in context: ensure array state initializes to `[]` (not `null`), handles `!res.ok` cleanly without setting error objects into array state, and extracts arrays safely (`Array.isArray(d) ? d : (d?.items ?? [])`).\n\
+             - Preserve `'use client'`, `export default`, and all JSX styling; provide exact verbatim `'target'` lines from `File Current Content`."
+        );
+    }
+    let path_lower_check = rel_file_path.to_lowercase();
+    let is_api_or_prisma_issue = path_lower_check.contains("/api/")
+        || path_lower_check.starts_with("api/")
+        || path_lower_check.contains("prisma")
+        || current_error_context.contains("TS2322")
+        || current_error_context.contains("TS2353")
+        || current_error_context.contains("Prisma");
+    if is_api_or_prisma_issue {
+        base_system_prompt.push_str(crate::self_healing::ZOD_PRISMA_TS2322_HEAL_GUIDE);
+    }
+
     let contracts_prompt = crate::orchestrator::format_axiom_contracts_prompt(&proj_dir, &rel_file_path);
+    let prisma_heal_summary = if is_api_or_prisma_issue {
+        crate::self_healing::extract_prisma_schema_summary_for_healing(&proj_dir)
+    } else {
+        String::new()
+    };
 
     const MAX_AI_ATTEMPTS: usize = 3;
     let mut attempt_feedback = String::new();
@@ -2814,6 +3095,11 @@ pub async fn project_heal_compile_error(
         let mut project_context = feature_scope_block.clone();
         let mut seen_ctx_files: std::collections::HashSet<String> = std::collections::HashSet::new();
         seen_ctx_files.insert(rel_file_path.to_lowercase());
+
+        if !prisma_heal_summary.is_empty() && project_context.len() < max_aux_total_chars {
+            let capped_prisma = truncate_context_snippet(&prisma_heal_summary, if compact_ctx { 1800 } else { 3200 });
+            project_context.push_str(&format!("\n{}\n", capped_prisma));
+        }
 
         if !contracts_prompt.is_empty() && project_context.len() < max_aux_total_chars {
             let capped_contracts = truncate_context_snippet(&contracts_prompt, if compact_ctx { 2000 } else { 4000 });
@@ -3053,7 +3339,7 @@ pub async fn project_heal_compile_error(
             t.is_empty() || !unquoted.chars().all(|c| c.is_ascii_digit())
         });
 
-        if resolved_edits.is_empty() {
+        if maybe_json.is_none() && resolved_edits.is_empty() {
             if let Some(malformed_edits) = extract_code_from_malformed_json_response(&clean_content, &rel_file_path) {
                 debug_log_to_file(format!("[AI Auto-Healing] Extracted embedded code from malformed JSON for: {}", rel_file_path));
                 resolved_edits = malformed_edits;
@@ -3095,8 +3381,27 @@ pub async fn project_heal_compile_error(
         });
 
         if resolved_edits.is_empty() {
-            last_failure_reason = "AI odgovor nije sadržao validan kod ili ciljanu izmenu (odbijena proza, neispravna putanja bez ekstenzije ili nevažeći JSON).".to_string();
-            attempt_feedback = last_failure_reason.clone();
+            let raw_lower = ai_msg.to_lowercase();
+            let used_coords = raw_lower.contains("\"startline\"")
+                || raw_lower.contains("\"endline\"")
+                || raw_lower.contains("\"startcolumn\"")
+                || raw_lower.contains("\"endcolumn\"")
+                || raw_lower.contains("\"start_line\"")
+                || raw_lower.contains("\"end_line\"")
+                || raw_lower.contains("\"linenumber\"")
+                || raw_lower.contains("\"range\":")
+                || raw_lower.contains("\"start\":")
+                || raw_lower.contains("\"line\":");
+            last_failure_reason = if used_coords {
+                "Odbijena izmena zasnovana na brojevima linija/koordinatama (startLine/endLine/line/range). Za izmenu postojećeg fajla obavezno navedi tačan postojeći 'target' blok iz fajla i 'replacement'.".to_string()
+            } else {
+                "AI odgovor nije sadržao validan kod ili ciljanu izmenu (odbijena proza, neispravna putanja bez ekstenzije ili nevažeći JSON).".to_string()
+            };
+            attempt_feedback = if used_coords {
+                "Your previous response used line numbers/coordinates (`startLine`/`endLine`/`start`/`range`/`line`) without a verbatim `'target'` substring. Coordinate edits are FORBIDDEN. Copy the exact existing line(s) from `File Current Content` into `'target'` and provide the fixed line(s) in `'replacement'`.".to_string()
+            } else {
+                last_failure_reason.clone()
+            };
             let _ = window.emit("server:log", serde_json::json!({
                 "text": format!("> [AI Auto-Healing] Pokušaj {}/{} odbijen: {}\n", ai_attempt, MAX_AI_ATTEMPTS, last_failure_reason),
                 "type": "warning"
@@ -3228,10 +3533,18 @@ pub async fn project_heal_compile_error(
                     && !repl_trimmed.contains("return ")
                     && !repl_trimmed.contains('<');
 
+                let is_helper_keyword = repl_trimmed.starts_with("interface ")
+                    || repl_trimmed.starts_with("type ")
+                    || repl_trimmed.starts_with("enum ")
+                    || repl_trimmed.starts_with("function ")
+                    || repl_trimmed.starts_with("async function ");
+
                 let is_partial_helper_snippet = !file_content_mut.is_empty()
                     && file_content_mut.contains("export default")
                     && !repl_trimmed.contains("export default")
-                    && repl_trimmed.lines().count() <= 10;
+                    && repl_trimmed.lines().count() <= 15
+                    && is_helper_keyword
+                    && is_complete_top_level_decl(repl_trimmed);
 
                 if is_just_import && !file_content_mut.is_empty() {
                     if !file_content_mut.contains(repl_trimmed) {
@@ -3248,6 +3561,33 @@ pub async fn project_heal_compile_error(
                             file_content_mut.insert_str(idx, &format!("{}\n\n", repl_trimmed));
                         }
                     }
+                } else if !file_content_mut.is_empty() && !is_md && !is_json {
+                    let starts_mid_expr = repl_trimmed.starts_with('<')
+                        || repl_trimmed.starts_with('{')
+                        || repl_trimmed.starts_with('(')
+                        || repl_trimmed.starts_with(')')
+                        || repl_trimmed.starts_with('}')
+                        || repl_trimmed.starts_with(']')
+                        || repl_trimmed.starts_with('.')
+                        || repl_trimmed.starts_with("return ")
+                        || repl_trimmed.starts_with("if ")
+                        || repl_trimmed.starts_with("if(")
+                        || repl_trimmed.starts_with("else ")
+                        || repl_trimmed.starts_with("for ")
+                        || repl_trimmed.starts_with("while ");
+                    let loses_default_export = file_content_mut.contains("export default")
+                        && !repl_trimmed.contains("export default");
+                    let loses_module_exports = file_content_mut.lines().count() >= 12
+                        && file_content_mut.contains("export ")
+                        && !repl_trimmed.contains("export ");
+                    if starts_mid_expr || loses_default_export || loses_module_exports {
+                        edit_reject_reason = Some(format!(
+                            "Za izmenu dela postojećeg fajla '{}' moraš navesti tačan postojeći 'target' string iz fajla.",
+                            edit_path
+                        ));
+                        break;
+                    }
+                    *file_content_mut = replacement.to_string();
                 } else {
                     *file_content_mut = replacement.to_string();
                 }
@@ -3420,7 +3760,7 @@ pub async fn project_heal_compile_error(
         }
 
         match verify_detail.outcome {
-            SingleFileVerifyOutcome::Passed(vkind) => {
+            SingleFileVerifyOutcome::Passed(vkind) if !is_non_ref_runtime => {
                 for (_, eid, atomic_patch) in registered_entries {
                     crate::katastar::finalize_katastar_outcome(
                         &eid,
@@ -3460,7 +3800,7 @@ pub async fn project_heal_compile_error(
                 }));
                 return Ok(true);
             }
-            SingleFileVerifyOutcome::Inconclusive => {
+            SingleFileVerifyOutcome::Inconclusive | SingleFileVerifyOutcome::Passed(_) => {
                 for (edit_path, eid, _) in registered_entries {
                     crate::katastar::track_pending_project_repair(
                         &project_id,
@@ -3497,6 +3837,51 @@ pub async fn project_heal_compile_error(
                     &baseline_tsc_diags,
                     &verify_detail.file_errors,
                 );
+                let syntax_re = regex::Regex::new(r"\bTS1\d{3}\b").ok();
+                let has_syntax_error = verify_detail.file_errors.iter().any(|e| {
+                    syntax_re
+                        .as_ref()
+                        .map_or(false, |re| re.is_match(e))
+                });
+                if is_non_ref_runtime
+                    && !has_syntax_error
+                    && diff.introduced.is_empty()
+                    && verify_detail.file_errors.len() <= baseline_tsc_diags.len()
+                {
+                    for (edit_path, eid, _) in registered_entries {
+                        crate::katastar::track_pending_project_repair(
+                            &project_id,
+                            &edit_path,
+                            &sig_info.error_signature,
+                            &eid,
+                            "ai",
+                        );
+                    }
+                    crate::katastar::record_project_heal_round(
+                        &proj_dir,
+                        &rel_file_path,
+                        ai_attempt,
+                        "ai",
+                        "pending_runtime",
+                        &[],
+                        &coi_unresolved,
+                        &format!(
+                            "Runtime guard applied without TS regression (pending dev runtime verification): {}",
+                            explanation
+                        ),
+                    );
+                    ensure_axiom_inspector_injected(&proj_dir);
+                    for ep in &edited_paths {
+                        let _ = window.emit("server:log", serde_json::json!({
+                            "text": format!("> [AI Auto-Healing] Primenjena runtime zaštita bez novih TS grešaka ({}) na fajl: {}\n", explanation, ep),
+                            "type": "info"
+                        }));
+                    }
+                    let _ = window.emit("server:heal-status", serde_json::json!({
+                        "status": "Završeno!"
+                    }));
+                    return Ok(true);
+                }
                 let improved = !baseline_tsc_diags.is_empty()
                     && diff.introduced.is_empty()
                     && (verify_detail.file_errors.len() < baseline_tsc_diags.len()
