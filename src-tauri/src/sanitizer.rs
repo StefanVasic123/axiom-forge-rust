@@ -14,8 +14,29 @@ pub fn is_html_template_file(file_path: &str) -> bool {
 }
 
 pub fn inject_axiom_attrs(content: &str, relative_path: &str) -> String {
-    if content.contains("data-axiom-component=") {
-        return content.to_string();
+    // First repair any previously misplaced `data-axiom-*` attributes produced before UTF-8 byte-offset fix
+    // (e.g. placed immediately before `<div` or split inside `<ta ... g>`).
+    let mut normalized_content = content.to_string();
+    if normalized_content.contains("data-axiom-component=") {
+        if let Ok(split_re) = regex::Regex::new(
+            r#"(<[A-Za-z_][A-Za-z0-9_.-]*)\s+data-axiom-component="([^"]*)"\s+data-axiom-file="([^"]*)"([A-Za-z0-9_.-]+)"#,
+        ) {
+            normalized_content = split_re
+                .replace_all(
+                    &normalized_content,
+                    "$1$4 data-axiom-component=\"$2\" data-axiom-file=\"$3\"",
+                )
+                .to_string();
+        }
+        if let Ok(before_tag_re) = regex::Regex::new(
+            r#"[ \t]?data-axiom-component="[^"]*"\s+data-axiom-file="[^"]*"(\s*<[A-Za-z_])"#,
+        ) {
+            normalized_content = before_tag_re.replace_all(&normalized_content, "$1").to_string();
+        }
+    }
+
+    if normalized_content.contains("data-axiom-component=") {
+        return normalized_content;
     }
 
     let path = std::path::Path::new(relative_path);
@@ -38,31 +59,32 @@ pub fn inject_axiom_attrs(content: &str, relative_path: &str) -> String {
         component_name = "Component".to_string();
     }
 
-    let mut first_match_idx = None;
-    let mut matched_tag_len = 0;
+    let mut first_match_insert_byte: Option<usize> = None;
 
-    let chars: Vec<char> = content.chars().collect();
+    // Collect (byte_offset, char) pairs so slicing uses true UTF-8 byte offsets
+    // even when multi-byte characters (curly quotes, em-dashes, accents, emojis) appear earlier in the file.
+    let chars: Vec<(usize, char)> = normalized_content.char_indices().collect();
     for i in 0..chars.len() {
-        if chars[i] == '<' && i + 1 < chars.len() {
+        if chars[i].1 == '<' && i + 1 < chars.len() {
             // Preskoči ako je ispred (nakon preskakanja razmaka) alfanumerički karakter, tačka ili donja crta (indikacija TypeScript generika ili poređenja)
             let mut is_generic_or_compare = false;
             if i > 0 {
                 let mut prev_idx = i - 1;
-                while prev_idx > 0 && chars[prev_idx].is_ascii_whitespace() {
+                while prev_idx > 0 && chars[prev_idx].1.is_ascii_whitespace() {
                     prev_idx -= 1;
                 }
-                let prev_c = chars[prev_idx];
+                let prev_c = chars[prev_idx].1;
                 if prev_c.is_ascii_alphanumeric() || prev_c == '.' || prev_c == '_' {
                     let mut word_start = prev_idx;
                     while word_start > 0 {
-                        let c = chars[word_start - 1];
+                        let c = chars[word_start - 1].1;
                         if c.is_ascii_alphanumeric() || c == '.' || c == '_' {
                             word_start -= 1;
                         } else {
                             break;
                         }
                     }
-                    let word: String = chars[word_start..=prev_idx].iter().collect();
+                    let word: String = chars[word_start..=prev_idx].iter().map(|(_, c)| *c).collect();
                     let keywords = ["return", "default", "yield", "await", "as", "typeof", "void", "delete"];
                     if !keywords.contains(&word.as_str()) {
                         is_generic_or_compare = true;
@@ -72,53 +94,57 @@ pub fn inject_axiom_attrs(content: &str, relative_path: &str) -> String {
             if is_generic_or_compare {
                 continue;
             }
-            let next_c = chars[i + 1];
+            let next_c = chars[i + 1].1;
             if next_c.is_ascii_alphabetic() || next_c == '_' {
                 let mut tag_name = String::new();
                 let mut j = i + 1;
-                while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '-' || chars[j] == '_' || chars[j] == '.') {
-                    tag_name.push(chars[j]);
+                while j < chars.len() && (chars[j].1.is_ascii_alphanumeric() || chars[j].1 == '-' || chars[j].1 == '_' || chars[j].1 == '.') {
+                    tag_name.push(chars[j].1);
                     j += 1;
                 }
-                
+
                 let is_context_provider_or_consumer = tag_name.ends_with(".Provider") || tag_name.ends_with(".Consumer");
-                
+
                 let is_valid_tag = if tag_name.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
-                    !is_context_provider_or_consumer 
-                        && tag_name != "ReactNode" 
-                        && tag_name != "ReactElement" 
-                        && tag_name != "FC" 
-                        && tag_name != "ComponentType" 
-                        && tag_name != "any" 
+                    !is_context_provider_or_consumer
+                        && tag_name != "ReactNode"
+                        && tag_name != "ReactElement"
+                        && tag_name != "FC"
+                        && tag_name != "ComponentType"
+                        && tag_name != "any"
                         && !tag_name.ends_with('.')
                 } else {
                     let html_tags = vec![
-                        "div", "section", "main", "header", "footer", "article", "aside", 
+                        "div", "section", "main", "header", "footer", "article", "aside",
                         "nav", "form", "ul", "ol", "table", "body", "html", "span", "p", "a", "h1", "h2", "h3", "h4", "h5", "h6"
                     ];
                     html_tags.contains(&tag_name.as_str())
                 };
-                
+
                 if is_valid_tag {
-                    first_match_idx = Some(i);
-                    matched_tag_len = tag_name.len() + 1;
+                    let insert_byte = if j < chars.len() {
+                        chars[j].0
+                    } else {
+                        normalized_content.len()
+                    };
+                    first_match_insert_byte = Some(insert_byte);
                     break;
                 }
             }
         }
     }
 
-    if let Some(idx) = first_match_idx {
-        let mut new_content = String::new();
-        new_content.push_str(&content[..idx + matched_tag_len]);
+    if let Some(insert_byte) = first_match_insert_byte {
+        let mut new_content = String::with_capacity(normalized_content.len() + 96);
+        new_content.push_str(&normalized_content[..insert_byte]);
         new_content.push_str(&format!(
             " data-axiom-component=\"{}\" data-axiom-file=\"{}\"",
             component_name, relative_path.replace('\\', "/")
         ));
-        new_content.push_str(&content[idx + matched_tag_len..]);
+        new_content.push_str(&normalized_content[insert_byte..]);
         new_content
     } else {
-        content.to_string()
+        normalized_content
     }
 }
 
@@ -2333,7 +2359,10 @@ pub fn post_process_generated_file(
             processed = processed.replace("\r\n", "\n");
         }
 
-        // 0. Ensure provider = "postgresql" if enums, Json or postgresql url are present
+        // 0. Ensure generator client and datasource db blocks are always present (and have valid url)
+        processed = ensure_prisma_generator_and_datasource(&processed);
+
+        // 0a. Ensure provider = "postgresql" if enums, Json or postgresql url are present
         if processed.contains("enum ") || processed.contains("postgresql://") {
             if processed.contains("provider = \"sqlite\"") {
                 processed = processed.replace("provider = \"sqlite\"", "provider = \"postgresql\"");
@@ -2347,20 +2376,14 @@ pub fn post_process_generated_file(
         // 0b. Normalize SQL-style / invalid Prisma referential actions (e.g., SET_NULL -> SetNull, CASCADE -> Cascade)
         processed = normalize_prisma_referential_actions(&processed);
 
-        // 1. Fix missing url in datasource block
-        if processed.contains("datasource db {") {
-            if let Some(start_idx) = processed.find("datasource db {") {
-                if let Some(close_brace) = processed[start_idx..].find('}') {
-                    let datasource_block = &processed[start_idx..start_idx + close_brace];
-                    if !datasource_block.contains("url") {
-                        let mut fixed_datasource = datasource_block.to_string();
-                        if let Some(open_brace_idx) = fixed_datasource.find('{') {
-                            fixed_datasource.insert_str(open_brace_idx + 1, "\n  url      = env(\"DATABASE_URL\")");
-                            processed = processed.replace(datasource_block, &fixed_datasource);
-                        }
-                    }
-                }
-            }
+        // 0c. Strip EnumName. prefix in @default(EnumName.MEMBER) and ensure used enum defaults exist in declared enums
+        processed = sanitize_prisma_enum_defaults(&processed);
+
+        // 1. Ensure `model User` exists if NextAuth Account/Session models are declared without it
+        let has_nextauth_adapter_models = (processed.contains("model Account") && processed.contains("providerAccountId"))
+            || (processed.contains("model Session") && processed.contains("sessionToken"));
+        if has_nextauth_adapter_models {
+            processed = ensure_prisma_user_model_if_missing(&processed);
         }
 
         // 2. Fix VerificationToken definition
@@ -3154,6 +3177,10 @@ export default function Home() {
         let is_hook_file = (path_lower.contains("/hooks/") || path_lower.starts_with("hooks/")) && !path_lower.contains("/api/");
         let is_route_handler = path_lower.ends_with("route.ts") || path_lower.ends_with("route.js");
 
+        // Normalize `@/prisma/schema` & `@/prisma/client` imports to `@prisma/client` (as `import type` on client/hook files)
+        // or `@/lib/prisma` (when importing the `prisma` runtime singleton), BEFORE server-import boundary stripping runs.
+        processed = normalize_prisma_schema_imports(&processed, (is_client_file || is_hook_file) && !is_route_handler);
+
         if is_client_file && processed.contains("export default async function") {
             processed = processed.replace("export default async function", "export default function");
         }
@@ -3340,6 +3367,11 @@ export default function Home() {
             } else {
                 processed = format!("import {{ z }} from 'zod';\n{}", processed);
             }
+        }
+
+        // Auto-inject `import bcrypt from 'bcryptjs';` in server/non-client JS/TS files using `bcrypt.*` without import
+        if (!is_client_file && !is_hook_file) || is_route_handler {
+            processed = ensure_bcrypt_imports(&processed);
         }
 
         // Auto-inject `import Link from 'next/link';` when `<Link ` or `<Link>` is used in JSX without importing Link
@@ -5403,4 +5435,396 @@ pub fn prune_unresolved_prisma_relations(schema: &str) -> String {
     }
 
     result
+}
+
+/// Ensures `generator client` and `datasource db` blocks exist in `schema.prisma`,
+/// and ensures an existing `datasource` block declares a `url`.
+pub fn ensure_prisma_generator_and_datasource(schema: &str) -> String {
+    let mut out = schema.to_string();
+    let has_generator = regex::Regex::new(r"(?m)^\s*generator\s+\w+\s*\{")
+        .map(|re| re.is_match(&out))
+        .unwrap_or(false);
+    let has_datasource = regex::Regex::new(r"(?m)^\s*datasource\s+\w+\s*\{")
+        .map(|re| re.is_match(&out))
+        .unwrap_or(false);
+
+    if has_datasource {
+        if let Ok(ds_re) = regex::Regex::new(r"(?ms)(^\s*datasource\s+\w+\s*\{)([^}]*)(\})") {
+            out = ds_re
+                .replace(&out, |caps: &regex::Captures| {
+                    let body = &caps[2];
+                    if !body.contains("url") {
+                        format!("{}\n  url      = env(\"DATABASE_URL\"){}{}", &caps[1], body, &caps[3])
+                    } else {
+                        caps[0].to_string()
+                    }
+                })
+                .to_string();
+        }
+    }
+
+    let mut prefix = String::new();
+    if !has_generator {
+        prefix.push_str("generator client {\n  provider = \"prisma-client-js\"\n}\n\n");
+    }
+    if !has_datasource {
+        prefix.push_str("datasource db {\n  provider = \"postgresql\"\n  url      = env(\"DATABASE_URL\")\n}\n\n");
+    }
+
+    if !prefix.is_empty() {
+        format!("{}{}", prefix, out.trim_start_matches('\n'))
+    } else {
+        out
+    }
+}
+
+fn is_valid_prisma_enum_member(tok: &str) -> bool {
+    let mut chars = tok.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !matches!(tok, "true" | "false" | "null")
+}
+
+/// Strips illegal `EnumName.` prefixes from Prisma `@default(EnumName.MEMBER)` attributes
+/// (converting them to `@default(MEMBER)`), and ensures any bare identifier used as `@default(MEMBER)`
+/// on a field of declared enum type `E` is declared inside `enum E { ... }`.
+pub fn sanitize_prisma_enum_defaults(schema: &str) -> String {
+    let enum_re = match regex::Regex::new(r"(?ms)^[ \t]*enum[ \t]+(\w+)[ \t]*\{([^}]*)\}") {
+        Ok(r) => r,
+        Err(_) => return schema.to_string(),
+    };
+
+    let mut enum_members: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    for cap in enum_re.captures_iter(schema) {
+        let Some(e_name) = cap.get(1).map(|m| m.as_str().to_string()) else {
+            continue;
+        };
+        let Some(e_body) = cap.get(2).map(|m| m.as_str()) else {
+            continue;
+        };
+        let mut members = Vec::new();
+        for line in e_body.lines() {
+            let clean = line.split("//").next().unwrap_or("").trim();
+            if clean.is_empty() || clean.starts_with('@') || clean.starts_with("/*") {
+                continue;
+            }
+            if let Some(tok) = clean.split_whitespace().next() {
+                if is_valid_prisma_enum_member(tok) {
+                    members.push(tok.to_string());
+                }
+            }
+        }
+        enum_members.insert(e_name, members);
+    }
+
+    if enum_members.is_empty() && !schema.contains("@default(") {
+        return schema.to_string();
+    }
+
+    let model_re = match regex::Regex::new(r"(?ms)^[ \t]*model[ \t]+(\w+)[ \t]*\{([^}]*)\}") {
+        Ok(r) => r,
+        Err(_) => return schema.to_string(),
+    };
+
+    let mut missing_enum_members: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    let mut model_replacements: Vec<(String, String)> = Vec::new();
+
+    for cap in model_re.captures_iter(schema) {
+        let Some(m_name) = cap.get(1).map(|m| m.as_str().to_string()) else {
+            continue;
+        };
+        let Some(m_body) = cap.get(2).map(|m| m.as_str()) else {
+            continue;
+        };
+        let mut updated_lines = Vec::new();
+        let mut model_changed = false;
+
+        for line in m_body.lines() {
+            let mut cur_line = line.to_string();
+            let trimmed = cur_line.trim();
+            if !trimmed.is_empty()
+                && !trimmed.starts_with("//")
+                && !trimmed.starts_with("@@")
+                && !trimmed.starts_with("/*")
+                && trimmed.contains("@default(")
+            {
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                let clean_type_opt = if parts.len() >= 2 {
+                    Some(parts[1].replace(['?', '[', ']'], ""))
+                } else {
+                    None
+                };
+                if let Some(clean_type) = clean_type_opt {
+                    if let Some(def_idx) = cur_line.find("@default(") {
+                        let open_idx = def_idx + "@default".len();
+                        if let Some(close_idx) = find_matching_paren_in_attr(&cur_line, open_idx) {
+                            let arg = cur_line[open_idx + 1..close_idx].trim().to_string();
+                            if !arg.contains('(') && !arg.starts_with('[') {
+                                let mut normalized_member: Option<String> = None;
+
+                                if let Some((prefix, member)) = arg.split_once('.') {
+                                    let p_trim = prefix.trim().to_string();
+                                    let m_trim = member.trim().to_string();
+                                    if (p_trim == clean_type || enum_members.contains_key(&p_trim))
+                                        && is_valid_prisma_enum_member(&m_trim)
+                                    {
+                                        let mut new_line = cur_line[..open_idx + 1].to_string();
+                                        new_line.push_str(&m_trim);
+                                        new_line.push_str(&cur_line[close_idx..]);
+                                        cur_line = new_line;
+                                        model_changed = true;
+                                        normalized_member = Some(m_trim);
+                                    }
+                                } else if enum_members.contains_key(&clean_type) {
+                                    let unquoted = arg.trim_matches(|c| c == '"' || c == '\'').to_string();
+                                    if is_valid_prisma_enum_member(&unquoted) {
+                                        if unquoted != arg {
+                                            let mut new_line = cur_line[..open_idx + 1].to_string();
+                                            new_line.push_str(&unquoted);
+                                            new_line.push_str(&cur_line[close_idx..]);
+                                            cur_line = new_line;
+                                            model_changed = true;
+                                        }
+                                        normalized_member = Some(unquoted);
+                                    }
+                                }
+
+                                if let Some(mem) = normalized_member {
+                                    if let Some(existing) = enum_members.get(&clean_type) {
+                                        if !existing.contains(&mem) {
+                                            let add_list = missing_enum_members.entry(clean_type).or_default();
+                                            if !add_list.contains(&mem) {
+                                                add_list.push(mem);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            updated_lines.push(cur_line);
+        }
+
+        if model_changed {
+            model_replacements.push((m_name, updated_lines.join("\n")));
+        }
+    }
+
+    let mut result = schema.to_string();
+    for (m_name, body_str) in model_replacements {
+        let pattern = format!(r"(?ms)(^[ \t]*model[ \t]+{}\s*\{{)([\s\S]*?)(\n*\}})", regex::escape(&m_name));
+        if let Ok(block_re) = regex::Regex::new(&pattern) {
+            result = block_re
+                .replace(&result, |caps: &regex::Captures| {
+                    format!("{}{}\n{}", &caps[1], body_str.trim_end(), caps[3].trim_start())
+                })
+                .to_string();
+        }
+    }
+
+    for (e_name, new_members) in missing_enum_members {
+        if new_members.is_empty() {
+            continue;
+        }
+        let pattern = format!(r"(?ms)(^[ \t]*enum[ \t]+{}\s*\{{)([\s\S]*?)(\n*\}})", regex::escape(&e_name));
+        if let Ok(block_re) = regex::Regex::new(&pattern) {
+            result = block_re
+                .replace(&result, |caps: &regex::Captures| {
+                    let mut body = caps[2].trim_end().to_string();
+                    for mem in &new_members {
+                        body.push_str(&format!("\n  {}", mem));
+                    }
+                    format!("{}{}\n{}", &caps[1], body, caps[3].trim_start())
+                })
+                .to_string();
+        }
+    }
+
+    result
+}
+
+/// Ensures `model User` exists when the schema or project uses NextAuth/user authentication.
+pub fn ensure_prisma_user_model_if_missing(schema: &str) -> String {
+    let has_user = regex::Regex::new(r"(?m)^[ \t]*model[ \t]+User[ \t]*\{")
+        .map(|re| re.is_match(schema))
+        .unwrap_or(false);
+    if has_user {
+        return schema.to_string();
+    }
+
+    let mut out = schema.trim_end().to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(
+        "model User {\n  id             String    @id @default(cuid())\n  name           String?\n  email          String    @unique\n  emailVerified  DateTime?\n  image          String?\n  hashedPassword String?\n  role           String    @default(\"USER\")\n  createdAt      DateTime  @default(now())\n  updatedAt      DateTime  @updatedAt\n}\n",
+    );
+    out
+}
+
+/// Rewrites incorrect imports pointing at Prisma schema files (e.g. `@/prisma/schema`,
+/// `~/prisma/schema`, `src/prisma/schema`, `@/prisma/client`, `../prisma/schema`) to
+/// `@/lib/prisma` (when importing `prisma` runtime singleton) or `@prisma/client`
+/// (automatically promoting non-type imports to `import type` on client/hook files).
+pub fn normalize_prisma_schema_imports(content: &str, is_client_or_hook: bool) -> String {
+    let raw_lines: Vec<&str> = content.lines().collect();
+    let mut out_lines: Vec<String> = Vec::with_capacity(raw_lines.len());
+    let mut changed = false;
+    let mut idx = 0usize;
+
+    while idx < raw_lines.len() {
+        let trimmed = raw_lines[idx].trim();
+        if trimmed.starts_with("import ") || trimmed.starts_with("import{") {
+            let mut end_idx = idx;
+            let mut stmt = raw_lines[idx].to_string();
+            let is_side_effect = trimmed.starts_with("import '") || trimmed.starts_with("import \"");
+            if !is_side_effect {
+                while !stmt.contains(" from ")
+                    && !stmt.contains("from'")
+                    && !stmt.contains("from\"")
+                    && !stmt.trim_end().ends_with(';')
+                    && end_idx + 1 < raw_lines.len()
+                {
+                    end_idx += 1;
+                    stmt.push('\n');
+                    stmt.push_str(raw_lines[end_idx]);
+                }
+            }
+
+            let flat = stmt.replace('\n', " ");
+            let flat_trim = flat.trim();
+            if let Some(spec) = extract_import_specifier(flat_trim) {
+                let s_low = spec.trim().replace('\\', "/").to_lowercase();
+                let is_schema_path = s_low == "@/prisma/schema"
+                    || s_low == "~/prisma/schema"
+                    || s_low == "src/prisma/schema"
+                    || s_low == "prisma/schema"
+                    || s_low == "@/prisma/client"
+                    || s_low == "~/prisma/client"
+                    || s_low == "src/prisma/client"
+                    || s_low == "prisma/client"
+                    || s_low.ends_with("/prisma/schema")
+                    || s_low.ends_with("/prisma/client");
+
+                if is_schema_path {
+                    let imports_prisma_singleton = regex::Regex::new(r"(?m)(?:import\s+prisma\b|\{[^}]*\bprisma\b)")
+                        .map(|re| re.is_match(flat_trim))
+                        .unwrap_or(false);
+                    let target_mod = if imports_prisma_singleton {
+                        "@/lib/prisma"
+                    } else {
+                        "@prisma/client"
+                    };
+                    let mut rewritten_stmt = stmt
+                        .replace(&format!("'{}'", spec), &format!("'{}'", target_mod))
+                        .replace(&format!("\"{}\"", spec), &format!("\"{}\"", target_mod));
+
+                    let is_already_top_type = flat_trim.starts_with("import type ") || flat_trim.starts_with("import type{");
+                    let is_inline_all_types = if !is_already_top_type && flat_trim.contains('{') && flat_trim.contains('}') {
+                        if let (Some(ob), Some(cb)) = (flat_trim.find('{'), flat_trim.find('}')) {
+                            if ob < cb {
+                                let inner = &flat_trim[ob + 1..cb];
+                                let items: Vec<&str> = inner.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                                !items.is_empty() && items.iter().all(|it| it.starts_with("type "))
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if target_mod == "@prisma/client"
+                        && is_client_or_hook
+                        && !is_already_top_type
+                        && !is_inline_all_types
+                    {
+                        // Remove any partial inline `type ` modifiers before promoting statement to `import type`
+                        if let Ok(inline_type_re) = regex::Regex::new(r"([\{,]\s*)type\s+") {
+                            rewritten_stmt = inline_type_re.replace_all(&rewritten_stmt, "$1").to_string();
+                        }
+                        if let Some(pos) = rewritten_stmt.find("import") {
+                            let after = &rewritten_stmt[pos + 6..];
+                            let new_after = if after.starts_with('{') {
+                                format!(" type {}", after)
+                            } else {
+                                format!(" type{}", after)
+                            };
+                            rewritten_stmt = format!("{}{}{}", &rewritten_stmt[..pos], "import", new_after);
+                        }
+                    }
+
+                    if rewritten_stmt != stmt {
+                        changed = true;
+                        for line_piece in rewritten_stmt.lines() {
+                            out_lines.push(line_piece.to_string());
+                        }
+                        idx = end_idx + 1;
+                        continue;
+                    }
+                }
+            }
+
+            for k in idx..=end_idx {
+                out_lines.push(raw_lines[k].to_string());
+            }
+            idx = end_idx + 1;
+            continue;
+        }
+        out_lines.push(raw_lines[idx].to_string());
+        idx += 1;
+    }
+
+    if !changed {
+        return content.to_string();
+    }
+    let mut joined = out_lines.join("\n");
+    if content.ends_with('\n') && !joined.ends_with('\n') {
+        joined.push('\n');
+    }
+    joined
+}
+
+/// Auto-injects `import bcrypt from 'bcryptjs';` when `bcrypt.*` methods are invoked
+/// without an existing `bcrypt` / `bcryptjs` import or local binding.
+pub fn ensure_bcrypt_imports(content: &str) -> String {
+    let has_bcrypt_call = regex::Regex::new(
+        r"(?m)\bbcrypt\s*\.\s*(?:hash|compare|genSalt|hashSync|compareSync|getRounds)\s*\(",
+    )
+    .map(|re| re.is_match(content))
+    .unwrap_or(false);
+
+    if !has_bcrypt_call {
+        return content.to_string();
+    }
+
+    let has_bcrypt_import = content.contains("from 'bcryptjs'")
+        || content.contains("from \"bcryptjs\"")
+        || content.contains("from 'bcrypt'")
+        || content.contains("from \"bcrypt\"")
+        || content.contains("require('bcryptjs')")
+        || content.contains("require(\"bcryptjs\")")
+        || content.contains("require('bcrypt')")
+        || content.contains("require(\"bcrypt\")");
+
+    if has_bcrypt_import {
+        return content.to_string();
+    }
+
+    let has_decl = regex::Regex::new(r"(?m)\b(?:const|let|var|function|class|import)\s+bcrypt\b")
+        .map(|re| re.is_match(content))
+        .unwrap_or(false);
+    if has_decl {
+        return content.to_string();
+    }
+
+    insert_import_after_use_client(content, "import bcrypt from 'bcryptjs';")
 }

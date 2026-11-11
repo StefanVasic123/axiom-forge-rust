@@ -334,6 +334,60 @@ pub fn apply_nextauth_prisma_template(schema: &str) -> String {
     out
 }
 
+/// Returns `true` if the project directory contains NextAuth or user-registration routes
+/// that expect a Prisma `User` model.
+pub fn project_requires_nextauth_user_model(proj_dir: &std::path::Path) -> bool {
+    [
+        "src/app/api/auth/[...nextauth]/route.ts",
+        "src/app/api/auth/[...nextauth]/route.tsx",
+        "src/app/api/auth/[...nextauth]/route.js",
+        "app/api/auth/[...nextauth]/route.ts",
+        "app/api/auth/[...nextauth]/route.tsx",
+        "app/api/auth/[...nextauth]/route.js",
+        "src/app/api/register/route.ts",
+        "src/app/api/register/route.js",
+        "app/api/register/route.ts",
+        "app/api/register/route.js",
+    ]
+    .iter()
+    .any(|rel| proj_dir.join(rel).is_file())
+}
+
+/// Scores a Prisma CLI error log so structural/pre-DMMF aborts (e.g. missing `datasource`
+/// or `generator` with 0 `error:` lines) always rank strictly worse than reachable DMMF
+/// field errors, preventing `best_schema` rollback to an unparseable/datasource-less schema.
+pub fn score_prisma_error_log(log: &str) -> usize {
+    let lower = log.to_lowercase();
+    let has_dmmf_count = regex::Regex::new(r"Validation Error Count:\s*(\d+)")
+        .ok()
+        .and_then(|re| re.captures(log))
+        .and_then(|cap| cap.get(1))
+        .and_then(|m| m.as_str().parse::<usize>().ok());
+
+    let missing_datasource_or_generator = lower.contains("don't have any datasource")
+        || lower.contains("no datasource")
+        || lower.contains("missing required field url in datasource")
+        || ((lower.contains("datasource") || lower.contains("generator"))
+            && lower.contains("error:")
+            && has_dmmf_count.is_none());
+
+    if missing_datasource_or_generator {
+        return 1000;
+    }
+
+    if let Some(n) = has_dmmf_count {
+        return n.max(1);
+    }
+
+    let err_lines = log.lines().filter(|l| l.trim().starts_with("error:")).count();
+    if err_lines > 0 {
+        err_lines
+    } else {
+        // Fatal CLI/parser abort with no structured `error:` lines must never outscore reachable DMMF errors.
+        500
+    }
+}
+
 /// Runs the deterministic schema.prisma sanitizer on the file on disk.
 /// Returns `true` if the file was changed.
 pub fn sanitize_prisma_schema_on_disk(schema_path: &std::path::Path) -> bool {
@@ -341,7 +395,19 @@ pub fn sanitize_prisma_schema_on_disk(schema_path: &std::path::Path) -> bool {
         if current.trim().is_empty() {
             return false;
         }
-        let fixed = post_process_generated_file("prisma/schema.prisma", &current, &serde_json::json!({}), false);
+        let proj_dir_opt = schema_path.parent().and_then(|p| {
+            if p.file_name().and_then(|n| n.to_str()) == Some("prisma") {
+                p.parent()
+            } else {
+                Some(p)
+            }
+        });
+        let pre = if proj_dir_opt.map_or(false, project_requires_nextauth_user_model) {
+            crate::sanitizer::ensure_prisma_user_model_if_missing(&current)
+        } else {
+            current.clone()
+        };
+        let fixed = post_process_generated_file("prisma/schema.prisma", &pre, &serde_json::json!({}), false);
         if !fixed.trim().is_empty() && fixed.replace("\r\n", "\n").trim() != current.replace("\r\n", "\n").trim() {
             return std::fs::write(schema_path, &fixed).is_ok();
         }
@@ -396,18 +462,7 @@ pub async fn heal_prisma_schema_loop(
     let mut pending_prisma_fix: Option<PendingPrismaFix> = None;
     let mut pending_ai_fixes: Vec<PendingPrismaFix> = Vec::new();
     let mut tried_katastar_ids: Vec<String> = Vec::new();
-
-    let count_prisma_errors = |log: &str| -> usize {
-        if let Ok(re) = regex::Regex::new(r"Validation Error Count:\s*(\d+)") {
-            if let Some(cap) = re.captures(log) {
-                if let Some(n) = cap.get(1).and_then(|m| m.as_str().parse::<usize>().ok()) {
-                    return n.max(1);
-                }
-            }
-        }
-        let err_lines = log.lines().filter(|l| l.trim().starts_with("error:")).count();
-        err_lines.max(1)
-    };
+    let requires_nextauth_user = project_requires_nextauth_user_model(proj_dir);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -545,7 +600,7 @@ pub async fn heal_prisma_schema_loop(
         }
 
         if let Ok(disk_schema) = std::fs::read_to_string(&schema_path) {
-            let err_count = count_prisma_errors(&error_log);
+            let err_count = score_prisma_error_log(&error_log);
             let should_update_best = best_schema
                 .as_ref()
                 .map_or(true, |(best_cnt, _)| err_count < *best_cnt);
@@ -655,16 +710,25 @@ pub async fn heal_prisma_schema_loop(
             }
         }
 
-        // Deterministic auto-healing for schema validation & relation errors (P1012, SET_NULL, duplicate back-relations)
+        // Deterministic auto-healing for schema validation, datasource/generator, enum @default & relation errors (P1012, SET_NULL, duplicate back-relations)
         if error_log.contains("Ambiguous relation detected")
             || error_log.contains("Wrongly named relation detected")
             || error_log.contains("Invalid referential action")
             || error_log.contains("Error validating")
+            || error_log.contains("Error parsing attribute")
+            || error_log.contains("don't have any datasource")
+            || error_log.contains("datasource")
+            || error_log.contains("generator")
             || error_log.contains("P1012")
         {
+            let pre_sanitize = if requires_nextauth_user {
+                crate::sanitizer::ensure_prisma_user_model_if_missing(&schema_content)
+            } else {
+                schema_content.clone()
+            };
             let deterministically_fixed = post_process_generated_file(
                 "prisma/schema.prisma",
-                &schema_content,
+                &pre_sanitize,
                 &serde_json::json!({}),
                 false,
             );
@@ -804,6 +868,7 @@ pub async fn heal_prisma_schema_loop(
             8. Ambiguous Relations (P1012): If a model defines two or more relations pointing to the same target model, assign unique relation names on BOTH models (`@relation(\"RoleA\", fields: ...)` paired with `@relation(\"RoleA\")`, etc.) and remove any extra duplicate un-named or synthetic arrays. \
             9. Referential Actions & Unique Relation Names (P1012): Referential actions inside `@relation(...)` (`onDelete`, `onUpdate`) MUST use exact Prisma PascalCase keywords: `SetNull`, `Cascade`, `Restrict`, `NoAction`, `SetDefault` (NEVER uppercase SQL keywords like `SET_NULL`, `CASCADE`, `NO_ACTION`, or `SET_DEFAULT`). Never keep two opposite relation fields on the same model sharing the same `@relation(\"...\")` name. \
             10. Undefined Types (P1012 'is neither a built-in type'): NEVER rename an undefined field type to the current model's own name or an unrelated model (that creates an invalid self-list or mismatched relation). Either define the missing model/enum cleanly if required, or remove the dangling relation field completely. \
+            11. Enum @default Values & Datasource: `@default(...)` on an enum field MUST use ONLY the bare enum member (e.g. `@default(PENDING)`), NEVER prefix it with the enum type name (`@default(Status.PENDING)` is invalid). Ensure any default member also exists inside its `enum { ... }` declaration, and always include both `generator client` and `datasource db` blocks. \
             First, in exactly 1 concise sentence, identify the compiler rule that was violated on the failing line. \
             Then, provide the complete corrected schema.prisma code wrapped in a ```prisma code block.".to_string();
 
@@ -877,7 +942,10 @@ pub async fn heal_prisma_schema_loop(
             Some(cleaned) => {
                 // Guard against partial LLM responses (e.g. returning only a single `model ... { ... }` block
                 // instead of the full schema.prisma, which would wipe out `datasource db`, `generator client`, and other models).
-                let merged_candidate = merge_prisma_ai_response(&schema_content, &cleaned);
+                let mut merged_candidate = merge_prisma_ai_response(&schema_content, &cleaned);
+                if requires_nextauth_user {
+                    merged_candidate = crate::sanitizer::ensure_prisma_user_model_if_missing(&merged_candidate);
+                }
                 // (1) Never write raw LLM output: run it through the deterministic sanitizer first
                 let sanitized = post_process_generated_file("prisma/schema.prisma", &merged_candidate, &serde_json::json!({}), false);
                 let unchanged = sanitized.replace("\r\n", "\n").trim() == schema_content.replace("\r\n", "\n").trim();

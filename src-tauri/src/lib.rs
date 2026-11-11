@@ -4098,4 +4098,245 @@ export async function PUT(request: Request) {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    #[test]
+    fn test_inject_axiom_attrs_utf8_and_self_repair() {
+        // 1. Multi-byte UTF-8 punctuation/characters before first JSX tag must NOT shift tag insertion byte offset
+        let utf8_tsx = "\"use client\";\n\
+// UI note: don’t break — šđčćž ✨\n\
+export default function HeroSection() {\n\
+  const label = \"Ready — it’s live ✨\";\n\
+  return (\n\
+    <div className=\"p-6\">\n\
+      <span>{label}</span>\n\
+    </div>\n\
+  );\n\
+}\n";
+        let injected = crate::sanitizer::inject_axiom_attrs(utf8_tsx, "src/app/page.tsx");
+        assert!(
+            injected.contains("<div data-axiom-component=\"Page\" data-axiom-file=\"src/app/page.tsx\" className=\"p-6\">"),
+            "Expected attributes cleanly inside `<div ...>` after UTF-8 text:\n{}",
+            injected
+        );
+        assert!(!injected.contains("data-axiom-file=\"src/app/page.tsx\" <div"));
+
+        // 2. Post-process must repair previously mangled tag placements (`<secti data-axiom-...` or `data-axiom-... <div`)
+        let corrupted_prefix = "\"use client\";\nexport default function Panel() {\n  return (\n    data-axiom-component=\"Page\" data-axiom-file=\"src/app/panel/page.tsx\"<section className=\"box\">\n      <p>Hi</p>\n    </section>\n  );\n}\n";
+        let repaired = crate::sanitizer::inject_axiom_attrs(corrupted_prefix, "src/app/panel/page.tsx");
+        assert!(
+            repaired.contains("<section data-axiom-component=\"Page\" data-axiom-file=\"src/app/panel/page.tsx\" className=\"box\">"),
+            "Expected mangled prefix attrs repaired onto `<section>`:\n{}",
+            repaired
+        );
+        assert!(!repaired.contains("data-axiom-file=\"src/app/panel/page.tsx\"<section"));
+
+        let corrupted_prefix_spaced = "\"use client\";\nexport default function PanelSpaced() {\n  return (\n    data-axiom-component=\"Page\" data-axiom-file=\"src/app/panel/page.tsx\"  <section className=\"box\">\n      <p>Hi</p>\n    </section>\n  );\n}\n";
+        let repaired_spaced = crate::sanitizer::inject_axiom_attrs(corrupted_prefix_spaced, "src/app/panel/page.tsx");
+        assert!(
+            repaired_spaced.contains("<section data-axiom-component=\"Page\" data-axiom-file=\"src/app/panel/page.tsx\" className=\"box\">"),
+            "Expected spaced mangled prefix attrs repaired onto `<section>`:\n{}",
+            repaired_spaced
+        );
+
+        let corrupted_split = "\"use client\";\nexport default function SplitBox() {\n  return (\n    <secti data-axiom-component=\"Page\" data-axiom-file=\"src/app/split/page.tsx\"on className=\"box\">\n      <p>Hi</p>\n    </section>\n  );\n}\n";
+        let repaired_split = crate::sanitizer::inject_axiom_attrs(corrupted_split, "src/app/split/page.tsx");
+        assert!(
+            repaired_split.contains("<section data-axiom-component=\"Page\" data-axiom-file=\"src/app/split/page.tsx\" className=\"box\">"),
+            "Expected split tag repaired onto `<section>`:\n{}",
+            repaired_split
+        );
+    }
+
+    #[test]
+    fn test_prisma_sanitizer_datasource_enum_defaults_and_scoring() {
+        let broken_schema = "enum ItemState {\n  ACTIVE\n  ARCHIVED\n}\n\n\
+model WorkItem {\n\
+  id    String    @id @default(cuid())\n\
+  state ItemState @default(ItemState.QUEUED)\n\
+}\n\n\
+model Account {\n\
+  id                String  @id @default(cuid())\n\
+  userId            String\n\
+  type              String\n\
+  provider          String\n\
+  providerAccountId String\n\
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)\n\
+}\n";
+        let processed = post_process_generated_file(
+            "prisma/schema.prisma",
+            broken_schema,
+            &serde_json::json!({}),
+            false,
+        );
+        assert!(processed.contains("generator client"), "Expected generator client:\n{}", processed);
+        assert!(processed.contains("datasource db"), "Expected datasource db:\n{}", processed);
+        assert!(processed.contains("env(\"DATABASE_URL\")"), "Expected DATABASE_URL env:\n{}", processed);
+        assert!(processed.contains("@default(QUEUED)"), "Expected stripped enum qualifier:\n{}", processed);
+        assert!(!processed.contains("@default(ItemState.QUEUED)"));
+        assert!(processed.contains("QUEUED"), "Expected QUEUED added to enum ItemState:\n{}", processed);
+        assert!(processed.contains("model User {"), "Expected missing NextAuth User model:\n{}", processed);
+
+        let missing_ds = "Error: You don't have any datasource defined in your schema.prisma.";
+        let cli_abort = "Error: P1012 schema parse error (unexpected token)";
+        let dmmf_errs = "Error code: P1012\nerror: Field broken\nerror: Field two\nerror: Field three\nValidation Error Count: 3";
+        let s_ds = crate::healer::score_prisma_error_log(missing_ds);
+        let s_abort = crate::healer::score_prisma_error_log(cli_abort);
+        let s_dmmf = crate::healer::score_prisma_error_log(dmmf_errs);
+        assert!(s_ds > s_abort && s_abort > s_dmmf && s_dmmf == 3, "scores: ds={}, abort={}, dmmf={}", s_ds, s_abort, s_dmmf);
+    }
+
+    #[test]
+    fn test_manifest_sanitization_and_hygiene_safeguards() {
+        // 1. Sentinel name resolution
+        assert_eq!(
+            crate::orchestrator::resolve_manifest_project_name(
+                Some("Business Analysis Failed"),
+                "WidgetForge is a modular platform for operational workflows",
+                "cmwc999999"
+            ),
+            "WidgetForge"
+        );
+        assert_eq!(
+            crate::orchestrator::resolve_manifest_project_name(Some("Analysis Failed"), "", "abc123def"),
+            "Axiom Project abc123"
+        );
+        assert_eq!(
+            crate::orchestrator::resolve_manifest_project_name(Some("CleanApp"), "desc", "id1"),
+            "CleanApp"
+        );
+
+        // 2. LBG API non-path pruning & typedFields/fields pruning for dangling relation types
+        let lbg = serde_json::json!({
+            "sharedContracts": {
+                "database": {
+                    "enums": {
+                        "ItemState": ["OPEN", "CLOSED"]
+                    },
+                    "models": {
+                        "Station": {
+                            "fields": ["id", "name", "status", "bookings"],
+                            "typedFields": ["id: String", "name: String", "status: ItemState", "bookings: GhostBooking[]"],
+                            "relations": ["bookings: GhostBooking[]", "facility: Facility"]
+                        },
+                        "Facility": {
+                            "fields": ["id", "title"],
+                            "typedFields": ["id: String", "title: String"],
+                            "relations": ["stations: Station[]"]
+                        }
+                    }
+                },
+                "api": {
+                    "endpoints": {
+                        "/api/stations": ["GET", "POST"],
+                        "POST /api/facility": ["POST"],
+                        "Analytics and Reporting": ["GET"],
+                        "Booking Module": ["POST"]
+                    }
+                }
+            }
+        });
+        let clean_lbg = crate::orchestrator::sanitize_live_builder_guide_contracts(&lbg);
+        let ep_obj = clean_lbg["sharedContracts"]["api"]["endpoints"].as_object().unwrap();
+        assert!(ep_obj.contains_key("/api/stations"));
+        assert!(ep_obj.contains_key("POST /api/facility"));
+        assert!(!ep_obj.contains_key("Analytics and Reporting"));
+        assert!(!ep_obj.contains_key("Booking Module"));
+
+        let station = &clean_lbg["sharedContracts"]["database"]["models"]["Station"];
+        let st_fields: Vec<&str> = station["fields"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        let st_typed: Vec<&str> = station["typedFields"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        assert!(!st_fields.contains(&"bookings"), "Expected dangling field removed: {:?}", st_fields);
+        assert!(st_fields.contains(&"status"));
+        assert!(!st_typed.iter().any(|s| s.contains("GhostBooking")), "Expected dangling typedField removed: {:?}", st_typed);
+        assert!(st_typed.contains(&"status: ItemState"));
+
+        let api_prompt = crate::orchestrator::format_api_endpoints_prompt(&lbg["sharedContracts"]["api"]);
+        assert!(api_prompt.contains("/api/stations"));
+        assert!(!api_prompt.contains("Analytics and Reporting"));
+
+        // 3. Prisma schema import rewrite + client type preservation + bcrypt injection
+        let hook_with_schema_imp = "\"use client\";\nimport { WorkItem, type ItemState } from '@/prisma/schema';\nexport function useWork() { return [] as WorkItem[]; }\n";
+        let hook_out = post_process_generated_file("src/hooks/useWork.ts", hook_with_schema_imp, &serde_json::json!({}), false);
+        assert!(
+            hook_out.contains("import type { WorkItem, ItemState } from '@prisma/client';"),
+            "Expected clean `import type` from @prisma/client without double `type`:\n{}",
+            hook_out
+        );
+
+        let route_with_schema_imp = "import { NextResponse } from 'next/server';\nimport { prisma } from '@/prisma/schema';\nexport async function POST(req: Request) {\n  const hashed = await bcrypt.hash('secret', 10);\n  return NextResponse.json({ hashed, ok: !!prisma });\n}\n";
+        let route_out = post_process_generated_file("src/app/api/register/route.ts", route_with_schema_imp, &serde_json::json!({}), false);
+        assert!(route_out.contains("from '@/lib/prisma'"), "Expected @/lib/prisma rewrite:\n{}", route_out);
+        assert!(route_out.contains("import bcrypt from 'bcryptjs';"), "Expected bcrypt auto-import:\n{}", route_out);
+
+        // 4. Client/hook direct `prisma.<model>` & deprecated NextAuth v3 validation rejections
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let bad_hook = "\"use client\";\nexport function useItems() { return prisma.workItem.findMany(); }\n";
+        assert!(rt.block_on(crate::orchestrator::validate_file_with_abstract_rules("src/hooks/useItems.ts", bad_hook, "qwen2.5-coder:7b")).is_err());
+
+        let bad_nextauth = "import Providers from 'next-auth/providers';\nexport const authOptions = { providers: [Providers.Credentials({})] };\n";
+        assert!(rt.block_on(crate::orchestrator::validate_file_with_abstract_rules("src/config/auth.ts", bad_nextauth, "qwen2.5-coder:7b")).is_err());
+
+        let ok_nextauth = "import type { NextAuthOptions } from 'next-auth';\nimport CredentialsProvider from 'next-auth/providers/credentials';\nexport const authOptions: NextAuthOptions = { providers: [CredentialsProvider({ name: 'cred', credentials: {}, async authorize() { return null; } })] };\n";
+        assert!(rt.block_on(crate::orchestrator::validate_file_with_abstract_rules("src/config/auth.ts", ok_nextauth, "qwen2.5-coder:7b")).is_ok());
+
+        // 5. NextAuth exact specifier matching (must reject deprecated barrel `'next-auth/providers'`)
+        let db = vec![PackageMeta {
+            name: "next-auth".to_string(),
+            version: "^4.24.7".to_string(),
+            aliases: vec!["next-auth/client".to_string()],
+            import_examples: vec![
+                "import CredentialsProvider from 'next-auth/providers/credentials';".to_string(),
+                "import { useSession } from 'next-auth/react';".to_string(),
+            ],
+            compatibility: serde_json::Map::new(),
+            best_practices: String::new(),
+        }];
+        assert_eq!(resolve_and_rewrite_import("next-auth/providers", &db), Some("next-auth".to_string()));
+        assert_eq!(resolve_and_rewrite_import("next-auth/providers/credentials", &db), None);
+
+        // 6. collect_missing_imports skips `@/prisma/schema` & relative `prisma/schema` while keeping real missing components
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v50_miss_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let src_dir = temp_dir.join("src");
+        std::fs::create_dir_all(src_dir.join("hooks")).unwrap();
+        std::fs::write(
+            src_dir.join("hooks/useDemo.ts"),
+            "import type { Row } from '@/prisma/schema';\nimport type { Alt } from '../../prisma/schema';\nimport { MissingWidget } from '@/components/MissingWidget';\nexport function useDemo() { return [] as Row[]; }\n",
+        )
+        .unwrap();
+        let mut missing = Vec::new();
+        crate::self_healing::collect_missing_imports(&src_dir, &src_dir, &mut missing);
+        assert!(
+            !missing.iter().any(|m| m.target_path.to_string_lossy().replace('\\', "/").contains("prisma/schema")),
+            "Import Fixer must never synthesize prisma/schema module"
+        );
+        assert!(
+            missing.iter().any(|m| m.target_path.to_string_lossy().replace('\\', "/").ends_with("components/MissingWidget.ts")),
+            "Real missing local component must still be collected"
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        // 7. sanitize_package_json_value_for_offline strips stale React 17 pins in Next 14+ projects
+        let mut pkg_val = serde_json::json!({
+            "dependencies": {
+                "next": "14.2.35",
+                "react": "^18.2.0",
+                "react-dom": "^18.2.0"
+            },
+            "resolutions": {
+                "react": "^17.0.2",
+                "react-dom": "^17.0.2"
+            },
+            "overrides": {
+                "react": "17.0.2",
+                "other-pkg": "1.2.3"
+            }
+        });
+        assert!(crate::packages::sanitize_package_json_value_for_offline(&mut pkg_val));
+        assert!(pkg_val.get("resolutions").is_none(), "Empty resolutions should be removed: {:?}", pkg_val);
+        assert!(pkg_val["overrides"].get("react").is_none());
+        assert_eq!(pkg_val["overrides"]["other-pkg"].as_str(), Some("1.2.3"));
+    }
+
 }

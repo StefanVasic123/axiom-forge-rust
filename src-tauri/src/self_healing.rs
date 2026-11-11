@@ -182,7 +182,19 @@ pub fn scan_and_fix_imports(dir: &std::path::Path, src_root: &std::path::Path, i
                                 }
                                 
                                 let literal = literal.trim();
-                                if !literal.is_empty() && (literal.starts_with('.') || literal.starts_with("@/")) {
+                                let lit_low = literal.replace('\\', "/").to_lowercase();
+                                let is_prisma_pseudo_spec = lit_low == "@/prisma/schema"
+                                    || lit_low == "~/prisma/schema"
+                                    || lit_low == "src/prisma/schema"
+                                    || lit_low == "prisma/schema"
+                                    || lit_low == "@/prisma/client"
+                                    || lit_low == "~/prisma/client"
+                                    || lit_low == "src/prisma/client"
+                                    || lit_low == "prisma/client"
+                                    || lit_low.ends_with("/prisma/schema")
+                                    || lit_low.ends_with("/prisma/client")
+                                    || lit_low.ends_with("/prisma/schema.prisma");
+                                if !literal.is_empty() && !is_prisma_pseudo_spec && (literal.starts_with('.') || literal.starts_with("@/")) {
                                     let mut exists = false;
                                     
                                     let raw_target = if let Some(sub) = literal.strip_prefix("@/") {
@@ -274,9 +286,9 @@ pub fn scan_and_fix_imports(dir: &std::path::Path, src_root: &std::path::Path, i
 }
 
 pub struct MissingImport {
-    target_path: std::path::PathBuf,
-    importing_file_path: std::path::PathBuf,
-    import_line: String,
+    pub target_path: std::path::PathBuf,
+    pub importing_file_path: std::path::PathBuf,
+    pub import_line: String,
 }
 
 pub fn collect_missing_imports(
@@ -312,7 +324,19 @@ pub fn collect_missing_imports(
                                 }
                                 
                                 let literal = literal.trim();
-                                if !literal.is_empty() && crate::packages::is_local_import_specifier(literal) && !literal.ends_with(".css") && !literal.ends_with(".scss") && !literal.ends_with(".json") {
+                                let lit_low = literal.replace('\\', "/").to_lowercase();
+                                let is_prisma_pseudo_spec = lit_low == "@/prisma/schema"
+                                    || lit_low == "~/prisma/schema"
+                                    || lit_low == "src/prisma/schema"
+                                    || lit_low == "prisma/schema"
+                                    || lit_low == "@/prisma/client"
+                                    || lit_low == "~/prisma/client"
+                                    || lit_low == "src/prisma/client"
+                                    || lit_low == "prisma/client"
+                                    || lit_low.ends_with("/prisma/schema")
+                                    || lit_low.ends_with("/prisma/client")
+                                    || lit_low.ends_with("/prisma/schema.prisma");
+                                if !literal.is_empty() && !is_prisma_pseudo_spec && crate::packages::is_local_import_specifier(literal) && !literal.ends_with(".css") && !literal.ends_with(".scss") && !literal.ends_with(".json") {
                                     let mut exists = false;
                                     
                                     let raw_target = if let Some(sub) = literal.strip_prefix("@/").or_else(|| literal.strip_prefix("~/")) {
@@ -329,6 +353,13 @@ pub fn collect_missing_imports(
                                         src_root.join(literal.trim_start_matches('/'))
                                     };
                                     let target_abs = normalize_path_components(&raw_target);
+                                    let target_norm = target_abs.to_string_lossy().replace('\\', "/").to_lowercase();
+                                    if target_norm.ends_with("/prisma/schema")
+                                        || target_norm.ends_with("/prisma/client")
+                                        || target_norm.ends_with("/prisma/schema.prisma")
+                                    {
+                                        continue;
+                                    }
                                     
                                     let variations = [
                                         target_abs.clone(),
@@ -2727,13 +2758,23 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                                 }
                                 let before = std::fs::read_to_string(&full_path).unwrap_or_default();
                                 let processed = post_process_generated_file(&path_str, &content_str, &serde_json::json!({}), has_tailwind);
-                                if processed == before {
-                                    continue;
-                                }
                                 let prev_diags = per_file_diag_lines
                                     .get(&path_str.to_lowercase())
                                     .cloned()
                                     .unwrap_or_default();
+                                if processed == before {
+                                    crate::katastar::record_project_heal_round(
+                                        proj_dir,
+                                        &path_str,
+                                        round,
+                                        "ai",
+                                        "unchanged_after_postprocess",
+                                        &[],
+                                        &prev_diags,
+                                        "AI rewrite normalized identically to existing file on disk (no effective code delta).",
+                                    );
+                                    continue;
+                                }
                                 if !before.is_empty() {
                                     if let Some(drop_reason) = crate::healer::detect_destructive_code_drop(&path_str, &before, &processed) {
                                         debug_log_to_file(format!("[Self-Healing] {}", drop_reason));

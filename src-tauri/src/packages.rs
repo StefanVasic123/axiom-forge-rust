@@ -357,6 +357,42 @@ pub fn is_local_import_specifier(spec: &str) -> bool {
     LOCAL_PATH_PREFIXES.iter().any(|p| lower.starts_with(p))
 }
 
+pub fn import_example_mentions_specifier(example: &str, specifier: &str) -> bool {
+    let spec = specifier.trim();
+    if spec.is_empty() {
+        return false;
+    }
+    if example.trim() == spec {
+        return true;
+    }
+    if example.contains(&format!("'{}'", spec))
+        || example.contains(&format!("\"{}\"", spec))
+        || example.contains(&format!("`{}`", spec))
+    {
+        return true;
+    }
+    let mut start = 0usize;
+    while let Some(rel_idx) = example[start..].find(spec) {
+        let idx = start + rel_idx;
+        let after_idx = idx + spec.len();
+        let before_ok = idx == 0
+            || example[..idx]
+                .chars()
+                .next_back()
+                .map_or(true, |c| matches!(c, ' ' | '\t' | ',' | ';' | '(' | '\'' | '"' | '`'));
+        let after_ok = after_idx == example.len()
+            || example[after_idx..]
+                .chars()
+                .next()
+                .map_or(true, |c| matches!(c, ' ' | '\t' | ',' | ';' | ')' | '\'' | '"' | '`'));
+        if before_ok && after_ok {
+            return true;
+        }
+        start = after_idx;
+    }
+    false
+}
+
 pub fn resolve_and_rewrite_import(imported_path: &str, packages_db: &[PackageMeta]) -> Option<String> {
     let imported_path_trimmed = imported_path.trim();
     if imported_path_trimmed.is_empty() {
@@ -415,13 +451,13 @@ pub fn resolve_and_rewrite_import(imported_path: &str, packages_db: &[PackageMet
             // Verify if this specific subpath is listed as valid in any import examples
             let mut is_valid_subpath = false;
             for example in &pkg.import_examples {
-                if example.contains(imported_path_trimmed) {
+                if import_example_mentions_specifier(example, imported_path_trimmed) {
                     is_valid_subpath = true;
                     break;
                 }
             }
             if !is_valid_subpath {
-                // It's a non-existent/hallucinated subpath of a known package (e.g. resend/client)
+                // It's a non-existent/hallucinated subpath of a known package (e.g. resend/client, next-auth/providers)
                 // Rewrite to the package name itself
                 return Some(pkg.name.clone());
             }
@@ -433,7 +469,7 @@ pub fn resolve_and_rewrite_import(imported_path: &str, packages_db: &[PackageMet
                 // If it starts with an alias, we check if it matches some known subpath, otherwise rewrite to pkg.name
                 let mut is_valid_subpath = false;
                 for example in &pkg.import_examples {
-                    if example.contains(imported_path_trimmed) {
+                    if import_example_mentions_specifier(example, imported_path_trimmed) {
                         is_valid_subpath = true;
                         break;
                     }
@@ -1219,6 +1255,21 @@ pub fn is_npm_network_error(err_log: &str) -> bool {
         || (lower.contains("request to ") && lower.contains("failed, reason:"))
 }
 
+fn is_legacy_react_lt18_pin(ver: &str) -> bool {
+    let v = ver
+        .trim()
+        .trim_start_matches(|c: char| matches!(c, '^' | '~' | '=' | 'v' | 'V'));
+    v.starts_with("17.")
+        || v == "17"
+        || v.starts_with("16.")
+        || v == "16"
+        || v.starts_with("15.")
+        || v == "15"
+        || v.starts_with("14.")
+        || v == "14"
+        || v.starts_with("0.")
+}
+
 pub fn sanitize_package_json_value_for_offline(json_val: &mut Value) -> bool {
     let mut changed = false;
     let bogus_subpaths = [
@@ -1366,6 +1417,34 @@ pub fn sanitize_package_json_value_for_offline(json_val: &mut Value) -> bool {
                             }
                         }
                     }
+                }
+            }
+        }
+        // Strip stale React <18 pins from `resolutions` / `overrides` in Next.js projects (e.g. Next 14 requires React >=18)
+        let explicit_react17_dep = obj
+            .get("dependencies")
+            .and_then(|d| d.as_object())
+            .and_then(|d| d.get("react"))
+            .and_then(|v| v.as_str())
+            .map_or(false, is_legacy_react_lt18_pin);
+        if is_nextjs_ctx && !explicit_react17_dep {
+            for pin_section in &["resolutions", "overrides"] {
+                let mut became_empty = false;
+                if let Some(sec_obj) = obj.get_mut(*pin_section).and_then(|s| s.as_object_mut()) {
+                    for pkg_k in &["react", "react-dom"] {
+                        let should_remove = sec_obj
+                            .get(*pkg_k)
+                            .and_then(|v| v.as_str())
+                            .map_or(false, is_legacy_react_lt18_pin);
+                        if should_remove {
+                            sec_obj.remove(*pkg_k);
+                            changed = true;
+                        }
+                    }
+                    became_empty = sec_obj.is_empty();
+                }
+                if became_empty {
+                    obj.remove(*pin_section);
                 }
             }
         }

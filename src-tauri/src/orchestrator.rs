@@ -711,6 +711,18 @@ pub async fn validate_file_with_abstract_rules(
         if trimmed.contains("new PrismaClient") {
             return Err("Client Component / hook must NOT instantiate PrismaClient.".to_string());
         }
+        let clean_client_code = strip_ts_js_comments_preserving_strings(trimmed);
+        if let Ok(client_prisma_re) = regex::Regex::new(
+            r"\bprisma\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*(findMany|findUnique|findFirst|findUniqueOrThrow|findFirstOrThrow|create|createMany|update|updateMany|upsert|delete|deleteMany|count|aggregate|groupBy)\s*\(",
+        ) {
+            if let Some(cap) = client_prisma_re.captures(&clean_client_code) {
+                let del_name = cap.get(1).map_or("model", |m| m.as_str());
+                return Err(format!(
+                    "Client Component / hook must NOT call `prisma.{}` directly; fetch from '/api/...' endpoints instead.",
+                    del_name
+                ));
+            }
+        }
         let raw_lines: Vec<&str> = trimmed.lines().collect();
         let mut idx_l = 0usize;
         while idx_l < raw_lines.len() {
@@ -785,6 +797,13 @@ pub async fn validate_file_with_abstract_rules(
     }
     if trimmed.contains("from 'src/") || trimmed.contains("from \"src/") {
         return Err("Never use bare 'src/...' module specifiers; always use '@/...' alias.".to_string());
+    }
+    if trimmed.contains("from 'next-auth/providers'")
+        || trimmed.contains("from \"next-auth/providers\"")
+        || trimmed.contains("from 'next-auth/client'")
+        || trimmed.contains("from \"next-auth/client\"")
+    {
+        return Err("Deprecated NextAuth v3 import (`next-auth/providers` or `next-auth/client`). Use NextAuth v4 subpaths (e.g. `CredentialsProvider` from `'next-auth/providers/credentials'`, `useSession` from `'next-auth/react'`).".to_string());
     }
 
     // 7. Basic bracket balance check to catch mid-stream truncation
@@ -2964,14 +2983,110 @@ fn parse_lbg_relation_entry(raw: &str) -> (String, String, bool) {
     (rel_field, target_model, is_array)
 }
 
+fn is_valid_lbg_api_endpoint_key(key: &str) -> bool {
+    let kt = key.trim();
+    if kt.is_empty() {
+        return false;
+    }
+    if kt.starts_with('/') || kt.contains("/api/") {
+        return true;
+    }
+    let mut parts = kt.split_whitespace();
+    if let (Some(method), Some(path), None) = (parts.next(), parts.next(), parts.next()) {
+        let m_up = method.to_uppercase();
+        if matches!(m_up.as_str(), "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS")
+            && path.starts_with('/')
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_prisma_primitive_or_scalar_type(base_ty: &str) -> bool {
+    matches!(
+        base_ty,
+        "String"
+            | "Int"
+            | "Float"
+            | "Boolean"
+            | "DateTime"
+            | "Json"
+            | "Bytes"
+            | "BigInt"
+            | "Decimal"
+            | "string"
+            | "number"
+            | "boolean"
+            | "Date"
+            | "any"
+            | "unknown"
+            | "object"
+    )
+}
+
+fn parse_lbg_field_name_and_type(raw: &str) -> (String, Option<(String, bool)>) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return (String::new(), None);
+    }
+    if let Some((lhs, rhs)) = trimmed.split_once(':') {
+        let fname = lhs.split_whitespace().next().unwrap_or("").trim().to_string();
+        let type_tok = rhs
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .split('(')
+            .next()
+            .unwrap_or("")
+            .trim();
+        let is_arr = type_tok.contains('[');
+        let base_ty = type_tok.replace(['?', '[', ']', ',', ';'], "").trim().to_string();
+        let ty_opt = if base_ty.is_empty() { None } else { Some((base_ty, is_arr)) };
+        (fname, ty_opt)
+    } else {
+        let toks: Vec<&str> = trimmed.split_whitespace().collect();
+        let fname = toks.first().copied().unwrap_or("").trim().to_string();
+        if toks.len() >= 2 {
+            let type_tok = toks[1].split('(').next().unwrap_or(toks[1]).trim();
+            let is_arr = type_tok.contains('[');
+            let base_ty = type_tok.replace(['?', '[', ']', ',', ';'], "").trim().to_string();
+            let ty_opt = if base_ty.is_empty() { None } else { Some((base_ty, is_arr)) };
+            (fname, ty_opt)
+        } else {
+            (fname, None)
+        }
+    }
+}
+
 /// Validates and cleans relational graph contracts inside `live_builder_guide.json` using
 /// model-agnostic Prisma graph invariants:
+/// - Prunes non-path prose headings accidentally placed in `sharedContracts.api.endpoints`,
 /// - Rejects relations referencing undeclared models (`target_model` missing from `models`),
 /// - Rejects unsupervised self-list relations (`M[]`) that lack a singular `M?` partner (or pair),
-/// - Rejects one-sided broken relations whose target model has neither an opposite relation nor FK.
-/// Preserves single-model (`models.len() < 2`) partial contracts unchanged.
+/// - Rejects one-sided broken relations whose target model has neither an opposite relation nor FK,
+/// - Keeps `typedFields` and `fields` consistent by pruning removed relation/undeclared model refs.
+/// Preserves single-model (`models.len() < 2`) partial database contracts unchanged.
 pub fn sanitize_live_builder_guide_contracts(lbg: &Value) -> Value {
     let mut out = lbg.clone();
+
+    if let Some(ep_obj) = out
+        .get_mut("sharedContracts")
+        .and_then(|c| c.get_mut("api"))
+        .and_then(|a| a.get_mut("endpoints"))
+        .and_then(|e| e.as_object_mut())
+    {
+        ep_obj.retain(|k, _| is_valid_lbg_api_endpoint_key(k));
+    }
+
+    let (declared_enums, has_declared_enums): (std::collections::HashSet<String>, bool) = out
+        .get("sharedContracts")
+        .and_then(|c| c.get("database"))
+        .and_then(|d| d.get("enums"))
+        .and_then(|e| e.as_object())
+        .map(|obj| (obj.keys().cloned().collect(), !obj.is_empty()))
+        .unwrap_or_default();
+
     let Some(models_obj) = out
         .get_mut("sharedContracts")
         .and_then(|c| c.get_mut("database"))
@@ -3004,6 +3119,9 @@ pub fn sanitize_live_builder_guide_contracts(lbg: &Value) -> Value {
             (m_name.clone(), fset)
         })
         .collect();
+
+    let mut removed_rel_fields: std::collections::HashMap<String, std::collections::HashSet<String>> = std::collections::HashMap::new();
+    let mut removed_rel_targets: std::collections::HashMap<String, std::collections::HashSet<String>> = std::collections::HashMap::new();
 
     let max_iters = declared_models.len() + 1;
     for _ in 0..max_iters {
@@ -3050,13 +3168,29 @@ pub fn sanitize_live_builder_guide_contracts(lbg: &Value) -> Value {
                     continue;
                 };
                 let (rel_field, target_model, is_array) = parse_lbg_relation_entry(rel_str);
+                let mut record_removed = || {
+                    if !rel_field.is_empty() {
+                        removed_rel_fields
+                            .entry(m_name.clone())
+                            .or_default()
+                            .insert(rel_field.to_lowercase());
+                    }
+                    if !target_model.is_empty() {
+                        removed_rel_targets
+                            .entry(m_name.clone())
+                            .or_default()
+                            .insert(target_model.clone());
+                    }
+                };
                 if target_model.is_empty() || !declared_models.contains(&target_model) {
+                    record_removed();
                     changed_any = true;
                     continue;
                 }
 
                 if target_model == m_name {
                     if is_array && self_singular_count == 0 && self_list_count < 2 {
+                        record_removed();
                         changed_any = true;
                         continue;
                     }
@@ -3093,6 +3227,7 @@ pub fn sanitize_live_builder_guide_contracts(lbg: &Value) -> Value {
                 if keep {
                     filtered_rels.push(rel_val.clone());
                 } else {
+                    record_removed();
                     changed_any = true;
                 }
             }
@@ -3104,6 +3239,78 @@ pub fn sanitize_live_builder_guide_contracts(lbg: &Value) -> Value {
 
         if !changed_any {
             break;
+        }
+    }
+
+    // Propagate pruned relations & undeclared non-scalar types to `typedFields` and `fields`
+    let model_keys: Vec<String> = models_obj.keys().cloned().collect();
+    for m_name in model_keys {
+        let Some(m_obj) = models_obj.get_mut(&m_name).and_then(|v| v.as_object_mut()) else {
+            continue;
+        };
+        let mut pruned_names: std::collections::HashSet<String> = removed_rel_fields
+            .get(&m_name)
+            .cloned()
+            .unwrap_or_default();
+        let bad_targets: std::collections::HashSet<String> = removed_rel_targets
+            .get(&m_name)
+            .cloned()
+            .unwrap_or_default();
+
+        let should_prune_entry = |raw_entry: &str, extra_pruned: &std::collections::HashSet<String>| -> (bool, String) {
+            let (fname, ty_opt) = parse_lbg_field_name_and_type(raw_entry);
+            let fname_low = fname.to_lowercase();
+            if !fname_low.is_empty() && extra_pruned.contains(&fname_low) {
+                return (true, fname_low);
+            }
+            if let Some((base_ty, is_arr)) = ty_opt {
+                if bad_targets.contains(&base_ty) {
+                    return (true, fname_low);
+                }
+                if !is_prisma_primitive_or_scalar_type(&base_ty)
+                    && !declared_models.contains(&base_ty)
+                    && !base_ty.starts_with("Unsupported")
+                    && (is_arr || (has_declared_enums && !declared_enums.contains(&base_ty)))
+                {
+                    return (true, fname_low);
+                }
+            }
+            (false, fname_low)
+        };
+
+        if let Some(tf_arr) = m_obj.get("typedFields").and_then(|f| f.as_array()).cloned() {
+            let mut filtered_tf: Vec<Value> = Vec::with_capacity(tf_arr.len());
+            for val in &tf_arr {
+                if let Some(s) = val.as_str() {
+                    let (prune, fname_low) = should_prune_entry(s, &pruned_names);
+                    if prune {
+                        if !fname_low.is_empty() {
+                            pruned_names.insert(fname_low);
+                        }
+                        continue;
+                    }
+                }
+                filtered_tf.push(val.clone());
+            }
+            if filtered_tf.len() != tf_arr.len() {
+                m_obj.insert("typedFields".to_string(), Value::Array(filtered_tf));
+            }
+        }
+
+        if let Some(f_arr) = m_obj.get("fields").and_then(|f| f.as_array()).cloned() {
+            let mut filtered_f: Vec<Value> = Vec::with_capacity(f_arr.len());
+            for val in &f_arr {
+                if let Some(s) = val.as_str() {
+                    let (prune, _) = should_prune_entry(s, &pruned_names);
+                    if prune {
+                        continue;
+                    }
+                }
+                filtered_f.push(val.clone());
+            }
+            if filtered_f.len() != f_arr.len() {
+                m_obj.insert("fields".to_string(), Value::Array(filtered_f));
+            }
         }
     }
 
@@ -3175,13 +3382,20 @@ pub fn format_api_endpoints_prompt(api_val: &Value) -> String {
     let mut out = String::new();
     let endpoints = api_val.get("endpoints").and_then(|e| e.as_object()).or_else(|| api_val.as_object());
     if let Some(eps) = endpoints {
-        if !eps.is_empty() {
+        let mut valid_lines: Vec<String> = Vec::new();
+        for (ep_path, methods_val) in eps {
+            if !is_valid_lbg_api_endpoint_key(ep_path) {
+                continue;
+            }
+            let methods = methods_val.as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<&str>>().join(", "))
+                .unwrap_or_else(|| "GET".to_string());
+            valid_lines.push(format!("- [{}] {}\n", methods, ep_path));
+        }
+        if !valid_lines.is_empty() {
             out.push_str("VERIFIED API ENDPOINTS TO CALL:\n");
-            for (ep_path, methods_val) in eps {
-                let methods = methods_val.as_array()
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<&str>>().join(", "))
-                    .unwrap_or_else(|| "GET".to_string());
-                out.push_str(&format!("- [{}] {}\n", methods, ep_path));
+            for line in valid_lines {
+                out.push_str(&line);
             }
         }
     }
@@ -3641,6 +3855,10 @@ pub fn get_expert_system_prompt(
         prompt.push_str(&format!("ROLE: Senior Flutter & Dart Mobile Developer\nFILE: {}\n", file_path));
     } else {
         prompt.push_str(&format!("ROLE: Expert TypeScript / JavaScript Developer\nFILE: {}\n- Always import local modules using the '@/...' alias (never bare 'src/...').\n- Never clone new PrismaClient() outside src/lib/prisma.ts.\n", file_path));
+        let path_low_fallback = file_path.to_lowercase().replace('\\', "/");
+        if path_low_fallback.contains("nextauth") || path_low_fallback.ends_with("/auth.ts") || path_low_fallback.ends_with("/auth.js") || path_low_fallback == "auth.ts" {
+            prompt.push_str("- NEXTAUTH V4 ONLY: Import `type { NextAuthOptions }` from `'next-auth'` and `CredentialsProvider` from `'next-auth/providers/credentials'` (NEVER deprecated v3 `'next-auth/providers'`). Use `PrismaAdapter` from `'@auth/prisma-adapter'` with `prisma` from `'@/lib/prisma'`.\n");
+        }
     }
     if !context_ref.is_empty() {
         prompt.push_str(context_ref);
@@ -3672,6 +3890,79 @@ fn extract_live_code_preview(raw: &str) -> String {
         joined.chars().skip(count - 1400).collect()
     } else {
         joined
+    }
+}
+
+/// Replaces upstream manifest sentinel/failure titles (e.g. "Business Analysis Failed",
+/// "Unknown Project", empty strings) with a clean domain name derived from `description`
+/// or a deterministic ID fallback.
+pub fn resolve_manifest_project_name(raw_name: Option<&str>, description: &str, project_id: &str) -> String {
+    let raw = raw_name.unwrap_or("").trim();
+    let raw_low = raw.to_lowercase();
+    let is_sentinel = raw.is_empty()
+        || matches!(
+            raw_low.as_str(),
+            "business analysis failed"
+                | "analysis failed"
+                | "project analysis failed"
+                | "generation failed"
+                | "error"
+                | "failed"
+                | "unknown project"
+                | "unknown"
+                | "untitled"
+                | "untitled project"
+                | "n/a"
+                | "null"
+                | "undefined"
+        )
+        || raw_low.contains("analysis failed")
+        || raw_low.starts_with("error:")
+        || raw_low.starts_with("failed:");
+
+    if !is_sentinel {
+        return raw.to_string();
+    }
+
+    let desc_trimmed = description.trim();
+    if !desc_trimmed.is_empty() {
+        for sep in [" is a ", " is an ", " is the ", ": ", " - ", " — ", " – "] {
+            if let Some(pos) = desc_trimmed.find(sep) {
+                let candidate = desc_trimmed[..pos]
+                    .trim()
+                    .trim_matches(|c: char| matches!(c, '"' | '\'' | '`'));
+                let wc = candidate.split_whitespace().count();
+                if !candidate.is_empty() && wc >= 1 && wc <= 6 && candidate.len() <= 60 {
+                    return candidate.to_string();
+                }
+            }
+        }
+        let first_clause = desc_trimmed
+            .split(['.', '!', '?', '\n'])
+            .next()
+            .unwrap_or(desc_trimmed)
+            .trim();
+        let words: Vec<&str> = first_clause.split_whitespace().take(4).collect();
+        if !words.is_empty() {
+            let candidate = words
+                .join(" ")
+                .trim_matches(|c: char| matches!(c, ',' | ':' | ';' | '-' | '"' | '\''))
+                .to_string();
+            if !candidate.is_empty() {
+                return candidate;
+            }
+        }
+    }
+
+    let short_id: String = project_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(6)
+        .collect();
+    if short_id.is_empty() {
+        "Axiom Project".to_string()
+    } else {
+        format!("Axiom Project {}", short_id)
     }
 }
 
@@ -3887,12 +4178,6 @@ pub async fn run_orchestrator(
         manifest = json.get("data").cloned().ok_or("No data in manifest response")?;
     }
     let files = manifest.get("files").and_then(|f| f.as_array()).ok_or("No files in manifest")?;
-    let name_val = manifest.get("name")
-        .or_else(|| manifest.get("projectName"))
-        .or_else(|| manifest.get("title"))
-        .or_else(|| manifest.get("metadata").and_then(|m| m.get("name")))
-        .or_else(|| manifest.get("metadata").and_then(|m| m.get("title")));
-    let name = name_val.and_then(|n| n.as_str()).unwrap_or("Unknown Project");
     let desc_val = manifest.get("description")
         .or_else(|| manifest.get("projectDescription"))
         .or_else(|| manifest.get("idea"))
@@ -3900,6 +4185,17 @@ pub async fn run_orchestrator(
         .or_else(|| manifest.get("metadata").and_then(|m| m.get("description")))
         .or_else(|| manifest.get("metadata").and_then(|m| m.get("idea")));
     let project_description = desc_val.and_then(|d| d.as_str()).unwrap_or("");
+    let name_val = manifest.get("name")
+        .or_else(|| manifest.get("projectName"))
+        .or_else(|| manifest.get("title"))
+        .or_else(|| manifest.get("metadata").and_then(|m| m.get("name")))
+        .or_else(|| manifest.get("metadata").and_then(|m| m.get("title")));
+    let name_owned = resolve_manifest_project_name(
+        name_val.and_then(|n| n.as_str()),
+        project_description,
+        &project_id,
+    );
+    let name = name_owned.as_str();
     let project_type = detect_project_type(&manifest);
 
     // Immediately register/update the project in projects.json with "generating" status
@@ -4904,8 +5200,12 @@ export default function RootLayout({
                 }
             }
             
-            let proj_desc = manifest.get("metadata").and_then(|m| m.get("description")).and_then(|d| d.as_str()).unwrap_or("");
-            let proj_name = manifest.get("metadata").and_then(|m| m.get("name")).and_then(|n| n.as_str()).unwrap_or(name);
+            let proj_desc = manifest.get("metadata").and_then(|m| m.get("description")).and_then(|d| d.as_str()).unwrap_or(project_description);
+            let proj_name = resolve_manifest_project_name(
+                manifest.get("metadata").and_then(|m| m.get("name")).and_then(|n| n.as_str()).or(Some(name)),
+                proj_desc,
+                &project_id,
+            );
             
             let (ui_flow, file_desc, default_content) = if has_public || proj_desc.to_lowercase().contains("landing") || proj_desc.to_lowercase().contains("marketing") {
                 ("Landing Page",
@@ -5123,10 +5423,22 @@ export default function RootLayout({
             &proj_dir,
         );
 
-        if file_path.replace('\\', "/").to_lowercase().ends_with("schema.prisma") {
+        let has_auth_routes = files_to_generate.iter().any(|f| {
+            f.get("path").and_then(|p| p.as_str()).map_or(false, |p| {
+                let low = p.replace('\\', "/").to_lowercase();
+                low.contains("api/auth/") || low.contains("api/register") || low.contains("nextauth")
+            })
+        });
+        let is_schema_prisma = file_path.replace('\\', "/").to_lowercase().ends_with("schema.prisma");
+        if is_schema_prisma {
             let api_routes_summary = extract_planned_api_routes_summary(&files_to_generate);
             if !api_routes_summary.is_empty() {
                 system_prompt.push_str(&api_routes_summary);
+            }
+            if has_auth_routes {
+                system_prompt.push_str(
+                    "\nCRITICAL AUTH SCHEMA CONTRACT:\n- This project includes NextAuth / user authentication routes. You MUST declare `generator client { provider = \"prisma-client-js\" }`, `datasource db { provider = \"postgresql\"\n  url = env(\"DATABASE_URL\") }`, and `model User` (with id, email @unique, name?, emailVerified?, image?, hashedPassword?, role?, createdAt, updatedAt) inside `prisma/schema.prisma`.\n"
+                );
             }
         }
 
@@ -5318,7 +5630,12 @@ export default function RootLayout({
 
             // Clean markdown backticks
             let cleaned = extract_code_content(&full_content);
-            processed_content = post_process_generated_file(file_path, &cleaned, &metamanifest, has_tailwind);
+            let pre_processed = if is_schema_prisma && has_auth_routes {
+                crate::sanitizer::ensure_prisma_user_model_if_missing(&cleaned)
+            } else {
+                cleaned
+            };
+            processed_content = post_process_generated_file(file_path, &pre_processed, &metamanifest, has_tailwind);
             
             // Run project-aware validation agent
             match validate_file_with_project_context(&proj_dir, file_path, &processed_content, &model_id).await {
@@ -5410,7 +5727,20 @@ export default function RootLayout({
     let has_prisma = proj_dir.join("prisma/schema.prisma").exists() || proj_dir.join("schema.prisma").exists();
     if has_prisma {
         emit_progress("install-deps", "Checking database setup...", 74.0);
-        let db_name = name.replace("-", "_").replace(" ", "_").to_lowercase();
+        let mut db_name: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+            .collect();
+        while db_name.contains("__") {
+            db_name = db_name.replace("__", "_");
+        }
+        db_name = db_name.trim_matches('_').chars().take(48).collect();
+        if db_name.is_empty() || !db_name.chars().next().map_or(false, |c| c.is_ascii_alphabetic()) {
+            db_name = format!("axiom_{}", db_name.trim_start_matches('_'));
+            if db_name == "axiom_" {
+                db_name = "axiom_db".to_string();
+            }
+        }
         
         #[cfg(target_os = "windows")]
         {
