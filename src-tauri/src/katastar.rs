@@ -1185,3 +1185,290 @@ pub fn get_error_katastar() -> Result<Value, String> {
         "entries": store.entries
     }))
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileHealAttemptRecord {
+    pub round: usize,
+    pub source: String,
+    pub outcome: String,
+    #[serde(default)]
+    pub resolved: Vec<String>,
+    #[serde(default)]
+    pub unresolved: Vec<String>,
+    pub summary: String,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FileErrorLedger {
+    #[serde(rename = "filePath")]
+    pub file_path: String,
+    #[serde(default)]
+    pub resolved: Vec<String>,
+    #[serde(default)]
+    pub unresolved: Vec<String>,
+    #[serde(default)]
+    pub attempts: Vec<FileHealAttemptRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectHealLedger {
+    #[serde(rename = "schemaVersion")]
+    pub schema_version: u32,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: String,
+    #[serde(default)]
+    pub files: std::collections::BTreeMap<String, FileErrorLedger>,
+}
+
+impl Default for ProjectHealLedger {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            files: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DiagnosticDiff {
+    pub resolved: Vec<String>,
+    pub still_unresolved: Vec<String>,
+    pub introduced: Vec<String>,
+    pub count_reduced: bool,
+}
+
+/// Produces a line-number-independent canonical key for a compiler/runtime diagnostic
+/// so line shifts from adding an `import` do not misclassify resolved vs unresolved errors.
+pub fn canonical_diag_key(raw_line: &str) -> String {
+    let trimmed = raw_line.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Ok(ts_re) = regex::Regex::new(r"(?i)\b(TS\d{4})\b\s*[:\]]?\s*(.+)$") {
+        if let Some(cap) = ts_re.captures(trimmed) {
+            let code = cap.get(1).map(|m| m.as_str().to_uppercase()).unwrap_or_default();
+            let msg = cap
+                .get(2)
+                .map(|m| m.as_str().split_whitespace().collect::<Vec<&str>>().join(" "))
+                .unwrap_or_default();
+            if !code.is_empty() && !msg.is_empty() {
+                return format!("{}:{}", code, msg);
+            }
+        }
+    }
+    let stripped = if let Ok(loc_re) = regex::Regex::new(
+        r#"^(?:[^\r\n()]+?\(\d+,\d+\):\s*(?:error|warning)\s*|Line\s+\d+,\s*Col\s+\d+:\s*(?:\[[^\]]+\]\s*)?|[^:\r\n]+:\d+:\d+\s*[-:]?\s*)"#,
+    ) {
+        loc_re.replace(trimmed, "").to_string()
+    } else {
+        trimmed.to_string()
+    };
+    stripped.split_whitespace().collect::<Vec<&str>>().join(" ")
+}
+
+pub fn compute_diagnostic_diff(baseline: &[String], post: &[String]) -> DiagnosticDiff {
+    let mut base_by_key: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for line in baseline {
+        let key = canonical_diag_key(line);
+        if !key.is_empty() {
+            base_by_key.entry(key).or_insert_with(|| line.clone());
+        }
+    }
+
+    let mut post_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut still_unresolved = Vec::new();
+    let mut introduced = Vec::new();
+    for line in post {
+        let key = canonical_diag_key(line);
+        if key.is_empty() {
+            continue;
+        }
+        post_keys.insert(key.clone());
+        if base_by_key.contains_key(&key) {
+            still_unresolved.push(line.clone());
+        } else {
+            introduced.push(line.clone());
+        }
+    }
+
+    let mut resolved = Vec::new();
+    for (key, orig_line) in &base_by_key {
+        if !post_keys.contains(key) {
+            resolved.push(orig_line.clone());
+        }
+    }
+
+    DiagnosticDiff {
+        resolved,
+        still_unresolved,
+        introduced,
+        count_reduced: post.len() < baseline.len(),
+    }
+}
+
+pub fn load_project_heal_ledger(proj_dir: &std::path::Path) -> ProjectHealLedger {
+    let ledger_path = proj_dir.join(".axiom").join("heal-ledger.json");
+    if ledger_path.is_file() {
+        if let Ok(raw) = std::fs::read_to_string(&ledger_path) {
+            if let Ok(parsed) = serde_json::from_str::<ProjectHealLedger>(&raw) {
+                return parsed;
+            }
+        }
+    }
+    ProjectHealLedger::default()
+}
+
+pub fn save_project_heal_ledger(proj_dir: &std::path::Path, ledger: &ProjectHealLedger) {
+    let axiom_dir = proj_dir.join(".axiom");
+    let _ = std::fs::create_dir_all(&axiom_dir);
+    let ledger_path = axiom_dir.join("heal-ledger.json");
+    if let Ok(pretty) = serde_json::to_string_pretty(ledger) {
+        let _ = std::fs::write(ledger_path, pretty);
+    }
+}
+
+pub fn record_project_heal_round(
+    proj_dir: &std::path::Path,
+    file_path: &str,
+    round: usize,
+    source: &str,
+    outcome: &str,
+    resolved_items: &[String],
+    unresolved_items: &[String],
+    summary: &str,
+) {
+    let norm_path = file_path.trim().replace('\\', "/").trim_start_matches("./").to_string();
+    if norm_path.is_empty() {
+        return;
+    }
+
+    let mut ledger = load_project_heal_ledger(proj_dir);
+    let entry = ledger.files.entry(norm_path.clone()).or_insert_with(|| FileErrorLedger {
+        file_path: norm_path.clone(),
+        ..Default::default()
+    });
+
+    let unresolved_keys: std::collections::HashSet<String> = unresolved_items
+        .iter()
+        .map(|u| canonical_diag_key(u))
+        .filter(|k| !k.is_empty())
+        .collect();
+
+    // Remove previously resolved keys only if they resurfaced as active unresolved errors
+    entry.resolved.retain(|r| !unresolved_keys.contains(&canonical_diag_key(r)));
+
+    let mut existing_res_keys: std::collections::HashSet<String> = entry
+        .resolved
+        .iter()
+        .map(|r| canonical_diag_key(r))
+        .collect();
+    for r in resolved_items {
+        let key = canonical_diag_key(r);
+        if !key.is_empty() && !unresolved_keys.contains(&key) && existing_res_keys.insert(key.clone()) {
+            entry.resolved.push(key);
+        }
+    }
+
+    let mut seen_unres = std::collections::HashSet::new();
+    let mut cleaned_unres = Vec::new();
+    for u in unresolved_items {
+        let t = u.trim();
+        if !t.is_empty() && seen_unres.insert(canonical_diag_key(t)) {
+            cleaned_unres.push(t.to_string());
+        }
+    }
+    entry.unresolved = cleaned_unres;
+
+    entry.attempts.push(FileHealAttemptRecord {
+        round,
+        source: source.to_string(),
+        outcome: outcome.to_string(),
+        resolved: resolved_items.to_vec(),
+        unresolved: unresolved_items.iter().take(10).cloned().collect(),
+        summary: summary.chars().take(400).collect(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    });
+    if entry.attempts.len() > 12 {
+        let excess = entry.attempts.len() - 12;
+        entry.attempts.drain(0..excess);
+    }
+
+    ledger.updated_at = chrono::Utc::now().to_rfc3339();
+    save_project_heal_ledger(proj_dir, &ledger);
+}
+
+/// Builds the Chain-of-Information block from `.axiom/heal-ledger.json` for round 2+.
+/// Strictly sends ONLY currently unresolved diagnostics (omitting already-resolved diagnostics
+/// so small models do not re-edit or undo verified fixes).
+pub fn format_chain_of_information_prompt(
+    proj_dir: &std::path::Path,
+    file_path: &str,
+    current_unresolved: &[String],
+    attempt: usize,
+) -> String {
+    let norm_path = file_path.trim().replace('\\', "/").trim_start_matches("./").to_string();
+    let ledger = load_project_heal_ledger(proj_dir);
+    let entry_opt = ledger.files.get(&norm_path);
+
+    let resolved_keys: std::collections::HashSet<String> = entry_opt
+        .map(|e| e.resolved.iter().map(|r| canonical_diag_key(r)).collect())
+        .unwrap_or_default();
+
+    let source_unresolved: Vec<String> = if !current_unresolved.is_empty() {
+        current_unresolved.to_vec()
+    } else {
+        entry_opt.map(|e| e.unresolved.clone()).unwrap_or_default()
+    };
+
+    let active_unresolved: Vec<String> = source_unresolved
+        .into_iter()
+        .filter(|u| {
+            let k = canonical_diag_key(u);
+            !k.is_empty() && !resolved_keys.contains(&k)
+        })
+        .collect();
+
+    if active_unresolved.is_empty() && entry_opt.map_or(true, |e| e.attempts.is_empty()) {
+        return String::new();
+    }
+
+    let mut out = String::from("\n--- CHAIN OF INFORMATION (UNRESOLVED ERRORS & ATTEMPT HISTORY) ---\n");
+    if !resolved_keys.is_empty() {
+        out.push_str(&format!(
+            "Note: {} earlier error(s) in this file are ALREADY RESOLVED & verified in ledger (omitted from this prompt — do NOT undo prior imports/fixes).\n",
+            resolved_keys.len()
+        ));
+    }
+
+    if !active_unresolved.is_empty() {
+        out.push_str("UNRESOLVED DIAGNOSTICS REQUIRING FIX NOW:\n");
+        for err in active_unresolved.iter().take(12) {
+            out.push_str(&format!("  - {}\n", err));
+        }
+    }
+
+    if let Some(entry) = entry_opt {
+        if !entry.attempts.is_empty() {
+            out.push_str("PRIOR ATTEMPTS IN THIS FILE:\n");
+            for att in entry.attempts.iter().rev().take(3).rev() {
+                out.push_str(&format!(
+                    "  * Round {} [{} -> {}]: {}\n",
+                    att.round, att.source, att.outcome, att.summary
+                ));
+            }
+        }
+    }
+
+    if attempt >= 2 {
+        out.push_str(
+            "DEEP CAUSAL REFLECTION REQUIRED BEFORE PROPOSING EDITS:\n\
+             1. Why did the previous attempt fail, trigger rollback, or leave remaining diagnostics?\n\
+             2. Did the previous edit depend on a missing/unverified symbol, wrong npm subpath, or broken exporter file?\n\
+             3. Apply the minimal verified fix (or multi-file exporter fix) targeting ONLY the unresolved diagnostics above without breaking anything already working.\n",
+        );
+    }
+    out.push_str("-------------------------------------------------------------------\n");
+    out
+}

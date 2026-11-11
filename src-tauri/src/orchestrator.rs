@@ -262,6 +262,366 @@ pub fn get_context_files_for(file_path: &str, proj_dir: &std::path::Path) -> Str
     context
 }
 
+fn strip_ts_js_comments_preserving_strings(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_tick = false;
+    let mut escaped = false;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        if escaped {
+            out.push(ch);
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if (in_single || in_double || in_tick) && ch == '\\' {
+            out.push(ch);
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if ch == '\'' && !in_double && !in_tick {
+            in_single = !in_single;
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        if ch == '"' && !in_single && !in_tick {
+            in_double = !in_double;
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        if ch == '`' && !in_single && !in_double {
+            in_tick = !in_tick;
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        if !in_single && !in_double && !in_tick && ch == '/' {
+            if chars.get(i + 1) == Some(&'/') {
+                i += 2;
+                while i < chars.len() && chars[i] != '\n' {
+                    out.push(' ');
+                    i += 1;
+                }
+                continue;
+            }
+            if chars.get(i + 1) == Some(&'*') {
+                i += 2;
+                while i < chars.len() {
+                    if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                        i += 2;
+                        out.push(' ');
+                        break;
+                    }
+                    out.push(if chars[i] == '\n' { '\n' } else { ' ' });
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        out.push(ch);
+        i += 1;
+    }
+    out
+}
+
+fn find_matching_brace_end(chars: &[char], open_idx: usize) -> Option<usize> {
+    if chars.get(open_idx) != Some(&'{') {
+        return None;
+    }
+    let mut depth = 0isize;
+    let mut i = open_idx;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_tick = false;
+    let mut escaped = false;
+    while i < chars.len() {
+        let ch = chars[i];
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if (in_single || in_double || in_tick) && ch == '\\' {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if ch == '\'' && !in_double && !in_tick {
+            in_single = !in_single;
+        } else if ch == '"' && !in_single && !in_tick {
+            in_double = !in_double;
+        } else if ch == '`' && !in_single && !in_double {
+            in_tick = !in_tick;
+        } else if !in_single && !in_double && !in_tick {
+            if ch == '{' {
+                depth += 1;
+            } else if ch == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn model_to_prisma_delegate(model_name: &str) -> String {
+    let mut chars = model_name.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_lowercase(), chars.as_str()),
+        None => String::new(),
+    }
+}
+
+pub fn extract_planned_api_routes_summary(files: &[Value]) -> String {
+    let mut routes: Vec<String> = Vec::new();
+    for f in files {
+        let Some(raw_path) = f.get("path").and_then(|p| p.as_str()) else { continue };
+        let norm = raw_path.replace('\\', "/");
+        let lower = norm.to_lowercase();
+        if (lower.contains("/api/") || lower.starts_with("api/"))
+            && (lower.ends_with("/route.ts") || lower.ends_with("/route.js"))
+        {
+            let ep = if let Some(idx) = lower.find("/api/") {
+                norm[idx..].trim_end_matches("/route.ts").trim_end_matches("/route.js")
+            } else {
+                norm.trim_end_matches("/route.ts").trim_end_matches("/route.js")
+            };
+            let desc = f
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .split_whitespace()
+                .collect::<Vec<&str>>()
+                .join(" ");
+            let desc_short: String = desc.chars().take(140).collect();
+            if desc_short.is_empty() {
+                routes.push(format!("- {}", ep));
+            } else {
+                routes.push(format!("- {}: {}", ep, desc_short));
+            }
+        }
+    }
+    routes.sort();
+    routes.dedup();
+    if routes.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nPLANNED API ROUTES REQUIRING DATABASE SCHEMA SUPPORT:\n{}\nEnsure EVERY model, enum, and scalar field referenced by these planned API routes is declared in schema.prisma.\n",
+            routes.join("\n")
+        )
+    }
+}
+
+pub async fn validate_file_with_project_context(
+    proj_dir: &std::path::Path,
+    file_path: &str,
+    content: &str,
+    model_id: &str,
+) -> Result<(), String> {
+    validate_file_with_abstract_rules(file_path, content, model_id).await?;
+
+    let path_lower = file_path.replace('\\', "/").to_lowercase();
+    let is_api_route = (path_lower.contains("/api/") || path_lower.starts_with("api/"))
+        && (path_lower.ends_with("/route.ts")
+            || path_lower.ends_with("/route.js")
+            || path_lower == "route.ts"
+            || path_lower == "route.js");
+
+    if !is_api_route {
+        return Ok(());
+    }
+
+    let clean_code = strip_ts_js_comments_preserving_strings(content);
+
+    // 1. Validate Prisma delegates and Enum references against actual prisma/schema.prisma on disk
+    let schema_path = [
+        proj_dir.join("prisma/schema.prisma"),
+        proj_dir.join("schema.prisma"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file());
+
+    if let Some(sp) = schema_path {
+        if let Ok(prisma_src) = std::fs::read_to_string(&sp) {
+            let contract = extract_prisma_schema_contract(&prisma_src);
+            if let Some(models_obj) = contract.get("models").and_then(|m| m.as_object()) {
+                if !models_obj.is_empty() {
+                    let valid_delegates: Vec<String> = models_obj
+                        .keys()
+                        .map(|m| model_to_prisma_delegate(m))
+                        .collect();
+
+                    if let Ok(del_re) = regex::Regex::new(
+                        r"\bprisma\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*(findMany|findUnique|findFirst|findUniqueOrThrow|findFirstOrThrow|create|createMany|update|updateMany|upsert|delete|deleteMany|count|aggregate|groupBy)\s*\(",
+                    ) {
+                        for cap in del_re.captures_iter(&clean_code) {
+                            if let Some(del_m) = cap.get(1) {
+                                let del_name = del_m.as_str();
+                                if !del_name.starts_with('$') && !valid_delegates.iter().any(|vd| vd == del_name) {
+                                    return Err(format!(
+                                        "Invalid Prisma delegate `prisma.{}` in {}: model does not exist in prisma/schema.prisma (declared delegates: {}).",
+                                        del_name,
+                                        file_path,
+                                        valid_delegates.join(", ")
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(enums_obj) = contract.get("enums").and_then(|e| e.as_object()) {
+                for enum_name in enums_obj.keys() {
+                    let usage_pat = format!(r"\b{}\.[A-Z][A-Z0-9_]*\b", regex::escape(enum_name));
+                    let used = regex::Regex::new(&usage_pat)
+                        .ok()
+                        .map_or(false, |re| re.is_match(&clean_code));
+                    if used {
+                        let decl_pat = format!(
+                            r#"(?s)(?:\bimport\s+(?:type\s+)?(?:\{{[^}}]*\b{}\b[^}}]*\}}|{}\b)|\b(?:enum|const|let|var|type|interface)\s+{}\b)"#,
+                            regex::escape(enum_name),
+                            regex::escape(enum_name),
+                            regex::escape(enum_name)
+                        );
+                        let declared_or_imported = regex::Regex::new(&decl_pat)
+                            .ok()
+                            .map_or(false, |re| re.is_match(&clean_code));
+                        if !declared_or_imported {
+                            return Err(format!(
+                                "Prisma enum `{}` is referenced in {} without importing it from '@prisma/client' or declaring it.",
+                                enum_name, file_path
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Validate URLSearchParams property access (`searchParams.id` instead of `searchParams.get('id')`)
+    let uses_url_search_params = (clean_code.contains("new URL(")
+        || clean_code.contains(".searchParams")
+        || clean_code.contains("URLSearchParams"))
+        && !clean_code.contains("searchParams: {")
+        && !clean_code.contains("searchParams:{");
+    if uses_url_search_params {
+        const VALID_SEARCH_PARAMS_PROPS: &[&str] = &[
+            "get",
+            "getAll",
+            "has",
+            "set",
+            "append",
+            "delete",
+            "keys",
+            "values",
+            "entries",
+            "forEach",
+            "sort",
+            "toString",
+            "size",
+            "valueOf",
+            "constructor",
+            "hasOwnProperty",
+        ];
+        if let Ok(sp_re) = regex::Regex::new(r"\bsearchParams\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)") {
+            for cap in sp_re.captures_iter(&clean_code) {
+                if let Some(prop_m) = cap.get(1) {
+                    let prop = prop_m.as_str();
+                    if !VALID_SEARCH_PARAMS_PROPS.contains(&prop) {
+                        return Err(format!(
+                            "Invalid URLSearchParams access `searchParams.{}` in {}: use `searchParams.get('{}')` instead.",
+                            prop, file_path, prop
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Detect double req.json() read or `try`-scoped `body` referenced in paired `catch`
+    if let Ok(try_re) = regex::Regex::new(r"\btry\s*\{") {
+        let code_chars: Vec<char> = clean_code.chars().collect();
+        let req_json_re = regex::Regex::new(r"\b(?:req|request)\s*\.\s*json\s*\(").unwrap();
+        let body_decl_re = regex::Regex::new(
+            r"\b(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=\n]+)?=\s*(?:await\s+)?(?:req|request)\s*\.\s*json\s*\(",
+        )
+        .unwrap();
+
+        for m in try_re.find_iter(&clean_code) {
+            let try_open_char_idx = clean_code[..m.end() - 1].chars().count();
+            let Some(try_close_char_idx) = find_matching_brace_end(&code_chars, try_open_char_idx) else {
+                continue;
+            };
+            let try_body: String = code_chars[try_open_char_idx + 1..try_close_char_idx].iter().collect();
+
+            // Check immediately following `catch (...) { ... }`
+            let mut k = try_close_char_idx + 1;
+            while k < code_chars.len() && code_chars[k].is_whitespace() {
+                k += 1;
+            }
+            let after_try: String = code_chars[k..].iter().collect();
+            let catch_re = regex::Regex::new(r"^catch\s*(?:\([^)]*\))?\s*\{").unwrap();
+            let Some(catch_m) = catch_re.find(&after_try) else {
+                continue;
+            };
+            let catch_open_char_idx = k + after_try[..catch_m.end() - 1].chars().count();
+            let Some(catch_close_char_idx) = find_matching_brace_end(&code_chars, catch_open_char_idx) else {
+                continue;
+            };
+            let catch_body: String = code_chars[catch_open_char_idx + 1..catch_close_char_idx].iter().collect();
+
+            if req_json_re.is_match(&try_body) && req_json_re.is_match(&catch_body) {
+                return Err(format!(
+                    "Invalid request body handling in {}: `request.json()` is called in both `try` and `catch` (stream already consumed). Parse body before `try` if needed in fallback.",
+                    file_path
+                ));
+            }
+
+            for cap in body_decl_re.captures_iter(&try_body) {
+                if let Some(v_m) = cap.get(1) {
+                    let var_name = v_m.as_str();
+                    // Check if catch redeclares it
+                    let redecl_pat = format!(r"\b(?:const|let|var)\s+{}\b", regex::escape(var_name));
+                    let redeclared_in_catch = regex::Regex::new(&redecl_pat)
+                        .ok()
+                        .map_or(false, |re| re.is_match(&catch_body));
+                    if redeclared_in_catch {
+                        continue;
+                    }
+                    // Check standalone reference in catch_body (not preceded by `.` or `:` property key)
+                    let ref_pat = format!(r"\b{}\b", regex::escape(var_name));
+                    if let Ok(ref_re) = regex::Regex::new(&ref_pat) {
+                        for r_m in ref_re.find_iter(&catch_body) {
+                            let prev_ch = catch_body[..r_m.start()].trim_end().chars().next_back();
+                            if prev_ch != Some('.') {
+                                return Err(format!(
+                                    "Out-of-scope variable `{}` in {}: declared inside `try` and referenced inside `catch` (causes TS2304). Hoist declaration before `try`.",
+                                    var_name, file_path
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub async fn validate_file_with_abstract_rules(
     file_path: &str,
     content: &str,
@@ -593,26 +953,35 @@ pub fn format_routes_prompt(routes: &[(String, String)]) -> String {
 pub fn generate_axiom_map(proj_dir: &std::path::Path) -> Result<(), String> {
     use std::fs;
     use std::path::{Path, PathBuf};
-    
+
     let mut files_map = serde_json::Map::new();
     let mut methods_map = serde_json::Map::new();
     let mut routes_map = serde_json::Map::new();
-    
+
     let mut source_files = Vec::new();
-    
+
     fn scan_dir(dir: &Path, source_files: &mut Vec<PathBuf>) {
-        if !dir.exists() { return; }
+        if !dir.exists() {
+            return;
+        }
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if name != "node_modules" && name != ".next" && name != "build" && name != "dist" {
+                    if name != "node_modules"
+                        && name != ".next"
+                        && name != "build"
+                        && name != "dist"
+                        && name != ".axiom"
+                        && name != ".git"
+                        && name != "target"
+                    {
                         scan_dir(&path, source_files);
                     }
                 } else if path.is_file() {
                     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                        if ext == "ts" || ext == "tsx" || ext == "js" || ext == "jsx" {
+                        if ext == "ts" || ext == "tsx" || ext == "js" || ext == "jsx" || ext == "mjs" || ext == "mts" {
                             source_files.push(path);
                         }
                     }
@@ -620,150 +989,217 @@ pub fn generate_axiom_map(proj_dir: &std::path::Path) -> Result<(), String> {
             }
         }
     }
-    
+
     scan_dir(proj_dir, &mut source_files);
-    
+    source_files.sort();
+
+    let import_from_re = regex::Regex::new(
+        r#"(?ms)(?:^|;|\n)\s*import\s+(?:type\s+)?(?:[A-Za-z0-9_$\*]+(?:\s+as\s+[A-Za-z0-9_$]+)?(?:\s*,\s*\{[^}]*\})?|\{[^}]*\})\s+from\s+['"]([^'"]+)['"]"#,
+    )
+    .ok();
+    let side_effect_import_re = regex::Regex::new(r#"(?m)^\s*import\s+['"]([^'"]+)['"]"#).ok();
+    let reexport_re = regex::Regex::new(
+        r#"(?ms)(?:^|;|\n)\s*export\s+(?:\*(?:\s+as\s+[A-Za-z0-9_$]+)?|\{[^}]*\})\s+from\s+['"]([^'"]+)['"]"#,
+    )
+    .ok();
+    let require_or_dyn_re = regex::Regex::new(r#"(?:\brequire|import)\s*\(\s*['"]([^'"]+)['"]\s*\)"#).ok();
+
+    let export_decl_re = regex::Regex::new(
+        r"(?m)^\s*export\s+(?:async\s+)?(?:function|const|let|var|type|interface|class|enum)\s+([A-Za-z0-9_$]+)",
+    )
+    .ok();
+    let export_list_re = regex::Regex::new(r"(?ms)^\s*export\s*\{([^}]+)\}").ok();
+    let method_fn_re = regex::Regex::new(
+        r"(?m)^(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^>\n]*>)?\s*\(([^)\n]*)\)",
+    )
+    .ok();
+    let method_arrow_re = regex::Regex::new(
+        r"(?m)^(?:export\s+)?const\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=\n]+)?=\s*(?:async\s+)?(?:\(([^)\n]*)\)|([A-Za-z_][A-Za-z0-9_]*))\s*=>",
+    )
+    .ok();
+
     for file_path in &source_files {
-        let Ok(content) = fs::read_to_string(file_path) else { continue; };
-        let Ok(rel_path) = file_path.strip_prefix(proj_dir) else { continue; };
+        let Ok(content) = fs::read_to_string(file_path) else {
+            continue;
+        };
+        let Ok(rel_path) = file_path.strip_prefix(proj_dir) else {
+            continue;
+        };
         let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
-        
+
         if let Some(route) = resolve_app_router_route(&rel_path_str) {
             routes_map.insert(
                 route,
                 serde_json::json!({
                     "file": rel_path_str.clone()
-                })
+                }),
             );
         }
-        
+
         let mut imports = Vec::new();
         let mut exports = Vec::new();
         let mut local_deps = Vec::new();
-        
-        for line in content.lines() {
-            let line = line.trim();
-            
-            if line.starts_with("import ") || line.starts_with("import{") {
-                if let Some(from_pos) = line.rfind("from") {
-                    let path_part = &line[from_pos + 4..].trim();
-                    let cleaned = path_part.trim_matches(|c| c == '\'' || c == '"' || c == ';').trim().to_string();
-                    if !cleaned.is_empty() {
-                        imports.push(cleaned.clone());
-                        
-                        let mut resolved_dep = None;
-                        if cleaned.starts_with("@/") {
-                            let rel_sub = cleaned.replacen("@/", "src/", 1);
-                            resolved_dep = Some(proj_dir.join(rel_sub));
-                        } else if cleaned.starts_with("./") || cleaned.starts_with("../") {
-                            if let Some(parent) = file_path.parent() {
-                                resolved_dep = Some(parent.join(&cleaned));
-                            }
-                        }
-                        
-                        if let Some(dep_base) = resolved_dep {
-                            let extensions = vec!["ts", "tsx", "js", "jsx"];
-                            for ext in extensions {
-                                let dep_file = dep_base.with_extension(ext);
-                                if dep_file.exists() {
-                                    if let Ok(dep_rel) = dep_file.strip_prefix(proj_dir) {
-                                        local_deps.push(dep_rel.to_string_lossy().replace('\\', "/"));
-                                        break;
+
+        let mut push_import = |spec: &str| {
+            let cleaned = spec.trim();
+            if cleaned.is_empty() {
+                return;
+            }
+            if !imports.contains(&cleaned.to_string()) {
+                imports.push(cleaned.to_string());
+            }
+
+            let dep_base_opt: Option<PathBuf> = if let Some(rest) = cleaned.strip_prefix("@/").or_else(|| cleaned.strip_prefix("~/")) {
+                Some(proj_dir.join("src").join(rest))
+            } else if cleaned.starts_with("./") || cleaned.starts_with("../") {
+                file_path.parent().map(|p| p.join(cleaned))
+            } else {
+                None
+            };
+
+            if let Some(dep_base) = dep_base_opt {
+                let mut candidates = Vec::new();
+                if dep_base.extension().is_some() {
+                    candidates.push(dep_base.clone());
+                } else {
+                    for ext in ["ts", "tsx", "js", "jsx", "mjs", "mts"] {
+                        candidates.push(dep_base.with_extension(ext));
+                    }
+                    for ext in ["ts", "tsx", "js", "jsx"] {
+                        candidates.push(dep_base.join(format!("index.{}", ext)));
+                    }
+                }
+                for cand in candidates {
+                    if cand.is_file() {
+                        if let Ok(canon) = std::fs::canonicalize(&cand) {
+                            if let Ok(canon_root) = std::fs::canonicalize(proj_dir) {
+                                if let Ok(dep_rel) = canon.strip_prefix(&canon_root) {
+                                    let rel_s = dep_rel.to_string_lossy().replace('\\', "/");
+                                    if !local_deps.contains(&rel_s) {
+                                        local_deps.push(rel_s);
                                     }
+                                    break;
                                 }
                             }
                         }
-                    }
-                }
-            }
-            
-            if line.starts_with("export ") {
-                if line.contains("default") {
-                    exports.push("default".to_string());
-                } else {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    for (idx, &part) in parts.iter().enumerate() {
-                        if (part == "const" || part == "let" || part == "var" || part == "function" || part == "type" || part == "interface" || part == "class") && idx + 1 < parts.len() {
-                            let name = parts[idx + 1].trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
-                            if !name.is_empty() {
-                                exports.push(name.to_string());
+                        if let Ok(dep_rel) = cand.strip_prefix(proj_dir) {
+                            let rel_s = dep_rel.to_string_lossy().replace('\\', "/");
+                            if !local_deps.contains(&rel_s) {
+                                local_deps.push(rel_s);
                             }
                             break;
                         }
                     }
                 }
             }
-            
-            if (line.starts_with("export function ") && line.contains("(")) || 
-               (line.starts_with("function ") && line.contains("(")) ||
-               (line.contains("const ") && line.contains("=") && line.contains("=>") && line.contains("(")) {
-                
-                let mut method_name = String::new();
-                if line.starts_with("export function ") {
-                    if let Some(rest) = line.strip_prefix("export function ") {
-                        method_name = rest.split('(').next().unwrap_or("").trim().to_string();
+        };
+
+        for re_opt in [&import_from_re, &side_effect_import_re, &reexport_re, &require_or_dyn_re] {
+            if let Some(re) = re_opt {
+                for cap in re.captures_iter(&content) {
+                    if let Some(m) = cap.get(1) {
+                        push_import(m.as_str());
                     }
-                } else if line.starts_with("function ") {
-                    if let Some(rest) = line.strip_prefix("function ") {
-                        method_name = rest.split('(').next().unwrap_or("").trim().to_string();
-                    }
-                } else if line.contains("const ") {
-                    if let Some(start_idx) = line.find("const ") {
-                        let after_const = &line[start_idx + 6..];
-                        if let Some(eq_idx) = after_const.find('=') {
-                            method_name = after_const[..eq_idx].trim().to_string();
-                        }
-                    }
-                }
-                
-                method_name = method_name.trim_matches(|c: char| !c.is_alphanumeric() && c != '_').to_string();
-                
-                if !method_name.is_empty() && method_name != "default" {
-                    let mut params = Vec::new();
-                    if let Some(open_paren) = line.find('(') {
-                        if let Some(close_paren) = line.find(')') {
-                            let param_sub = &line[open_paren + 1..close_paren];
-                            for p in param_sub.split(',') {
-                                let p_trimmed = p.trim().to_string();
-                                if !p_trimmed.is_empty() {
-                                    params.push(p_trimmed);
-                                }
-                            }
-                        }
-                    }
-                    
-                    methods_map.insert(
-                        method_name,
-                        serde_json::json!({
-                            "definedIn": rel_path_str.clone(),
-                            "parameters": params,
-                            "returns": "any"
-                        })
-                    );
                 }
             }
         }
-        
+
+        if content.contains("export default") {
+            exports.push("default".to_string());
+        }
+        if let Some(ref re) = export_decl_re {
+            for cap in re.captures_iter(&content) {
+                if let Some(m) = cap.get(1) {
+                    let name = m.as_str().trim();
+                    if !name.is_empty() && name != "default" && !exports.contains(&name.to_string()) {
+                        exports.push(name.to_string());
+                    }
+                }
+            }
+        }
+        if let Some(ref re) = export_list_re {
+            for cap in re.captures_iter(&content) {
+                if let Some(list_m) = cap.get(1) {
+                    for raw_item in list_m.as_str().split(',') {
+                        let cleaned = raw_item
+                            .split_whitespace()
+                            .last()
+                            .unwrap_or("")
+                            .trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '$');
+                        if !cleaned.is_empty() && cleaned != "type" && !exports.contains(&cleaned.to_string()) {
+                            exports.push(cleaned.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut push_method = |name: &str, raw_params: &str| {
+            let clean_name = name.trim();
+            if clean_name.is_empty()
+                || matches!(
+                    clean_name,
+                    "default" | "if" | "for" | "while" | "switch" | "catch" | "return" | "typeof" | "await"
+                )
+            {
+                return;
+            }
+            let params: Vec<String> = raw_params
+                .split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect();
+            methods_map.insert(
+                clean_name.to_string(),
+                serde_json::json!({
+                    "definedIn": rel_path_str.clone(),
+                    "parameters": params,
+                    "returns": "any"
+                }),
+            );
+        };
+
+        if let Some(ref re) = method_fn_re {
+            for cap in re.captures_iter(&content) {
+                if let Some(n) = cap.get(1) {
+                    let params = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+                    push_method(n.as_str(), params);
+                }
+            }
+        }
+        if let Some(ref re) = method_arrow_re {
+            for cap in re.captures_iter(&content) {
+                if let Some(n) = cap.get(1) {
+                    let params = cap
+                        .get(2)
+                        .or_else(|| cap.get(3))
+                        .map(|m| m.as_str())
+                        .unwrap_or("");
+                    push_method(n.as_str(), params);
+                }
+            }
+        }
+
         files_map.insert(
             rel_path_str,
             serde_json::json!({
                 "exports": exports,
                 "imports": imports,
                 "dependencies": local_deps
-            })
+            }),
         );
     }
-    
+
     let axiom_map = serde_json::json!({
         "routes": routes_map,
         "files": files_map,
         "methods": methods_map
     });
-    
+
     if let Ok(pretty) = serde_json::to_string_pretty(&axiom_map) {
         let _ = fs::write(proj_dir.join("axiom-map.json"), pretty);
     }
-    
+
     Ok(())
 }
 
@@ -1569,6 +2005,8 @@ pub fn extract_prisma_schema_contract(content: &str) -> Value {
             if let (Some(name_match), Some(body_match)) = (cap.get(1), cap.get(2)) {
                 let model_name = name_match.as_str().trim().to_string();
                 let mut scalar_fields = Vec::new();
+                let mut typed_fields = Vec::new();
+                let mut required_fields = Vec::new();
                 let mut relation_fields = Vec::new();
 
                 for line in body_match.as_str().lines() {
@@ -1586,12 +2024,22 @@ pub fn extract_prisma_schema_contract(content: &str) -> Value {
                             relation_fields.push(format!("{}: {}", field_name, field_type));
                         } else {
                             scalar_fields.push(field_name.to_string());
+                            typed_fields.push(format!("{}: {}", field_name, field_type));
+                            let is_optional_or_list = field_type.ends_with('?') || field_type.ends_with("[]");
+                            let has_auto_default = trimmed.contains("@default(") || trimmed.contains("@updatedAt");
+                            if !is_optional_or_list && !has_auto_default {
+                                required_fields.push(field_name.to_string());
+                            }
                         }
                     }
                 }
 
+                let delegate = model_to_prisma_delegate(&model_name);
                 models.insert(model_name, serde_json::json!({
+                    "delegate": delegate,
                     "fields": scalar_fields,
+                    "typedFields": typed_fields,
+                    "requiredFields": required_fields,
                     "relations": relation_fields
                 }));
             }
@@ -2103,6 +2551,58 @@ fn upsert_file_contract_into_root(
         }
     }
 
+    // Extract return keys for hooks & exported interface/type properties into capabilities.members
+    let mut members = Vec::new();
+    if role == "client-hook" {
+        if let Ok(ret_re) = regex::Regex::new(r"(?s)return\s*\{([^}]+)\}\s*;?") {
+            for cap in ret_re.captures_iter(content) {
+                if let Some(body) = cap.get(1) {
+                    for raw_line in body.as_str().split(',') {
+                        let clean = raw_line
+                            .lines()
+                            .map(|l| l.split("//").next().unwrap_or("").trim())
+                            .collect::<Vec<&str>>()
+                            .join(" ");
+                        let key = clean
+                            .split(':')
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                        if !key.is_empty() && !members.contains(&key.to_string()) {
+                            members.push(key.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(iface_re) = regex::Regex::new(r"(?s)export\s+(?:interface|type)\s+[A-Za-z0-9_]+\s*(?:=\s*)?\{([^}]+)\}") {
+        for cap in iface_re.captures_iter(content) {
+            if let Some(body) = cap.get(1) {
+                for line in body.as_str().lines() {
+                    let trimmed = line.split("//").next().unwrap_or("").trim();
+                    if trimmed.is_empty() || trimmed.starts_with('[') || trimmed.starts_with('*') || trimmed.starts_with("/*") {
+                        continue;
+                    }
+                    let prop = trimmed
+                        .split(':')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .trim_end_matches('?')
+                        .trim();
+                    if !prop.is_empty()
+                        && prop.chars().all(|c| c.is_alphanumeric() || c == '_')
+                        && !members.contains(&prop.to_string())
+                    {
+                        members.push(prop.to_string());
+                    }
+                }
+            }
+        }
+    }
+
     let file_entry = serde_json::json!({
         "path": norm_path,
         "role": role,
@@ -2112,6 +2612,7 @@ fn upsert_file_contract_into_root(
         },
         "capabilities": {
             "exports": exports,
+            "members": members,
             "states": state_contracts,
             "endpoints": endpoints,
             "models": prisma_models,
@@ -2328,6 +2829,30 @@ pub fn format_axiom_contracts_prompt(proj_dir: &std::path::Path, current_file_pa
             .and_then(|e| e.as_array())
             .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_default();
+        let members: Vec<&str> = entry
+            .get("capabilities")
+            .and_then(|c| c.get("members"))
+            .and_then(|e| e.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let endpoints: Vec<&str> = entry
+            .get("capabilities")
+            .and_then(|c| c.get("endpoints"))
+            .and_then(|e| e.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let models: Vec<&str> = entry
+            .get("capabilities")
+            .and_then(|c| c.get("models"))
+            .and_then(|e| e.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let enums: Vec<&str> = entry
+            .get("capabilities")
+            .and_then(|c| c.get("enums"))
+            .and_then(|e| e.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
         let api_calls: Vec<&str> = entry
             .get("consumedContracts")
             .and_then(|c| c.get("apiCalls"))
@@ -2340,7 +2865,14 @@ pub fn format_axiom_contracts_prompt(proj_dir: &std::path::Path, current_file_pa
             .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_default();
 
-        if exports.is_empty() && api_calls.is_empty() && routes.is_empty() {
+        if exports.is_empty()
+            && members.is_empty()
+            && endpoints.is_empty()
+            && models.is_empty()
+            && enums.is_empty()
+            && api_calls.is_empty()
+            && routes.is_empty()
+        {
             continue;
         }
 
@@ -2361,6 +2893,19 @@ pub fn format_axiom_contracts_prompt(proj_dir: &std::path::Path, current_file_pa
         let mut summary = format!("- {} [{}]", path, role);
         if !exports.is_empty() {
             summary.push_str(&format!(" exports:[{}]", exports.join(", ")));
+        }
+        if !members.is_empty() {
+            let cap_members: Vec<&str> = members.iter().take(12).copied().collect();
+            summary.push_str(&format!(" members:[{}]", cap_members.join(", ")));
+        }
+        if !models.is_empty() {
+            summary.push_str(&format!(" models:[{}]", models.join(", ")));
+        }
+        if !enums.is_empty() {
+            summary.push_str(&format!(" enums:[{}]", enums.join(", ")));
+        }
+        if !endpoints.is_empty() {
+            summary.push_str(&format!(" endpoints:[{}]", endpoints.join(", ")));
         }
         if !api_calls.is_empty() {
             summary.push_str(&format!(" calls:[{}]", api_calls.join(", ")));
@@ -2572,7 +3117,12 @@ pub fn format_database_contract_prompt(db_val: &Value) -> String {
         if !models.is_empty() {
             out.push_str("ACTIVE DATABASE MODELS:\n");
             for (m_name, m_data) in models {
-                let fields = m_data.get("fields")
+                let fields = m_data.get("typedFields")
+                    .or_else(|| m_data.get("fields"))
+                    .and_then(|f| f.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<&str>>().join(", "))
+                    .unwrap_or_default();
+                let scalars = m_data.get("fields")
                     .and_then(|f| f.as_array())
                     .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<&str>>().join(", "))
                     .unwrap_or_default();
@@ -2580,8 +3130,27 @@ pub fn format_database_contract_prompt(db_val: &Value) -> String {
                     .and_then(|r| r.as_array())
                     .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<&str>>().join(", "))
                     .unwrap_or_default();
+                let delegate = m_data.get("delegate")
+                    .and_then(|d| d.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| model_to_prisma_delegate(m_name));
+                let required = m_data.get("requiredFields")
+                    .and_then(|r| r.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<&str>>().join(", "))
+                    .unwrap_or_default();
 
-                out.push_str(&format!("- model {} {{\n    scalars: [{}]\n    relations: [{}]\n  }}\n", m_name, fields, relations));
+                let scalars_line = if !scalars.is_empty() { scalars } else { fields.clone() };
+                out.push_str(&format!("- model {} {{\n    scalars: [{}]\n    relations: [{}]\n", m_name, scalars_line, relations));
+                if m_data.get("typedFields").is_some() && !fields.is_empty() {
+                    out.push_str(&format!("    types: [{}]\n", fields));
+                }
+                if !delegate.is_empty() {
+                    out.push_str(&format!("    delegate: prisma.{}\n", delegate));
+                }
+                if !required.is_empty() {
+                    out.push_str(&format!("    requiredOnCreate: [{}]\n", required));
+                }
+                out.push_str("  }\n");
             }
         }
     }
@@ -4267,6 +4836,7 @@ export default function RootLayout({
                             }
                         }
                         files_to_generate = merged;
+                        crate::sanitizer::deduplicate_manifest_files(&mut files_to_generate);
                         debug_log_to_file(format!(
                             "[Orchestrator] Expanded and merged file list from {} to {} files using local Ollama (Attempt {}).",
                             files.len(), files_to_generate.len(), expansion_attempts
@@ -4553,6 +5123,13 @@ export default function RootLayout({
             &proj_dir,
         );
 
+        if file_path.replace('\\', "/").to_lowercase().ends_with("schema.prisma") {
+            let api_routes_summary = extract_planned_api_routes_summary(&files_to_generate);
+            if !api_routes_summary.is_empty() {
+                system_prompt.push_str(&api_routes_summary);
+            }
+        }
+
         if file_path == "package.json" || file_path.ends_with("/package.json") {
             let mut pkg_extra = " IMPORTANT: When generating package.json, always use modern, stable dependency versions".to_string();
             if let Some(nextjs_v) = overrides.and_then(|o| o.get("nextjs")).and_then(|n| n.as_str()) {
@@ -4743,8 +5320,8 @@ export default function RootLayout({
             let cleaned = extract_code_content(&full_content);
             processed_content = post_process_generated_file(file_path, &cleaned, &metamanifest, has_tailwind);
             
-            // Run abstract validation agent
-            match validate_file_with_abstract_rules(file_path, &processed_content, &model_id).await {
+            // Run project-aware validation agent
+            match validate_file_with_project_context(&proj_dir, file_path, &processed_content, &model_id).await {
                 Ok(()) => {
                     file_gen_success = true;
                 }
@@ -4979,6 +5556,14 @@ export default function RootLayout({
 
     // Run pre-build hygiene pass (tsconfig, package.json, bare imports, CSS dedup, UI primitives, App Router route exports)
     crate::self_healing::run_hygiene_pass_on_project(&proj_dir);
+
+    // Refresh structural graphs & cross-file contracts BEFORE compiler self-healing so healer gets complete disk state
+    if let Err(e) = generate_axiom_map(&proj_dir) {
+        debug_log_to_file(format!("[Axiom Map] Greška pri pre-heal kreiranju axiom-map.json: {}", e));
+    }
+    generate_project_metadata(&proj_dir, &project_id, &files_to_generate);
+    generate_axiom_features_json(&proj_dir, name, &files_to_generate);
+    refresh_axiom_contracts_for_project(&proj_dir, &project_id, &files_to_generate);
 
     // Run self-healing compiler loop to automatically correct any compilation or syntax errors
     let heal_warnings = perform_self_healing_loop(&proj_dir, &model_id, &files_to_generate).await;

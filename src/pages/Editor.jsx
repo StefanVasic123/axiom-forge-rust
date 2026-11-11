@@ -686,34 +686,6 @@ export default function EditorPage() {
     setActiveTabPath(node.path);
   }, [openTabs, projectId]);
 
-  // One-click AI fix for current preview page / runtime error
-  const handleAIFixCurrentPage = useCallback(async (customPrompt) => {
-    let targetFile = activeTab;
-    if (!targetFile && activePreviewFile) {
-      await openFile(activePreviewFile);
-      targetFile = activePreviewFile;
-    } else if (activePreviewFile && activeTab?.path !== activePreviewFile?.path) {
-      await openFile(activePreviewFile);
-      targetFile = activePreviewFile;
-    }
-
-    if (!targetFile && files && files.length > 0) {
-      const homePage = files.find(f => f.path.endsWith('page.tsx') || f.path.endsWith('page.jsx'));
-      if (homePage) {
-        await openFile(homePage);
-        targetFile = homePage;
-      }
-    }
-
-    const promptText = typeof customPrompt === 'string' && customPrompt.trim().length > 0
-      ? customPrompt
-      : (previewRuntimeError
-          ? `Ispravi sledeću runtime grešku na ovoj stranici: "${previewRuntimeError.message}". Osiguraj ispravne React hook pozive, bezbedno formatiranje datuma (new Date(val).toLocaleDateString()) i da se stranica bez greške renderuje u preview-u.`
-          : `Unapredi prikaz i funkcionalnost ovog fajla (${targetFile?.path || 'trenutna stranica'}): 1) Ukloni sve early-return blokade za sesiju (if (!session) return Loading ili if (status === 'unauthenticated') return Log in) kako bi se stranica odmah prikazala u preview modu; 2) Inicijalizuj useState sa 4 do 6 realističnih domenskih mock stavki (ili kompletnim podacima za grafikone) tako da interfejs nikada ne bude prazan; 3) Primeni moderan, responzivan Tailwind dizajn (max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8, kartice sa rounded-xl border shadow-sm, dugmad sa inline-flex items-center gap-2).`);
-
-    setAiExternalPrompt(promptText);
-  }, [activeTab, activePreviewFile, files, openFile, previewRuntimeError]);
-
   // Auto-scroll terminal
   useEffect(() => {
     if (showTerminal) {
@@ -890,7 +862,7 @@ export default function EditorPage() {
   };
 
 
-  const handleReloadPreview = () => {
+  const handleReloadPreview = useCallback(() => {
     setIframeLoading(true);
     setPreviewRuntimeError(null);
     if (webviewRef.current) {
@@ -901,20 +873,23 @@ export default function EditorPage() {
       }
     }
     setTimeout(() => setIframeLoading(false), 2500);
-  };
+  }, [previewUrl]);
 
-  const handleHealError = async () => {
-    if (!compileError) return;
+  const handleHealError = useCallback(async (errorOverride) => {
+    const errObj = (errorOverride && typeof errorOverride === 'object' && errorOverride.filePath && errorOverride.errorMessage)
+      ? errorOverride
+      : compileError;
+    if (!errObj) return false;
     setHealingInProgress(true);
     setHealStatus('Započinjem popravku...');
     try {
       const res = await window.electronAPI.server.healCompileError(
         projectId,
-        compileError.filePath,
-        compileError.errorMessage
+        errObj.filePath,
+        errObj.errorMessage
       );
       if (res) {
-        const healedFilePath = compileError.filePath;
+        const healedFilePath = errObj.filePath;
         setCompileError(null);
         setPreviewRuntimeError(null);
         // Reload healed file from disk into Monaco openTabs so editor state is not stale!
@@ -931,7 +906,9 @@ export default function EditorPage() {
         if (showPreview) {
           setTimeout(() => handleReloadPreview(), 800);
         }
+        return true;
       }
+      return false;
     } catch (err) {
       console.error("Auto-healing error:", err);
       setHealStatus('Greška pri popravci: ' + err.toString());
@@ -940,10 +917,72 @@ export default function EditorPage() {
         type: 'error',
         id: Date.now()
       }]);
+      return false;
     } finally {
       setHealingInProgress(false);
     }
-  };
+  }, [compileError, handleReloadPreview, projectId, showPreview]);
+
+  // One-click AI fix for current preview page / compile / runtime error
+  const handleAIFixCurrentPage = useCallback(async (customPrompt) => {
+    const explicitPrompt = typeof customPrompt === 'string' && customPrompt.trim().length > 0
+      ? customPrompt.trim()
+      : '';
+
+    let targetFile = activeTab;
+    if (!explicitPrompt && (compileError?.filePath || previewRuntimeError)) {
+      const errFilePath = compileError?.filePath
+        || previewRuntimeError?.sourceFile
+        || resolveRouteToFile(previewRuntimeError?.path || currentPreviewRoute)?.path
+        || activePreviewFile?.path
+        || targetFile?.path
+        || 'src/app/page.tsx';
+      const errMessage = compileError?.errorMessage
+        || previewRuntimeError?.details
+        || previewRuntimeError?.message
+        || 'Runtime error in preview';
+
+      const errNode = files?.find(f => f.path.replace(/\\/g, '/') === errFilePath)
+        || { path: errFilePath, name: errFilePath.split('/').pop() };
+      await openFile(errNode);
+
+      const healed = await handleHealError({
+        projectId,
+        filePath: errFilePath,
+        errorMessage: errMessage
+      });
+      if (healed) {
+        return;
+      }
+
+      setAiExternalPrompt(
+        `Popravi tačnu compile/runtime grešku u fajlu \`${errFilePath}\` bez promene UI dizajna ili funkcionalnosti:\n\n${errMessage}\n\nPronađi uzrok greške (npr. nedostajući import, pogrešan tip ili eksport) i ispravi isključivo ono što uzrokuje grešku.`
+      );
+      return;
+    }
+
+    if (!targetFile && activePreviewFile) {
+      await openFile(activePreviewFile);
+      targetFile = activePreviewFile;
+    } else if (activePreviewFile && activeTab?.path !== activePreviewFile?.path) {
+      await openFile(activePreviewFile);
+      targetFile = activePreviewFile;
+    }
+
+    if (!targetFile && files && files.length > 0) {
+      const homePage = files.find(f => f.path.endsWith('page.tsx') || f.path.endsWith('page.jsx'));
+      if (homePage) {
+        await openFile(homePage);
+        targetFile = homePage;
+      }
+    }
+
+    const promptText = explicitPrompt
+      ? explicitPrompt
+      : `Unapredi prikaz i funkcionalnost ovog fajla (${targetFile?.path || 'trenutna stranica'}): 1) Ukloni sve early-return blokade za sesiju (if (!session) return Loading ili if (status === 'unauthenticated') return Log in) kako bi se stranica odmah prikazala u preview modu; 2) Inicijalizuj useState sa 4 do 6 realističnih domenskih mock stavki (ili kompletnim podacima za grafikone) tako da interfejs nikada ne bude prazan; 3) Primeni moderan, responzivan Tailwind dizajn (max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8, kartice sa rounded-xl border shadow-sm, dugmad sa inline-flex items-center gap-2).`;
+
+    setAiExternalPrompt(promptText);
+  }, [activeTab, activePreviewFile, compileError, currentPreviewRoute, files, handleHealError, openFile, previewRuntimeError, projectId, resolveRouteToFile]);
 
   const handleInstallPackage = async () => {
     if (!missingPackage) return;
@@ -1198,14 +1237,20 @@ export default function EditorPage() {
       if (data && data.channel === 'axiom-preview-error') {
         console.log('[Editor] Preview runtime error caught:', data);
         window.electronAPI?.debugLog?.(`[Preview RuntimeError] project=${projectId} route=${data.path || currentPreviewRoute} source=${data.sourceFile || 'none'} msg=${data.message}`);
+        const cleanSourceFile = data.sourceFile
+          ? data.sourceFile.replace(/\\/g, '/').replace(/^\.\//, '')
+          : null;
         setPreviewRuntimeError({
           message: data.message || 'Nepoznata runtime greška',
+          details: data.details || data.message || '',
+          sourceFile: cleanSourceFile,
           path: data.path || currentPreviewRoute,
           time: Date.now()
         });
-        const targetFilePath = data.sourceFile
-          ? data.sourceFile.replace(/\\/g, '/').replace(/^\.\//, '')
-          : (resolveRouteToFile(data.path || currentPreviewRoute)?.path || resolveRouteToFile(currentPreviewRoute)?.path || 'src/app/page.tsx');
+        const targetFilePath = cleanSourceFile
+          || resolveRouteToFile(data.path || currentPreviewRoute)?.path
+          || resolveRouteToFile(currentPreviewRoute)?.path
+          || 'src/app/page.tsx';
         if (targetFilePath) {
           setCompileError(prev => prev || {
             projectId,
@@ -2213,7 +2258,7 @@ export default function EditorPage() {
                           </div>
                           <div className="flex items-center gap-2 shrink-0 ml-3">
                             <button
-                              onClick={() => handleAIFixCurrentPage(`Ispravi runtime grešku na ovoj stranici: "${previewRuntimeError.message}". Osiguraj ispravan rad sa React hook/query pozivima.`)}
+                              onClick={() => handleAIFixCurrentPage()}
                               className="flex items-center gap-1.5 px-3 py-1 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded text-[11px] shadow transition-colors"
                             >
                               <Sparkles className="w-3.5 h-3.5" />

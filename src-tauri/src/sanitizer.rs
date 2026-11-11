@@ -282,6 +282,49 @@ pub fn normalize_project_structure(files: &mut Vec<Value>, metamanifest: &Value,
             }
         }
     }
+
+    deduplicate_manifest_files(files);
+}
+
+pub fn deduplicate_manifest_files(files: &mut Vec<Value>) {
+    let mut seen_idx: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut out: Vec<Value> = Vec::with_capacity(files.len());
+    for mut item in files.drain(..) {
+        if let Some(raw_path) = item.get("path").and_then(|p| p.as_str()).map(|s| s.to_string()) {
+            let clean_path = raw_path
+                .trim()
+                .replace('\\', "/")
+                .trim_start_matches("./")
+                .to_string();
+            let norm = clean_path.to_lowercase();
+            if !norm.is_empty() {
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("path".to_string(), serde_json::json!(clean_path));
+                }
+                if let Some(&existing_idx) = seen_idx.get(&norm) {
+                    if let (Some(existing_obj), Some(new_obj)) = (out[existing_idx].as_object_mut(), item.as_object()) {
+                        for field in ["description", "language", "defaultContent", "role"] {
+                            let existing_str = existing_obj
+                                .get(field)
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.trim())
+                                .unwrap_or("");
+                            if let Some(new_val) = new_obj.get(field) {
+                                let new_str = new_val.as_str().map(|s| s.trim()).unwrap_or("");
+                                if !new_str.is_empty() && (existing_str.is_empty() || new_str.len() > existing_str.len()) {
+                                    existing_obj.insert(field.to_string(), new_val.clone());
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                seen_idx.insert(norm, out.len());
+            }
+        }
+        out.push(item);
+    }
+    *files = out;
 }
 
 pub fn get_axiom_inspector_script() -> &'static str {
@@ -735,6 +778,139 @@ pub fn deduplicate_repeated_css_blocks(css: &str) -> String {
     out
 }
 
+fn normalize_rel_fs_components(p: &std::path::Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+pub fn widen_narrow_ui_props_interfaces(content: &str) -> String {
+    let Ok(re) = regex::Regex::new(
+        r#"(?m)^[ \t]*(?:export\s+)?interface\s+[A-Za-z0-9_]*Props\b(?:\s+extends\s+[^{;]+?)?\s*\{"#,
+    ) else {
+        return content.to_string();
+    };
+
+    let bytes = content.as_bytes();
+    let mut insertions: Vec<usize> = Vec::new();
+
+    for m in re.find_iter(content) {
+        let open_idx = m.end() - 1;
+        if bytes.get(open_idx) != Some(&b'{') {
+            continue;
+        }
+        let mut depth = 0isize;
+        let mut close_idx = None;
+        let mut i = open_idx;
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut in_tick = false;
+        let mut in_line_comment = false;
+        let mut in_block_comment = false;
+        let mut escaped = false;
+
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_line_comment {
+                if b == b'\n' {
+                    in_line_comment = false;
+                }
+                i += 1;
+                continue;
+            }
+            if in_block_comment {
+                if b == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    in_block_comment = false;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            if escaped {
+                escaped = false;
+                i += 1;
+                continue;
+            }
+            if (in_single || in_double || in_tick) && b == b'\\' {
+                escaped = true;
+                i += 1;
+                continue;
+            }
+            if !in_double && !in_tick && b == b'\'' {
+                in_single = !in_single;
+                i += 1;
+                continue;
+            }
+            if !in_single && !in_tick && b == b'"' {
+                in_double = !in_double;
+                i += 1;
+                continue;
+            }
+            if !in_single && !in_double && b == b'`' {
+                in_tick = !in_tick;
+                i += 1;
+                continue;
+            }
+            if !in_single && !in_double && !in_tick {
+                if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+                    in_line_comment = true;
+                    i += 2;
+                    continue;
+                }
+                if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    in_block_comment = true;
+                    i += 2;
+                    continue;
+                }
+                if b == b'{' {
+                    depth += 1;
+                } else if b == b'}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_idx = Some(i);
+                        break;
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        if let Some(end_idx) = close_idx {
+            let body = &content[open_idx + 1..end_idx];
+            if !body.contains("[key:") {
+                insertions.push(end_idx);
+            }
+        }
+    }
+
+    if insertions.is_empty() {
+        return content.to_string();
+    }
+
+    let mut out = content.to_string();
+    insertions.sort_unstable();
+    insertions.dedup();
+    for pos in insertions.into_iter().rev() {
+        let before_has_nl = pos > 0 && out.as_bytes()[pos - 1] == b'\n';
+        let patch = if before_has_nl {
+            "  [key: string]: any;\n"
+        } else {
+            "\n  [key: string]: any;\n"
+        };
+        out.insert_str(pos, patch);
+    }
+    out
+}
+
 pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
     let raw_src_dir = proj_dir.join("src");
     let has_src = raw_src_dir.exists();
@@ -746,10 +922,13 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
         return;
     }
     let src_dir = if has_src { raw_src_dir } else { proj_dir.to_path_buf() };
+    let components_dir = src_dir.join("components");
+    let ui_dir = components_dir.join("ui");
 
-    // 1. Collect all named imports referencing `@/components/ui` or `@/components/ui/<subpath>` across source dirs
+    // 1. Collect all named imports referencing `@/components/ui`, `@/components/ui/<subpath>`,
+    //    or relative `'./...'` / `'../...'` UI module imports inside `components/**`.
     let ui_import_re = match regex::Regex::new(
-        r#"(?ms)import\s+(?:type\s+)?\{([^}]+)\}\s+from\s+['"](@/components/ui(?:/[^'"]+)?)['"]"#
+        r#"(?ms)import\s+(?:type\s+)?\{([^}]+)\}\s+from\s+['"]((?:@/components/ui(?:/[^'"]+)?|\.\.?/[^'"]+))['"]"#
     ) {
         Ok(r) => r,
         Err(_) => return,
@@ -770,36 +949,72 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
                     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
                     if matches!(ext, "ts" | "tsx" | "js" | "jsx") {
                         if let Ok(content) = std::fs::read_to_string(&p) {
+                            let is_inside_components = p.starts_with(&components_dir);
                             for cap in ui_import_re.captures_iter(&content) {
                                 let names = cap.get(1).map(|m| m.as_str()).unwrap_or("");
                                 let spec = cap.get(2).map(|m| m.as_str()).unwrap_or("");
-                                let sub = spec.trim_start_matches("@/");
-                                let base = src_dir.join(sub);
-                                let target = if base.with_extension("tsx").is_file() {
-                                    base.with_extension("tsx")
-                                } else if base.with_extension("ts").is_file() {
-                                    base.with_extension("ts")
-                                } else if base.is_dir() && base.join("index.tsx").is_file() {
-                                    base.join("index.tsx")
-                                } else if base.is_dir() && base.join("index.ts").is_file() {
-                                    base.join("index.ts")
-                                } else if spec == "@/components/ui" && src_dir.join("components/ui.tsx").is_file() {
-                                    src_dir.join("components/ui.tsx")
+
+                                let mut parsed_pascal: Vec<String> = Vec::new();
+                                for item in names.split(',') {
+                                    let raw = item.trim();
+                                    if raw.starts_with("type ") {
+                                        continue;
+                                    }
+                                    let clean = raw.split_whitespace().next().unwrap_or("").trim();
+                                    if !clean.is_empty() && clean.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
+                                        parsed_pascal.push(clean.to_string());
+                                    }
+                                }
+                                if parsed_pascal.is_empty() {
+                                    continue;
+                                }
+
+                                let base = if spec.starts_with("@/") {
+                                    src_dir.join(spec.trim_start_matches("@/"))
+                                } else if is_inside_components {
+                                    let Some(parent) = p.parent() else { continue };
+                                    let joined = normalize_rel_fs_components(&parent.join(spec));
+                                    if !(joined.starts_with(&ui_dir) || joined == ui_dir) {
+                                        continue;
+                                    }
+                                    joined
                                 } else {
                                     continue;
                                 };
-                                let set = demanded.entry(target).or_default();
-                                for item in names.split(',') {
-                                    let clean = item
-                                        .trim()
-                                        .trim_start_matches("type ")
-                                        .split_whitespace()
-                                        .next()
-                                        .unwrap_or("")
-                                        .trim();
-                                    if !clean.is_empty() && clean.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
-                                        set.insert(clean.to_string());
+
+                                let existing_target = if base.is_file() {
+                                    Some(base.clone())
+                                } else if base.with_extension("tsx").is_file() {
+                                    Some(base.with_extension("tsx"))
+                                } else if base.with_extension("ts").is_file() {
+                                    Some(base.with_extension("ts"))
+                                } else if base.is_dir() && base.join("index.tsx").is_file() {
+                                    Some(base.join("index.tsx"))
+                                } else if base.is_dir() && base.join("index.ts").is_file() {
+                                    Some(base.join("index.ts"))
+                                } else if (spec == "@/components/ui" || base == ui_dir) && src_dir.join("components/ui.tsx").is_file() {
+                                    Some(src_dir.join("components/ui.tsx"))
+                                } else {
+                                    None
+                                };
+
+                                let target = if let Some(found) = existing_target {
+                                    found
+                                } else if base == ui_dir {
+                                    src_dir.join("components/ui.tsx")
+                                } else if base.starts_with(&ui_dir) {
+                                    if base.extension().is_some() {
+                                        base.clone()
+                                    } else {
+                                        base.with_extension("tsx")
                                     }
+                                } else {
+                                    continue;
+                                };
+
+                                let set = demanded.entry(target).or_default();
+                                for sym in parsed_pascal {
+                                    set.insert(sym);
                                 }
                             }
                         }
@@ -809,12 +1024,12 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
         }
     }
 
-    // 2. Also inspect existing `src/components/ui.tsx` and `src/components/ui/*.tsx` to relax strict variant/size unions
+    // 2. Also inspect existing `src/components/ui.tsx` and `src/components/ui/*.tsx` to relax strict props & unions
     let mut ui_files: std::collections::BTreeSet<std::path::PathBuf> = demanded.keys().cloned().collect();
     if src_dir.join("components/ui.tsx").is_file() {
         ui_files.insert(src_dir.join("components/ui.tsx"));
     }
-    if let Ok(entries) = std::fs::read_dir(src_dir.join("components/ui")) {
+    if let Ok(entries) = std::fs::read_dir(&ui_dir) {
         for entry in entries.flatten() {
             let p = entry.path();
             if p.is_file() && matches!(p.extension().and_then(|e| e.to_str()), Some("tsx" | "ts")) {
@@ -823,20 +1038,37 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
         }
     }
 
-    let union_prop_re = regex::Regex::new(r#"(?m)^(\s*(?:variant|size)\??:\s*)((?:['"][^'"]+['"]\s*\|\s*)+['"][^'"]+['"])(\s*;?)"#).ok();
+    let union_prop_re = regex::Regex::new(r#"(?m)^(\s*(?:variant|size|color)\??:\s*)((?:['"][^'"]+['"]\s*\|\s*)+['"][^'"]+['"])(\s*;?)"#).ok();
 
     for ui_file in ui_files {
-        let Ok(mut content) = std::fs::read_to_string(&ui_file) else { continue };
-        let original = content.clone();
-
-        if let Some(ref re) = union_prop_re {
-            if !content.contains("(string & {})") {
-                content = re.replace_all(&content, "${1}${2} | (string & {})${3}").to_string();
+        let existed_before = ui_file.is_file();
+        let original = if existed_before {
+            match std::fs::read_to_string(&ui_file) {
+                Ok(c) => c,
+                Err(_) => continue,
             }
+        } else {
+            String::new()
+        };
+        let mut content = original.clone();
+
+        if existed_before {
+            if let Some(ref re) = union_prop_re {
+                content = re.replace_all(&content, |caps: &regex::Captures| {
+                    let full = &caps[0];
+                    if full.contains("(string & {})") {
+                        full.to_string()
+                    } else {
+                        format!("{}{} | (string & {{}}){}", &caps[1], &caps[2], &caps[3])
+                    }
+                }).to_string();
+            }
+            content = widen_narrow_ui_props_interfaces(&content);
         }
 
         if let Some(missing_syms) = demanded.get(&ui_file) {
             let mut appended = String::new();
+            let mut added_syms: Vec<String> = Vec::new();
             for sym in missing_syms {
                 if !has_named_export_symbol(&content, sym) {
                     let fallback = match sym.as_str() {
@@ -854,21 +1086,38 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
                         _ => format!("export const {} = ({{ children, className = '', ...props }}: any) => <div className={{className}} {{...props}}>{{children}}</div>;\n", sym),
                     };
                     appended.push_str(&fallback);
+                    added_syms.push(sym.clone());
                 }
             }
             if !appended.is_empty() {
                 if !content.contains("import React") && !content.contains("from 'react'") && !content.contains("from \"react\"") {
-                    content = format!("import React from 'react';\n{}", content);
+                    content = if content.trim().is_empty() {
+                        "import React from 'react';\n".to_string()
+                    } else {
+                        format!("import React from 'react';\n{}", content)
+                    };
                 }
                 if !content.trim_start().starts_with("\"use client\"") && !content.trim_start().starts_with("'use client'") {
                     content = format!("\"use client\";\n\n{}", content);
                 }
-                content.push('\n');
+                if !content.ends_with('\n') {
+                    content.push('\n');
+                }
                 content.push_str(&appended);
+                if !existed_before && !content.contains("export default") {
+                    if let Some(stem) = ui_file.file_stem().and_then(|s| s.to_str()) {
+                        if let Some(primary) = added_syms.iter().find(|s| s.as_str() == stem).or_else(|| added_syms.first()) {
+                            content.push_str(&format!("\nexport default {};\n", primary));
+                        }
+                    }
+                }
             }
         }
 
-        if content != original {
+        if content != original && !content.trim().is_empty() {
+            if let Some(parent) = ui_file.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             let _ = std::fs::write(&ui_file, content);
         }
     }

@@ -1,9 +1,11 @@
 use crate::*;
 
 pub fn generate_axiom_features_json(proj_dir: &std::path::Path, project_name: &str, files_list: &[Value]) {
-    let mut files_by_dir: HashMap<String, Vec<Value>> = HashMap::new();
+    let mut deduped_files = files_list.to_vec();
+    crate::sanitizer::deduplicate_manifest_files(&mut deduped_files);
+    let mut files_by_dir: std::collections::BTreeMap<String, Vec<Value>> = std::collections::BTreeMap::new();
     
-    for file_spec in files_list {
+    for file_spec in &deduped_files {
         if let Some(path_str) = file_spec.get("path").and_then(|p| p.as_str()) {
             let normalized = path_str.replace('\\', "/");
             let parts: Vec<&str> = normalized.split('/').collect();
@@ -82,7 +84,7 @@ pub fn generate_axiom_features_json(proj_dir: &std::path::Path, project_name: &s
         "version": "1.0",
         "generatedAt": chrono::Utc::now().to_rfc3339(),
         "projectName": project_name,
-        "totalFiles": files_list.len(),
+        "totalFiles": deduped_files.len(),
         "features": features,
         "_usage": "This file is used by the Axiom Forge AI editor. Edit 'editableDescription' to change what a feature does."
     });

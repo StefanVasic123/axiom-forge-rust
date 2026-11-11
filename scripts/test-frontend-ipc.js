@@ -60,6 +60,17 @@ async function runFrontendTests() {
   assert(fs.existsSync(dashboardPath), 'AgencyDashboard.jsx page exists');
   assert(fs.existsSync(reviewModalPath), 'ReviewModal.jsx component exists');
 
+  // Test 5: Validate Editor.jsx error-first healing flow & TDZ ordering
+  const editorPath = path.join(__dirname, '../src/pages/Editor.jsx');
+  assert(fs.existsSync(editorPath), 'Editor.jsx exists');
+  const editorContent = fs.readFileSync(editorPath, 'utf8');
+  const healPos = editorContent.indexOf('const handleHealError =');
+  const aiFixPos = editorContent.indexOf('const handleAIFixCurrentPage =');
+  assert(healPos !== -1 && aiFixPos !== -1 && healPos < aiFixPos, 'handleHealError is declared before handleAIFixCurrentPage (no TDZ)');
+  assert(editorContent.includes('errorOverride && typeof errorOverride === \'object\''), 'handleHealError guards SyntheticEvent vs errorOverride');
+  assert(editorContent.includes('const healed = await handleHealError('), 'handleAIFixCurrentPage invokes handleHealError first when error is active');
+  assert(editorContent.includes('return true;') && editorContent.includes('return false;'), 'handleHealError returns explicit boolean status');
+
   console.log(`\nFrontend IPC Test Summary: ${passCount} Passed, ${failCount} Failed.`);
 
   if (failCount > 0) {

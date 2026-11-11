@@ -3544,4 +3544,558 @@ model Tag {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    #[test]
+    fn test_deduplication_and_features_json_v49() {
+        let mut files = vec![
+            serde_json::json!({ "path": "src\\hooks\\useItems.ts", "description": "short" }),
+            serde_json::json!({ "path": "src/hooks/useItems.ts", "description": "Complete typed hook managing item CRUD and loading states" }),
+            serde_json::json!({ "path": "./src/hooks/useItems.ts", "description": "" }),
+            serde_json::json!({ "path": "src/app/api/items/route.ts", "description": "REST API route for items" }),
+        ];
+        crate::sanitizer::deduplicate_manifest_files(&mut files);
+        assert_eq!(files.len(), 2, "Normalized duplicate manifest paths must collapse into 2 unique entries");
+        let hook_entry = files
+            .iter()
+            .find(|f| f["path"].as_str() == Some("src/hooks/useItems.ts"))
+            .unwrap();
+        assert!(hook_entry["description"].as_str().unwrap().contains("Complete typed hook"));
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v49_feat_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join(".axiom")).unwrap();
+        let dup_input = vec![
+            serde_json::json!({ "path": "src/hooks/useItems.ts" }),
+            serde_json::json!({ "path": "src\\hooks\\useItems.ts" }),
+            serde_json::json!({ "path": "src/app/api/items/route.ts" }),
+            serde_json::json!({ "path": "src/app/items/page.tsx" }),
+        ];
+        crate::editor_ai::generate_axiom_features_json(&temp_dir, "sample-app", &dup_input);
+        let feat_val: Value = serde_json::from_str(&std::fs::read_to_string(temp_dir.join("axiom-features.json")).unwrap()).unwrap();
+        assert_eq!(feat_val["totalFiles"].as_u64(), Some(3), "totalFiles must count deduplicated unique files");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_auxiliary_json_maps_and_contracts_v49() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v49_aux_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("prisma")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/lib/helpers")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/hooks")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/app/api/shipments")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/app/shipments")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/components")).unwrap();
+
+        let schema_src = r#"
+enum RecordState {
+  DRAFT
+  ACTIVE
+}
+
+model Shipment {
+  id String @id @default(cuid())
+  title String
+  weight Float
+  state RecordState @default(DRAFT)
+}
+"#;
+        std::fs::write(temp_dir.join("prisma/schema.prisma"), schema_src).unwrap();
+        std::fs::write(
+            temp_dir.join("src/lib/helpers/index.ts"),
+            "export const helperA = (x: string) => x.trim();\nexport const helperB = () => 1;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.join("src/lib/format.ts"),
+            "import {\n  helperA,\n  helperB,\n} from './helpers';\nexport function formatTitle(raw: string) {\n  if (raw.length > 0) {\n    return helperA(raw);\n  }\n  return String(helperB());\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.join("src/hooks/useShipments.ts"),
+            "'use client';\nimport { useState } from 'react';\nimport { formatTitle } from '../lib/format';\nexport function useShipments() {\n  const [shipments, setShipments] = useState<string[]>([]);\n  const reloadShipments = () => formatTitle('ok');\n  return { shipments, setShipments, reloadShipments };\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.join("src/app/api/shipments/route.ts"),
+            "import { NextResponse } from 'next/server';\nexport async function GET(request: Request) {\n  return NextResponse.json({ url: request.url });\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.join("src/app/shipments/page.tsx"),
+            "import { ShipmentBoard } from '@/components/ShipmentBoard';\nexport default function ShipmentsPage() { return <ShipmentBoard />; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.join("src/components/ShipmentBoard.tsx"),
+            "'use client';\nimport { useShipments } from '@/hooks/useShipments';\nexport function ShipmentBoard() { const { shipments } = useShipments(); return <div>{shipments.length}</div>; }\n",
+        )
+        .unwrap();
+
+        crate::orchestrator::generate_axiom_map(&temp_dir).unwrap();
+        let map_val: Value = serde_json::from_str(&std::fs::read_to_string(temp_dir.join("axiom-map.json")).unwrap()).unwrap();
+        let fmt_deps = map_val["files"]["src/lib/format.ts"]["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            fmt_deps.contains(&"src/lib/helpers/index.ts"),
+            "Multiline + barrel import must resolve in axiom-map.json: {:?}",
+            fmt_deps
+        );
+        let method_keys: Vec<&str> = map_val["methods"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert!(
+            !method_keys.iter().any(|k| k.starts_with('(')),
+            "Malformed `(request` token must never appear in methods: {:?}",
+            method_keys
+        );
+        assert_eq!(map_val["routes"]["/shipments"]["file"].as_str(), Some("src/app/shipments/page.tsx"));
+
+        // generate_project_metadata with empty files_list must still scan disk and resolve relative `../` imports
+        crate::healer::generate_project_metadata(&temp_dir, "proj_v49", &[]);
+        let meta_val: Value = serde_json::from_str(&std::fs::read_to_string(temp_dir.join(".axiom/metadata.json")).unwrap()).unwrap();
+        let hook_deps = meta_val["dependencies"]["src/hooks/useShipments.ts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            hook_deps.contains(&"src/lib/format.ts"),
+            "Disk-scanned metadata.json must resolve ../lib/format: {:?}",
+            hook_deps
+        );
+        assert!(meta_val["dependencies"].get("src/components/ShipmentBoard.tsx").is_some());
+
+        // refresh_axiom_contracts_for_project must capture capabilities.members and surface schema models/enums
+        crate::orchestrator::refresh_axiom_contracts_for_project(&temp_dir, "proj_v49", &[]);
+        let contracts_val: Value = serde_json::from_str(
+            &std::fs::read_to_string(temp_dir.join(".axiom/axiom-contracts.json")).unwrap(),
+        )
+        .unwrap();
+        let hook_members = contracts_val["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"].as_str() == Some("src/hooks/useShipments.ts"))
+            .and_then(|f| f["capabilities"]["members"].as_array())
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>();
+        assert!(hook_members.contains(&"shipments"));
+        assert!(hook_members.contains(&"reloadShipments"));
+
+        let contracts_prompt = crate::orchestrator::format_axiom_contracts_prompt(&temp_dir, "src/components/ShipmentBoard.tsx");
+        assert!(contracts_prompt.contains("models:[Shipment]"), "Schema models must appear:\n{}", contracts_prompt);
+        assert!(contracts_prompt.contains("enums:[RecordState]"), "Schema enums must appear:\n{}", contracts_prompt);
+        assert!(contracts_prompt.contains("members:[shipments"), "Hook members must appear:\n{}", contracts_prompt);
+
+        // Database contract + planned routes summary
+        let db_contract = crate::orchestrator::extract_prisma_schema_contract(schema_src);
+        assert_eq!(db_contract["models"]["Shipment"]["delegate"].as_str(), Some("shipment"));
+        let db_prompt = crate::orchestrator::format_database_contract_prompt(&db_contract);
+        assert!(db_prompt.contains("prisma.shipment"));
+        assert!(db_prompt.contains("requiredOnCreate"));
+        assert!(db_prompt.contains("RecordState"));
+
+        let planned = crate::orchestrator::extract_planned_api_routes_summary(&[
+            serde_json::json!({ "path": "src/app/api/shipments/route.ts", "description": "Manage shipments" }),
+        ]);
+        assert!(planned.contains("/api/shipments"));
+        assert!(planned.contains("PLANNED API ROUTES REQUIRING DATABASE SCHEMA SUPPORT"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_ui_reconciliation_and_wide_props_v49() {
+        let narrow = "export interface PillProps {\n  variant?: 'default' | 'success';\n  label?: string;\n}\n";
+        let widened = crate::sanitizer::widen_narrow_ui_props_interfaces(narrow);
+        assert!(widened.contains("[key: string]: any"), "Narrow UI Props interface must be widened:\n{}", widened);
+        let widened_twice = crate::sanitizer::widen_narrow_ui_props_interfaces(&widened);
+        assert_eq!(widened, widened_twice, "Widening must be idempotent");
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v49_ui_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("src/components/cards")).unwrap();
+        std::fs::write(
+            temp_dir.join("src/components/cards/ItemCard.tsx"),
+            "'use client';\nimport { StatusPill } from '../ui/StatusPill';\nexport function ItemCard() { return <StatusPill label=\"OK\" />; }\n",
+        )
+        .unwrap();
+
+        crate::sanitizer::ensure_ui_primitives_reconciled(&temp_dir);
+        let generated_ui = temp_dir.join("src/components/ui/StatusPill.tsx");
+        assert!(generated_ui.is_file(), "Relative '../ui/StatusPill' import must synthesize missing UI primitive");
+        let ui_src = std::fs::read_to_string(&generated_ui).unwrap();
+        assert!(ui_src.contains("export const StatusPill") || ui_src.contains("export function StatusPill"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_semantic_import_edits_and_noop_strip_v49() {
+        let ai_json = serde_json::json!({
+            "file": "src/app/board/page.tsx",
+            "edits": [
+                { "type": "import", "module": "vendor-icons/v2", "namedImports": ["VendorPlusIcon"] },
+                { "type": "replace", "search": "VendorPlusIcon", "replacement": "VendorPlusIcon" }
+            ]
+        });
+        let edits = crate::healer::extract_edits_from_json(&ai_json, "src/app/board/page.tsx");
+        assert_eq!(edits.len(), 1, "No-op search==replacement must be stripped, keeping only ensure_import");
+        assert_eq!(edits[0]["op"].as_str(), Some("ensure_import"));
+        assert_eq!(edits[0]["module"].as_str(), Some("vendor-icons/v2"));
+
+        // Deletion edit (target non-empty -> replacement "") and explicit from/to path rewrite stay intact
+        let misc_json = serde_json::json!({
+            "edits": [
+                { "path": "src/a.ts", "target": "staleCode();", "replacement": "" },
+                { "type": "import", "path": "src/b.ts", "from": "old/path", "to": "@/new/path" }
+            ]
+        });
+        let misc_edits = crate::healer::extract_edits_from_json(&misc_json, "src/a.ts");
+        assert_eq!(misc_edits.len(), 2);
+        assert!(misc_edits.iter().all(|e| e.get("op").is_none()));
+
+        // Test .d.ts auto-redirection from wrong subpath v1 -> v2 + `'use client'` preservation
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v49_sem_imp_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("node_modules/vendor-icons/v1")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("node_modules/vendor-icons/v2")).unwrap();
+        std::fs::write(
+            temp_dir.join("node_modules/vendor-icons/package.json"),
+            r#"{"name":"vendor-icons"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.join("node_modules/vendor-icons/v1/index.d.ts"),
+            "export declare function OtherLegacyIcon(): any;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.join("node_modules/vendor-icons/v2/index.d.ts"),
+            "export declare function VendorPlusIcon(): any;\n",
+        )
+        .unwrap();
+
+        let wrong_subpath_edit = serde_json::json!({
+            "op": "ensure_import",
+            "path": "src/app/board/page.tsx",
+            "module": "vendor-icons/v1",
+            "namedImports": ["VendorPlusIcon"]
+        });
+        let page_src = "'use client';\nimport React from 'react';\nexport default function BoardPage() { return <VendorPlusIcon />; }\n";
+        let updated = crate::healer::apply_semantic_ensure_import_edit(
+            &temp_dir,
+            "src/app/board/page.tsx",
+            &wrong_subpath_edit,
+            page_src,
+        )
+        .unwrap();
+        assert!(updated.trim_start().starts_with("'use client';"));
+        assert!(
+            updated.contains("from 'vendor-icons/v2'") || updated.contains("from \"vendor-icons/v2\""),
+            "Should auto-redirect wrong subpath via .d.ts:\n{}",
+            updated
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_auto_import_generics_ambiguity_and_dts_v49() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v49_autoimp_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("node_modules/sample-icons/pack-b")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/components/alpha")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/components/beta")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/app/board")).unwrap();
+
+        std::fs::write(
+            temp_dir.join("node_modules/sample-icons/package.json"),
+            r#"{"name":"sample-icons"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.join("node_modules/sample-icons/pack-b/index.d.ts"),
+            "export declare function SampleAddIcon(): JSX.Element;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.join("src/components/UniqueBanner.tsx"),
+            "export function UniqueBanner() { return <div />; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.join("src/components/alpha/DupCard.tsx"),
+            "export function DupCard() { return <div />; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.join("src/components/beta/DupCard.tsx"),
+            "export function DupCard() { return <div />; }\n",
+        )
+        .unwrap();
+
+        let page_file = temp_dir.join("src/app/board/page.tsx");
+        let page_src = r#"'use client';
+import { useState } from 'react';
+export default function BoardPage() {
+  const [rows] = useState<RecordType[]>([]);
+  const list: Array<ItemRow> = [];
+  return (
+    <main>
+      <UniqueBanner />
+      <DupCard />
+      <SampleAddIcon />
+      <span>{rows.length + list.length}</span>
+    </main>
+  );
+}
+"#;
+        std::fs::write(&page_file, page_src).unwrap();
+
+        let extra = crate::self_healing::extract_missing_ident_candidates_from_error(
+            "ReferenceError: SampleAddIcon is not defined\nReferenceError: window is not defined",
+        );
+        let updated = crate::self_healing::auto_import_missing_symbols_in_file(
+            &temp_dir,
+            &page_file,
+            "src/app/board/page.tsx",
+            &extra,
+        )
+        .expect("Should auto-import missing SampleAddIcon and UniqueBanner");
+
+        assert!(updated.contains("SampleAddIcon") && updated.contains("sample-icons/pack-b"));
+        assert!(updated.contains("UniqueBanner") && updated.contains("@/components/UniqueBanner"));
+        assert!(!updated.contains("import { RecordType"), "Must skip TS generic RecordType:\n{}", updated);
+        assert!(!updated.contains("import { ItemRow"), "Must skip TS generic ItemRow:\n{}", updated);
+        assert!(!updated.contains("DupCard } from"), "Must skip ambiguous local DupCard:\n{}", updated);
+        assert!(!updated.contains("import { window"), "Must never auto-import browser global window:\n{}", updated);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_project_aware_api_route_validator_v49() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v49_val_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("prisma")).unwrap();
+        std::fs::write(
+            temp_dir.join("prisma/schema.prisma"),
+            "enum WorkState {\n  OPEN\n  DONE\n}\nmodel WorkItem {\n  id String @id\n  title String\n  state WorkState @default(OPEN)\n}\n",
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        // 1. Hallucinated prisma delegate must fail
+        let bad_delegate = r#"
+import { NextResponse } from 'next/server';
+import { prisma } from '@/lib/prisma';
+export async function GET() {
+  const rows = await prisma.fakeEntity.findMany();
+  return NextResponse.json(rows);
+}
+"#;
+        assert!(
+            rt.block_on(crate::orchestrator::validate_file_with_project_context(
+                &temp_dir,
+                "src/app/api/work/route.ts",
+                bad_delegate,
+                "qwen2.5-coder:7b",
+            ))
+            .is_err(),
+            "Must reject hallucinated prisma.fakeEntity delegate"
+        );
+
+        // 2. Unimported Prisma enum must fail
+        let bad_enum = r#"
+import { NextResponse } from 'next/server';
+import { prisma } from '@/lib/prisma';
+export async function GET() {
+  const rows = await prisma.workItem.findMany({ where: { state: WorkState.OPEN } });
+  return NextResponse.json(rows);
+}
+"#;
+        assert!(
+            rt.block_on(crate::orchestrator::validate_file_with_project_context(
+                &temp_dir,
+                "src/app/api/work/route.ts",
+                bad_enum,
+                "qwen2.5-coder:7b",
+            ))
+            .is_err(),
+            "Must reject unimported Prisma enum WorkState"
+        );
+
+        // 3. URLSearchParams direct property access (`searchParams.itemId`) must fail
+        let bad_sp = r#"
+import { NextResponse } from 'next/server';
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url);
+  return NextResponse.json({ id: searchParams.itemId });
+}
+"#;
+        assert!(
+            rt.block_on(crate::orchestrator::validate_file_with_project_context(
+                &temp_dir,
+                "src/app/api/work/route.ts",
+                bad_sp,
+                "qwen2.5-coder:7b",
+            ))
+            .is_err(),
+            "Must reject searchParams.itemId on URLSearchParams"
+        );
+
+        // 4. `try { const payload = await request.json(); } catch { return NextResponse.json(payload); }` must fail
+        let bad_catch_scope = r#"
+import { NextResponse } from 'next/server';
+export async function POST(request: Request) {
+  try {
+    const payload = await request.json();
+    return NextResponse.json(payload);
+  } catch {
+    return NextResponse.json({ fallback: payload }, { status: 500 });
+  }
+}
+"#;
+        assert!(
+            rt.block_on(crate::orchestrator::validate_file_with_project_context(
+                &temp_dir,
+                "src/app/api/work/route.ts",
+                bad_catch_scope,
+                "qwen2.5-coder:7b",
+            ))
+            .is_err(),
+            "Must reject try-scoped payload referenced in catch block"
+        );
+
+        // 5. Double request.json() inside paired try/catch must fail
+        let bad_double_json = r#"
+import { NextResponse } from 'next/server';
+export async function POST(request: Request) {
+  try {
+    const payload = await request.json();
+    return NextResponse.json(payload);
+  } catch {
+    const retryBody = await request.json();
+    return NextResponse.json(retryBody, { status: 500 });
+  }
+}
+"#;
+        assert!(
+            rt.block_on(crate::orchestrator::validate_file_with_project_context(
+                &temp_dir,
+                "src/app/api/work/route.ts",
+                bad_double_json,
+                "qwen2.5-coder:7b",
+            ))
+            .is_err(),
+            "Must reject double request.json() across try and catch"
+        );
+
+        // 6. Valid route with separate POST + PUT handlers, valid delegate + imported enum + comment URL must pass
+        let valid_route = r#"
+import { NextResponse } from 'next/server';
+import { WorkState } from '@prisma/client';
+import { prisma } from '@/lib/prisma';
+// External spec reference: https://example.com/api-docs
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const filterId = searchParams.get('id');
+  const rows = await prisma.workItem.findMany({ where: { state: WorkState.OPEN } });
+  return NextResponse.json({ filterId, rows });
+}
+export async function POST(request: Request) {
+  const body = await request.json();
+  return NextResponse.json(body);
+}
+export async function PUT(request: Request) {
+  const body = await request.json();
+  return NextResponse.json(body);
+}
+"#;
+        assert!(
+            rt.block_on(crate::orchestrator::validate_file_with_project_context(
+                &temp_dir,
+                "src/app/api/work/route.ts",
+                valid_route,
+                "qwen2.5-coder:7b",
+            ))
+            .is_ok(),
+            "Valid route with separate POST/PUT and comment URL must pass"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_heal_ledger_and_chain_of_information_v49() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v49_coi_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let baseline = vec![
+            "Line 10, Col 5: [TS2304] Cannot find name 'IconA'.".to_string(),
+            "Line 22, Col 9: [TS2339] Property 'badField' does not exist on type 'Row'.".to_string(),
+        ];
+        // Simulates adding an import shifted line 22 -> line 23 while resolving IconA
+        let post = vec![
+            "Line 23, Col 9: [TS2339] Property 'badField' does not exist on type 'Row'.".to_string(),
+        ];
+        let diff = crate::katastar::compute_diagnostic_diff(&baseline, &post);
+        assert_eq!(diff.resolved.len(), 1);
+        assert!(diff.resolved[0].contains("IconA"));
+        assert!(diff.introduced.is_empty(), "Line shift 22->23 must not count as newly introduced error");
+        assert!(diff.count_reduced);
+
+        crate::katastar::record_project_heal_round(
+            &temp_dir,
+            "src/app/board/page.tsx",
+            1,
+            "ai",
+            "partial_progress",
+            &diff.resolved,
+            &post,
+            "Added missing IconA import",
+        );
+
+        let prompt = crate::katastar::format_chain_of_information_prompt(
+            &temp_dir,
+            "src/app/board/page.tsx",
+            &[baseline[0].clone(), post[0].clone()],
+            2,
+        );
+        assert!(!prompt.contains("Cannot find name 'IconA'"), "Resolved error must be omitted from active unresolved prompt:\n{}", prompt);
+        assert!(prompt.contains("badField"), "Remaining unresolved error must stay in Chain-of-Information:\n{}", prompt);
+        assert!(prompt.contains("ALREADY RESOLVED"), "Must instruct LLM not to undo earlier verified fix:\n{}", prompt);
+        assert!(prompt.contains("DEEP CAUSAL REFLECTION REQUIRED"), "Round 2+ must require deep causal reflection:\n{}", prompt);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
 }

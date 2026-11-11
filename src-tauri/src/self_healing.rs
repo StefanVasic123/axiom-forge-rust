@@ -1004,6 +1004,7 @@ pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
     crate::apply_ast_sanity_pass_to_project(proj_dir);
     crate::sanitizer::ensure_directory_barrel_files(proj_dir);
     crate::sanitizer::ensure_ui_primitives_reconciled(proj_dir);
+    let _ = auto_import_missing_symbols_in_project(proj_dir);
 }
 
 fn collect_exporter_context_for_file(proj_dir: &std::path::Path, rel_path: &str, content: &str) -> String {
@@ -1162,7 +1163,7 @@ fn resolve_dts_entry_in_dir(base_dir: &std::path::Path, rel: &str) -> Option<std
     None
 }
 
-fn resolve_external_dts_path(proj_dir: &std::path::Path, spec: &str) -> Option<std::path::PathBuf> {
+pub fn resolve_external_dts_path(proj_dir: &std::path::Path, spec: &str) -> Option<std::path::PathBuf> {
     let nm_dir = proj_dir.join("node_modules");
     if !nm_dir.is_dir() {
         return None;
@@ -1283,7 +1284,7 @@ fn collect_dts_exports_single_file(content: &str, out_syms: &mut Vec<String>, se
     let mut wildcard_targets: Vec<String> = Vec::new();
     let mut external_or_unparseable_wildcard = false;
 
-    let Ok(decl_re) = regex::Regex::new(r#"(?m)^\s*export\s+(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:function\*?|const|let|var|class|enum|interface|type|namespace)\s+([A-Za-z_$][A-Za-z0-9_$]*)"#) else {
+    let Ok(decl_re) = regex::Regex::new(r#"(?m)(?:^|;)\s*export\s+(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:function\*?|const|let|var|class|enum|interface|type|namespace)\s+([A-Za-z_$][A-Za-z0-9_$]*)"#) else {
         return (wildcard_targets, true);
     };
     for cap in decl_re.captures_iter(&cleaned) {
@@ -1295,14 +1296,14 @@ fn collect_dts_exports_single_file(content: &str, out_syms: &mut Vec<String>, se
         }
     }
 
-    let Ok(default_re) = regex::Regex::new(r#"(?m)^\s*export\s+(?:default\b|=\s*)"#) else {
+    let Ok(default_re) = regex::Regex::new(r#"(?m)(?:^|;)\s*export\s+(?:default\b|=\s*)"#) else {
         return (wildcard_targets, true);
     };
     if default_re.is_match(&cleaned) {
         *has_default = true;
     }
 
-    let Ok(braced_re) = regex::Regex::new(r#"(?ms)^\s*export\s+(?:type\s+)?\{([^}]+)\}"#) else {
+    let Ok(braced_re) = regex::Regex::new(r#"(?ms)(?:^|;)\s*export\s+(?:type\s+)?\{([^}]+)\}"#) else {
         return (wildcard_targets, true);
     };
     for cap in braced_re.captures_iter(&cleaned) {
@@ -1329,7 +1330,7 @@ fn collect_dts_exports_single_file(content: &str, out_syms: &mut Vec<String>, se
         }
     }
 
-    let Ok(ns_star_re) = regex::Regex::new(r#"(?m)^\s*export\s+\*\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*)\s+from\s+['"][^'"]+['"]"#) else {
+    let Ok(ns_star_re) = regex::Regex::new(r#"(?m)(?:^|;)\s*export\s+\*\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*)\s+from\s+['"][^'"]+['"]"#) else {
         return (wildcard_targets, true);
     };
     for cap in ns_star_re.captures_iter(&cleaned) {
@@ -1341,7 +1342,7 @@ fn collect_dts_exports_single_file(content: &str, out_syms: &mut Vec<String>, se
         }
     }
 
-    let Ok(star_re) = regex::Regex::new(r#"(?m)^\s*export\s+(?:type\s+)?\*\s+from\s+['"]([^'"]+)['"]"#) else {
+    let Ok(star_re) = regex::Regex::new(r#"(?m)(?:^|;)\s*export\s+(?:type\s+)?\*\s+from\s+['"]([^'"]+)['"]"#) else {
         return (wildcard_targets, true);
     };
     for cap in star_re.captures_iter(&cleaned) {
@@ -1350,6 +1351,7 @@ fn collect_dts_exports_single_file(content: &str, out_syms: &mut Vec<String>, se
             if target.starts_with('.') {
                 wildcard_targets.push(target.to_string());
             } else {
+                wildcard_targets.push(format!("pkg:{}", target));
                 external_or_unparseable_wildcard = true;
             }
         }
@@ -1406,10 +1408,726 @@ fn parse_dts_exports_with_guard(entry_path: &std::path::Path) -> DtsParseResult 
     }
 }
 
+/// Queries `.d.ts` files on disk (including deep wildcard re-exports) to verify if package `spec`
+/// exports a concrete symbol `sym`. Unlike prompt-listing, a single-symbol boolean query never
+/// feeds partial symbol dumps to the LLM, so it safely traverses up to depth 3 / 90 files.
+pub fn dts_package_exports_symbol(proj_dir: &std::path::Path, spec: &str, sym: &str) -> bool {
+    if sym.trim().is_empty() {
+        return false;
+    }
+    let Some(entry) = resolve_external_dts_path(proj_dir, spec) else {
+        return false;
+    };
+
+    const MAX_FILES: usize = 90;
+    const MAX_DEPTH: usize = 3;
+    let mut visited: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+    let mut queue: std::collections::VecDeque<(std::path::PathBuf, usize)> = std::collections::VecDeque::new();
+    queue.push_back((entry, 0));
+
+    while let Some((cur_path, depth)) = queue.pop_front() {
+        if visited.len() >= MAX_FILES || !visited.insert(cur_path.clone()) {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&cur_path) else {
+            continue;
+        };
+        let mut syms = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut has_default = false;
+        let (wildcards, _) = collect_dts_exports_single_file(&content, &mut syms, &mut seen, &mut has_default);
+        if seen.contains(sym) {
+            return true;
+        }
+        if depth >= MAX_DEPTH {
+            continue;
+        }
+        let parent_dir = cur_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        for target in wildcards {
+            if let Some(ext_spec) = target.strip_prefix("pkg:") {
+                if let Some(ext_path) = resolve_external_dts_path(proj_dir, ext_spec) {
+                    if !visited.contains(&ext_path) {
+                        queue.push_back((ext_path, depth + 1));
+                    }
+                }
+            } else {
+                let joined = normalize_path_components(&parent_dir.join(&target));
+                if let Some(sub_path) = [
+                    joined.clone(),
+                    joined.with_extension("d.ts"),
+                    joined.with_extension("d.mts"),
+                    std::path::PathBuf::from(format!("{}.d.ts", joined.to_string_lossy())),
+                    joined.join("index.d.ts"),
+                    joined.join("index.d.mts"),
+                ]
+                .into_iter()
+                .find(|p| p.is_file())
+                {
+                    if !visited.contains(&sub_path) {
+                        queue.push_back((sub_path, depth + 1));
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn collect_subpath_candidates_in_pkg(
+    pkg_dir: &std::path::Path,
+    pkg_name: &str,
+    sym_lower: &str,
+    out: &mut Vec<String>,
+) {
+    let mut sub_specs: Vec<(bool, usize, String)> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(pkg_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.')
+            || matches!(
+                name.as_str(),
+                "node_modules" | "lib" | "dist" | "cjs" | "esm" | "umd" | "build" | "src" | "types"
+            )
+        {
+            continue;
+        }
+        if p.is_dir() {
+            if p.join("index.d.ts").is_file() || p.join("index.d.mts").is_file() {
+                let spec = format!("{}/{}", pkg_name, name);
+                let base = name.trim_end_matches(|c: char| c.is_ascii_digit()).to_lowercase();
+                let exact = !base.is_empty() && sym_lower.starts_with(&base);
+                sub_specs.push((exact, base.len(), spec));
+            }
+            // Also check depth-2 subdirs (e.g. `@heroicons/react/24/outline` or scoped icon sets)
+            if let Ok(sub_entries) = std::fs::read_dir(&p) {
+                for sub_ent in sub_entries.flatten() {
+                    let sp = sub_ent.path();
+                    if sp.is_dir() {
+                        let sname = sub_ent.file_name().to_string_lossy().to_string();
+                        if !sname.starts_with('.')
+                            && sname != "node_modules"
+                            && (sp.join("index.d.ts").is_file() || sp.join("index.d.mts").is_file())
+                        {
+                            let spec = format!("{}/{}/{}", pkg_name, name, sname);
+                            let base = sname.trim_end_matches(|c: char| c.is_ascii_digit()).to_lowercase();
+                            let exact = !base.is_empty() && sym_lower.starts_with(&base);
+                            sub_specs.push((exact, base.len(), spec));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    sub_specs.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.2.len().cmp(&b.2.len()))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    for (_, _, spec) in sub_specs {
+        if !out.contains(&spec) {
+            out.push(spec);
+        }
+    }
+}
+
+pub fn find_installed_dts_package_for_symbol(
+    proj_dir: &std::path::Path,
+    preferred_specs: &[String],
+    sym: &str,
+) -> Option<String> {
+    if sym.trim().is_empty() || !proj_dir.join("node_modules").is_dir() {
+        return None;
+    }
+
+    // 1. Check packages already imported by the file first
+    for spec in preferred_specs {
+        if !spec.starts_with('.') && !spec.starts_with("@/") && !spec.starts_with("~/") {
+            if dts_package_exports_symbol(proj_dir, spec, sym) {
+                return Some(spec.clone());
+            }
+        }
+    }
+
+    // 2. Discover candidate packages & subpaths dynamically from preferred roots, package.json, and node_modules
+    let nm_dir = proj_dir.join("node_modules");
+    let sym_lower = sym.to_lowercase();
+    let mut candidates: Vec<String> = Vec::new();
+    let mut pkg_roots: Vec<String> = Vec::new();
+
+    for spec in preferred_specs {
+        if !spec.starts_with('.') && !spec.starts_with("@/") && !spec.starts_with("~/") {
+            let (root, _) = split_pkg_specifier(spec);
+            if !root.is_empty() && !pkg_roots.contains(&root) {
+                pkg_roots.push(root);
+            }
+        }
+    }
+
+    let pkg_json = proj_dir.join("package.json");
+    if pkg_json.is_file() {
+        if let Ok(raw) = std::fs::read_to_string(&pkg_json) {
+            if let Ok(val) = serde_json::from_str::<Value>(&raw) {
+                if let Some(deps) = val.get("dependencies").and_then(|d| d.as_object()) {
+                    for dep in deps.keys() {
+                        let dl = dep.to_lowercase();
+                        if matches!(
+                            dl.as_str(),
+                            "next" | "react" | "react-dom" | "prisma" | "@prisma/client" | "typescript" | "tailwindcss" | "autoprefixer" | "postcss" | "eslint" | "zod" | "bcryptjs"
+                        ) {
+                            continue;
+                        }
+                        if !pkg_roots.contains(dep) {
+                            pkg_roots.push(dep.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let is_tooling_pkg = |name: &str| -> bool {
+        let dl = name.to_lowercase();
+        matches!(
+            dl.as_str(),
+            "next" | "react" | "react-dom" | "prisma" | "@prisma/client" | "typescript"
+                | "tailwindcss" | "autoprefixer" | "postcss" | "eslint" | "prettier"
+                | "zod" | "bcryptjs"
+        ) || dl.starts_with("@types/")
+            || dl.starts_with("@babel/")
+            || dl.starts_with("@eslint")
+            || dl.starts_with("@next/")
+            || dl.starts_with("@prisma/")
+            || dl.starts_with("@swc/")
+            || dl.starts_with("eslint")
+    };
+
+    // Expand each prioritized root (both root entry and installed subpaths)
+    for root in &pkg_roots {
+        if is_tooling_pkg(root) {
+            continue;
+        }
+        let p = nm_dir.join(root);
+        if p.is_dir() {
+            if !candidates.contains(root) {
+                candidates.push(root.clone());
+            }
+            collect_subpath_candidates_in_pkg(&p, root, &sym_lower, &mut candidates);
+        }
+    }
+
+    // Fallback discovery across top-level installed packages in node_modules/ (handles packages omitted from package.json)
+    if let Ok(nm_entries) = std::fs::read_dir(&nm_dir) {
+        let mut fallback_roots: Vec<String> = Vec::new();
+        for ent in nm_entries.flatten() {
+            let p = ent.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let name = ent.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            if name.starts_with('@') {
+                if name == "@types" || name == "@babel" || name == "@next" || name == "@prisma" || name == "@swc" || name.starts_with("@eslint") {
+                    continue;
+                }
+                if let Ok(scoped_entries) = std::fs::read_dir(&p) {
+                    for sc in scoped_entries.flatten() {
+                        if sc.path().is_dir() {
+                            let sname = format!("{}/{}", name, sc.file_name().to_string_lossy());
+                            if !is_tooling_pkg(&sname) && !pkg_roots.contains(&sname) {
+                                fallback_roots.push(sname);
+                            }
+                        }
+                    }
+                }
+            } else if !is_tooling_pkg(&name) && !pkg_roots.contains(&name) {
+                fallback_roots.push(name);
+            }
+        }
+        fallback_roots.sort();
+        for root in fallback_roots.into_iter().take(120) {
+            if candidates.len() >= 180 {
+                break;
+            }
+            let p = nm_dir.join(&root);
+            if !candidates.contains(&root) {
+                candidates.push(root.clone());
+            }
+            collect_subpath_candidates_in_pkg(&p, &root, &sym_lower, &mut candidates);
+        }
+    }
+
+    for spec in candidates {
+        if preferred_specs.iter().any(|p| p == &spec) {
+            continue;
+        }
+        if dts_package_exports_symbol(proj_dir, &spec, sym) {
+            return Some(spec);
+        }
+    }
+
+    None
+}
+
+pub fn extract_missing_ident_candidates_from_error(err_ctx: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let patterns = [
+        r#"ReferenceError:\s*([A-Za-z_$][A-Za-z0-9_$]*)\s+is not defined"#,
+        r#"Cannot find name\s+['"`]([A-Za-z_$][A-Za-z0-9_$]*)['"`]"#,
+        r#"\b([A-Za-z_$][A-Za-z0-9_$]*)\s+is not defined\b"#,
+    ];
+    for pat in &patterns {
+        if let Ok(re) = regex::Regex::new(pat) {
+            for cap in re.captures_iter(err_ctx) {
+                if let Some(m) = cap.get(1) {
+                    let sym = m.as_str().trim().to_string();
+                    if !sym.is_empty() && !out.contains(&sym) {
+                        out.push(sym);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn collect_declared_or_imported_idents(content: &str) -> std::collections::HashSet<String> {
+    let mut known: std::collections::HashSet<String> = [
+        "React", "Fragment", "Suspense", "StrictMode", "Component", "PureComponent",
+        "Promise", "Error", "TypeError", "SyntaxError", "Array", "Object", "Date",
+        "Math", "JSON", "Map", "Set", "WeakMap", "WeakSet", "RegExp", "URL",
+        "URLSearchParams", "Headers", "Request", "Response", "FormData", "Blob",
+        "File", "Event", "CustomEvent", "Intl", "Symbol", "Number", "String",
+        "Boolean", "BigInt", "JSX", "Metadata", "NextResponse", "NextRequest",
+        "Window", "Document", "HTMLElement", "HTMLInputElement", "HTMLButtonElement",
+        "HTMLFormElement", "HTMLDivElement", "HTMLSelectElement", "HTMLTextAreaElement",
+        "Record", "Partial", "Required", "Readonly", "Pick", "Omit", "Exclude", "Extract",
+        "ReturnType", "Awaited", "ReadonlyArray",
+        "window", "document", "globalThis", "navigator", "location", "history",
+        "localStorage", "sessionStorage", "fetch", "console", "process", "Buffer",
+        "setTimeout", "clearTimeout", "setInterval", "clearInterval",
+        "requestAnimationFrame", "cancelAnimationFrame", "alert", "confirm", "prompt",
+        "Infinity", "NaN", "undefined", "null", "true", "false",
+    ]
+    .into_iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    // 1. All imported bindings (supports multiline imports, aliases `Orig as Alias`, default + braced)
+    if let Ok(imp_re) = regex::Regex::new(r#"(?ms)\bimport\s+(?:type\s+)?([\s\S]*?)\s+from\s+['"][^'"]+['"]"#) {
+        for cap in imp_re.captures_iter(content) {
+            let clause = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            if let Some(ob) = clause.find('{') {
+                let default_part = clause[..ob].trim().trim_end_matches(',').trim();
+                if !default_part.is_empty() && !default_part.starts_with('*') {
+                    known.insert(default_part.to_string());
+                }
+                if let Some(cb) = clause.rfind('}') {
+                    let inner = &clause[ob + 1..cb];
+                    for raw_item in inner.split(',') {
+                        let it = raw_item.trim().trim_start_matches("type ").trim();
+                        if it.is_empty() {
+                            continue;
+                        }
+                        let local = if let Some((_, alias)) = it.split_once(" as ") {
+                            alias.trim()
+                        } else {
+                            it.split_whitespace().next().unwrap_or("")
+                        };
+                        if !local.is_empty() {
+                            known.insert(local.to_string());
+                        }
+                    }
+                }
+            } else if let Some(star_pos) = clause.find("* as ") {
+                let alias = clause[star_pos + 5..].trim();
+                if !alias.is_empty() {
+                    known.insert(alias.to_string());
+                }
+            } else {
+                let def = clause.trim();
+                if !def.is_empty() {
+                    known.insert(def.to_string());
+                }
+            }
+        }
+    }
+
+    // 2. Local declarations (`function`, `const`, `let`, `var`, `class`, `interface`, `type`, `enum`)
+    if let Ok(decl_re) = regex::Regex::new(
+        r#"(?m)\b(?:function\*?|const|let|var|class|interface|type|enum)\s+([A-Za-z_$][A-Za-z0-9_$]*)\b"#,
+    ) {
+        for cap in decl_re.captures_iter(content) {
+            if let Some(m) = cap.get(1) {
+                known.insert(m.as_str().to_string());
+            }
+        }
+    }
+
+    // 3. Destructured variable declarations `const { A, B: C } = ...`
+    if let Ok(destr_re) = regex::Regex::new(r#"(?ms)\b(?:const|let|var)\s*\{([^}]+)\}\s*="#) {
+        for cap in destr_re.captures_iter(content) {
+            let inner = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            for item in inner.split(',') {
+                let t = item.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                let local = if let Some((_, rhs)) = t.split_once(':') {
+                    rhs.split('=').next().unwrap_or("").trim()
+                } else {
+                    t.split('=').next().unwrap_or("").trim()
+                };
+                if !local.is_empty() && local.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$') {
+                    known.insert(local.to_string());
+                }
+            }
+        }
+    }
+
+    known
+}
+
+fn extract_unimported_jsx_components(
+    content: &str,
+    known: &std::collections::HashSet<String>,
+    is_jsx_file: bool,
+    extra_missing_idents: &[String],
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    for extra in extra_missing_idents {
+        let t = extra.trim();
+        if !t.is_empty() && !known.contains(t) && !missing.iter().any(|m| m == t) {
+            missing.push(t.to_string());
+        }
+    }
+
+    if !is_jsx_file {
+        return missing;
+    }
+
+    let Ok(tag_re) = regex::Regex::new(r"<([A-Z][A-Za-z0-9_]*)(?:\s|/>|>)") else {
+        return missing;
+    };
+
+    let mut in_block_comment = false;
+    let lines: Vec<&str> = content.lines().collect();
+    for raw_line in lines {
+        let line_trim = raw_line.trim();
+        if line_trim.starts_with("//") || line_trim.starts_with("{/*") {
+            if line_trim.starts_with("/*") && !line_trim.contains("*/") {
+                in_block_comment = true;
+            }
+            continue;
+        }
+        if in_block_comment {
+            if line_trim.contains("*/") {
+                in_block_comment = false;
+            }
+            continue;
+        }
+        if line_trim.starts_with("import ")
+            || line_trim.starts_with("type ")
+            || line_trim.starts_with("export type ")
+            || line_trim.starts_with("interface ")
+            || line_trim.starts_with("export interface ")
+        {
+            continue;
+        }
+
+        for cap in tag_re.captures_iter(raw_line) {
+            let Some(m) = cap.get(1) else { continue };
+            let lt_pos = cap.get(0).map(|x| x.start()).unwrap_or(0);
+            let sym = m.as_str();
+            if known.contains(sym) || missing.iter().any(|s| s == sym) {
+                continue;
+            }
+
+            // Skip TypeScript generic arguments: check char immediately before `<`
+            let prefix = &raw_line[..lt_pos];
+            let prev_ch = prefix.chars().last();
+            if matches!(prev_ch, Some(c) if c.is_alphanumeric() || c == '_' || c == '$' || c == ']' || c == ')') {
+                continue;
+            }
+            // Skip type-annotation context `<Generic>` right after `:` or `as` or `extends` or `implements`
+            let prefix_trim = prefix.trim_end();
+            if prefix_trim.ends_with(':')
+                || prefix_trim.ends_with(" as")
+                || prefix_trim.ends_with(" extends")
+                || prefix_trim.ends_with(" implements")
+            {
+                // Exception: ternary `cond ? <Comp /> : <Other />` ends with `:` before `<Other />` or `?` before `<Comp />`!
+                // Note `prefix_trim.ends_with(':')` in TS could be `x: Record<...>` (already filtered by prev_ch alphanumeric) or `case X: <Comp />` or ternary `: <Comp />`!
+                // Wait: in `const x: Promise<Foo>` char before `<` is 'e', already caught above! What about `const x: <T>() => ...`? Handled below via `after` check!
+                if !prefix_trim.ends_with("? :") && !content.contains(&format!("</{}>", sym)) {
+                    // Check if closing /> or JSX attributes follow
+                    let after = &raw_line[m.end()..];
+                    if !after.contains("/>") && !after.starts_with('>') {
+                        continue;
+                    }
+                }
+            }
+
+            // Skip generic arrow fn `<T>(...)`, `<T, ...>`, `<T extends ...>`, member `<Foo.Bar>`
+            let after = &raw_line[m.end()..];
+            if after.starts_with('.')
+                || after.starts_with('=')
+                || after.starts_with(',')
+                || after.starts_with(" extends ")
+                || after.starts_with(">(")
+            {
+                continue;
+            }
+
+            // Confirm strong JSX signal: self-closing `<Sym .../>`, closing `</Sym>`, or JSX tag `<Sym prop=` or `<Sym>`
+            let has_closing_tag = content.contains(&format!("</{}>", sym));
+            let has_inline_self_close = after.contains("/>") || after.trim_start().starts_with('>');
+            let has_multiline_jsx_open = raw_line[m.end()..].trim().is_empty()
+                || after.trim_start().chars().next().map_or(false, |c| c.is_ascii_alphabetic() || c == '{');
+            if has_closing_tag || has_inline_self_close || has_multiline_jsx_open {
+                missing.push(sym.to_string());
+            }
+        }
+    }
+
+    missing
+}
+
+fn find_unique_local_module_for_symbol(
+    proj_dir: &std::path::Path,
+    abs_file: &std::path::Path,
+    sym: &str,
+) -> Option<(String, bool)> {
+    let raw_src = proj_dir.join("src");
+    let has_src = raw_src.exists();
+    let scan_root = if has_src { raw_src.clone() } else { proj_dir.to_path_buf() };
+
+    let default_decl_re = regex::Regex::new(&format!(
+        r#"(?m)\bexport\s+default\s+(?:async\s+)?(?:function\s+{}|class\s+{}|{};)"#,
+        regex::escape(sym),
+        regex::escape(sym),
+        regex::escape(sym)
+    ))
+    .ok();
+
+    let mut matches: Vec<(String, bool)> = Vec::new();
+    let mut stack = vec![scan_root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                let n = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if n != "node_modules" && n != ".next" && n != ".git" && n != ".axiom" && n != "prisma" && n != "api" {
+                    stack.push(p);
+                }
+            } else if p.is_file() && p != abs_file {
+                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if !matches!(ext, "ts" | "tsx" | "js" | "jsx") {
+                    continue;
+                }
+                let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if matches!(fname, "page.tsx" | "page.jsx" | "layout.tsx" | "layout.jsx" | "route.ts" | "route.js") {
+                    continue;
+                }
+                if let Ok(c) = std::fs::read_to_string(&p) {
+                    let has_named = crate::sanitizer::has_named_export_symbol(&c, sym);
+                    let has_default_only = !has_named
+                        && default_decl_re
+                            .as_ref()
+                            .map(|re| re.is_match(&c))
+                            .unwrap_or(false);
+                    if has_named || has_default_only {
+                        if let Ok(rel) = p.strip_prefix(&scan_root) {
+                            let mut rel_str = rel.to_string_lossy().replace('\\', "/");
+                            if let Some(dot_idx) = rel_str.rfind('.') {
+                                rel_str.truncate(dot_idx);
+                            }
+                            if let Some(stripped) = rel_str.strip_suffix("/index") {
+                                rel_str = stripped.to_string();
+                            }
+                            if !rel_str.is_empty() {
+                                matches.push((format!("@/{}", rel_str), has_default_only));
+                                if matches.len() > 1 {
+                                    return None;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if matches.len() == 1 {
+        matches.into_iter().next()
+    } else {
+        None
+    }
+}
+
+pub fn merge_or_insert_import_statement(
+    content: &str,
+    module_spec: &str,
+    sym: &str,
+    is_default: bool,
+) -> String {
+    if !is_default {
+        let esc_mod = regex::escape(module_spec);
+        let pat = format!(
+            r#"(?m)^([ \t]*import\s+(?:[A-Za-z_$][A-Za-z0-9_$]*\s*,\s*)?\{{)([^}}]*)(\}}\s*from\s*['"]{}['"]\s*;?)"#,
+            esc_mod
+        );
+        if let Ok(re) = regex::Regex::new(&pat) {
+            if let Some(cap) = re.captures(content) {
+                let prefix = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+                let existing = cap.get(2).map(|m| m.as_str()).unwrap_or("").trim();
+                let suffix = cap.get(3).map(|m| m.as_str()).unwrap_or("");
+                if !prefix.starts_with("import type") {
+                    let already_in = existing
+                        .split(',')
+                        .any(|s| s.trim().split_whitespace().next() == Some(sym));
+                    if already_in {
+                        return content.to_string();
+                    }
+                    let combined = if existing.is_empty() {
+                        format!(" {} ", sym)
+                    } else {
+                        format!(" {}, {} ", existing.trim_end_matches(','), sym)
+                    };
+                    let replacement = format!("{}{}{}", prefix, combined, suffix);
+                    return re.replace(content, replacement.as_str()).to_string();
+                }
+            }
+        }
+    }
+
+    let import_line = if is_default {
+        format!("import {} from '{}';", sym, module_spec)
+    } else {
+        format!("import {{ {} }} from '{}';", sym, module_spec)
+    };
+    let with_imp = crate::sanitizer::insert_import_after_use_client(content, &import_line);
+    crate::sanitizer::hoist_use_client_directive(&with_imp)
+}
+
+pub fn auto_import_missing_symbols_in_content(
+    proj_dir: &std::path::Path,
+    abs_file: &std::path::Path,
+    rel_path: &str,
+    orig_content: &str,
+    extra_missing_idents: &[String],
+) -> Option<String> {
+    let lower = rel_path.to_lowercase();
+    let is_jsx = lower.ends_with(".tsx") || lower.ends_with(".jsx");
+    let is_ts = lower.ends_with(".ts") || lower.ends_with(".js");
+    if !is_jsx && !is_ts {
+        return None;
+    }
+    if lower.contains("/api/") && lower.ends_with("route.ts") {
+        return None;
+    }
+
+    let mut existing_specs: Vec<String> = regex::Regex::new(
+        r#"(?ms)(?:import\s+(?:type\s+)?[\s\S]*?\s+from\s+|import\s+|require\s*\(\s*)['"]([^'"]+)['"]"#,
+    )
+    .ok()
+    .map(|re| {
+        re.captures_iter(orig_content)
+            .filter_map(|c| c.get(1).map(|m| m.as_str().trim().to_string()))
+            .collect()
+    })
+    .unwrap_or_default();
+
+    let mut content = orig_content.to_string();
+    let known = collect_declared_or_imported_idents(&content);
+    let missing_syms = extract_unimported_jsx_components(&content, &known, is_jsx, extra_missing_idents);
+
+    if missing_syms.is_empty() {
+        return None;
+    }
+
+    for sym in missing_syms {
+        if let Some(pkg_spec) = find_installed_dts_package_for_symbol(proj_dir, &existing_specs, &sym) {
+            content = merge_or_insert_import_statement(&content, &pkg_spec, &sym, false);
+            if !existing_specs.iter().any(|s| s == &pkg_spec) {
+                existing_specs.push(pkg_spec);
+            }
+        } else if let Some((local_spec, is_def)) = find_unique_local_module_for_symbol(proj_dir, abs_file, &sym) {
+            content = merge_or_insert_import_statement(&content, &local_spec, &sym, is_def);
+        }
+    }
+
+    if content != orig_content {
+        Some(content)
+    } else {
+        None
+    }
+}
+
+pub fn auto_import_missing_symbols_in_file(
+    proj_dir: &std::path::Path,
+    abs_file: &std::path::Path,
+    rel_path: &str,
+    extra_missing_idents: &[String],
+) -> Option<String> {
+    let Ok(orig_content) = std::fs::read_to_string(abs_file) else {
+        return None;
+    };
+    auto_import_missing_symbols_in_content(proj_dir, abs_file, rel_path, &orig_content, extra_missing_idents)
+}
+
+pub fn auto_import_missing_symbols_in_project(proj_dir: &std::path::Path) -> usize {
+    let mut updated = 0usize;
+    fn walk_tsx(dir: &std::path::Path, proj_dir: &std::path::Path, updated: &mut usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                let n = p.file_name().and_then(|x| x.to_str()).unwrap_or("");
+                if n != "node_modules" && n != ".next" && n != ".git" && n != ".axiom" && n != "prisma" {
+                    walk_tsx(&p, proj_dir, updated);
+                }
+            } else if p.is_file() {
+                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if matches!(ext, "tsx" | "jsx") {
+                    if let Ok(rel) = p.strip_prefix(proj_dir) {
+                        let rel_str = rel.to_string_lossy().replace('\\', "/");
+                        if let Some(next_content) = auto_import_missing_symbols_in_file(proj_dir, &p, &rel_str, &[]) {
+                            if std::fs::write(&p, next_content).is_ok() {
+                                *updated += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if proj_dir.join("src").is_dir() {
+        walk_tsx(&proj_dir.join("src"), proj_dir, &mut updated);
+    } else {
+        for d_name in ["app", "components", "hooks", "lib", "pages"] {
+            let d = proj_dir.join(d_name);
+            if d.is_dir() {
+                walk_tsx(&d, proj_dir, &mut updated);
+            }
+        }
+    }
+    updated
+}
+
 /// Inspects real `.d.ts` type definitions in `node_modules/` for external npm packages imported
-/// by `file_content` when `error_context` indicates missing symbol/export/module errors.
+/// by `file_content` when `error_context` indicates missing symbol/export/module/reference errors.
 /// Enforces a strict wildcard bailout guard (max depth 1, <= 15 relative `export *`) so a
-/// truncated partial symbol list is never presented as exhaustive truth to the LLM.
+/// truncated partial symbol list is never presented as exhaustive truth to the LLM, while also
+/// performing single-symbol `.d.ts` resolution for `TS2304`/`ReferenceError` missing identifiers.
 pub fn inspect_dts_exports_for_file(proj_dir: &std::path::Path, file_content: &str, error_context: &str) -> String {
     let err_lower = error_context.to_lowercase();
     let has_symbol_or_mod_err = error_context.contains("TS2305")
@@ -1417,10 +2135,14 @@ pub fn inspect_dts_exports_for_file(proj_dir: &std::path::Path, file_content: &s
         || error_context.contains("TS2724")
         || error_context.contains("TS2307")
         || error_context.contains("TS2339")
+        || error_context.contains("TS2304")
+        || error_context.contains("ReferenceError")
         || err_lower.contains("has no exported member")
         || err_lower.contains("does not contain a default export")
         || err_lower.contains("attempted import error")
-        || err_lower.contains("module not found");
+        || err_lower.contains("module not found")
+        || err_lower.contains("is not defined")
+        || err_lower.contains("cannot find name");
     if !has_symbol_or_mod_err || !proj_dir.join("node_modules").is_dir() {
         return String::new();
     }
@@ -1448,59 +2170,69 @@ pub fn inspect_dts_exports_for_file(proj_dir: &std::path::Path, file_content: &s
             specs.push(raw_spec.to_string());
         }
     }
-    if specs.is_empty() {
-        return String::new();
-    }
-
-    // Prioritize external specifiers directly mentioned in `error_context`
-    let mentioned: Vec<String> = specs
-        .iter()
-        .filter(|s| error_context.contains(s.as_str()) || err_lower.contains(&s.to_lowercase()))
-        .cloned()
-        .collect();
-    let ordered_specs = if !mentioned.is_empty() { mentioned } else { specs };
-
-    let err_tokens: std::collections::HashSet<String> = error_context
-        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$')
-        .filter(|t| t.len() >= 2)
-        .map(|t| t.to_lowercase())
-        .collect();
 
     let mut lines: Vec<String> = Vec::new();
-    for spec in ordered_specs.into_iter().take(3) {
-        let Some(dts_path) = resolve_external_dts_path(proj_dir, &spec) else {
-            continue;
-        };
-        let parsed = parse_dts_exports_with_guard(&dts_path);
-        if parsed.incomplete || (parsed.symbols.is_empty() && !parsed.has_default) {
-            continue;
+    if !specs.is_empty() {
+        // Prioritize external specifiers directly mentioned in `error_context`
+        let mentioned: Vec<String> = specs
+            .iter()
+            .filter(|s| error_context.contains(s.as_str()) || err_lower.contains(&s.to_lowercase()))
+            .cloned()
+            .collect();
+        let ordered_specs = if !mentioned.is_empty() { mentioned } else { specs.clone() };
+
+        let err_tokens: std::collections::HashSet<String> = error_context
+            .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$')
+            .filter(|t| t.len() >= 2)
+            .map(|t| t.to_lowercase())
+            .collect();
+
+        for spec in ordered_specs.into_iter().take(3) {
+            let Some(dts_path) = resolve_external_dts_path(proj_dir, &spec) else {
+                continue;
+            };
+            let parsed = parse_dts_exports_with_guard(&dts_path);
+            if parsed.incomplete || (parsed.symbols.is_empty() && !parsed.has_default) {
+                continue;
+            }
+
+            let total_syms = parsed.symbols.len();
+            let mut syms = parsed.symbols;
+            syms.sort_by(|a, b| {
+                let a_low = a.to_lowercase();
+                let b_low = b.to_lowercase();
+                let a_hit = err_tokens.contains(&a_low) || err_tokens.iter().any(|t| t.len() >= 3 && (a_low.contains(t) || t.contains(&a_low)));
+                let b_hit = err_tokens.contains(&b_low) || err_tokens.iter().any(|t| t.len() >= 3 && (b_low.contains(t) || t.contains(&b_low)));
+                b_hit.cmp(&a_hit).then_with(|| a.cmp(b))
+            });
+
+            let truncated_extra = total_syms.saturating_sub(40);
+            let displayed: Vec<String> = syms.into_iter().take(40).collect();
+            let sym_str = if displayed.is_empty() {
+                "(default export only)".to_string()
+            } else if truncated_extra > 0 {
+                format!("{} (+{} more exports)", displayed.join(", "), truncated_extra)
+            } else {
+                displayed.join(", ")
+            };
+            lines.push(format!(
+                "- `{}` [default export: {}]: {}",
+                spec,
+                if parsed.has_default { "yes" } else { "no" },
+                sym_str
+            ));
         }
+    }
 
-        let total_syms = parsed.symbols.len();
-        let mut syms = parsed.symbols;
-        syms.sort_by(|a, b| {
-            let a_low = a.to_lowercase();
-            let b_low = b.to_lowercase();
-            let a_hit = err_tokens.contains(&a_low) || err_tokens.iter().any(|t| t.len() >= 3 && (a_low.contains(t) || t.contains(&a_low)));
-            let b_hit = err_tokens.contains(&b_low) || err_tokens.iter().any(|t| t.len() >= 3 && (b_low.contains(t) || t.contains(&b_low)));
-            b_hit.cmp(&a_hit).then_with(|| a.cmp(b))
-        });
-
-        let truncated_extra = total_syms.saturating_sub(40);
-        let displayed: Vec<String> = syms.into_iter().take(40).collect();
-        let sym_str = if displayed.is_empty() {
-            "(default export only)".to_string()
-        } else if truncated_extra > 0 {
-            format!("{} (+{} more exports)", displayed.join(", "), truncated_extra)
-        } else {
-            displayed.join(", ")
-        };
-        lines.push(format!(
-            "- `{}` [default export: {}]: {}",
-            spec,
-            if parsed.has_default { "yes" } else { "no" },
-            sym_str
-        ));
+    // Resolve concrete installed package subpath for missing TS2304 / ReferenceError symbols
+    let missing_idents = extract_missing_ident_candidates_from_error(error_context);
+    for ident in missing_idents.into_iter().take(4) {
+        if let Some(resolved_spec) = find_installed_dts_package_for_symbol(proj_dir, &specs, &ident) {
+            lines.push(format!(
+                "- Verified symbol on disk for `{}`: `import {{ {} }} from '{}';`",
+                ident, ident, resolved_spec
+            ));
+        }
     }
 
     if lines.is_empty() {
@@ -1610,6 +2342,7 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
         entry_id: String,
         source: String,
         prev_file_errors: usize,
+        prev_diags: Vec<String>,
     }
 
     let client = reqwest::Client::new();
@@ -1641,7 +2374,7 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
     // Discovers ALL type & import errors simultaneously and repairs in topological order.
     // =========================================================================
     if has_local_tsc {
-        const MAX_TSC_ROUNDS: usize = 8;
+        const MAX_TSC_ROUNDS: usize = 10;
         let mut pending_tsc_fixes: Vec<PendingBuildFix> = Vec::new();
         let mut prev_total_tsc_errors: Option<usize> = None;
         let mut rollback_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -1652,15 +2385,20 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
             };
 
             let mut file_err_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            let mut per_file_diag_lines: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
             for d in &diags {
                 let key = resolve_project_file_candidate(proj_dir, &d.file)
                     .unwrap_or_else(|| d.file.clone())
                     .to_lowercase();
-                *file_err_counts.entry(key).or_insert(0) += 1;
+                *file_err_counts.entry(key.clone()).or_insert(0) += 1;
+                per_file_diag_lines
+                    .entry(key)
+                    .or_default()
+                    .push(format!("Line {}, Col {}: [{}] {}", d.line, d.col, d.code, d.message));
             }
             let total_errors = diags.len();
 
-            // Verify previous Tier 1 fixes with rollback protection on regression or zero improvement
+            // Verify previous Tier 1 fixes with diff-based partial progress retention & rollback protection
             if !pending_tsc_fixes.is_empty() {
                 let total_spiked = prev_total_tsc_errors
                     .map(|prev| total_errors > prev + 3)
@@ -1668,8 +2406,14 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
 
                 for pf in pending_tsc_fixes.drain(..) {
                     let pf_key = pf.path.to_lowercase();
+                    let cur_diags = per_file_diag_lines.get(&pf_key).cloned().unwrap_or_default();
                     let cur_errs = *file_err_counts.get(&pf_key).unwrap_or(&0);
-                    let improved = cur_errs < pf.prev_file_errors && !total_spiked;
+                    let diff = crate::katastar::compute_diagnostic_diff(&pf.prev_diags, &cur_diags);
+                    let improved = !total_spiked
+                        && diff.introduced.is_empty()
+                        && (cur_errs < pf.prev_file_errors
+                            || (!diff.resolved.is_empty() && cur_errs <= pf.prev_file_errors));
+                    let round_num = round.saturating_sub(1).max(1);
 
                     if tsc_ok || cur_errs == 0 {
                         let atomic_patch = if pf.source == "ai" {
@@ -1686,7 +2430,48 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                             None,
                             model,
                         );
+                        crate::katastar::record_project_heal_round(
+                            proj_dir,
+                            &pf.path,
+                            round_num,
+                            &pf.source,
+                            "verified",
+                            &diff.resolved,
+                            &cur_diags,
+                            &format!("tsc cleared errors ({} -> 0)", pf.prev_file_errors),
+                        );
                         debug_log_to_file(format!("[Katastar] Tier 1 tsc passed for '{}' (entry {}).", pf.path, pf.entry_id));
+                    } else if pf.source == "ai" && improved {
+                        // Verified partial progress: keep edit on disk, record resolved vs unresolved in project ledger,
+                        // and do NOT promote partial fix as globally verified in Katastar.
+                        crate::katastar::finalize_katastar_outcome(
+                            &pf.entry_id,
+                            false,
+                            &pf.source,
+                            "partial_progress",
+                            None,
+                            None,
+                            model,
+                        );
+                        crate::katastar::record_project_heal_round(
+                            proj_dir,
+                            &pf.path,
+                            round_num,
+                            &pf.source,
+                            "partial_progress",
+                            &diff.resolved,
+                            &cur_diags,
+                            &format!(
+                                "kept partial progress (errors {} -> {}, resolved {}, introduced 0)",
+                                pf.prev_file_errors,
+                                cur_errs,
+                                diff.resolved.len()
+                            ),
+                        );
+                        debug_log_to_file(format!(
+                            "[Self-Healing] Kept partial Tier 1 improvement on '{}' (errors {} -> {}, resolved {}).",
+                            pf.path, pf.prev_file_errors, cur_errs, diff.resolved.len()
+                        ));
                     } else {
                         crate::katastar::finalize_katastar_outcome(
                             &pf.entry_id,
@@ -1700,16 +2485,30 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                         if pf.source == "katastar" {
                             tried_katastar_ids.push(pf.entry_id);
                         }
-                        if pf.source == "katastar" || !improved {
-                            restore_pending_file_snapshot(proj_dir, &pf.path, &pf.before);
-                            if pf.source == "ai" {
-                                *rollback_counts.entry(pf_key.clone()).or_insert(0) += 1;
-                            }
-                            debug_log_to_file(format!(
-                                "[Self-Healing] Rolled back Tier 1 {} edit on '{}' (errors {} -> {}, total spiked={}).",
-                                pf.source, pf.path, pf.prev_file_errors, cur_errs, total_spiked
-                            ));
+                        restore_pending_file_snapshot(proj_dir, &pf.path, &pf.before);
+                        if pf.source == "ai" {
+                            *rollback_counts.entry(pf_key.clone()).or_insert(0) += 1;
                         }
+                        crate::katastar::record_project_heal_round(
+                            proj_dir,
+                            &pf.path,
+                            round_num,
+                            &pf.source,
+                            "rolled_back",
+                            &[],
+                            &pf.prev_diags,
+                            &format!(
+                                "rolled back (errors {} -> {}, introduced {}, total_spiked={})",
+                                pf.prev_file_errors,
+                                cur_errs,
+                                diff.introduced.len(),
+                                total_spiked
+                            ),
+                        );
+                        debug_log_to_file(format!(
+                            "[Self-Healing] Rolled back Tier 1 {} edit on '{}' (errors {} -> {}, introduced {}, total spiked={}).",
+                            pf.source, pf.path, pf.prev_file_errors, cur_errs, diff.introduced.len(), total_spiked
+                        ));
                     }
                 }
             }
@@ -1761,7 +2560,7 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                 break;
             }
             sorted_files.retain(|(p, _)| *rollback_counts.get(&p.to_lowercase()).unwrap_or(&0) < 2);
-            sorted_files.truncate(3);
+            sorted_files.truncate(4);
 
             // Try Katastar verified patches first
             let mut katastar_hints: Vec<String> = Vec::new();
@@ -1790,6 +2589,10 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                         && std::fs::write(&full_path, &processed).is_ok()
                     {
                         katastar_applied_any = true;
+                        let prev_diags = per_file_diag_lines
+                            .get(&path_str.to_lowercase())
+                            .cloned()
+                            .unwrap_or_default();
                         pending_tsc_fixes.push(PendingBuildFix {
                             path: path_str.clone(),
                             before: orig_content,
@@ -1797,6 +2600,7 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                             entry_id: best.entry_id.clone(),
                             source: "katastar".to_string(),
                             prev_file_errors: file_diags.len(),
+                            prev_diags,
                         });
                     }
                 }
@@ -1805,13 +2609,15 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                 continue;
             }
 
-            // Build Tier 1 AI prompt with exact TS diagnostics & imported exporter contracts
+            // Build Tier 1 AI prompt with exact TS diagnostics, imported exporter contracts & chain-of-information ledger
             let mut batch_payload = Vec::new();
             let mut exporter_context = String::new();
             let mut diag_summary = String::new();
+            let mut chain_ctx = String::new();
             let mut extra_rulepacks = String::new();
             let mut expected_paths: Vec<String> = Vec::new();
             let mut pkg_ctx = String::new();
+            let heal_ledger = crate::katastar::load_project_heal_ledger(proj_dir);
 
             for (path_str, file_diags) in &sorted_files {
                 let full_path = proj_dir.join(path_str);
@@ -1820,6 +2626,17 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                 diag_summary.push_str(&format!("\n--- {} ({} errors) ---\n", path_str, file_diags.len()));
                 for d in file_diags.iter().take(12) {
                     diag_summary.push_str(&format!("  Line {}, Col {}: [{}] {}\n", d.line, d.col, d.code, d.message));
+                }
+                let norm_ledger_key = path_str.trim().replace('\\', "/").trim_start_matches("./").to_string();
+                if heal_ledger.files.get(&norm_ledger_key).map_or(false, |e| !e.attempts.is_empty() || !e.resolved.is_empty()) {
+                    let cur_lines = per_file_diag_lines
+                        .get(&path_str.to_lowercase())
+                        .cloned()
+                        .unwrap_or_default();
+                    let file_coi = crate::katastar::format_chain_of_information_prompt(proj_dir, path_str, &cur_lines, round);
+                    if !file_coi.is_empty() {
+                        chain_ctx.push_str(&format!("\n[History for {}]{}", path_str, file_coi));
+                    }
                 }
                 if exporter_context.len() < 4500 {
                     exporter_context.push_str(&collect_exporter_context_for_file(proj_dir, path_str, &orig_content));
@@ -1875,10 +2692,11 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
             }
 
             let user_prompt = format!(
-                "TypeScript Diagnostics:{}\n\n{}{}\nFiles to fix (JSON):\n{}\n\nReturn ONLY a JSON object `{{\"files\": [{{\"path\": \"...\", \"content\": \"...\"}}]}}` containing the complete repaired files.",
+                "TypeScript Diagnostics:{}\n\n{}{}{}\nFiles to fix (JSON):\n{}\n\nReturn ONLY a JSON object `{{\"files\": [{{\"path\": \"...\", \"content\": \"...\"}}]}}` containing the complete repaired files.",
                 diag_summary,
                 exporter_context,
                 contracts_ctx,
+                chain_ctx,
                 serde_json::to_string_pretty(&batch_payload).unwrap_or_default()
             );
 
@@ -1912,14 +2730,38 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                                 if processed == before {
                                     continue;
                                 }
+                                let prev_diags = per_file_diag_lines
+                                    .get(&path_str.to_lowercase())
+                                    .cloned()
+                                    .unwrap_or_default();
                                 if !before.is_empty() {
                                     if let Some(drop_reason) = crate::healer::detect_destructive_code_drop(&path_str, &before, &processed) {
                                         debug_log_to_file(format!("[Self-Healing] {}", drop_reason));
+                                        crate::katastar::record_project_heal_round(
+                                            proj_dir,
+                                            &path_str,
+                                            round,
+                                            "ai",
+                                            "rejected_drop",
+                                            &[],
+                                            &prev_diags,
+                                            &drop_reason,
+                                        );
                                         continue;
                                     }
                                 }
-                                if let Err(val_err) = crate::orchestrator::validate_file_with_abstract_rules(&path_str, &processed, model).await {
+                                if let Err(val_err) = crate::orchestrator::validate_file_with_project_context(proj_dir, &path_str, &processed, model).await {
                                     debug_log_to_file(format!("[Self-Healing] Rejected Tier 1 candidate for '{}': {}", path_str, val_err));
+                                    crate::katastar::record_project_heal_round(
+                                        proj_dir,
+                                        &path_str,
+                                        round,
+                                        "ai",
+                                        "validation_rejected",
+                                        &[],
+                                        &prev_diags,
+                                        &val_err,
+                                    );
                                     continue;
                                 }
                                 if let Some(parent) = full_path.parent() {
@@ -1954,6 +2796,7 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                                         entry_id,
                                         source: "ai".to_string(),
                                         prev_file_errors: prev_err,
+                                        prev_diags,
                                     });
                                 }
                             }
@@ -2169,6 +3012,7 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                             entry_id: best.entry_id.clone(),
                             source: "katastar".to_string(),
                             prev_file_errors: 1,
+                            prev_diags: Vec::new(),
                         });
                     }
                 }
@@ -2285,7 +3129,7 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                                     continue;
                                 }
                             }
-                            if let Err(val_err) = crate::orchestrator::validate_file_with_abstract_rules(&path_str, &processed, model).await {
+                            if let Err(val_err) = crate::orchestrator::validate_file_with_project_context(proj_dir, &path_str, &processed, model).await {
                                 debug_log_to_file(format!("[Self-Healing] Rejected Tier 2 candidate for '{}': {}", path_str, val_err));
                                 continue;
                             }
@@ -2312,6 +3156,7 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                                     entry_id,
                                     source: "ai".to_string(),
                                     prev_file_errors: 1,
+                                    prev_diags: Vec::new(),
                                 });
                             }
                         }
