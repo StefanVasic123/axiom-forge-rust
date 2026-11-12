@@ -3098,6 +3098,13 @@ pub async fn project_heal_compile_error(
     if is_api_or_prisma_issue {
         base_system_prompt.push_str(crate::self_healing::ZOD_PRISMA_TS2322_HEAL_GUIDE);
     }
+    let structural_diags = crate::reviewer::diagnose_heal_stagnation(&rel_file_path, &file_content, &current_error_context, 0);
+    if !structural_diags.is_empty() {
+        base_system_prompt.push_str("\n\n--- SEMANTIC & FORMAT REVIEW FINDINGS ---\n");
+        for sd in structural_diags {
+            base_system_prompt.push_str(&format!("- {}\n", sd));
+        }
+    }
 
     let contracts_prompt = crate::orchestrator::format_axiom_contracts_prompt(&proj_dir, &rel_file_path);
     let prisma_heal_summary = if is_api_or_prisma_issue {

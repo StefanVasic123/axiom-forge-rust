@@ -1334,6 +1334,7 @@ pub fn sanitize_package_json_value_for_offline(json_val: &mut Value) -> bool {
         "jest",
         "ts-jest",
         "@types/jest",
+        "@types/prisma",
         "react-testing-library",
         "@testing-library/react",
         "@testing-library/jest-dom",
@@ -1465,17 +1466,49 @@ pub fn sanitize_package_json_value_for_offline(json_val: &mut Value) -> bool {
                 }
             }
         }
-        // Strip stale React <18 pins from `resolutions` / `overrides` in Next.js projects (e.g. Next 14 requires React >=18)
+        // Upgrade legacy Stripe SDK (<12, e.g. `^8.135.0` -> `^17.5.0`) while preserving `>=12` pins
+        for sec in &["dependencies", "devDependencies"] {
+            if let Some(deps) = obj.get_mut(*sec).and_then(|d| d.as_object_mut()) {
+                let upgrade_stripe = deps
+                    .get("stripe")
+                    .and_then(|v| v.as_str())
+                    .map_or(false, |ver| {
+                        let cleaned = ver
+                            .trim()
+                            .trim_start_matches(|c: char| matches!(c, '^' | '~' | '>' | '<' | '=' | 'v' | 'V' | ' '));
+                        let major_str = cleaned.split('.').next().unwrap_or("");
+                        matches!(major_str.parse::<u32>(), Ok(m) if m < 12)
+                    });
+                if upgrade_stripe {
+                    deps.insert("stripe".to_string(), serde_json::json!("^17.5.0"));
+                    changed = true;
+                }
+            }
+        }
+
+        // Strip stale React <18 pins and TypeScript <5 pins from `resolutions` / `overrides` in Next.js / TS5 projects
         let explicit_react17_dep = obj
             .get("dependencies")
             .and_then(|d| d.as_object())
             .and_then(|d| d.get("react"))
             .and_then(|v| v.as_str())
             .map_or(false, is_legacy_react_lt18_pin);
-        if is_nextjs_ctx && !explicit_react17_dep {
-            for pin_section in &["resolutions", "overrides"] {
-                let mut became_empty = false;
-                if let Some(sec_obj) = obj.get_mut(*pin_section).and_then(|s| s.as_object_mut()) {
+        let has_ts5_dep = obj
+            .get("devDependencies")
+            .or_else(|| obj.get("dependencies"))
+            .and_then(|d| d.as_object())
+            .and_then(|d| d.get("typescript"))
+            .and_then(|v| v.as_str())
+            .map_or(false, |ver| {
+                let v = ver
+                    .trim()
+                    .trim_start_matches(|c: char| matches!(c, '^' | '~' | '=' | 'v' | 'V'));
+                v.starts_with("5.") || v == "5"
+            });
+        for pin_section in &["resolutions", "overrides"] {
+            let mut became_empty = false;
+            if let Some(sec_obj) = obj.get_mut(*pin_section).and_then(|s| s.as_object_mut()) {
+                if is_nextjs_ctx && !explicit_react17_dep {
                     for pkg_k in &["react", "react-dom"] {
                         let should_remove = sec_obj
                             .get(*pkg_k)
@@ -1486,11 +1519,26 @@ pub fn sanitize_package_json_value_for_offline(json_val: &mut Value) -> bool {
                             changed = true;
                         }
                     }
-                    became_empty = sec_obj.is_empty();
                 }
-                if became_empty {
-                    obj.remove(*pin_section);
+                if has_ts5_dep {
+                    let remove_ts_pin = sec_obj
+                        .get("typescript")
+                        .and_then(|v| v.as_str())
+                        .map_or(false, |ver| {
+                            let v = ver
+                                .trim()
+                                .trim_start_matches(|c: char| matches!(c, '^' | '~' | '=' | 'v' | 'V'));
+                            v.starts_with("4.") || v == "4" || v.starts_with("3.") || v == "3"
+                        });
+                    if remove_ts_pin {
+                        sec_obj.remove("typescript");
+                        changed = true;
+                    }
                 }
+                became_empty = sec_obj.is_empty();
+            }
+            if became_empty {
+                obj.remove(*pin_section);
             }
         }
     }
@@ -2283,6 +2331,9 @@ pub async fn run_npm_install_with_auto_healing(
         // package-lock.json intact before weakening version ranges or removing valid packages.
         if prefer_offline {
             prefer_offline = false;
+            if let Some((prev_eid, _, prev_source)) = pending_npm_repair.take() {
+                crate::katastar::finalize_katastar_outcome(&prev_eid, false, &prev_source, "npm_install", None, None, "");
+            }
             let eid = crate::katastar::register_repair_attempt(
                 "npm",
                 &err_log,
@@ -2296,6 +2347,10 @@ pub async fn run_npm_install_with_auto_healing(
             pending_npm_repair = Some((eid, cur_sig_info.error_signature, "deterministic".to_string()));
             emit_log("> [Self-Healing] Offline npm cache nije uspeo (moguć zastareo cache packument). Prelazim na online npm rezoluciju bez --prefer-offline...\n", false);
             continue;
+        }
+
+        if let Some((prev_eid, _, prev_source)) = pending_npm_repair.take() {
+            crate::katastar::finalize_katastar_outcome(&prev_eid, false, &prev_source, "npm_install", None, None, "");
         }
 
         if let Some(action) = analyze_npm_install_failure(&err_log) {

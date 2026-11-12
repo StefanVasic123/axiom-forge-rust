@@ -816,6 +816,14 @@ window.electronAPI = {
         throw e;
       }
     },
+    getPolicyRegistry: async () => {
+      try {
+        return await invoke('get_policy_registry');
+      } catch (e) {
+        console.error('Failed to get policy registry:', e);
+        throw e;
+      }
+    },
     exportTrainingDataset: async (outputDir = null, modelBase = null) => {
       try {
         return await invoke('export_mini_llm_training_dataset', { outputDir, modelBase });

@@ -844,6 +844,22 @@ pub fn get_verified_sanitizer_patches_at(store_path: &std::path::Path, file_path
     out
 }
 
+pub fn normalize_katastar_hint(hint: &str) -> String {
+    let trimmed = hint.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let low = trimmed.to_lowercase();
+    if low == "popravka generisana od strane ai modela"
+        || low == "izvučen popravljen kod iz ai odgovora"
+        || low == "izvucen popravljen kod iz ai odgovora"
+        || low == "primenjen kompletan popravljen kod iz ai odgovora"
+    {
+        return String::new();
+    }
+    truncate_chars(&scrub_sensitive_text(trimmed), 280)
+}
+
 pub fn register_repair_attempt_at(
     store_path: &std::path::Path,
     category: &str,
@@ -864,7 +880,7 @@ pub fn register_repair_attempt_at(
     };
     let id = entry_id_for(&sig_info.category, &sig_info.error_signature, &strategy_key);
     let now = chrono::Utc::now().to_rfc3339();
-    let scrubbed_hint = truncate_chars(&scrub_sensitive_text(hint), 280);
+    let scrubbed_hint = normalize_katastar_hint(hint);
 
     let _guard = katastar_lock();
     let mut store = load_katastar_store_at(store_path);
@@ -987,7 +1003,7 @@ pub fn finalize_katastar_outcome_at(
                 }
             }
             if let Some(h) = upgraded_hint {
-                let clean_h = truncate_chars(&scrub_sensitive_text(h), 280);
+                let clean_h = normalize_katastar_hint(h);
                 if !clean_h.is_empty() {
                     entry.hint = clean_h;
                 }
@@ -1579,27 +1595,73 @@ fn classify_error_domain(text: &str) -> &'static str {
     }
 }
 
-fn extract_error_count_from_warnings(warnings: &[String]) -> usize {
-    let mut total = 0usize;
-    let re_paren = regex::Regex::new(r"TypeScript greške\s*\((\d+)\)").ok();
-    let re_prijavila = regex::Regex::new(r"prijavila\s+(\d+)\s+greš").ok();
+struct WarningSummary {
+    residual_errors: usize,
+    has_prisma_failure: bool,
+    has_build_failure: bool,
+}
+
+fn summarize_warnings_metrics(warnings: &[String], project_name: &str) -> WarningSummary {
+    let re_ts_paren = regex::Regex::new(r"TypeScript greške\s*\((\d+)\)").ok();
+    let re_ts_prijavila = regex::Regex::new(r"TypeScript provera prijavila\s+(\d+)\s+greš").ok();
+    let re_unresolved_imports = regex::Regex::new(r"nerazrešeni lokalni importi\s*\((\d+)\)").ok();
+
+    let mut max_ts_errors: Option<usize> = None;
+    let mut non_ts_errors: usize = 0;
+    let mut has_prisma_failure = project_name.eq_ignore_ascii_case("Business Analysis Failed");
+    let mut has_build_failure = false;
+
     for w in warnings {
-        let mut matched_num = None;
-        if let Some(ref re) = re_paren {
-            if let Some(c) = re.captures(w) {
-                matched_num = c.get(1).and_then(|m| m.as_str().parse::<usize>().ok());
-            }
+        let low = w.to_lowercase();
+        if low.contains("prisma validation")
+            || low.contains("prisma validate nije prošao")
+            || low.contains("p1012")
+        {
+            has_prisma_failure = true;
         }
-        if matched_num.is_none() {
-            if let Some(ref re) = re_prijavila {
-                if let Some(c) = re.captures(w) {
-                    matched_num = c.get(1).and_then(|m| m.as_str().parse::<usize>().ok());
-                }
-            }
+        if low.contains("next build greška")
+            || low.contains("next build nije uspeo")
+            || low.contains("failed to compile")
+        {
+            has_build_failure = true;
         }
-        total += matched_num.unwrap_or(1);
+
+        let ts_num = re_ts_paren
+            .as_ref()
+            .and_then(|re| re.captures(w))
+            .and_then(|c| c.get(1))
+            .and_then(|m| m.as_str().parse::<usize>().ok())
+            .or_else(|| {
+                re_ts_prijavila
+                    .as_ref()
+                    .and_then(|re| re.captures(w))
+                    .and_then(|c| c.get(1))
+                    .and_then(|m| m.as_str().parse::<usize>().ok())
+            });
+
+        if let Some(n) = ts_num {
+            // Avoid double-counting when both "TypeScript greške (N)" and "TypeScript provera prijavila N grešaka" appear
+            max_ts_errors = Some(max_ts_errors.map_or(n, |cur| cur.max(n)));
+            continue;
+        }
+
+        if let Some(import_n) = re_unresolved_imports
+            .as_ref()
+            .and_then(|re| re.captures(w))
+            .and_then(|c| c.get(1))
+            .and_then(|m| m.as_str().parse::<usize>().ok())
+        {
+            non_ts_errors += import_n;
+        } else {
+            non_ts_errors += 1;
+        }
     }
-    total
+
+    WarningSummary {
+        residual_errors: max_ts_errors.unwrap_or(0) + non_ts_errors,
+        has_prisma_failure,
+        has_build_failure,
+    }
 }
 
 fn count_workspace_code_files(proj_dir: &std::path::Path) -> usize {
@@ -1691,10 +1753,11 @@ pub fn compute_model_progress_telemetry_at(
     struct CohortPoint {
         version: String,
         model_id: String,
+        is_instrumented: bool,
+        is_clean_build: bool,
         f100: f64,
         bug_scope: f64,
         accuracy: f64,
-        warnings_count: usize,
         residual_errors: usize,
     }
     let mut points: Vec<CohortPoint> = Vec::new();
@@ -1706,6 +1769,7 @@ pub fn compute_model_progress_telemetry_at(
         }
         let name = proj.get("name").and_then(|v| v.as_str()).unwrap_or(&pid).to_string();
         let created_at = proj.get("createdAt").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let proj_status = proj.get("status").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase();
         let proj_dir = proj
             .get("localPath")
             .and_then(|v| v.as_str())
@@ -1725,10 +1789,11 @@ pub fn compute_model_progress_telemetry_at(
             }
         };
 
+        let heal_ledger_path = proj_dir.join(".axiom/heal-ledger.json");
+        let has_heal_ledger = heal_ledger_path.is_file();
         let heal_ledger: ProjectHealLedger = {
-            let p = proj_dir.join(".axiom/heal-ledger.json");
-            if p.is_file() {
-                std::fs::read_to_string(&p)
+            if has_heal_ledger {
+                std::fs::read_to_string(&heal_ledger_path)
                     .ok()
                     .and_then(|s| serde_json::from_str(&s).ok())
                     .unwrap_or_default()
@@ -1757,6 +1822,7 @@ pub fn compute_model_progress_telemetry_at(
             .filter(|s| !s.trim().is_empty())
             .map(|s| s.trim().to_string());
         let version = explicit_ver.unwrap_or_else(|| infer_app_version_from_timestamp(&created_at));
+        let (maj, min, pat, _) = semver_sort_key(&version);
 
         let model_id = proj
             .get("metadata")
@@ -1772,6 +1838,20 @@ pub fn compute_model_progress_telemetry_at(
                 continue;
             }
         }
+
+        let has_warnings_field = proj.get("metadata").and_then(|m| m.get("warnings")).is_some()
+            || proj.get("metadata").and_then(|m| m.get("hasWarnings")).is_some()
+            || gen_state.get("warnings").is_some()
+            || gen_state.get("hasWarnings").is_some();
+
+        let gs_status = gen_state.get("status").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase();
+        let gs_phase = gen_state.get("phase").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase();
+        let is_in_progress = matches!(proj_status.as_str(), "generating" | "analyzing" | "pending")
+            && gs_status != "completed"
+            && gs_phase != "complete";
+
+        // Projects created prior to v0.1.48 without saved warnings or heal-ledger were unmeasured.
+        let is_instrumented = has_warnings_field || has_heal_ledger || (maj, min, pat) >= (0, 1, 48);
 
         let mut warnings: Vec<String> = proj
             .get("metadata")
@@ -1800,7 +1880,8 @@ pub fn compute_model_progress_telemetry_at(
         let total_files = disk_files_len.max(completed_files_len).max(1);
 
         let mut affected_files: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let file_ref_re = regex::Regex::new(r"(?:src/)?[A-Za-z0-9_.\-/\[\]]+\.(?:tsx|ts|jsx|js|prisma)").ok();
+        let mut healed_files_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let file_ref_re = regex::Regex::new(r"(?:src/)?[A-Za-z0-9_.\-/\[\]]+\.(?:tsx|ts|jsx|js|css|prisma)").ok();
         for w in &warnings {
             let dom = classify_error_domain(w);
             if let Some(acc) = domain_map.get_mut(dom) {
@@ -1814,11 +1895,11 @@ pub fn compute_model_progress_telemetry_at(
             }
         }
 
-        let mut healed_files_count = 0usize;
         let mut ledger_resolved_count = 0usize;
         for (fpath, entry) in &heal_ledger.files {
+            let norm_fp = fpath.to_lowercase();
             if !entry.resolved.is_empty() {
-                healed_files_count += 1;
+                healed_files_set.insert(norm_fp.clone());
                 ledger_resolved_count += entry.resolved.len();
                 for res_item in &entry.resolved {
                     let dom = classify_error_domain(&format!("{} {}", fpath, res_item));
@@ -1829,7 +1910,7 @@ pub fn compute_model_progress_telemetry_at(
                 }
             }
             if !entry.unresolved.is_empty() {
-                affected_files.insert(fpath.to_lowercase());
+                affected_files.insert(norm_fp);
                 for unres in &entry.unresolved {
                     let dom = classify_error_domain(&format!("{} {}", fpath, unres));
                     if let Some(acc) = domain_map.get_mut(dom) {
@@ -1840,7 +1921,12 @@ pub fn compute_model_progress_telemetry_at(
             }
         }
 
-        let residual_errors = extract_error_count_from_warnings(&warnings);
+        let healed_files_count = healed_files_set.len();
+        let mut touched_files = affected_files.clone();
+        touched_files.extend(healed_files_set.iter().cloned());
+
+        let warn_summary = summarize_warnings_metrics(&warnings, &name);
+        let residual_errors = warn_summary.residual_errors;
         let total_features = features_val
             .get("features")
             .and_then(|v| v.as_array())
@@ -1848,47 +1934,92 @@ pub fn compute_model_progress_telemetry_at(
             .filter(|&n| n > 0)
             .unwrap_or_else(|| (total_files / 3).max(1));
 
-        let unresolved_file_count = if affected_files.is_empty() && !warnings.is_empty() {
+        let unresolved_file_count = if affected_files.is_empty() && (!warnings.is_empty() || warn_summary.has_prisma_failure) {
             1
         } else {
             affected_files.len()
         };
-        let bug_scope = ((unresolved_file_count as f64) / (total_files as f64)).clamp(0.0, 1.0);
-        let clean_first_pass_files = total_files.saturating_sub(healed_files_count + unresolved_file_count);
-        let f100 = if warnings.is_empty() && unresolved_file_count == 0 {
+
+        let telemetry_status = if is_in_progress {
+            "in_progress"
+        } else if !is_instrumented {
+            "unmeasured"
+        } else {
+            "measured"
+        };
+
+        let bug_scope = if !is_instrumented {
+            0.0
+        } else {
+            ((unresolved_file_count as f64) / (total_files as f64)).clamp(0.0, 1.0)
+        };
+        let clean_first_pass_files = total_files.saturating_sub(touched_files.len());
+        let f100 = if !is_instrumented {
+            0.0
+        } else if warnings.is_empty() && unresolved_file_count == 0 && !warn_summary.has_prisma_failure && !warn_summary.has_build_failure {
             if healed_files_count == 0 {
                 1.0
             } else {
-                // Features clean at first pass weighted with complete final healing
                 (0.45 * (clean_first_pass_files as f64 / total_files as f64) + 0.55).clamp(0.0, 1.0)
             }
         } else {
-            let buggy_features = (unresolved_file_count + (residual_errors / 8)).min(total_features);
+            // Failed Prisma schema invalidates DB/API backbone features across the app
+            let prisma_feature_penalty = if warn_summary.has_prisma_failure {
+                (total_features * 2).div_ceil(3)
+            } else {
+                0
+            };
+            let buggy_features = (unresolved_file_count + (residual_errors / 8) + prisma_feature_penalty).min(total_features);
             ((total_features.saturating_sub(buggy_features)) as f64 / (total_features as f64)).clamp(0.0, 1.0)
         };
 
         let mu = (residual_errors as f64) / (total_files as f64);
         let phi = 1.0 / (1.0 + 0.25 * mu);
-        let accuracy = ((0.55 * f100 + 0.45 * (1.0 - bug_scope)) * phi).clamp(0.0, 1.0);
+        let systemic_penalty = if warn_summary.has_prisma_failure {
+            0.35
+        } else if warn_summary.has_build_failure {
+            0.88
+        } else {
+            1.0
+        };
+        let accuracy = if !is_instrumented {
+            0.0
+        } else {
+            ((0.55 * f100 + 0.45 * (1.0 - bug_scope)) * phi * systemic_penalty).clamp(0.0, 1.0)
+        };
+        let is_clean_build = is_instrumented
+            && !is_in_progress
+            && warnings.is_empty()
+            && unresolved_file_count == 0
+            && residual_errors == 0
+            && !warn_summary.has_prisma_failure
+            && !warn_summary.has_build_failure;
 
-        points.push(CohortPoint {
-            version: version.clone(),
-            model_id: model_id.clone(),
-            f100,
-            bug_scope,
-            accuracy,
-            warnings_count: warnings.len(),
-            residual_errors,
-        });
+        if !is_in_progress {
+            points.push(CohortPoint {
+                version: version.clone(),
+                model_id: model_id.clone(),
+                is_instrumented,
+                is_clean_build,
+                f100,
+                bug_scope,
+                accuracy,
+                residual_errors,
+            });
+        }
 
         project_records.push(serde_json::json!({
             "id": pid,
             "name": name,
             "appVersion": version,
             "modelId": model_id,
+            "telemetryStatus": telemetry_status,
+            "isCleanBuild": is_clean_build,
+            "hasPrismaFailure": warn_summary.has_prisma_failure,
+            "hasBuildFailure": warn_summary.has_build_failure,
             "totalFiles": total_files,
             "totalFeatures": total_features,
-            "firstPassCleanRatePct": ((clean_first_pass_files as f64 / total_files as f64) * 1000.0).round() / 10.0,
+            "firstPassCleanRatePct": if is_instrumented { ((clean_first_pass_files as f64 / total_files as f64) * 1000.0).round() / 10.0 } else { 0.0 },
             "f100Pct": (f100 * 1000.0).round() / 10.0,
             "bugScopePct": (bug_scope * 1000.0).round() / 10.0,
             "accuracyPct": (accuracy * 1000.0).round() / 10.0,
@@ -1947,12 +2078,40 @@ pub fn compute_model_progress_telemetry_at(
     let mut ema_accuracy: Option<f64> = None;
 
     for ((_, _, _, ver_str), cohort) in by_version {
-        let n = cohort.len().max(1) as f64;
-        let mean_acc = cohort.iter().map(|p| p.accuracy).sum::<f64>() / n;
-        let mean_f100 = cohort.iter().map(|p| p.f100).sum::<f64>() / n;
-        let mean_bug_scope = cohort.iter().map(|p| p.bug_scope).sum::<f64>() / n;
-        let total_residual: usize = cohort.iter().map(|p| p.residual_errors).sum();
-        let clean_projects = cohort.iter().filter(|p| p.warnings_count == 0).count();
+        let mut cohort_models: Vec<String> = cohort
+            .iter()
+            .map(|p| p.model_id.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        cohort_models.sort();
+
+        let measured: Vec<&CohortPoint> = cohort.iter().filter(|p| p.is_instrumented).collect();
+        if measured.is_empty() {
+            versions_timeline.push(serde_json::json!({
+                "version": format!("v{}", ver_str),
+                "rawVersion": ver_str,
+                "telemetryStatus": "unmeasured",
+                "projectCount": cohort.len(),
+                "cleanProjectsCount": 0,
+                "models": cohort_models,
+                "rawAccuracyPct": 0.0,
+                "exponentialIndexPct": 0.0,
+                "f100Pct": 0.0,
+                "bugScopePct": 0.0,
+                "deltaVsPrevPct": 0.0,
+                "deltaVsBestPct": 0.0,
+                "totalResidualErrors": 0,
+            }));
+            continue;
+        }
+
+        let n = measured.len().max(1) as f64;
+        let mean_acc = measured.iter().map(|p| p.accuracy).sum::<f64>() / n;
+        let mean_f100 = measured.iter().map(|p| p.f100).sum::<f64>() / n;
+        let mean_bug_scope = measured.iter().map(|p| p.bug_scope).sum::<f64>() / n;
+        let total_residual: usize = measured.iter().map(|p| p.residual_errors).sum();
+        let clean_projects = measured.iter().filter(|p| p.is_clean_build).count();
 
         let delta_vs_prev = prev_accuracy.map(|p| mean_acc - p).unwrap_or(0.0);
         let delta_vs_best = best_accuracy.map(|b| mean_acc - b).unwrap_or(0.0);
@@ -1965,17 +2124,10 @@ pub fn compute_model_progress_telemetry_at(
         let momentum_boost = 0.35_f64 * delta_vs_best.max(0.0) * (1.0 - next_ema);
         let exp_index = ((next_ema + momentum_boost).clamp(0.0, 1.0)) * 100.0;
 
-        let mut cohort_models: Vec<String> = cohort
-            .iter()
-            .map(|p| p.model_id.clone())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        cohort_models.sort();
-
         versions_timeline.push(serde_json::json!({
             "version": format!("v{}", ver_str),
             "rawVersion": ver_str,
+            "telemetryStatus": "measured",
             "projectCount": cohort.len(),
             "cleanProjectsCount": clean_projects,
             "models": cohort_models,
@@ -2021,9 +2173,16 @@ pub fn compute_model_progress_telemetry_at(
         sb.cmp(&sa)
     });
 
-    let latest_summary = versions_timeline.last().cloned().unwrap_or_else(|| {
+    let latest_summary = versions_timeline
+        .iter()
+        .rev()
+        .find(|v| v.get("telemetryStatus").and_then(|s| s.as_str()) == Some("measured"))
+        .cloned()
+        .or_else(|| versions_timeline.last().cloned())
+        .unwrap_or_else(|| {
         serde_json::json!({
             "version": format!("v{}", env!("CARGO_PKG_VERSION")),
+            "telemetryStatus": "unmeasured",
             "rawAccuracyPct": 0.0,
             "exponentialIndexPct": 0.0,
             "f100Pct": 0.0,

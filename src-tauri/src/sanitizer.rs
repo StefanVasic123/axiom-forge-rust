@@ -1348,41 +1348,553 @@ pub fn reconcile_server_prisma_enum_usage(
     format!("import {{ {} }} from '@prisma/client';\n{}", enums_to_import.join(", "), out)
 }
 
+fn find_matching_brace_byte(src: &str, open_brace: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
+    if bytes.get(open_brace).copied() != Some(b'{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut i = open_brace;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_tick = false;
+    let mut esc = false;
+    while i < src.len() {
+        let ch = src[i..].chars().next()?;
+        if esc {
+            esc = false;
+        } else if ch == '\\' && (in_single || in_double || in_tick) {
+            esc = true;
+        } else if ch == '\'' && !in_double && !in_tick {
+            in_single = !in_single;
+        } else if ch == '"' && !in_single && !in_tick {
+            in_double = !in_double;
+        } else if ch == '`' && !in_single && !in_double {
+            in_tick = !in_tick;
+        } else if !in_single && !in_double && !in_tick {
+            if ch == '{' {
+                depth += 1;
+            } else if ch == '}' {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+        }
+        i += ch.len_utf8();
+    }
+    None
+}
+
+/// Deterministically hoists `const body = await request.json()` out of `try { ... }`
+/// when its paired `catch (...) { ... }` block references `body` (eliminating `TS2304: Cannot find name 'body'`).
+pub fn sanitize_try_catch_body_scope(content: &str) -> String {
+    let Ok(try_re) = regex::Regex::new(r"\btry\s*\{") else {
+        return content.to_string();
+    };
+    let Ok(decl_re) = regex::Regex::new(
+        r"(?m)^([ \t]*)(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=\n]+)?=\s*((?:await\s+)?(?:req|request)\s*\.\s*json\s*\([^)]*\)\s*;?)",
+    ) else {
+        return content.to_string();
+    };
+    let Ok(catch_re) = regex::Regex::new(r"^\s*catch\s*(?:\([^)]*\))?\s*\{") else {
+        return content.to_string();
+    };
+
+    let mut out = content.to_string();
+    for _pass in 0..8 {
+        let mut applied_edit: Option<(usize, usize, String)> = None;
+        for m in try_re.find_iter(&out) {
+            let try_start = m.start();
+            let open_brace = m.end() - 1;
+            let Some(try_end) = find_matching_brace_byte(&out, open_brace) else {
+                continue;
+            };
+            let try_body = &out[open_brace + 1..try_end - 1];
+            let after_try = &out[try_end..];
+            let Some(catch_m) = catch_re.find(after_try) else {
+                continue;
+            };
+            let catch_open = try_end + catch_m.end() - 1;
+            let Some(catch_end) = find_matching_brace_byte(&out, catch_open) else {
+                continue;
+            };
+            let catch_body = &out[catch_open + 1..catch_end - 1];
+
+            for cap in decl_re.captures_iter(try_body) {
+                let full_m = cap.get(0).unwrap();
+                let decl_indent = cap.get(1).map_or("", |g| g.as_str());
+                let var_name = cap.get(2).map_or("", |g| g.as_str());
+                let rhs = cap.get(3).map_or("", |g| g.as_str());
+                if var_name.is_empty() {
+                    continue;
+                }
+                let esc = regex::escape(var_name);
+                let redecl_in_catch = regex::Regex::new(&format!(r"\b(?:const|let|var)\s+{}\b", esc))
+                    .ok()
+                    .map_or(false, |re| re.is_match(catch_body));
+                if redecl_in_catch {
+                    continue;
+                }
+                let ref_in_catch = regex::Regex::new(&format!(r"\b{}\b", esc))
+                    .ok()
+                    .map_or(false, |re| {
+                        re.find_iter(catch_body).any(|rm| {
+                            let prev_ch = catch_body[..rm.start()].trim_end().chars().next_back();
+                            let next_ch = catch_body[rm.end()..].trim_start().chars().next();
+                            prev_ch != Some('.') && next_ch != Some(':')
+                        })
+                    });
+                if !ref_in_catch {
+                    continue;
+                }
+
+                // Determine indentation on the `try {` line
+                let line_start = out[..try_start].rfind('\n').map_or(0, |p| p + 1);
+                let try_line_indent: String = out[line_start..try_start]
+                    .chars()
+                    .take_while(|c| *c == ' ' || *c == '\t')
+                    .collect();
+
+                let mut new_try_body = String::with_capacity(try_body.len());
+                new_try_body.push_str(&try_body[..full_m.start()]);
+                new_try_body.push_str(&format!("{}{} = {}", decl_indent, var_name, rhs));
+                new_try_body.push_str(&try_body[full_m.end()..]);
+
+                let replacement = format!(
+                    "let {}: any = {{}};\n{}try {{{}}}",
+                    var_name, try_line_indent, new_try_body
+                );
+                applied_edit = Some((try_start, try_end, replacement));
+                break;
+            }
+            if applied_edit.is_some() {
+                break;
+            }
+        }
+        if let Some((s, e, repl)) = applied_edit {
+            out.replace_range(s..e, &repl);
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// Strips outdated hardcoded `apiVersion: '20XX-XX-XX'` options from `new Stripe(key, { ... })`
+/// so modern/upgraded Stripe SDK types compile without literal-date `TS2322` errors.
+pub fn sanitize_stripe_client_init(content: &str) -> String {
+    if !content.contains("Stripe") || !content.contains("apiVersion") {
+        return content.to_string();
+    }
+    let mut out = content.to_string();
+    // Case 1: Only `apiVersion` in options object -> `new Stripe(key)`
+    if let Ok(re_only) = regex::Regex::new(
+        r#"new\s+Stripe\s*\(\s*([^,\n\)]+?)\s*,\s*\{\s*apiVersion\s*:\s*['"][^'"]+['"]\s*,?\s*\}\s*\)"#,
+    ) {
+        out = re_only.replace_all(&out, "new Stripe($1)").to_string();
+    }
+    // Case 2: `apiVersion` alongside other properties -> remove only the `apiVersion` entry
+    if let Ok(re_prop) = regex::Regex::new(
+        r#"(?m),?\s*\bapiVersion\s*:\s*['"][^'"]+['"]\s*,?"#,
+    ) {
+        if out.contains("new Stripe(") {
+            out = re_prop
+                .replace_all(&out, |caps: &regex::Captures| {
+                    let s = caps.get(0).map_or("", |m| m.as_str());
+                    if s.trim_start().starts_with(',') && s.trim_end().ends_with(',') {
+                        ","
+                    } else {
+                        ""
+                    }
+                })
+                .to_string();
+        }
+    }
+    out
+}
+
+/// Normalizes broken auth CTA destinations (`/dashboard/login` -> `/login`, `/dashboard/register` -> `/register`).
+pub fn normalize_auth_navigation_links(content: &str) -> String {
+    content
+        .replace("'/dashboard/login'", "'/login'")
+        .replace("\"/dashboard/login\"", "\"/login\"")
+        .replace("`/dashboard/login`", "`/login`")
+        .replace("'/dashboard/register'", "'/register'")
+        .replace("\"/dashboard/register\"", "\"/register\"")
+        .replace("`/dashboard/register`", "`/register`")
+}
+
+/// Fixes JSX double-currency glitches (`$${item.price}` when mock data also holds `'$50'`)
+/// and normalizes `/dashboard/login` & `/dashboard/register` links.
+pub fn sanitize_tsx_ux_glitches(content: &str, rel_path: &str) -> String {
+    let mut out = normalize_auth_navigation_links(content);
+    let low = rel_path.replace('\\', "/").to_ascii_lowercase();
+    if !(low.ends_with(".tsx") || low.ends_with(".jsx")) {
+        return out;
+    }
+
+    // Check if JSX contains literal `$` immediately before `{expr}` and money strings like `'$50'` exist in file
+    if let Ok(re_money_mock) = regex::Regex::new(r#":\s*['"]\$\s*\d"#) {
+        if re_money_mock.is_match(&out) {
+            if let Ok(re_jsx_dollar) = regex::Regex::new(r">(\s*)\$\{\s*([A-Za-z_][A-Za-z0-9_.\?\(\)\[\]]*)\s*\}(\s*)<") {
+                out = re_jsx_dollar
+                    .replace_all(&out, |caps: &regex::Captures| {
+                        let expr = &caps[2];
+                        format!(
+                            ">{}{{typeof {} === 'string' && {}.trim().startsWith('$') ? {} : `$${{{}}}`}}{}<",
+                            &caps[1], expr, expr, expr, expr, &caps[3]
+                        )
+                    })
+                    .to_string();
+            }
+        }
+    }
+    out
+}
+
+fn normalize_enum_token(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_uppercase())
+        .collect()
+}
+
+/// Reconciles client-side mock enum string literals (e.g. `status: 'confirmed'`, `role: 'petOwner'`)
+/// against `prisma/schema.prisma` enum members WITHOUT importing runtime `@prisma/client` into browser bundles.
+pub fn reconcile_client_prisma_enum_mocks(
+    proj_dir: &std::path::Path,
+    file_path: &str,
+    content: &str,
+) -> String {
+    let path_low = file_path.replace('\\', "/").to_lowercase();
+    if !(path_low.ends_with(".ts") || path_low.ends_with(".tsx") || path_low.ends_with(".js") || path_low.ends_with(".jsx")) {
+        return content.to_string();
+    }
+    if path_low.contains("/api/") || path_low.ends_with("/route.ts") || path_low.ends_with("/route.js") {
+        return content.to_string();
+    }
+
+    let Some(schema_path) = [
+        proj_dir.join("prisma/schema.prisma"),
+        proj_dir.join("schema.prisma"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file()) else {
+        return content.to_string();
+    };
+    let Ok(schema_src) = std::fs::read_to_string(&schema_path) else {
+        return content.to_string();
+    };
+    let contract = crate::orchestrator::extract_prisma_schema_contract(&schema_src);
+    let Some(enums_obj) = contract.get("enums").and_then(|e| e.as_object()) else {
+        return content.to_string();
+    };
+    if enums_obj.is_empty() {
+        return content.to_string();
+    }
+
+    let mut member_lookup: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for values_val in enums_obj.values() {
+        if let Some(arr) = values_val.as_array() {
+            for item in arr {
+                if let Some(m) = item.as_str() {
+                    for tok in m.split_whitespace() {
+                        let clean_tok = tok.trim_end_matches(',');
+                        if !clean_tok.is_empty() && !clean_tok.starts_with("//") {
+                            member_lookup.insert(normalize_enum_token(clean_tok), clean_tok.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if member_lookup.is_empty() {
+        return content.to_string();
+    }
+
+    let Ok(re_kv) = regex::Regex::new(
+        r#"(?m)\b(status|role|priority|tier|plan|type|state|category|paymentStatus|bookingStatus)\s*:\s*(['"])([A-Za-z][A-Za-z0-9_-]*)(['"])(\s*as\s+any)?"#,
+    ) else {
+        return content.to_string();
+    };
+
+    re_kv
+        .replace_all(content, |caps: &regex::Captures| {
+            let key = &caps[1];
+            let q = &caps[2];
+            let raw_val = &caps[3];
+            let as_any = caps.get(5).map_or("", |m| m.as_str());
+            let norm = normalize_enum_token(raw_val);
+            if let Some(canonical) = member_lookup.get(&norm) {
+                if raw_val != canonical || as_any.is_empty() {
+                    return format!("{}: {}{}{}", key, q, canonical, format!("{} as any", q));
+                }
+            }
+            caps[0].to_string()
+        })
+        .to_string()
+}
+
+fn split_tailwind_apply_tokens(body: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    for ch in body.chars() {
+        if ch.is_whitespace() && paren_depth == 0 && bracket_depth == 0 {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            _ => {}
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn is_css_transform_function_token(tok: &str) -> bool {
+    let Some(paren_pos) = tok.find('(') else {
+        return false;
+    };
+    if !tok.ends_with(')') {
+        return false;
+    }
+    let fn_name = tok[..paren_pos].trim().to_ascii_lowercase();
+    matches!(
+        fn_name.as_str(),
+        "translate"
+            | "translatex"
+            | "translatey"
+            | "translatez"
+            | "translate3d"
+            | "scale"
+            | "scalex"
+            | "scaley"
+            | "scalez"
+            | "scale3d"
+            | "rotate"
+            | "rotatex"
+            | "rotatey"
+            | "rotatez"
+            | "rotate3d"
+            | "skew"
+            | "skewx"
+            | "skewy"
+            | "matrix"
+            | "matrix3d"
+            | "perspective"
+    )
+}
+
+/// Rewrites Tailwind `@apply` rules that illegally embed raw CSS transform functions
+/// such as `@apply transform translateX(100%);` into valid CSS `transform: translateX(100%);`
+/// declarations (while preserving any legitimate utility classes on `@apply`).
+pub fn sanitize_tailwind_css(css: &str) -> String {
+    let mut out = String::with_capacity(css.len());
+    for (idx, line) in css.split_inclusive('\n').enumerate() {
+        let _ = idx;
+        let line_no_nl = line.trim_end_matches(&['\r', '\n'][..]);
+        let nl_suffix = &line[line_no_nl.len()..];
+        let trimmed = line_no_nl.trim();
+        if trimmed.starts_with("@apply ") && trimmed.ends_with(';') && !trimmed.contains('{') && !trimmed.contains('}') {
+            let indent_len = line_no_nl.len() - line_no_nl.trim_start().len();
+            let indent = &line_no_nl[..indent_len];
+            let inner = trimmed["@apply ".len()..trimmed.len() - 1].trim();
+            let tokens = split_tailwind_apply_tokens(inner);
+            let mut transform_fns = Vec::new();
+            let mut has_important = false;
+            let mut other_tokens = Vec::new();
+            for tok in tokens {
+                if tok == "!important" {
+                    has_important = true;
+                } else if is_css_transform_function_token(&tok) {
+                    transform_fns.push(tok);
+                } else {
+                    other_tokens.push(tok);
+                }
+            }
+            if !transform_fns.is_empty() {
+                other_tokens.retain(|t| t != "transform");
+                let imp = if has_important { " !important" } else { "" };
+                if !other_tokens.is_empty() {
+                    out.push_str(&format!("{}@apply {}{};\n", indent, other_tokens.join(" "), imp));
+                }
+                out.push_str(&format!("{}transform: {}{};{}", indent, transform_fns.join(" "), imp, nl_suffix));
+                continue;
+            }
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+fn is_valid_top_level_css_at_statement(stmt_no_comments: &str) -> bool {
+    let t = stmt_no_comments.trim_start().to_ascii_lowercase();
+    t.starts_with("@tailwind ")
+        || t.starts_with("@tailwind\t")
+        || t.starts_with("@import ")
+        || t.starts_with("@import\t")
+        || t.starts_with("@charset ")
+        || t.starts_with("@namespace ")
+        || t.starts_with("@layer ")
+}
+
+fn strip_css_comments_only(s: &str) -> String {
+    let mut res = String::new();
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            if let Some(rel_end) = s[i + 2..].find("*/") {
+                i = i + 2 + rel_end + 2;
+                continue;
+            } else {
+                break;
+            }
+        }
+        let ch = s[i..].chars().next().unwrap();
+        res.push(ch);
+        i += ch.len_utf8();
+    }
+    res
+}
+
+fn extract_css_comments_preserving_newlines(s: &str) -> String {
+    let mut res = String::new();
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            if let Some(rel_end) = s[i + 2..].find("*/") {
+                let end = i + 2 + rel_end + 2;
+                res.push_str(&s[i..end]);
+                res.push('\n');
+                i = end;
+                continue;
+            } else {
+                res.push_str(&s[i..]);
+                break;
+            }
+        }
+        let ch = s[i..].chars().next().unwrap();
+        i += ch.len_utf8();
+    }
+    res
+}
+
 pub fn deduplicate_repeated_css_blocks(css: &str) -> String {
     let mut out = String::new();
     let mut seen_blocks: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let chars: Vec<(usize, char)> = css.char_indices().collect();
+    let bytes = css.as_bytes();
     let mut i = 0usize;
     let mut chunk_start = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
 
-    while i < chars.len() {
-        let (byte_pos, ch) = chars[i];
+    while i < css.len() {
+        if i + 1 < css.len() && !in_single && !in_double && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            if let Some(rel_end) = css[i + 2..].find("*/") {
+                i = i + 2 + rel_end + 2;
+                continue;
+            } else {
+                break;
+            }
+        }
+        let ch = css[i..].chars().next().unwrap();
+        if escape {
+            escape = false;
+            i += ch.len_utf8();
+            continue;
+        }
+        if ch == '\\' && (in_single || in_double) {
+            escape = true;
+            i += ch.len_utf8();
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            i += ch.len_utf8();
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            i += ch.len_utf8();
+            continue;
+        }
+        if in_single || in_double {
+            i += ch.len_utf8();
+            continue;
+        }
+
         if ch == '{' {
+            // Check if any orphaned declaration (like `;` outside a block) sits before this selector `{`
+            let prefix_slice = &css[chunk_start..i];
+            if let Some(last_semi) = prefix_slice.rfind(';') {
+                let before_semi = &prefix_slice[..=last_semi];
+                let comments_only = extract_css_comments_preserving_newlines(before_semi);
+                out.push_str(&comments_only);
+                chunk_start += last_semi + 1;
+            }
+
             let mut depth = 1usize;
             let mut j = i + 1;
-            while j < chars.len() && depth > 0 {
-                if chars[j].1 == '{' {
-                    depth += 1;
-                } else if chars[j].1 == '}' {
-                    depth -= 1;
+            let mut b_single = false;
+            let mut b_double = false;
+            let mut b_escape = false;
+            while j < css.len() && depth > 0 {
+                if j + 1 < css.len() && !b_single && !b_double && bytes[j] == b'/' && bytes[j + 1] == b'*' {
+                    if let Some(rel_end) = css[j + 2..].find("*/") {
+                        j = j + 2 + rel_end + 2;
+                        continue;
+                    } else {
+                        j = css.len();
+                        break;
+                    }
                 }
-                j += 1;
+                let bch = css[j..].chars().next().unwrap();
+                if b_escape {
+                    b_escape = false;
+                } else if bch == '\\' && (b_single || b_double) {
+                    b_escape = true;
+                } else if bch == '\'' && !b_double {
+                    b_single = !b_single;
+                } else if bch == '"' && !b_single {
+                    b_double = !b_double;
+                } else if !b_single && !b_double {
+                    if bch == '{' {
+                        depth += 1;
+                    } else if bch == '}' {
+                        depth -= 1;
+                    }
+                }
+                j += bch.len_utf8();
             }
             if depth == 0 {
-                let end_byte = if j < chars.len() { chars[j].0 } else { css.len() };
+                let end_byte = j;
                 let block = &css[chunk_start..end_byte];
                 let norm: String = block.split_whitespace().collect::<Vec<&str>>().join(" ");
-                let is_at_rule = norm.trim_start().starts_with('@');
                 let count = seen_blocks.entry(norm.clone()).or_insert(0);
                 *count += 1;
-                if is_at_rule || norm.len() <= 18 || *count == 1 {
+                if norm.len() <= 10 || *count == 1 {
                     out.push_str(block);
                 }
                 chunk_start = end_byte;
-                i = j;
+                i = end_byte;
                 continue;
             } else {
-                // Unclosed trailing CSS block from LLM truncation: drop incomplete tail or close cleanly
+                // Unclosed trailing CSS block from LLM truncation: close cleanly
                 let tail = &css[chunk_start..];
                 if tail.trim().len() > 4 {
                     out.push_str(tail.trim_end());
@@ -1393,18 +1905,489 @@ pub fn deduplicate_repeated_css_blocks(css: &str) -> String {
                 }
                 return out;
             }
-        } else if ch == '\n' && css[chunk_start..byte_pos].trim().starts_with("@") && css[chunk_start..byte_pos].contains(';') {
-            let line_end = byte_pos + 1;
-            out.push_str(&css[chunk_start..line_end]);
-            chunk_start = line_end;
+        } else if ch == '}' {
+            // Stray unmatched closing brace at top-level depth 0: keep comments only, drop orphan decls & `}`
+            let prefix = &css[chunk_start..i];
+            out.push_str(&extract_css_comments_preserving_newlines(prefix));
+            chunk_start = i + ch.len_utf8();
+            i = chunk_start;
+            continue;
+        } else if ch == ';' {
+            let stmt_end = i + ch.len_utf8();
+            let mut advance_to = stmt_end;
+            if advance_to < css.len() && bytes[advance_to] == b'\r' {
+                advance_to += 1;
+            }
+            if advance_to < css.len() && bytes[advance_to] == b'\n' {
+                advance_to += 1;
+            }
+            let raw_stmt = &css[chunk_start..advance_to];
+            let no_comments = strip_css_comments_only(raw_stmt);
+            if is_valid_top_level_css_at_statement(&no_comments) {
+                out.push_str(raw_stmt);
+            } else {
+                out.push_str(&extract_css_comments_preserving_newlines(raw_stmt));
+            }
+            chunk_start = advance_to;
+            i = advance_to;
+            continue;
         }
-        i += 1;
+        i += ch.len_utf8();
     }
 
     if chunk_start < css.len() {
-        out.push_str(&css[chunk_start..]);
+        let tail = &css[chunk_start..];
+        let no_comments = strip_css_comments_only(tail);
+        if no_comments.trim().is_empty() {
+            out.push_str(tail);
+        } else {
+            out.push_str(&extract_css_comments_preserving_newlines(tail));
+        }
     }
     out
+}
+
+fn find_balanced_brace_expr_end(src: &str, open_brace: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
+    if bytes.get(open_brace).copied() != Some(b'{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut i = open_brace;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_tick = false;
+    let mut escape = false;
+    while i < src.len() {
+        if !in_single && !in_double && !in_tick && i + 1 < src.len() {
+            if bytes[i] == b'/' && bytes[i + 1] == b'/' {
+                if let Some(nl) = src[i..].find('\n') {
+                    i += nl + 1;
+                    continue;
+                }
+                return None;
+            }
+            if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                if let Some(rel) = src[i + 2..].find("*/") {
+                    i += 2 + rel + 2;
+                    continue;
+                }
+                return None;
+            }
+        }
+        let ch = src[i..].chars().next()?;
+        if escape {
+            escape = false;
+        } else if ch == '\\' && (in_single || in_double || in_tick) {
+            escape = true;
+        } else if ch == '\'' && !in_double && !in_tick {
+            in_single = !in_single;
+        } else if ch == '"' && !in_single && !in_tick {
+            in_double = !in_double;
+        } else if ch == '`' && !in_single && !in_double {
+            in_tick = !in_tick;
+        } else if !in_single && !in_double && !in_tick {
+            if ch == '{' {
+                depth += 1;
+            } else if ch == '}' {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+        }
+        i += ch.len_utf8();
+    }
+    None
+}
+
+fn format_js_prop_key(name: &str) -> String {
+    let valid_ident = !name.is_empty()
+        && name
+            .chars()
+            .enumerate()
+            .all(|(idx, c)| (idx == 0 && (c.is_ascii_alphabetic() || c == '_' || c == '$')) || (idx > 0 && (c.is_ascii_alphanumeric() || c == '_' || c == '$')));
+    if valid_ident {
+        name.to_string()
+    } else {
+        serde_json::to_string(name).unwrap_or_else(|_| format!("\"{}\"", name))
+    }
+}
+
+fn format_jsx_tag_arg(tag_name: &str) -> String {
+    if tag_name.is_empty() {
+        return "React.Fragment".to_string();
+    }
+    let first = tag_name.chars().next().unwrap_or('a');
+    if first.is_ascii_uppercase() || tag_name.contains('.') {
+        tag_name.to_string()
+    } else {
+        serde_json::to_string(tag_name).unwrap_or_else(|_| format!("'{}'", tag_name))
+    }
+}
+
+fn clean_jsx_text_node(raw: &str) -> Option<String> {
+    if !raw.contains('\n') && !raw.contains('\r') {
+        if raw.trim().is_empty() {
+            return None;
+        }
+        return Some(raw.to_string());
+    }
+    let lines: Vec<&str> = raw.split('\n').map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join(" "))
+    }
+}
+
+fn parse_jsx_element_to_create_element(src: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = src.as_bytes();
+    if bytes.get(start).copied() != Some(b'<') {
+        return None;
+    }
+    let mut pos = start + 1;
+    let is_fragment = bytes.get(pos).copied() == Some(b'>');
+    let tag_name = if is_fragment {
+        pos += 1;
+        String::new()
+    } else {
+        let name_start = pos;
+        let first = src[pos..].chars().next()?;
+        if !(first.is_ascii_alphabetic() || first == '_' || first == '$') {
+            return None;
+        }
+        pos += first.len_utf8();
+        while pos < src.len() {
+            let c = src[pos..].chars().next()?;
+            if c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '.' || c == '-' {
+                pos += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let name = &src[name_start..pos];
+        // Tag name must be followed by whitespace, '>', or '/>'
+        let next_ch = src[pos..].chars().next()?;
+        if !next_ch.is_whitespace() && next_ch != '>' && next_ch != '/' {
+            return None;
+        }
+        name.to_string()
+    };
+
+    let mut prop_entries: Vec<String> = Vec::new();
+    let mut self_closing = false;
+
+    if !is_fragment {
+        loop {
+            while pos < src.len() && src[pos..].chars().next().map_or(false, |c| c.is_whitespace()) {
+                pos += src[pos..].chars().next()?.len_utf8();
+            }
+            if pos >= src.len() {
+                return None;
+            }
+            if src[pos..].starts_with("/>") {
+                self_closing = true;
+                pos += 2;
+                break;
+            }
+            if bytes[pos] == b'>' {
+                pos += 1;
+                break;
+            }
+            if bytes[pos] == b'{' {
+                let end_brace = find_balanced_brace_expr_end(src, pos)?;
+                let inner = src[pos + 1..end_brace - 1].trim();
+                if let Some(spread_expr) = inner.strip_prefix("...") {
+                    let converted = convert_jsx_expressions_in_ts_inner(spread_expr.trim());
+                    prop_entries.push(format!("...{}", converted));
+                    pos = end_brace;
+                    continue;
+                }
+                return None;
+            }
+            // Attribute name
+            let attr_start = pos;
+            let first = src[pos..].chars().next()?;
+            if !(first.is_ascii_alphabetic() || first == '_' || first == '$') {
+                return None;
+            }
+            while pos < src.len() {
+                let c = src[pos..].chars().next()?;
+                if c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '-' || c == ':' {
+                    pos += c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let attr_name = &src[attr_start..pos];
+            while pos < src.len() && src[pos..].chars().next().map_or(false, |c| c.is_whitespace()) {
+                pos += src[pos..].chars().next()?.len_utf8();
+            }
+            if pos < src.len() && bytes[pos] == b'=' {
+                pos += 1;
+                while pos < src.len() && src[pos..].chars().next().map_or(false, |c| c.is_whitespace()) {
+                    pos += src[pos..].chars().next()?.len_utf8();
+                }
+                if pos >= src.len() {
+                    return None;
+                }
+                let val_str = match bytes[pos] {
+                    b'"' | b'\'' => {
+                        let q = bytes[pos];
+                        let mut q_end = pos + 1;
+                        let mut q_esc = false;
+                        while q_end < src.len() {
+                            let c = src[q_end..].chars().next()?;
+                            if q_esc {
+                                q_esc = false;
+                            } else if c == '\\' {
+                                q_esc = true;
+                            } else if q_end < src.len() && bytes[q_end] == q {
+                                break;
+                            }
+                            q_end += c.len_utf8();
+                        }
+                        if q_end >= src.len() {
+                            return None;
+                        }
+                        let lit = src[pos..=q_end].to_string();
+                        pos = q_end + 1;
+                        lit
+                    }
+                    b'{' => {
+                        let end_brace = find_balanced_brace_expr_end(src, pos)?;
+                        let inner = src[pos + 1..end_brace - 1].trim();
+                        if inner.is_empty() {
+                            return None;
+                        }
+                        let converted = convert_jsx_expressions_in_ts_inner(inner);
+                        pos = end_brace;
+                        converted
+                    }
+                    _ => return None,
+                };
+                prop_entries.push(format!("{}: {}", format_js_prop_key(attr_name), val_str));
+            } else {
+                prop_entries.push(format!("{}: true", format_js_prop_key(attr_name)));
+            }
+        }
+    }
+
+    let props_arg = if prop_entries.is_empty() {
+        "null".to_string()
+    } else {
+        format!("{{ {} }}", prop_entries.join(", "))
+    };
+    let tag_arg = format_jsx_tag_arg(&tag_name);
+
+    if self_closing {
+        return Some((format!("React.createElement({}, {})", tag_arg, props_arg), pos));
+    }
+
+    // Parse children until matching `</tag_name>`
+    let expected_close = format!("</{}>", tag_name);
+    let mut children: Vec<String> = Vec::new();
+    loop {
+        if pos >= src.len() {
+            return None;
+        }
+        if src[pos..].starts_with("</") {
+            let after_slash = &src[pos + 2..];
+            if is_fragment {
+                if after_slash.trim_start().starts_with('>') {
+                    let gt_rel = after_slash.find('>')?;
+                    pos = pos + 2 + gt_rel + 1;
+                    break;
+                }
+                return None;
+            }
+            if let Some(after_tag) = after_slash.strip_prefix(&tag_name) {
+                let ws_trim = after_tag.trim_start();
+                if ws_trim.starts_with('>') {
+                    let consumed = src.len() - ws_trim.len() + 1;
+                    pos = consumed;
+                    break;
+                }
+            }
+            let _ = &expected_close;
+            return None;
+        }
+        if bytes[pos] == b'<' {
+            let (child_ce, next_pos) = parse_jsx_element_to_create_element(src, pos)?;
+            children.push(child_ce);
+            pos = next_pos;
+            continue;
+        }
+        if bytes[pos] == b'{' {
+            let end_brace = find_balanced_brace_expr_end(src, pos)?;
+            let inner = src[pos + 1..end_brace - 1].trim();
+            pos = end_brace;
+            if inner.is_empty() || (inner.starts_with("/*") && inner.ends_with("*/")) {
+                continue;
+            }
+            children.push(convert_jsx_expressions_in_ts_inner(inner));
+            continue;
+        }
+        // Text segment until next '<' or '{'
+        let text_start = pos;
+        while pos < src.len() && bytes[pos] != b'<' && bytes[pos] != b'{' {
+            let c = src[pos..].chars().next()?;
+            pos += c.len_utf8();
+        }
+        if let Some(cleaned) = clean_jsx_text_node(&src[text_start..pos]) {
+            if let Ok(lit) = serde_json::to_string(&cleaned) {
+                children.push(lit);
+            }
+        }
+    }
+
+    if children.is_empty() {
+        Some((format!("React.createElement({}, {})", tag_arg, props_arg), pos))
+    } else {
+        Some((
+            format!("React.createElement({}, {}, {})", tag_arg, props_arg, children.join(", ")),
+            pos,
+        ))
+    }
+}
+
+fn is_jsx_preceding_context(before: &str) -> bool {
+    let trimmed = before.trim_end();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.ends_with("=>")
+        || trimmed.ends_with("&&")
+        || trimmed.ends_with("||")
+        || trimmed.ends_with("??")
+    {
+        return true;
+    }
+    if let Some(last) = trimmed.chars().last() {
+        if matches!(last, '(' | '[' | ',' | ':' | '?' | '=') {
+            return true;
+        }
+    }
+    if let Some(stripped) = trimmed.strip_suffix("return") {
+        return stripped
+            .chars()
+            .last()
+            .map_or(true, |c| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'));
+    }
+    false
+}
+
+fn convert_jsx_expressions_in_ts_inner(src: &str) -> String {
+    if !src.contains("</") && !src.contains("/>") {
+        return src.to_string();
+    }
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_tick = false;
+    let mut escape = false;
+
+    while i < src.len() {
+        if !in_single && !in_double && !in_tick && i + 1 < src.len() {
+            if bytes[i] == b'/' && bytes[i + 1] == b'/' {
+                let end = src[i..].find('\n').map_or(src.len(), |n| i + n + 1);
+                out.push_str(&src[i..end]);
+                i = end;
+                continue;
+            }
+            if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                let end = src[i + 2..].find("*/").map_or(src.len(), |n| i + 2 + n + 2);
+                out.push_str(&src[i..end]);
+                i = end;
+                continue;
+            }
+        }
+        let ch = src[i..].chars().next().unwrap();
+        if escape {
+            escape = false;
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        if ch == '\\' && (in_single || in_double || in_tick) {
+            escape = true;
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        if ch == '\'' && !in_double && !in_tick {
+            in_single = !in_single;
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        if ch == '"' && !in_single && !in_tick {
+            in_double = !in_double;
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        if ch == '`' && !in_single && !in_double {
+            in_tick = !in_tick;
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        if !in_single && !in_double && !in_tick && ch == '<' && is_jsx_preceding_context(&src[..i]) {
+            if let Some((ce, end_pos)) = parse_jsx_element_to_create_element(src, i) {
+                out.push_str(&ce);
+                i = end_pos;
+                continue;
+            }
+        }
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Converts accidental JSX inside pure `.ts` files (never `.tsx`/`.d.ts`) into
+/// `React.createElement(...)` calls and ensures `import React from 'react';` is present.
+pub fn sanitize_jsx_in_ts_file(content: &str, rel_path: &str) -> String {
+    let low = rel_path.replace('\\', "/").to_ascii_lowercase();
+    if !low.ends_with(".ts") || low.ends_with(".d.ts") {
+        return content.to_string();
+    }
+    if !content.contains("</") && !content.contains("/>") {
+        return content.to_string();
+    }
+    let converted = convert_jsx_expressions_in_ts_inner(content);
+    if converted == content {
+        return converted;
+    }
+
+    let has_react_default_or_ns = regex::Regex::new(
+        r#"(?m)^\s*import\s+(?:React\b|\*\s+as\s+React\b)"#,
+    )
+    .map(|re| re.is_match(&converted))
+    .unwrap_or_else(|_| converted.contains("import React") || converted.contains("* as React"));
+
+    if has_react_default_or_ns {
+        return converted;
+    }
+
+    let trimmed_start = converted.trim_start();
+    if trimmed_start.starts_with("\"use client\"") || trimmed_start.starts_with("'use client'") {
+        if let Some(nl) = converted.find('\n') {
+            let (first, rest) = converted.split_at(nl + 1);
+            return format!("{}import React from 'react';\n{}", first, rest);
+        }
+    }
+    format!("import React from 'react';\n{}", converted)
+}
+
+/// Removes redundant/unreachable prefix branches inside `middleware()` based on
+/// the actual negative lookahead exclusions parsed from `export const config.matcher`.
+pub fn sanitize_middleware_redundancy(content: &str, rel_path: &str) -> String {
+    crate::reviewer::sanitize_middleware_principled(content, rel_path)
 }
 
 fn normalize_rel_fs_components(p: &std::path::Path) -> std::path::PathBuf {
@@ -2007,7 +2990,10 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
                                         continue;
                                     }
                                     let clean = raw.split_whitespace().next().unwrap_or("").trim();
-                                    if !clean.is_empty() && clean.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
+                                    if !clean.is_empty()
+                                        && (clean.chars().next().map_or(false, |c| c.is_ascii_uppercase())
+                                            || matches!(clean, "toast" | "useToast"))
+                                    {
                                         parsed_pascal.push(clean.to_string());
                                     }
                                 }
@@ -2283,8 +3269,13 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
                         "TableFooter" => "export const TableFooter = ({ children, className = '', ...props }: any) => <tfoot className={className} {...props}>{children}</tfoot>;\n".to_string(),
                         "TableRow" => "export const TableRow = ({ children, className = '', ...props }: any) => <tr className={`border-b border-slate-200 transition-colors ${className}`} {...props}>{children}</tr>;\n".to_string(),
                         "TableHead" => "export const TableHead = ({ children, className = '', ...props }: any) => <th className={`px-3 py-2 text-left font-medium text-slate-600 ${className}`} {...props}>{children}</th>;\n".to_string(),
+                        "TableHeaderCell" => "export const TableHeaderCell = ({ children, className = '', ...props }: any) => <th className={`px-3 py-2 text-left font-medium text-slate-600 ${className}`} {...props}>{children}</th>;\n".to_string(),
                         "TableCell" => "export const TableCell = ({ children, className = '', ...props }: any) => <td className={`px-3 py-2 align-middle ${className}`} {...props}>{children}</td>;\n".to_string(),
                         "TableCaption" => "export const TableCaption = ({ children, className = '', ...props }: any) => <caption className={`mt-2 text-sm text-slate-500 ${className}`} {...props}>{children}</caption>;\n".to_string(),
+                        "Toast" => "export const Toast = ({ children, className = '', ...props }: any) => <div role=\"status\" className={`rounded-lg border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 shadow-md ${className}`} {...props}>{children}</div>;\n".to_string(),
+                        "Toaster" => "export const Toaster = () => null;\n".to_string(),
+                        "toast" => "export const toast = (opts: any) => { if (typeof window !== 'undefined') console.info('[toast]', opts?.title || opts?.description || opts); return { id: 'axiom-toast', dismiss: () => {}, update: () => {} }; };\n".to_string(),
+                        "useToast" => "export const useToast = () => ({ toast: (opts: any) => { if (typeof window !== 'undefined') console.info('[toast]', opts?.title || opts?.description || opts); return { id: 'axiom-toast', dismiss: () => {}, update: () => {} }; }, toasts: [] as any[], dismiss: (_id?: string) => {} });\n".to_string(),
                         "Link" => "export const Link = ({ children, href = '#', prefetch, replace, scroll, shallow, locale, legacyBehavior, className = '', ...props }: any) => <a href={typeof href === 'string' ? href : '#'} className={className} {...props}>{children}</a>;\n".to_string(),
                         _ => format!("export const {} = ({{ children, className = '', ...props }}: any) => <div className={{className}} {{...props}}>{{children}}</div>;\n", sym),
                     };
@@ -3761,7 +4752,8 @@ pub fn post_process_generated_file(
             }
         }
 
-        let cleaned_css = deduplicate_repeated_css_blocks(content);
+        let tw_cleaned = sanitize_tailwind_css(content);
+        let cleaned_css = deduplicate_repeated_css_blocks(&tw_cleaned);
         if is_target_css && !cleaned_css.contains("@tailwind base") {
             return format!("@tailwind base;\n@tailwind components;\n@tailwind utilities;\n\n{}", cleaned_css);
         }
@@ -4761,6 +5753,12 @@ export default function Home() {
             let is_ui_mod = path_lower.contains("/components/ui") || path_lower.ends_with("/ui.tsx") || path_lower.ends_with("/ui.jsx");
             processed = repair_bare_react_fc_signatures(&processed, is_ui_mod);
         }
+        if path_lower.ends_with(".ts") && !path_lower.ends_with(".d.ts") {
+            processed = sanitize_jsx_in_ts_file(&processed, &normalized_path);
+        }
+        if path_lower.ends_with("middleware.ts") || path_lower.ends_with("middleware.js") {
+            processed = sanitize_middleware_redundancy(&processed, &normalized_path);
+        }
 
         // Expand barrel hook imports `import { useA, useB } from '@/hooks'` into individual `import { useA } from '@/hooks/useA'`
         if processed.contains("from '@/hooks'") || processed.contains("from \"@/hooks\"") {
@@ -4889,6 +5887,9 @@ export default function Home() {
         processed = ensure_hook_type_exports(&processed, &normalized_path);
 
         processed = sanitize_optional_user_password_access(&processed);
+        processed = sanitize_try_catch_body_scope(&processed);
+        processed = sanitize_stripe_client_init(&processed);
+        processed = sanitize_tsx_ux_glitches(&processed, &normalized_path);
     }
 
     processed

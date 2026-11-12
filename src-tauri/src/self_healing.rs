@@ -1090,7 +1090,8 @@ pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
                     let rel_lower = rel.to_lowercase();
                     if rel_lower.ends_with(".css") || rel_lower.ends_with(".scss") {
                         if let Ok(c) = std::fs::read_to_string(&p) {
-                            let deduped = crate::sanitizer::deduplicate_repeated_css_blocks(&c);
+                            let tw_cleaned = crate::sanitizer::sanitize_tailwind_css(&c);
+                            let deduped = crate::sanitizer::deduplicate_repeated_css_blocks(&tw_cleaned);
                             if deduped != c {
                                 let _ = std::fs::write(&p, deduped);
                             }
@@ -1108,11 +1109,21 @@ pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
                                 let is_ui_mod = rel_lower.contains("/components/ui") || rel_lower.ends_with("/ui.tsx") || rel_lower.ends_with("/ui.jsx");
                                 next = crate::sanitizer::repair_bare_react_fc_signatures(&next, is_ui_mod);
                             }
+                            if rel_lower.ends_with(".ts") && !rel_lower.ends_with(".d.ts") {
+                                next = crate::sanitizer::sanitize_jsx_in_ts_file(&next, &rel);
+                            }
+                            if rel_lower.ends_with("middleware.ts") || rel_lower.ends_with("middleware.js") {
+                                next = crate::sanitizer::sanitize_middleware_redundancy(&next, &rel);
+                            }
                             next = crate::sanitizer::sanitize_optional_user_password_access(&next);
                             next = crate::sanitizer::ensure_hook_type_exports(&next, &rel);
                             next = crate::sanitizer::sanitize_root_layout_missing_children(&next, &rel, true);
                             next = reconcile_external_icon_imports_in_content(proj_dir, &next);
+                            next = crate::sanitizer::sanitize_try_catch_body_scope(&next);
+                            next = crate::sanitizer::sanitize_stripe_client_init(&next);
+                            next = crate::sanitizer::sanitize_tsx_ux_glitches(&next, &rel);
                             next = crate::sanitizer::reconcile_server_prisma_enum_usage(proj_dir, &rel, &next);
+                            next = crate::sanitizer::reconcile_client_prisma_enum_mocks(proj_dir, &rel, &next);
                             if crate::sanitizer::is_app_router_route_file(&rel) {
                                 next = crate::sanitizer::sanitize_app_router_route_exports(&next, &rel);
                             }
@@ -1142,6 +1153,7 @@ pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
             if let Ok(c) = std::fs::read_to_string(&p) {
                 let mut next = crate::sanitizer::normalize_bare_local_imports(&c);
                 next = crate::sanitizer::ensure_next_server_imports(&next, root_candidate);
+                next = crate::sanitizer::sanitize_middleware_redundancy(&next, root_candidate);
                 if next != c {
                     let _ = std::fs::write(&p, next);
                 }
@@ -3630,6 +3642,25 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                 if prior_fails >= 1 {
                     diag_summary.push_str("  [WARNING: Previous AI repair attempt for this file made NO valid progress or was rejected. You MUST apply a concrete different code fix now!]\n");
                 }
+                if path_low.ends_with(".ts")
+                    && !path_low.ends_with(".d.ts")
+                    && file_diags.iter().any(|d| matches!(d.code.as_str(), "TS1005" | "TS1109" | "TS1161"))
+                {
+                    diag_summary.push_str("  [CRITICAL .ts RULE: This is a plain '.ts' file (NOT '.tsx'). TypeScript forbids JSX syntax (<Tag>...</Tag>) in '.ts' files! Replace any JSX with `React.createElement(Tag, props, children)` + `import React from 'react';`, or export pure TS config without JSX.]\n");
+                }
+                let file_diag_text_for_rev = per_file_diag_blocks
+                    .get(&path_str.to_lowercase())
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                let review_diags = crate::reviewer::diagnose_heal_stagnation(
+                    path_str,
+                    &orig_content,
+                    file_diag_text_for_rev,
+                    prior_fails,
+                );
+                for rd in review_diags {
+                    diag_summary.push_str(&format!("  [REVIEW DIRECTIVE] {}\n", rd));
+                }
                 for (d_idx, d) in file_diags.iter().take(12).enumerate() {
                     diag_summary.push_str(&format!("  Line {}, Col {}: [{}] {}\n", d.line, d.col, d.code, d.message));
                     if d_idx < 5 && d.line > 0 {
@@ -3831,7 +3862,6 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                                         .map(|s| s.as_str())
                                         .unwrap_or(&diag_summary);
                                     let atomic_patch = crate::katastar::extract_safe_atomic_patch(&path_str, &before, &processed);
-                                    let sig_info = crate::katastar::normalize_error_signature("compile", file_diag_raw, Some(&path_str));
                                     let entry_id = crate::katastar::register_repair_attempt(
                                         "compile",
                                         file_diag_raw,
@@ -3839,7 +3869,7 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                                         "ai",
                                         if atomic_patch.is_some() { "search_replace" } else { "ai_edit" },
                                         atomic_patch,
-                                        &sig_info.normalized_sample,
+                                        "",
                                         model,
                                     );
                                     pending_tsc_fixes.push(PendingBuildFix {
@@ -4275,7 +4305,6 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                             }
                             if std::fs::write(&full_path, &processed).is_ok() {
                                 let atomic_patch = crate::katastar::extract_safe_atomic_patch(&path_str, &before_disk, &processed);
-                                let sig_info = crate::katastar::normalize_error_signature("compile", &build_output, Some(&path_str));
                                 let entry_id = crate::katastar::register_repair_attempt(
                                     "compile",
                                     &build_output,
@@ -4283,7 +4312,7 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                                     "ai",
                                     if atomic_patch.is_some() { "search_replace" } else { "ai_edit" },
                                     atomic_patch,
-                                    &sig_info.normalized_sample,
+                                    "",
                                     model,
                                 );
                                 pending_fixes.push(PendingBuildFix {

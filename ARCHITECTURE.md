@@ -72,7 +72,9 @@ Ovaj dokument predstavlja kanonsku mapu izvršavanja koda u **Axiom Forge** desk
 | `self_healing.rs` | 5.022 L | Post-gen loop: Prisma DB, `.d.ts` inspekcija, Tier 1 (`tsc`), Tier 2 (`next build`) | Razdvojiti `verifier.rs` (`Tier 0/1/2`) i `dts_inspector.rs` |
 | `healer.rs` | 4.528 L | Single-file preview repair, Prisma heal loop, JSON/targeted edit parser, drop-guard | Izdvojiti `patch_parser.rs` i Prisma healer |
 | `packages.rs` | 2.402 L | Katalog verzija/praksi paketa + `npm install` offline/ETARGET recovery | Zadržati kao katalog + npm healer |
-| `katastar.rs` | 2.202 L | Katastar grešaka, `heal-ledger`, telemetrija tačnosti i SFT trainer | Spremno za dodavanje `ruleId` atribucije |
+| `katastar.rs` | 2.202 L | Katastar grešaka, `heal-ledger`, telemetrija tačnosti i SFT trainer | Dodata atribucija po `ruleId` potpisima preko `policy_registry.rs` |
+| `policy_registry.rs` | ~420 L | Kanonski **Policy Registry** (`ruleId`), prompt direktive i mapa 6 pipeline agenata | *Novo u Fazi 2 (`v0.1.54`)* — povezan sa `orchestrator.rs`, `reviewer.rs` i `/ai-optimizer` |
+| `reviewer.rs` | ~835 L | Pre-save token-aware AST-balans, Edge middleware matcher & API route audit | *Novo u Fazi 1 (`v0.1.54`)* — proverava `{}`/`()`/`[]` balans i stagnaciju |
 | `server.rs` | 1.047 L | Dev server runner, parsanje logova, `map_next_chunk_url_to_source` | Čisto izdvojen runtime modul |
 | `editor_ai.rs` | 926 L | Ručni AI asistent za pojedinačne fajlove/projekte | Čisto izdvojen editor modul |
 | `project.rs` | 789 L | CRUD projekata, podešavanja, keychain tokeni, import, `.env` detekcija | Stabilno |
@@ -80,15 +82,15 @@ Ovaj dokument predstavlja kanonsku mapu izvršavanja koda u **Axiom Forge** desk
 
 ### React Frontend (`src/`)
 
-- **Ključne stranice (`src/pages/`):** `Dashboard.jsx`, `ProjectConfig.jsx`, `ProjectDetail.jsx`, `Editor.jsx` (`116 KB` — kandidat za razbijanje u Fazi 4), `AiOptimizer.jsx`, `Settings.jsx`, `AgencyDashboard.jsx`, `InstallationWizard.jsx`.
+- **Ključne stranice (`src/pages/`):** `Dashboard.jsx`, `ProjectConfig.jsx`, `ProjectDetail.jsx`, `Editor.jsx` (`116 KB` — kandidat za razbijanje u Fazi 4), `AiOptimizer.jsx` (sadrži i klikabilni **Pipeline Orchestrator & Policy Registry Inspector**), `Settings.jsx`, `AgencyDashboard.jsx`, `InstallationWizard.jsx`.
 - **Most (`src/lib/ipc-bridge.js`):** Mapira `window.electronAPI.*` pozive na Tauri `invoke(...)` i event listener-e.
 
 ---
 
 ## 3. Plan Refaktora (`v0.1.53+`)
 
-- **Faza 0 (završena u ovom koraku):** `ARCHITECTURE.md` + izdvajanje svih testova iz `lib.rs` u `src-tauri/src/tests/`.
-- **Faza 1 (`v0.1.53`):** Domensko cepanje u `domains/` (`prisma`, `nextjs_ui`, `auth_nextauth`, `payments_stripe`, `middleware_edge`), `pipeline/` i `healing/` uz `pub use` re-eksporte za nultu regresiju.
-- **Faza 2 (`v0.1.54`):** Jedinstveni **Policy Registry** (`ruleId`) — svako pravilo na jednom mestu daje prompt, validator, deterministički popravak i metriku učinka u `/ai-optimizer`.
+- **Faza 0 (završena u `v0.1.53`):** `ARCHITECTURE.md` + izdvajanje svih testova iz `lib.rs` u `src-tauri/src/tests/`.
+- **Faza 1 (`v0.1.54`):** Uvođenje `reviewer.rs` (semantički/strukturni pregled + anti-stagnacija) i priprema za domensko cepanje u `domains/` / `pipeline/` / `healing/`.
+- **Faza 2 (završena u `v0.1.54`):** Jedinstveni **Policy Registry** (`policy_registry.rs`, `ruleId`) — svako pravilo na jednom mestu daje prompt direktive, pre-save validator, deterministički sanajzer, heal direktivu i klikabilan Pipeline Inspector sa Katastar statistikom u `/ai-optimizer`.
 - **Faza 3 (`v0.1.55`):** Uvođenje `tree-sitter` + `tree-sitter-typescript` AST engine-a umesto krhkih regex-a za import/export i JSX strukturu.
-- **Faza 4:** Razbijanje `Editor.jsx` u manje komponente i dodavanje interaktivnog Pipeline/Policy Inspectora u UI.
+- **Faza 4:** Razbijanje `Editor.jsx` u manje komponente i proširenje vizuelnog Pipeline/Policy Inspectora u UI.

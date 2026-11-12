@@ -657,3 +657,562 @@ export const config = { matcher: ['/dashboard/:path*', '/((?!api|_next/static|_n
     }
 
 
+    #[test]
+    fn test_v52_loyaltyhub_css_ts_jsx_middleware_pkg_and_katastar_fixes() {
+        // 1. CSS: @apply transform translateX(100%), duplicated @layer components, stray `}`, and orphan declarations
+        let broken_css = r#"@keyframes slideIn {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+@layer components {
+  .slide-in {
+    @apply transform translateX(100%);
+    animation: slideIn 0.3s ease-in-out forwards;
+  }
+}
+
+@layer components {
+  .slide-in {
+    @apply transform translateX(100%);
+    animation: slideIn 0.3s ease-in-out forwards;
+  }
+}
+  .slide-in {
+    @apply transform translateX(100%);
+    animation: slideIn 0.3s ease-in-out forwards;
+  }
+}
+  @apply transform translateX(100%);
+  animation: slideIn 0.3s ease-in-out forwards;
+}
+"#;
+        let fixed_css = post_process_generated_file("src/app/globals.css", broken_css, &serde_json::json!({}), true);
+        assert!(fixed_css.contains("@tailwind base;"), "Missing @tailwind base:\n{}", fixed_css);
+        assert!(!fixed_css.contains("@apply transform translateX"), "Invalid @apply transform translateX must be converted:\n{}", fixed_css);
+        assert!(fixed_css.contains("transform: translateX(100%);"), "Expected native CSS transform:\n{}", fixed_css);
+        assert_eq!(fixed_css.matches("@layer components").count(), 1, "Duplicate @layer components must be collapsed:\n{}", fixed_css);
+        assert_eq!(fixed_css.matches('{').count(), fixed_css.matches('}').count(), "CSS braces must balance cleanly:\n{}", fixed_css);
+        assert!(!fixed_css.trim_end().ends_with("forwards;\n}"), "Orphan tail declaration must be dropped:\n{}", fixed_css);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        assert!(rt.block_on(crate::orchestrator::validate_file_with_abstract_rules("src/app/globals.css", broken_css, "")).is_err());
+        assert!(rt.block_on(crate::orchestrator::validate_file_with_abstract_rules("src/app/globals.css", &fixed_css, "")).is_ok());
+
+        // 2. `.ts` JSX-to-React.createElement conversion (`src/config/i18n.ts`) without breaking TS generics
+        let broken_i18n_ts = r#"import { I18nextProvider, initReactI18next } from 'react-i18next';
+import i18n from 'i18next';
+
+const locales: Array<string> = ['en', 'es'];
+
+export default function I18nProvider({ children }: { children: React.ReactNode }) {
+  return <I18nextProvider i18n={i18n}>{children}</I18nextProvider>;
+}
+export { I18nProvider, locales };
+"#;
+        let fixed_i18n = post_process_generated_file("src/config/i18n.ts", broken_i18n_ts, &serde_json::json!({}), false);
+        assert!(fixed_i18n.contains("import React from 'react';"), "Must inject React import for createElement:\n{}", fixed_i18n);
+        assert!(fixed_i18n.contains("React.createElement(I18nextProvider, { i18n: i18n }, children)"), "Must rewrite JSX to React.createElement:\n{}", fixed_i18n);
+        assert!(fixed_i18n.contains("Array<string>"), "Must preserve TS generics:\n{}", fixed_i18n);
+        assert!(!fixed_i18n.contains("</I18nextProvider>"), "Closing JSX tag must be gone:\n{}", fixed_i18n);
+        assert!(rt.block_on(crate::orchestrator::validate_file_with_abstract_rules("src/config/i18n.ts", broken_i18n_ts, "")).is_err());
+        assert!(rt.block_on(crate::orchestrator::validate_file_with_abstract_rules("src/config/i18n.ts", &fixed_i18n, "")).is_ok());
+
+        // 3. `src/middleware.ts` redundant inline static skip stripped when negative lookahead matcher already excludes `_next/static`
+        let redundant_mw = r#"import { NextResponse, NextRequest } from 'next/server';
+
+export async function middleware(request: NextRequest) {
+  const { pathname } = request.nextUrl;
+
+  // Bypass static asset queries at the matcher layer
+  if (pathname.startsWith('/_next/static') || pathname.startsWith('/_next/image') || pathname.includes('.')) {
+    return NextResponse.next();
+  }
+
+  if (pathname.startsWith('/dashboard')) {
+    return NextResponse.redirect(new URL('/login', request.url));
+  }
+
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: [
+    '/((?!api|_next/static|_next/image|_vercel|favicon\\.ico|.*\\..*).*)'
+  ]
+};
+"#;
+        let cleaned_mw = crate::sanitizer::sanitize_middleware_redundancy(redundant_mw, "src/middleware.ts");
+        assert!(!cleaned_mw.contains("pathname.startsWith('/_next/static')"), "Redundant static branch must be stripped:\n{}", cleaned_mw);
+        assert!(cleaned_mw.contains("pathname.startsWith('/dashboard')"), "Auth branch must remain:\n{}", cleaned_mw);
+
+        // 4. package.json strips `@types/prisma` and legacy `resolutions.typescript: 4.x` under TS 5
+        let mut pkg = serde_json::json!({
+            "name": "loyaltyhub",
+            "dependencies": { "next": "14.2.35", "react": "^18.2.0", "react-dom": "^18.2.0", "@prisma/client": "5.22.0" },
+            "devDependencies": { "@types/prisma": "^1.0.0", "prisma": "5.22.0", "typescript": "^5.3.3" },
+            "resolutions": { "typescript": "4.9.4" }
+        });
+        assert!(crate::packages::sanitize_package_json_value_for_offline(&mut pkg));
+        assert!(pkg["devDependencies"].get("@types/prisma").is_none(), "@types/prisma must be removed: {:?}", pkg);
+        assert!(pkg.get("resolutions").is_none(), "Empty resolutions after dropping stale TS 4.9.4 pin must be removed: {:?}", pkg);
+
+        // 5. Katastar rejects boilerplate Serbian fallback hints
+        let temp_k = std::env::temp_dir().join(format!(
+            "axiom_v52_katastar_hint_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let k_path = temp_k.join("katastar.json");
+        let eid = crate::katastar::register_repair_attempt_at(
+            &k_path,
+            "compile",
+            "src/a.ts(1,1): error TS1005: '>' expected.",
+            "src/a.ts",
+            "ai",
+            "ai_edit",
+            None,
+            "Popravka generisana od strane AI modela",
+            "qwen2.5-coder:7b",
+        );
+        crate::katastar::finalize_katastar_outcome_at(
+            &k_path,
+            &eid,
+            true,
+            "ai",
+            "tsc_noemit",
+            None,
+            Some("Izvučen popravljen kod iz AI odgovora"),
+            "qwen2.5-coder:7b",
+        );
+        let store = crate::katastar::load_katastar_store_at(&k_path);
+        assert_eq!(store.entries[0].hint, "", "Boilerplate Serbian fallback hint must NOT pollute katastar");
+        let _ = std::fs::remove_dir_all(&temp_k);
+    }
+
+
+    #[test]
+    fn test_v53_reviewer_pipeline_status_middleware_and_api_route_forms() {
+        use crate::orchestrator::{sync_live_builder_guide_pipeline_status, validate_file_with_abstract_rules};
+        use crate::reviewer::{
+            check_delimiter_balance, diagnose_heal_stagnation, extract_middleware_matcher_exclusions,
+            review_generated_file, sanitize_middleware_principled, ReviewSeverity,
+        };
+
+        // 1. LiveBuilderGuide `generationPipeline[*].status` transitions pending -> in_progress -> completed
+        let temp_lbg = std::env::temp_dir().join(format!(
+            "axiom_v53_lbg_status_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(temp_lbg.join(".axiom")).unwrap();
+        let lbg_init = serde_json::json!({
+            "generationPipeline": [
+                { "phaseId": "dependencies", "files": ["package.json"], "status": "pending" },
+                { "phaseId": "auth", "files": ["src/app/api/register/route.ts", "src/app/login/page.tsx"], "status": "pending" }
+            ]
+        });
+        std::fs::write(
+            temp_lbg.join(".axiom/live_builder_guide.json"),
+            serde_json::to_string_pretty(&lbg_init).unwrap(),
+        )
+        .unwrap();
+
+        sync_live_builder_guide_pipeline_status(
+            &temp_lbg,
+            &["package.json".to_string(), "src/app/api/register/route.ts".to_string()],
+            false,
+        );
+        let mid: Value = serde_json::from_str(&std::fs::read_to_string(temp_lbg.join(".axiom/live_builder_guide.json")).unwrap()).unwrap();
+        assert_eq!(mid["generationPipeline"][0]["status"], "completed");
+        assert_eq!(mid["generationPipeline"][1]["status"], "in_progress");
+
+        sync_live_builder_guide_pipeline_status(&temp_lbg, &[], true);
+        let fin: Value = serde_json::from_str(&std::fs::read_to_string(temp_lbg.join(".axiom/live_builder_guide.json")).unwrap()).unwrap();
+        assert_eq!(fin["generationPipeline"][0]["status"], "completed");
+        assert_eq!(fin["generationPipeline"][1]["status"], "completed");
+        let _ = std::fs::remove_dir_all(&temp_lbg);
+
+        // 2. App Router API Route Handler rejects Pages Router types & importing from `@/app/api/.../route`
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let bad_pages_api = r#"import { NextApiRequest, NextApiResponse } from 'next';
+import { NextResponse } from 'next/server';
+export async function POST(request: NextApiRequest, response: NextApiResponse) {
+  return NextResponse.json({ ok: true });
+}
+"#;
+        assert!(rt.block_on(validate_file_with_abstract_rules("src/app/api/register/route.ts", bad_pages_api, "")).is_err());
+
+        let bad_route_import = r#"import { NextResponse } from 'next/server';
+import { authOptions } from '@/app/api/auth/[...nextauth]/route';
+export async function POST() {
+  return NextResponse.json({ hasOpts: Boolean(authOptions) });
+}
+"#;
+        assert!(rt.block_on(validate_file_with_abstract_rules("src/app/api/register/route.ts", bad_route_import, "")).is_err());
+
+        // 3. Principled Middleware parser & unreachable-branch sanitizer + Edge-unsafe check
+        let mw_with_unreachable = r#"import { NextResponse, NextRequest } from 'next/server';
+
+export async function middleware(request: NextRequest) {
+  const { pathname } = request.nextUrl;
+
+  if (pathname.startsWith('/_next/static') || pathname.endsWith('.ico')) {
+    return NextResponse.next();
+  }
+
+  if (pathname.startsWith('/dashboard')) {
+    return NextResponse.redirect(new URL('/login', request.url));
+  }
+
+  if (pathname.startsWith('/api')) {
+    const locale = pathname.split('/')[2];
+    if (locale === 'es') {
+      return NextResponse.rewrite(new URL(`/${locale}${pathname}`, request.url));
+    }
+  }
+
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: [
+    '/((?!api|_next/static|_next/image|_vercel|favicon\\.ico|.*\\..*).*)'
+  ]
+};
+"#;
+        let spec = extract_middleware_matcher_exclusions(mw_with_unreachable);
+        assert!(spec.has_negative_lookahead);
+        assert!(spec.excluded_literals.iter().any(|s| s == "api"));
+        assert!(spec.excluded_literals.iter().any(|s| s == "_next/static"));
+        let stripped_mw = sanitize_middleware_principled(mw_with_unreachable, "src/middleware.ts");
+        assert!(!stripped_mw.contains("pathname.startsWith('/_next/static')"), "Excluded static branch must be removed:\n{}", stripped_mw);
+        assert!(!stripped_mw.contains("pathname.startsWith('/api')"), "Excluded unreachable /api branch must be removed:\n{}", stripped_mw);
+        assert!(stripped_mw.contains("pathname.startsWith('/dashboard')"), "Reachable auth branch must stay:\n{}", stripped_mw);
+
+        let edge_unsafe_mw = "import prisma from '@/lib/prisma';\nexport function middleware() { return prisma ? null : null; }\n";
+        let mw_issues = review_generated_file("src/middleware.ts", edge_unsafe_mw);
+        assert!(mw_issues.iter().any(|i| i.severity == ReviewSeverity::Error && i.rule_id == "middleware:edge-unsafe-import"));
+
+        // 4. Delimiter balance check & stagnant auto-heal diagnostic directives
+        assert!(check_delimiter_balance("body { color: red; }\n}", true).is_err());
+        assert!(check_delimiter_balance("export function f() { return /\\}/; }\n", false).is_ok());
+        assert!(check_delimiter_balance("export function f() { return 1; }\n}\n", false).is_err());
+
+        let stag_dirs = diagnose_heal_stagnation(
+            "src/config/i18n.ts",
+            "export default function P({ children }: any) { return <I18n>{children}</I18n>; }",
+            "TS1005 '>' expected.",
+            2,
+        );
+        assert!(stag_dirs.iter().any(|d| d.contains("[format:jsx-in-plain-ts]")));
+        assert!(stag_dirs.iter().any(|d| d.contains("[heal:anti-stagnation]")));
+    }
+
+    #[test]
+    fn test_v54_telemetry_bug_fixes_legacy_dedup_prisma_and_inprogress() {
+        use crate::katastar::compute_model_progress_telemetry_at;
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v54_telemetry_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let projects_dir = temp_dir.join("projects");
+        for id in ["p46", "p48", "p49", "p52", "p53"] {
+            std::fs::create_dir_all(projects_dir.join(format!("{}/src/app", id))).unwrap();
+            for i in 0..10 {
+                std::fs::write(
+                    projects_dir.join(format!("{}/src/app/f{}.tsx", id, i)),
+                    "export default function P(){return null;}",
+                )
+                .unwrap();
+            }
+        }
+        std::fs::create_dir_all(projects_dir.join("p53/.axiom")).unwrap();
+        std::fs::write(
+            projects_dir.join("p53/.axiom/generation_state.json"),
+            r#"{"appVersion":"0.1.53","phase":"generating","status":"generating","warnings":[]}"#,
+        )
+        .unwrap();
+
+        let projects_json = serde_json::json!([
+            // Bug 2: Legacy pre-v0.1.48 without warnings/ledger -> must be unmeasured, NOT 100%
+            {
+                "id": "p46", "name": "ShoeCraft Legacy", "status": "ready", "createdAt": "2026-11-10T10:36:38Z"
+            },
+            // Bug 1: Duplicate TS warning lines (68 + 68) -> must count 68 + 1 = 69, NOT 137
+            {
+                "id": "p48", "name": "BalkanFlow", "status": "ready", "createdAt": "2026-11-10T18:45:34Z",
+                "metadata": {
+                    "appVersion": "0.1.48",
+                    "modelId": "qwen2.5-coder:7b",
+                    "warnings": [
+                        "TypeScript greške (68): src/app/f0.tsx:9 TS2353",
+                        "next build greška: Failed to compile.",
+                        "TypeScript provera prijavila 68 grešaka"
+                    ]
+                }
+            },
+            // Bug 3: Failed Prisma schema ("Business Analysis Failed") -> must be heavily penalized (<35%)
+            {
+                "id": "p49", "name": "Business Analysis Failed", "status": "ready", "createdAt": "2026-11-11T12:57:37Z",
+                "metadata": {
+                    "appVersion": "0.1.49",
+                    "modelId": "qwen2.5-coder:7b",
+                    "warnings": [
+                        "Prisma validation/generation failed (Failed to validate schema)",
+                        "TypeScript greške (8): src/app/f0.tsx:60 TS1005",
+                        "next build greška: Failed to compile.",
+                        "prisma validate nije prošao"
+                    ]
+                }
+            },
+            // Good v0.1.52 build -> Δ Best must be positive (>= 0), NOT compared to phantom v46 100%
+            {
+                "id": "p52", "name": "LoyaltyHub", "status": "ready", "createdAt": "2026-11-12T14:06:53Z",
+                "metadata": {
+                    "appVersion": "0.1.52",
+                    "modelId": "qwen2.5-coder:7b",
+                    "warnings": [
+                        "TypeScript greške (4): src/app/f0.tsx:41 TS1005",
+                        "TypeScript provera prijavila 4 grešaka"
+                    ]
+                }
+            },
+            // Bug 4: In-progress generating project -> excluded from versionsTimeline & clean builds
+            {
+                "id": "p53", "name": "PetSit Generating", "status": "generating", "createdAt": "2026-11-12T15:10:19Z",
+                "metadata": {
+                    "appVersion": "0.1.53",
+                    "modelId": "qwen2.5-coder:7b"
+                }
+            }
+        ]);
+        let projects_file = temp_dir.join("projects.json");
+        std::fs::write(&projects_file, serde_json::to_string_pretty(&projects_json).unwrap()).unwrap();
+        let katastar_path = temp_dir.join("katastar.json");
+        std::fs::write(&katastar_path, r#"{"version":1,"entries":[]}"#).unwrap();
+        let settings_path = temp_dir.join("settings.json");
+        std::fs::write(&settings_path, r#"{"ollamaModel":"qwen2.5-coder:7b"}"#).unwrap();
+
+        let telemetry = compute_model_progress_telemetry_at(
+            &projects_file,
+            &projects_dir,
+            &katastar_path,
+            &settings_path,
+            Some("qwen2.5-coder:7b"),
+        )
+        .unwrap();
+
+        let projects = telemetry["projects"].as_array().unwrap();
+        let p46 = projects.iter().find(|p| p["id"] == "p46").unwrap();
+        let p48 = projects.iter().find(|p| p["id"] == "p48").unwrap();
+        let p49 = projects.iter().find(|p| p["id"] == "p49").unwrap();
+        let p52 = projects.iter().find(|p| p["id"] == "p52").unwrap();
+        let p53 = projects.iter().find(|p| p["id"] == "p53").unwrap();
+
+        assert_eq!(p46["telemetryStatus"], "unmeasured");
+        assert_eq!(p48["residualErrors"], 69, "TS errors must not be double counted");
+        assert_eq!(p52["residualErrors"], 4, "TS errors in p52 must not be double counted");
+        assert_eq!(p49["hasPrismaFailure"], true);
+        assert!(p49["accuracyPct"].as_f64().unwrap() < 35.0, "Prisma failure must heavily penalize accuracy, got {}", p49["accuracyPct"]);
+        assert_eq!(p53["telemetryStatus"], "in_progress");
+
+        let timeline = telemetry["versionsTimeline"].as_array().unwrap();
+        // v0.1.53 (in_progress only) must not appear in versionsTimeline; summary must point to v0.1.52
+        assert!(timeline.iter().all(|v| v["version"] != "v0.1.53"));
+        assert_eq!(telemetry["summary"]["version"], "v0.1.52");
+        let row_52 = timeline.iter().find(|v| v["version"] == "v0.1.52").unwrap();
+        assert!(row_52["deltaVsBestPct"].as_f64().unwrap() > 0.0, "v0.1.52 must beat v0.1.48/v0.1.49 without phantom 100% baseline");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_v54_auth_routes_injection_and_ux_glitches() {
+        use crate::orchestrator::ensure_nextjs_required_auth_pages;
+        use crate::sanitizer::sanitize_tsx_ux_glitches;
+
+        let mut manifest_files = vec![
+            serde_json::json!({ "path": "src/middleware.ts", "description": "Auth guard" }),
+            serde_json::json!({ "path": "src/app/dashboard/bookings/page.tsx", "description": "Protected bookings" }),
+        ];
+        assert!(ensure_nextjs_required_auth_pages(&mut manifest_files, "PetSit Connect"));
+        let paths: Vec<String> = manifest_files
+            .iter()
+            .filter_map(|v| v.get("path").and_then(|p| p.as_str()).map(|s| s.to_string()))
+            .collect();
+        assert!(paths.contains(&"src/app/login/page.tsx".to_string()), "Missing /login page: {:?}", paths);
+        assert!(paths.contains(&"src/app/register/page.tsx".to_string()), "Missing /register page: {:?}", paths);
+        // Idempotent second call
+        assert!(!ensure_nextjs_required_auth_pages(&mut manifest_files, "PetSit Connect"));
+
+        let glitch_page = r#"
+const services = [{ title: 'Sitting', metrics: { price: '$50' } }];
+export default function HomePage() {
+  return (
+    <div>
+      <span>${services[0].metrics.price}</span>
+      <button onClick={() => router.push('/dashboard/login')}>Log In</button>
+      <a href="/dashboard/register">Sign Up</a>
+    </div>
+  );
+}
+"#;
+        let fixed = sanitize_tsx_ux_glitches(glitch_page, "src/app/page.tsx");
+        assert!(fixed.contains("router.push('/login')"), "Broken /dashboard/login must be rewritten: {}", fixed);
+        assert!(fixed.contains("\"/register\""), "Broken /dashboard/register must be rewritten: {}", fixed);
+        assert!(fixed.contains("startsWith('$')"), "Double currency $$50 guard missing: {}", fixed);
+    }
+
+    #[test]
+    fn test_v54_try_catch_body_scope_hoist_and_reviewer() {
+        use crate::reviewer::check_try_catch_body_scope;
+        use crate::sanitizer::sanitize_try_catch_body_scope;
+
+        let broken_route = r#"import { NextRequest, NextResponse } from 'next/server';
+export async function POST(request: NextRequest) {
+  try {
+    const body = await request.json();
+    return NextResponse.json(body);
+  } catch (error) {
+    return NextResponse.json({ fallback: true, attempted: body }, { status: 500 });
+  }
+}
+"#;
+        let issues = check_try_catch_body_scope(broken_route, "src/app/api/bookings/route.ts");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].rule_id, "api.try-catch-body-scope");
+
+        let fixed = sanitize_try_catch_body_scope(broken_route);
+        assert!(fixed.contains("let body: any = {};\n  try {"), "Expected hoisted `let body: any = {{}}`: {}", fixed);
+        assert!(fixed.contains("body = await request.json();"), "Expected assignment inside try: {}", fixed);
+        assert!(check_try_catch_body_scope(&fixed, "src/app/api/bookings/route.ts").is_empty(), "Fixed code must pass reviewer: {}", fixed);
+    }
+
+    #[test]
+    fn test_v54_stripe_legacy_upgrade_and_apiversion_cleanup() {
+        use crate::packages::sanitize_package_json_value_for_offline;
+        use crate::sanitizer::sanitize_stripe_client_init;
+
+        let mut pkg_legacy = serde_json::json!({
+            "dependencies": {
+                "next": "14.2.35",
+                "stripe": "^8.135.0"
+            }
+        });
+        assert!(sanitize_package_json_value_for_offline(&mut pkg_legacy));
+        assert_eq!(pkg_legacy["dependencies"]["stripe"], "^17.5.0");
+
+        let mut pkg_modern = serde_json::json!({
+            "dependencies": {
+                "next": "14.2.35",
+                "stripe": "^23.1.0"
+            }
+        });
+        assert!(!sanitize_package_json_value_for_offline(&mut pkg_modern));
+        assert_eq!(pkg_modern["dependencies"]["stripe"], "^23.1.0");
+
+        let stripe_src = "import Stripe from 'stripe';\nconst stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', { apiVersion: '2022-11-15' });\n";
+        let fixed_stripe = sanitize_stripe_client_init(stripe_src);
+        assert_eq!(
+            fixed_stripe,
+            "import Stripe from 'stripe';\nconst stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '');\n"
+        );
+    }
+
+    #[test]
+    fn test_v54_ui_toast_stubs_and_client_prisma_enum_mocks() {
+        use crate::sanitizer::{ensure_ui_primitives_reconciled, reconcile_client_prisma_enum_mocks};
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v54_ui_enum_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("prisma")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/app/dashboard/reviews")).unwrap();
+
+        std::fs::write(
+            temp_dir.join("prisma/schema.prisma"),
+            "enum BookingStatus { PENDING CONFIRMED COMPLETED }\nenum UserRole { PET_OWNER SITTER }\n",
+        )
+        .unwrap();
+
+        let page_src = r#""use client";
+import { toast } from '@/components/ui/use-toast';
+import { TableHeaderCell } from '@/components/ui';
+
+const demo = { status: 'confirmed', role: 'petOwner' };
+export default function ReviewsPage() {
+  toast({ title: 'Loaded' });
+  return <TableHeaderCell>{demo.status}</TableHeaderCell>;
+}
+"#;
+        std::fs::write(temp_dir.join("src/app/dashboard/reviews/page.tsx"), page_src).unwrap();
+
+        ensure_ui_primitives_reconciled(&temp_dir);
+        let toast_file = std::fs::read_to_string(temp_dir.join("src/components/ui/use-toast.tsx")).unwrap();
+        assert!(toast_file.contains("export const toast"), "toast stub must be synthesized: {}", toast_file);
+        let ui_file = std::fs::read_to_string(temp_dir.join("src/components/ui.tsx")).unwrap();
+        assert!(ui_file.contains("export const TableHeaderCell"), "TableHeaderCell stub missing: {}", ui_file);
+
+        let reconciled = reconcile_client_prisma_enum_mocks(&temp_dir, "src/app/dashboard/reviews/page.tsx", page_src);
+        assert!(reconciled.contains("status: 'CONFIRMED' as any"), "Expected uppercase schema enum match: {}", reconciled);
+        assert!(reconciled.contains("role: 'PET_OWNER' as any"), "Expected snake-case schema enum match: {}", reconciled);
+        assert!(!reconciled.contains("from '@prisma/client'"), "Must NEVER inject @prisma/client into client files: {}", reconciled);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_v54_policy_registry_snapshot_and_prompt_directives() {
+        use crate::policy_registry::{build_policy_registry_snapshot_at, prompt_directives_for_file};
+
+        let api_dir = prompt_directives_for_file("src/app/api/payments/route.ts", true, true);
+        assert!(api_dir.contains("[api.try-catch-body-scope]"), "Missing try-catch rule: {}", api_dir);
+        assert!(api_dir.contains("[payments.stripe-sdk-compatibility]"), "Missing stripe rule: {}", api_dir);
+
+        let mw_dir = prompt_directives_for_file("src/middleware.ts", true, false);
+        assert!(mw_dir.contains("[middleware.matcher-exclusions]"), "Missing matcher rule: {}", mw_dir);
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v54_policy_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let katastar_path = temp_dir.join("katastar.json");
+        std::fs::write(
+            &katastar_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "version": 1,
+                "entries": [
+                    {
+                        "error_signature": "TS2304: Cannot find name 'body'.",
+                        "category": "TypeScript",
+                        "recommended_fix_hint": "Hoist body above try",
+                        "occurrences": 3,
+                        "verified": true,
+                        "success_count": 2,
+                        "fail_count": 0
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let snap = build_policy_registry_snapshot_at(&katastar_path);
+        assert!(snap["totalRules"].as_u64().unwrap() >= 12);
+        assert_eq!(snap["totalAgents"].as_u64().unwrap(), 6);
+        let rules = snap["rules"].as_array().unwrap();
+        let try_rule = rules.iter().find(|r| r["id"] == "api.try-catch-body-scope").unwrap();
+        assert_eq!(try_rule["katastarMatches"], 1);
+        assert_eq!(try_rule["verifiedFixes"], 2);
+        assert_eq!(try_rule["successRatePct"], 100.0);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+
+

@@ -10,6 +10,8 @@ pub mod hardware;
 pub mod server;
 pub mod healer;
 pub mod katastar;
+pub mod policy_registry;
+pub mod reviewer;
 pub mod self_healing;
 pub mod orchestrator;
 
@@ -22,6 +24,8 @@ pub use hardware::*;
 pub use server::*;
 pub use healer::*;
 pub use katastar::*;
+pub use policy_registry::*;
+pub use reviewer::*;
 pub use self_healing::*;
 pub use orchestrator::*;
 
@@ -345,6 +349,7 @@ pub fn run() {
             project_run_prisma_generate,
             get_error_katastar,
             katastar::get_model_progress_telemetry,
+            policy_registry::get_policy_registry,
             katastar::export_mini_llm_training_dataset,
             task_start_generation,
             task_pause_generation,

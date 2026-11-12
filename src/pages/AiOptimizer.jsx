@@ -16,6 +16,9 @@ import {
   Check,
   AlertTriangle,
   Layers,
+  GitBranch,
+  ChevronRight,
+  Code2,
 } from 'lucide-react';
 import { useI18n } from '../i18n/I18nContext';
 
@@ -27,10 +30,11 @@ function formatDelta(val) {
 }
 
 function AccuracyTrendSvg({ timeline }) {
-  if (!timeline || timeline.length === 0) {
+  const measured = (timeline || []).filter((pt) => pt.telemetryStatus !== 'unmeasured');
+  if (measured.length === 0) {
     return (
       <div className="h-52 flex items-center justify-center text-slate-500 text-sm border border-dashed border-slate-800 rounded-xl">
-        No generated project cohorts yet. Generate a project to populate your accuracy trajectory.
+        No measured project cohorts yet. Generate a project to populate your accuracy trajectory.
       </div>
     );
   }
@@ -44,11 +48,11 @@ function AccuracyTrendSvg({ timeline }) {
   const plotW = width - padL - padR;
   const plotH = height - padT - padB;
 
-  const pts = timeline.map((pt, idx) => {
+  const pts = measured.map((pt, idx) => {
     const x =
-      timeline.length === 1
+      measured.length === 1
         ? padL + plotW / 2
-        : padL + (idx / (timeline.length - 1)) * plotW;
+        : padL + (idx / (measured.length - 1)) * plotW;
     const yExp = padT + (1 - Math.min(100, Math.max(0, pt.exponentialIndexPct)) / 100) * plotH;
     const yRaw = padT + (1 - Math.min(100, Math.max(0, pt.rawAccuracyPct)) / 100) * plotH;
     return { ...pt, x, yExp, yRaw };
@@ -165,6 +169,10 @@ export default function AiOptimizer() {
   const [exportResult, setExportResult] = useState(null);
   const [copiedCmd, setCopiedCmd] = useState(false);
 
+  const [policyRegistry, setPolicyRegistry] = useState(null);
+  const [selectedAgentId, setSelectedAgentId] = useState('all');
+  const [selectedRuleId, setSelectedRuleId] = useState('manifest.required-auth-routes');
+
   const loadAll = useCallback(async (modelFilter = selectedModel) => {
     setLoading(true);
     setErrorMsg('');
@@ -173,11 +181,15 @@ export default function AiOptimizer() {
       if (!api) {
         throw new Error('AI Optimizer telemetry bridge is unavailable.');
       }
-      const [telRes, cfgRes] = await Promise.all([
+      const [telRes, cfgRes, regRes] = await Promise.all([
         api.getTelemetry(modelFilter === 'all' ? null : modelFilter),
         api.getConfig(),
+        api.getPolicyRegistry ? api.getPolicyRegistry().catch(() => null) : Promise.resolve(null),
       ]);
       setTelemetry(telRes);
+      if (regRes) {
+        setPolicyRegistry(regRes);
+      }
       if (cfgRes) {
         setConfig({
           aggressiveness: Number(cfgRes.aggressiveness ?? 0.8),
@@ -241,6 +253,15 @@ export default function AiOptimizer() {
 
   const deltaPrevNum = Number(summary.deltaVsPrevPct || 0);
   const deltaBestNum = Number(summary.deltaVsBestPct || 0);
+
+  const registryAgents = policyRegistry?.agents || [];
+  const registryRules = policyRegistry?.rules || [];
+  const filteredRules =
+    selectedAgentId === 'all'
+      ? registryRules
+      : registryRules.filter((r) => r.agentStage === selectedAgentId);
+  const activeRule =
+    filteredRules.find((r) => r.id === selectedRuleId) || filteredRules[0] || registryRules[0] || null;
 
   return (
     <div className="max-w-7xl mx-auto pb-16 space-y-6">
@@ -570,25 +591,35 @@ export default function AiOptimizer() {
                 </td>
               </tr>
             ) : (
-              timeline.map((row) => (
-                <tr key={row.version} className="hover:bg-slate-800/30">
-                  <td className="py-2.5 px-3 text-indigo-300 font-semibold">{row.version}</td>
-                  <td className="py-2.5 px-3 text-slate-300">{row.projectCount}</td>
-                  <td className="py-2.5 px-3 text-slate-300">
-                    {row.cleanProjectsCount}/{row.projectCount}
-                  </td>
-                  <td className="py-2.5 px-3 text-emerald-300">{row.f100Pct}%</td>
-                  <td className="py-2.5 px-3 text-amber-300">{row.bugScopePct}%</td>
-                  <td className="py-2.5 px-3 text-slate-200">{row.rawAccuracyPct}%</td>
-                  <td className="py-2.5 px-3 text-white font-bold">{row.exponentialIndexPct}%</td>
-                  <td className={`py-2.5 px-3 ${row.deltaVsPrevPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                    {formatDelta(row.deltaVsPrevPct)}
-                  </td>
-                  <td className={`py-2.5 px-3 ${row.deltaVsBestPct >= 0 ? 'text-cyan-300' : 'text-amber-400'}`}>
-                    {formatDelta(row.deltaVsBestPct)}
-                  </td>
-                </tr>
-              ))
+              timeline.map((row) => {
+                const isUnmeasured = row.telemetryStatus === 'unmeasured';
+                return (
+                  <tr key={row.version} className="hover:bg-slate-800/30">
+                    <td className="py-2.5 px-3 text-indigo-300 font-semibold">
+                      <span>{row.version}</span>
+                      {isUnmeasured && (
+                        <span className="ml-2 px-1.5 py-0.5 text-[10px] rounded bg-slate-800 text-slate-400 font-normal">
+                          unmeasured
+                        </span>
+                      )}
+                    </td>
+                    <td className="py-2.5 px-3 text-slate-300">{row.projectCount}</td>
+                    <td className="py-2.5 px-3 text-slate-300">
+                      {isUnmeasured ? '—' : `${row.cleanProjectsCount}/${row.projectCount}`}
+                    </td>
+                    <td className="py-2.5 px-3 text-emerald-300">{isUnmeasured ? '—' : `${row.f100Pct}%`}</td>
+                    <td className="py-2.5 px-3 text-amber-300">{isUnmeasured ? '—' : `${row.bugScopePct}%`}</td>
+                    <td className="py-2.5 px-3 text-slate-200">{isUnmeasured ? '—' : `${row.rawAccuracyPct}%`}</td>
+                    <td className="py-2.5 px-3 text-white font-bold">{isUnmeasured ? '—' : `${row.exponentialIndexPct}%`}</td>
+                    <td className={`py-2.5 px-3 ${isUnmeasured ? 'text-slate-500' : row.deltaVsPrevPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      {isUnmeasured ? '—' : formatDelta(row.deltaVsPrevPct)}
+                    </td>
+                    <td className={`py-2.5 px-3 ${isUnmeasured ? 'text-slate-500' : row.deltaVsBestPct >= 0 ? 'text-cyan-300' : 'text-amber-400'}`}>
+                      {isUnmeasured ? '—' : formatDelta(row.deltaVsBestPct)}
+                    </td>
+                  </tr>
+                );
+              })
             )}
           </tbody>
         </table>
@@ -613,21 +644,243 @@ export default function AiOptimizer() {
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-800/60 text-xs">
-            {projects.map((p) => (
-              <tr key={p.id} className="hover:bg-slate-800/30">
-                <td className="py-2.5 px-3 text-slate-200 font-medium">{p.name}</td>
-                <td className="py-2.5 px-3 font-mono text-indigo-300">v{p.appVersion}</td>
-                <td className="py-2.5 px-3 font-mono text-slate-400">{p.modelId}</td>
-                <td className="py-2.5 px-3 font-mono text-slate-300">{p.totalFiles}</td>
-                <td className="py-2.5 px-3 font-mono text-emerald-300">{p.firstPassCleanRatePct}%</td>
-                <td className="py-2.5 px-3 font-mono text-amber-300">{p.bugScopePct}%</td>
-                <td className="py-2.5 px-3 font-mono text-cyan-300">{p.healedIssuesCount}</td>
-                <td className="py-2.5 px-3 font-mono text-white font-semibold">{p.accuracyPct}%</td>
-              </tr>
-            ))}
+            {projects.map((p) => {
+              const isUnmeasured = p.telemetryStatus === 'unmeasured';
+              const isInProgress = p.telemetryStatus === 'in_progress';
+              return (
+                <tr key={p.id} className="hover:bg-slate-800/30">
+                  <td className="py-2.5 px-3 text-slate-200 font-medium">
+                    <span>{p.name}</span>
+                    {isUnmeasured && (
+                      <span className="ml-2 px-1.5 py-0.5 text-[10px] rounded bg-slate-800 text-slate-400">
+                        unmeasured
+                      </span>
+                    )}
+                    {isInProgress && (
+                      <span className="ml-2 px-1.5 py-0.5 text-[10px] rounded bg-indigo-500/20 text-indigo-300">
+                        in progress
+                      </span>
+                    )}
+                    {p.hasPrismaFailure && (
+                      <span className="ml-2 px-1.5 py-0.5 text-[10px] rounded bg-rose-500/20 text-rose-300">
+                        prisma failed
+                      </span>
+                    )}
+                  </td>
+                  <td className="py-2.5 px-3 font-mono text-indigo-300">v{p.appVersion}</td>
+                  <td className="py-2.5 px-3 font-mono text-slate-400">{p.modelId}</td>
+                  <td className="py-2.5 px-3 font-mono text-slate-300">{p.totalFiles}</td>
+                  <td className="py-2.5 px-3 font-mono text-emerald-300">{isUnmeasured ? '—' : `${p.firstPassCleanRatePct}%`}</td>
+                  <td className="py-2.5 px-3 font-mono text-amber-300">{isUnmeasured ? '—' : `${p.bugScopePct}%`}</td>
+                  <td className="py-2.5 px-3 font-mono text-cyan-300">{isUnmeasured ? '—' : p.healedIssuesCount}</td>
+                  <td className="py-2.5 px-3 font-mono text-white font-semibold">
+                    {isUnmeasured || isInProgress ? '—' : `${p.accuracyPct}%`}
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>
+
+      {/* Interactive Agent Pipeline & Policy Registry (ruleId) Inspector */}
+      {registryAgents.length > 0 && (
+        <div className="bg-slate-900/40 border border-slate-800 rounded-2xl p-6 space-y-5">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+            <div>
+              <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+                <GitBranch className="w-5 h-5 text-indigo-400" />
+                {t('aiOptimizer.policyRegistryTitle', 'Pipeline Orchestrator & Policy Registry (ruleId) Inspector')}
+              </h2>
+              <p className="text-xs text-slate-400 mt-1">
+                Click an execution stage or rule to inspect unified prompt directives, pre-save guards, Rust deterministic sanitizers, and Katastar verification stats.
+              </p>
+            </div>
+            <div className="flex items-center gap-2 text-xs font-mono">
+              <button
+                onClick={() => setSelectedAgentId('all')}
+                className={`px-3 py-1.5 rounded-lg border transition-colors ${
+                  selectedAgentId === 'all'
+                    ? 'bg-indigo-600/30 border-indigo-500 text-indigo-200'
+                    : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                All Rules ({policyRegistry?.totalRules ?? registryRules.length})
+              </button>
+            </div>
+          </div>
+
+          {/* Clickable 6-Stage Pipeline Graph */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-2.5">
+            {registryAgents.map((agent) => {
+              const isSelected = selectedAgentId === agent.id;
+              return (
+                <button
+                  key={agent.id}
+                  onClick={() => {
+                    const nextId = isSelected ? 'all' : agent.id;
+                    setSelectedAgentId(nextId);
+                    if (nextId !== 'all' && agent.ruleIds?.length > 0) {
+                      setSelectedRuleId(agent.ruleIds[0]);
+                    }
+                  }}
+                  className={`text-left p-3.5 rounded-xl border transition-all ${
+                    isSelected
+                      ? 'bg-indigo-600/20 border-indigo-400 shadow-lg shadow-indigo-950/40'
+                      : 'bg-slate-950/60 border-slate-800 hover:border-slate-700'
+                  }`}
+                >
+                  <div className="flex items-center justify-between text-[10px] font-mono text-slate-400 mb-1">
+                    <span>STAGE {agent.stageOrder}</span>
+                    <span className="px-1.5 py-0.5 rounded bg-slate-900 text-indigo-300">
+                      {agent.ruleCount} rules
+                    </span>
+                  </div>
+                  <div className="text-xs font-semibold text-white leading-snug">{agent.name}</div>
+                  <div className="mt-2 flex items-center justify-between text-[10px] font-mono text-slate-400">
+                    <span>Katastar: {agent.katastarMatches}</span>
+                    <span className="text-emerald-400">Verified: {agent.verifiedFixes}</span>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Selected Agent Summary Banner when filtered */}
+          {selectedAgentId !== 'all' && (() => {
+            const ag = registryAgents.find((a) => a.id === selectedAgentId);
+            if (!ag) return null;
+            return (
+              <div className="bg-slate-950/70 border border-indigo-500/30 rounded-xl px-4 py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 text-xs">
+                <div>
+                  <span className="text-indigo-300 font-semibold">{ag.name}:</span>{' '}
+                  <span className="text-slate-300">{ag.description}</span>
+                </div>
+                <span className="font-mono text-[11px] text-cyan-300 shrink-0">{ag.modulePath}</span>
+              </div>
+            );
+          })()}
+
+          {/* Rules List + Rule Detail Inspector */}
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+            <div className="lg:col-span-5 space-y-2 max-h-[420px] overflow-y-auto pr-1">
+              {filteredRules.map((rule) => {
+                const isRuleActive = activeRule?.id === rule.id;
+                const sevBadge =
+                  rule.severity === 'error'
+                    ? 'bg-rose-500/20 text-rose-300 border-rose-500/30'
+                    : rule.severity === 'warning'
+                    ? 'bg-amber-500/20 text-amber-300 border-amber-500/30'
+                    : 'bg-cyan-500/20 text-cyan-300 border-cyan-500/30';
+                return (
+                  <button
+                    key={rule.id}
+                    onClick={() => setSelectedRuleId(rule.id)}
+                    className={`w-full text-left p-3 rounded-xl border transition-all flex items-start justify-between gap-2 ${
+                      isRuleActive
+                        ? 'bg-slate-900 border-indigo-500'
+                        : 'bg-slate-950/60 border-slate-800/80 hover:border-slate-700'
+                    }`}
+                  >
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-mono text-[11px] text-indigo-300 font-semibold truncate">
+                          {rule.id}
+                        </span>
+                        <span className={`px-1.5 py-0.5 text-[10px] font-mono rounded border ${sevBadge}`}>
+                          {rule.severity}
+                        </span>
+                      </div>
+                      <div className="text-xs text-slate-200 font-medium mt-1 truncate">{rule.title}</div>
+                      <div className="text-[10px] text-slate-500 mt-1 font-mono">
+                        {rule.domain} · {rule.katastarMatches} Katastar hits
+                      </div>
+                    </div>
+                    <ChevronRight className={`w-4 h-4 shrink-0 mt-1 ${isRuleActive ? 'text-indigo-400' : 'text-slate-600'}`} />
+                  </button>
+                );
+              })}
+            </div>
+
+            {activeRule && (
+              <div className="lg:col-span-7 bg-slate-950/80 border border-slate-800 rounded-xl p-5 space-y-4">
+                <div className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-800 pb-3">
+                  <div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <Code2 className="w-4 h-4 text-indigo-400" />
+                      <span className="font-mono text-sm font-bold text-indigo-300">{activeRule.id}</span>
+                      <span className="px-2 py-0.5 text-[10px] font-mono rounded bg-slate-800 text-slate-300">
+                        {activeRule.agentStageLabel}
+                      </span>
+                    </div>
+                    <h3 className="text-sm font-semibold text-white mt-1.5">{activeRule.title}</h3>
+                  </div>
+                  <div className="flex items-center gap-2 font-mono text-[11px]">
+                    <span className="px-2 py-1 rounded bg-slate-900 border border-slate-800 text-slate-300">
+                      Hits: {activeRule.katastarMatches}
+                    </span>
+                    <span className="px-2 py-1 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-300">
+                      Verified: {activeRule.verifiedFixes}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="space-y-3 text-xs">
+                  <div>
+                    <span className="text-[10px] uppercase tracking-wider text-slate-400 block mb-1">
+                      Target File Roles
+                    </span>
+                    <div className="flex flex-wrap gap-1.5">
+                      {(activeRule.appliesToRoles || []).map((role) => (
+                        <span key={role} className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700 font-mono text-[11px] text-cyan-300">
+                          {role}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div>
+                    <span className="text-[10px] uppercase tracking-wider text-slate-400 block mb-1">
+                      1. Single-Source Prompt Directive
+                    </span>
+                    <div className="bg-slate-900/90 border border-slate-800 rounded-lg p-3 text-slate-200 leading-relaxed font-mono text-[11px]">
+                      {activeRule.promptDirective}
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <div>
+                      <span className="text-[10px] uppercase tracking-wider text-slate-400 block mb-1">
+                        2. Pre-Save Reviewer Check
+                      </span>
+                      <div className="bg-slate-900/70 border border-slate-800 rounded-lg p-3 text-slate-300 leading-relaxed">
+                        {activeRule.validatorSummary}
+                      </div>
+                    </div>
+                    <div>
+                      <span className="text-[10px] uppercase tracking-wider text-slate-400 block mb-1">
+                        3. Deterministic Sanitizer Function
+                      </span>
+                      <div className="bg-slate-900/70 border border-slate-800 rounded-lg p-3 font-mono text-[11px] text-emerald-300 break-all">
+                        {activeRule.sanitizerFnName}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div>
+                    <span className="text-[10px] uppercase tracking-wider text-slate-400 block mb-1">
+                      4. Auto-Heal Stagnation Directive
+                    </span>
+                    <div className="bg-amber-500/5 border border-amber-500/20 rounded-lg p-3 text-amber-200 leading-relaxed">
+                      {activeRule.healDirective}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Local Inference Tuning & Directives */}
       <div className="bg-slate-900/40 border border-slate-800 rounded-2xl p-6 space-y-6">

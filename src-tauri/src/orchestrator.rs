@@ -718,11 +718,30 @@ pub async fn validate_file_with_abstract_rules(
         }
     }
 
-    // 2. Repeating CSS block loop check
+    // 2. Repeating CSS block loop, stray `}`, & invalid @apply CSS function check
     if is_css_file {
         let deduped = crate::sanitizer::deduplicate_repeated_css_blocks(trimmed);
         if trimmed.len() > 256 && deduped.len() * 2 < trimmed.len() {
             return Err("CSS file contains repeating duplicate rule blocks (generation loop).".to_string());
+        }
+        let mut css_depth: isize = 0;
+        for ch in trimmed.chars() {
+            if ch == '{' {
+                css_depth += 1;
+            } else if ch == '}' {
+                css_depth -= 1;
+                if css_depth < 0 {
+                    return Err("CSS file contains an unexpected unmatched closing brace `}`.".to_string());
+                }
+            }
+        }
+        if css_depth > 0 {
+            return Err(format!("CSS file has {} unclosed '{{' block(s).", css_depth));
+        }
+        if let Ok(bad_apply_re) = regex::Regex::new(r"(?im)@apply\s+[^;\n{}]*\b(?:translate[XYZ3d]*|scale[XYZ3d]*|rotate[XYZ3d]*|skew[XY]?|matrix(?:3d)?|perspective)\s*\(") {
+            if bad_apply_re.is_match(trimmed) {
+                return Err("CSS `@apply` cannot take raw CSS transform functions like `translateX(100%)`. Use native CSS `transform: translateX(100%);` or Tailwind utility classes (`translate-x-full`).".to_string());
+            }
         }
         return Ok(());
     }
@@ -903,12 +922,6 @@ pub async fn validate_file_with_abstract_rules(
             let Some(resolved) = resolved_opt else {
                 return false;
             };
-            if resolved.starts_with("src/app/api/")
-                || resolved.starts_with("app/api/")
-                || resolved.contains("/api/")
-            {
-                return false;
-            }
             let last_seg = resolved.rsplit('/').next().unwrap_or("");
             let stem = last_seg
                 .strip_suffix(".tsx")
@@ -918,7 +931,7 @@ pub async fn validate_file_with_abstract_rules(
                 .unwrap_or(last_seg);
             matches!(
                 stem,
-                "page" | "layout" | "loading" | "error" | "not-found" | "template" | "default" | "global-error"
+                "page" | "layout" | "loading" | "error" | "not-found" | "template" | "default" | "global-error" | "route"
             )
         };
 
@@ -1096,6 +1109,30 @@ pub async fn validate_file_with_abstract_rules(
     }
     if open_curly > close_curly + 2 {
         return Err(format!("Generated code appears truncated: {} unclosed '{{' block(s).", open_curly - close_curly));
+    }
+
+    // 8. Pure `.ts` files (not `.tsx`/`.d.ts`) cannot parse JSX tags under TS `jsx: preserve`
+    if path_lower.ends_with(".ts") && !path_lower.ends_with(".d.ts") {
+        let uncommented = strip_ts_js_comments_preserving_strings(trimmed);
+        let has_jsx_closing = regex::Regex::new(r"</[A-Za-z_$][A-Za-z0-9_$.]*\s*>|</>")
+            .map(|re| re.is_match(&uncommented))
+            .unwrap_or(false);
+        let has_jsx_return_self_closing = regex::Regex::new(r"(?s)\breturn\s*\(?\s*<[A-Za-z_$][A-Za-z0-9_$.]*(?:\s+[^>]*?)?/>")
+            .map(|re| re.is_match(&uncommented))
+            .unwrap_or(false);
+        if has_jsx_closing || has_jsx_return_self_closing {
+            return Err(format!(
+                "Pure `.ts` file `{}` contains JSX syntax (`<Tag>...</Tag>`). Convert JSX to `React.createElement(...)` (with `import React from 'react';`) or avoid returning JSX from `.ts` files.",
+                file_path
+            ));
+        }
+    }
+
+    // 9. Semantic & Format Review Service (delimiter integrity, App Router handler form, Edge Middleware safety)
+    for issue in crate::reviewer::review_generated_file(file_path, trimmed) {
+        if issue.severity == crate::reviewer::ReviewSeverity::Error {
+            return Err(format!("[{}] {} {}", issue.rule_id, issue.message, issue.repair_directive));
+        }
     }
 
     Ok(())
@@ -3398,6 +3435,76 @@ fn parse_lbg_field_name_and_type(raw: &str) -> (String, Option<(String, bool)>) 
 /// - Rejects one-sided broken relations whose target model has neither an opposite relation nor FK,
 /// - Keeps `typedFields` and `fields` consistent by pruning removed relation/undeclared model refs.
 /// Preserves single-model (`models.len() < 2`) partial database contracts unchanged.
+/// Synchronizes `generationPipeline[*].status` inside `.axiom/live_builder_guide.json`
+/// based on completed files (marking phases `completed`, `in_progress`, or `pending`),
+/// or sets all non-empty pipeline phases to `completed` once generation completes (`all_done = true`).
+pub fn sync_live_builder_guide_pipeline_status(
+    proj_dir: &Path,
+    completed_files: &[String],
+    all_done: bool,
+) {
+    let lbg_path = proj_dir.join(".axiom").join("live_builder_guide.json");
+    if !lbg_path.is_file() {
+        return;
+    }
+    let Ok(raw) = fs::read_to_string(&lbg_path) else {
+        return;
+    };
+    let Ok(mut lbg) = serde_json::from_str::<Value>(&raw) else {
+        return;
+    };
+
+    let norm_done: std::collections::HashSet<String> = completed_files
+        .iter()
+        .map(|f| f.replace('\\', "/").trim_start_matches("./").to_ascii_lowercase())
+        .collect();
+
+    let mut changed = false;
+    if let Some(phases) = lbg.get_mut("generationPipeline").and_then(|v| v.as_array_mut()) {
+        for phase in phases.iter_mut() {
+            let phase_files: Vec<String> = phase
+                .get("files")
+                .and_then(|f| f.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str())
+                        .map(|s| s.replace('\\', "/").trim_start_matches("./").to_ascii_lowercase())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let next_status = if all_done {
+                "completed"
+            } else if phase_files.is_empty() {
+                "pending"
+            } else {
+                let done_count = phase_files.iter().filter(|pf| norm_done.contains(*pf)).count();
+                if done_count >= phase_files.len() {
+                    "completed"
+                } else if done_count > 0 {
+                    "in_progress"
+                } else {
+                    "pending"
+                }
+            };
+
+            let prev_status = phase.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            if prev_status != next_status {
+                if let Some(obj) = phase.as_object_mut() {
+                    obj.insert("status".to_string(), serde_json::json!(next_status));
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    if changed {
+        if let Ok(pretty) = serde_json::to_string_pretty(&lbg) {
+            let _ = fs::write(&lbg_path, pretty);
+        }
+    }
+}
+
 pub fn sanitize_live_builder_guide_contracts(lbg: &Value) -> Value {
     let mut out = lbg.clone();
 
@@ -3833,7 +3940,8 @@ pub fn get_expert_system_prompt(
              - Write clean, modern, responsive CSS rules with flexbox, grid, smooth transitions, and accessible colors.\n\
              - If this is a CSS module (e.g. *.module.css), define clean class selectors (camelCase or kebab-case) matching component usage.\n\
              - Do NOT import JavaScript, TypeScript, Prisma, or backend libraries.\n\
-             - Do NOT generate empty placeholders; provide full, polished styling rules.\n"
+             - Do NOT generate empty placeholders; provide full, polished styling rules.\n\n{}",
+            crate::policy_registry::prompt_directives_for_file(file_path, false, false)
         );
     }
 
@@ -3941,6 +4049,15 @@ pub fn get_expert_system_prompt(
             );
         }
 
+        let policy_block = crate::policy_registry::prompt_directives_for_file(
+            file_path,
+            path_lower.contains("auth") || path_lower.contains("register") || context_ref.to_lowercase().contains("next-auth"),
+            path_lower.contains("stripe") || path_lower.contains("payment") || path_lower.contains("checkout") || context_ref.to_lowercase().contains("stripe"),
+        );
+        if !policy_block.is_empty() {
+            prompt.push_str(&format!("\n{}\n", policy_block));
+        }
+
         if let Some(ref lbg) = lbg_val {
             if let Some(db_contracts) = lbg.get("sharedContracts").and_then(|c| c.get("database")) {
                 let fmt_db = format_database_contract_prompt(db_contracts);
@@ -3968,12 +4085,14 @@ pub fn get_expert_system_prompt(
     // 7b. FILE-SCOPED PROMPT: Next.js Edge Middleware (middleware.ts / middleware.js)
     if path_lower.ends_with("middleware.ts") || path_lower.ends_with("middleware.js") {
         let meta_rules = get_middleware_metacognitive_rules(Some(proj_dir), context_ref);
+        let policy_block = crate::policy_registry::prompt_directives_for_file(file_path, true, false);
         return format!(
-            "You are a Senior Next.js Edge Architecture Engineer. Write only clean, production-ready Next.js Middleware code wrapped in markdown code blocks. No explanations.\n\n{}\n{}\n\
+            "You are a Senior Next.js Edge Architecture Engineer. Write only clean, production-ready Next.js Middleware code wrapped in markdown code blocks. No explanations.\n\n{}\n{}\n{}\n\
              - NEVER import from 'express' (no Request, Response, NextFunction from 'express'). Always import `{{ NextResponse }}` and `type {{ NextRequest }}` from `'next/server'`.\n\
              - Always export `function middleware(request: NextRequest)` and `export const config = {{ matcher: [...] }}`.\n",
             NEXTJS_MIDDLEWARE_RULEPACK,
-            meta_rules
+            meta_rules,
+            policy_block
         );
     }
 
@@ -3993,6 +4112,11 @@ pub fn get_expert_system_prompt(
              - Provide clear TypeScript interfaces for state and hook return values.\n",
             HOOK_CHAIN_OF_THOUGHT
         );
+
+        let policy_block = crate::policy_registry::prompt_directives_for_file(file_path, false, false);
+        if !policy_block.is_empty() {
+            prompt.push_str(&format!("\n{}\n", policy_block));
+        }
 
         if let Some(ref lbg) = lbg_val {
             if let Some(api_contracts) = lbg.get("sharedContracts").and_then(|c| c.get("api")) {
@@ -4028,6 +4152,15 @@ pub fn get_expert_system_prompt(
              FILE: {}\n",
             file_path
         );
+        let policy_block = crate::policy_registry::prompt_directives_for_file(
+            file_path,
+            path_lower.contains("auth") || path_lower.contains("register") || context_ref.to_lowercase().contains("next-auth"),
+            path_lower.contains("stripe") || path_lower.contains("payment") || path_lower.contains("checkout") || context_ref.to_lowercase().contains("stripe"),
+        );
+        if !policy_block.is_empty() {
+            prompt.push_str(&format!("\n{}\n", policy_block));
+        }
+
         if let Some(ref lbg) = lbg_val {
             if let Some(db_contracts) = lbg.get("sharedContracts").and_then(|c| c.get("database")) {
                 let fmt_db = format_database_contract_prompt(db_contracts);
@@ -4135,6 +4268,15 @@ pub fn get_expert_system_prompt(
             );
         }
 
+        let policy_block = crate::policy_registry::prompt_directives_for_file(
+            file_path,
+            path_lower.contains("login") || path_lower.contains("register") || path_lower.contains("auth"),
+            path_lower.contains("pricing") || path_lower.contains("checkout") || path_lower.contains("billing"),
+        );
+        if !policy_block.is_empty() {
+            prompt.push_str(&format!("\n{}\n", policy_block));
+        }
+
         if let Some(ref lbg) = lbg_val {
             if let Some(spec) = lbg.get("projectSpecification") {
                 if let Some(style) = spec.get("importExportStyle").and_then(|s| s.as_str()) {
@@ -4197,6 +4339,14 @@ pub fn get_expert_system_prompt(
         let path_low_fallback = file_path.to_lowercase().replace('\\', "/");
         if path_low_fallback.contains("nextauth") || path_low_fallback.ends_with("/auth.ts") || path_low_fallback.ends_with("/auth.js") || path_low_fallback == "auth.ts" {
             prompt.push_str("- NEXTAUTH V4 ONLY: Import `type { NextAuthOptions }` from `'next-auth'` and `CredentialsProvider` from `'next-auth/providers/credentials'` (NEVER deprecated v3 `'next-auth/providers'`). Use `PrismaAdapter` from `'@auth/prisma-adapter'` with `prisma` from `'@/lib/prisma'`.\n- AUTH UTILITY BOUNDARY: Export `authOptions: NextAuthOptions` and auth helpers ONLY from utility files (`src/utils/auth.ts`, `src/lib/auth.ts`); NEVER export NextAuth App Router `{ handler as GET, handler as POST }` outside `src/app/api/auth/[...nextauth]/route.ts`.\n- OPTIONAL USER FIELDS: Access optional credential hashes via safe cast `(user as any)?.hashedPassword || (user as any)?.password || ''` so `tsc` passes even when `User` schema uses either field name.\n");
+        }
+        let policy_block = crate::policy_registry::prompt_directives_for_file(
+            file_path,
+            path_low_fallback.contains("auth"),
+            path_low_fallback.contains("stripe") || path_low_fallback.contains("payment"),
+        );
+        if !policy_block.is_empty() {
+            prompt.push_str(&format!("\n{}\n", policy_block));
         }
     }
     if !context_ref.is_empty() {
@@ -4303,6 +4453,318 @@ pub fn resolve_manifest_project_name(raw_name: Option<&str>, description: &str, 
     } else {
         format!("Axiom Project {}", short_id)
     }
+}
+
+/// Guarantees Next.js App Router `/login` (`src/app/login/page.tsx`) and `/register` (`src/app/register/page.tsx`)
+/// routes exist whenever the manifest contains auth signals (middleware, next-auth, `/api/register`, or `/dashboard` routes),
+/// preventing `/login -> 404` when `middleware.ts` redirects unauthenticated users.
+pub fn ensure_nextjs_required_auth_pages(files_to_generate: &mut Vec<Value>, project_name: &str) -> bool {
+    let uses_root_app_dir = files_to_generate.iter().any(|f| {
+        f.get("path")
+            .and_then(|p| p.as_str())
+            .map_or(false, |p| {
+                let low = p.replace('\\', "/").to_lowercase();
+                low.starts_with("app/")
+            })
+    }) && !files_to_generate.iter().any(|f| {
+        f.get("path")
+            .and_then(|p| p.as_str())
+            .map_or(false, |p| p.replace('\\', "/").to_lowercase().starts_with("src/"))
+    });
+
+    let prefix = if uses_root_app_dir { "app" } else { "src/app" };
+
+    let has_auth_signals = files_to_generate.iter().any(|f| {
+        let low = f
+            .get("path")
+            .and_then(|p| p.as_str())
+            .unwrap_or("")
+            .replace('\\', "/")
+            .to_lowercase();
+        let desc = f
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+        low.ends_with("middleware.ts")
+            || low.ends_with("middleware.js")
+            || low.contains("nextauth")
+            || low.contains("/api/auth/")
+            || low.contains("/api/register")
+            || low.contains("/dashboard/")
+            || low.ends_with("/dashboard/page.tsx")
+            || low.contains("/profile/page.")
+            || low.contains("/admin/page.")
+            || desc.contains("nextauth")
+            || desc.contains("sign in")
+    });
+
+    if !has_auth_signals {
+        return false;
+    }
+
+    let has_login = files_to_generate.iter().any(|f| {
+        let low = f
+            .get("path")
+            .and_then(|p| p.as_str())
+            .unwrap_or("")
+            .replace('\\', "/")
+            .to_lowercase();
+        low == "src/app/login/page.tsx"
+            || low == "src/app/login/page.jsx"
+            || low == "app/login/page.tsx"
+            || low == "app/login/page.jsx"
+    });
+
+    let has_register = files_to_generate.iter().any(|f| {
+        let low = f
+            .get("path")
+            .and_then(|p| p.as_str())
+            .unwrap_or("")
+            .replace('\\', "/")
+            .to_lowercase();
+        low == "src/app/register/page.tsx"
+            || low == "src/app/register/page.jsx"
+            || low == "app/register/page.tsx"
+            || low == "app/register/page.jsx"
+    });
+
+    let mut injected = false;
+    let safe_name = if project_name.trim().is_empty() {
+        "Axiom App"
+    } else {
+        project_name.trim()
+    };
+
+    if !has_login {
+        let login_default = format!(
+r#""use client";
+
+import React, {{ useState }} from 'react';
+import Link from 'next/link';
+import {{ signIn }} from 'next-auth/react';
+import {{ useRouter }} from 'next/navigation';
+
+export default function LoginPage() {{
+  const router = useRouter();
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e: React.FormEvent) => {{
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+    try {{
+      const res = await signIn('credentials', {{
+        email,
+        password,
+        redirect: false,
+      }});
+      if (res?.error) {{
+        setError('Invalid email or password.');
+      }} else {{
+        router.push('/dashboard');
+        router.refresh();
+      }}
+    }} catch {{
+      setError('Unable to sign in right now.');
+    }} finally {{
+      setLoading(false);
+    }}
+  }};
+
+  return (
+    <div className="min-h-[80vh] flex items-center justify-center px-4 py-12 bg-slate-50">
+      <div className="max-w-md w-full bg-white rounded-2xl border border-slate-200 shadow-lg p-8">
+        <div className="text-center mb-6">
+          <h1 className="text-2xl font-bold text-slate-900">Sign in to {}</h1>
+          <p className="text-sm text-slate-500 mt-1">Enter your credentials to access your dashboard</p>
+        </div>
+        {{error && (
+          <div className="mb-4 rounded-lg bg-rose-50 border border-rose-200 px-3 py-2 text-sm text-rose-700">
+            {{error}}
+          </div>
+        )}}
+        <form onSubmit={{handleSubmit}} className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1">Email</label>
+            <input
+              type="email"
+              required
+              value={{email}}
+              onChange={{(e) => setEmail(e.target.value)}}
+              placeholder="you@example.com"
+              className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1">Password</label>
+            <input
+              type="password"
+              required
+              value={{password}}
+              onChange={{(e) => setPassword(e.target.value)}}
+              placeholder="••••••••"
+              className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            />
+          </div>
+          <button
+            type="submit"
+            disabled={{loading}}
+            className="w-full rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-60 text-white font-semibold py-2.5 text-sm transition-colors"
+          >
+            {{loading ? 'Signing in...' : 'Sign In'}}
+          </button>
+        </form>
+        <p className="mt-6 text-center text-sm text-slate-600">
+          Don&apos;t have an account?{{' '}}
+          <Link href="/register" className="text-indigo-600 hover:underline font-medium">
+            Create an account
+          </Link>
+        </p>
+      </div>
+    </div>
+  );
+}}
+"#,
+            safe_name
+        );
+
+        files_to_generate.push(serde_json::json!({
+            "path": format!("{}/login/page.tsx", prefix),
+            "role": "ui",
+            "language": "typescript",
+            "description": format!("Login page for '{}' using NextAuth CredentialsProvider (`signIn('credentials', {{ redirect: false }})`) with link to /register and /dashboard.", safe_name),
+            "defaultContent": login_default
+        }));
+        injected = true;
+    }
+
+    if !has_register {
+        let register_default = format!(
+r#""use client";
+
+import React, {{ useState }} from 'react';
+import Link from 'next/link';
+import {{ signIn }} from 'next-auth/react';
+import {{ useRouter }} from 'next/navigation';
+
+export default function RegisterPage() {{
+  const router = useRouter();
+  const [name, setName] = useState('');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e: React.FormEvent) => {{
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+    try {{
+      const res = await fetch('/api/register', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ name, email, password }}),
+      }});
+      const data = await res.json().catch(() => ({{}}));
+      if (!res.ok) {{
+        setError(data?.error || data?.message || 'Registration failed.');
+        setLoading(false);
+        return;
+      }}
+      await signIn('credentials', {{ email, password, redirect: false }});
+      router.push('/dashboard');
+      router.refresh();
+    }} catch {{
+      setError('Unable to create account right now.');
+    }} finally {{
+      setLoading(false);
+    }}
+  }};
+
+  return (
+    <div className="min-h-[80vh] flex items-center justify-center px-4 py-12 bg-slate-50">
+      <div className="max-w-md w-full bg-white rounded-2xl border border-slate-200 shadow-lg p-8">
+        <div className="text-center mb-6">
+          <h1 className="text-2xl font-bold text-slate-900">Create your {} account</h1>
+          <p className="text-sm text-slate-500 mt-1">Get started in seconds</p>
+        </div>
+        {{error && (
+          <div className="mb-4 rounded-lg bg-rose-50 border border-rose-200 px-3 py-2 text-sm text-rose-700">
+            {{error}}
+          </div>
+        )}}
+        <form onSubmit={{handleSubmit}} className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1">Full Name</label>
+            <input
+              type="text"
+              required
+              value={{name}}
+              onChange={{(e) => setName(e.target.value)}}
+              placeholder="Alex Mercer"
+              className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1">Email</label>
+            <input
+              type="email"
+              required
+              value={{email}}
+              onChange={{(e) => setEmail(e.target.value)}}
+              placeholder="you@example.com"
+              className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1">Password</label>
+            <input
+              type="password"
+              required
+              minLength={{6}}
+              value={{password}}
+              onChange={{(e) => setPassword(e.target.value)}}
+              placeholder="At least 6 characters"
+              className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            />
+          </div>
+          <button
+            type="submit"
+            disabled={{loading}}
+            className="w-full rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-60 text-white font-semibold py-2.5 text-sm transition-colors"
+          >
+            {{loading ? 'Creating account...' : 'Create Account'}}
+          </button>
+        </form>
+        <p className="mt-6 text-center text-sm text-slate-600">
+          Already have an account?{{' '}}
+          <Link href="/login" className="text-indigo-600 hover:underline font-medium">
+            Sign in
+          </Link>
+        </p>
+      </div>
+    </div>
+  );
+}}
+"#,
+            safe_name
+        );
+
+        files_to_generate.push(serde_json::json!({
+            "path": format!("{}/register/page.tsx", prefix),
+            "role": "ui",
+            "language": "typescript",
+            "description": format!("Registration page for '{}' calling POST /api/register and NextAuth signIn with link to /login.", safe_name),
+            "defaultContent": register_default
+        }));
+        injected = true;
+    }
+
+    injected
 }
 
 pub async fn run_orchestrator(
@@ -5577,6 +6039,15 @@ export default function RootLayout({
                 "defaultContent": default_content
             }));
         }
+
+        let auth_proj_name = resolve_manifest_project_name(
+            manifest.get("metadata").and_then(|m| m.get("name")).and_then(|n| n.as_str()).or(Some(name)),
+            manifest.get("metadata").and_then(|m| m.get("description")).and_then(|d| d.as_str()).unwrap_or(project_description),
+            &project_id,
+        );
+        if ensure_nextjs_required_auth_pages(&mut files_to_generate, &auth_proj_name) {
+            debug_log_to_file("[Orchestrator] Injected mandatory App Router auth routes (/login, /register) matching auth/middleware signals.".to_string());
+        }
     }
 
     let has_tailwind = files_to_generate.iter().any(|f| {
@@ -5982,6 +6453,7 @@ export default function RootLayout({
             };
             processed_content = post_process_generated_file(file_path, &pre_processed, &metamanifest, has_tailwind);
             processed_content = crate::sanitizer::reconcile_server_prisma_enum_usage(&proj_dir, file_path, &processed_content);
+            processed_content = crate::sanitizer::reconcile_client_prisma_enum_mocks(&proj_dir, file_path, &processed_content);
             
             // Run project-aware validation agent
             match validate_file_with_project_context(&proj_dir, file_path, &processed_content, &model_id).await {
@@ -6055,6 +6527,7 @@ export default function RootLayout({
         checkpoint_state["currentFilePath"] = serde_json::json!(file_path);
         checkpoint_state["updatedAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
         save_generation_checkpoint(&proj_dir, &checkpoint_state);
+        sync_live_builder_guide_pipeline_status(&proj_dir, &completed_files, false);
     }
 
     // Check if stopped before post-processing
@@ -6313,6 +6786,7 @@ export default function RootLayout({
     }
     checkpoint_state["updatedAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
     save_generation_checkpoint(&proj_dir, &checkpoint_state);
+    sync_live_builder_guide_pipeline_status(&proj_dir, &completed_files, true);
     unregister_task_control(&task_id, &project_id);
 
     let final_completion_msg = if completion_warnings.is_empty() {
