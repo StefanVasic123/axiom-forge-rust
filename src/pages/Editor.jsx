@@ -742,8 +742,9 @@ export default function EditorPage() {
         }, 100);
       }
 
-      // If server logs indicate ready or compiling progress, update starting state and clear stale compileError
-      if (text.includes('Ready in') || text.includes('Local:') || text.includes('ready on') || text.includes('compiled successfully') || text.includes('Compiled /') || text.includes('✓ Compiled')) {
+      // If server logs indicate ready or real route compile completion (never Next.js internal /_error or /_not-found error pages), clear stale compileError
+      const isInternalErrorPageLog = text.includes('/_error') || text.includes('/_not-found');
+      if (!isInternalErrorPageLog && (text.includes('Ready in') || text.includes('Local:') || text.includes('ready on') || text.includes('compiled successfully') || text.includes('Compiled /') || text.includes('✓ Compiled'))) {
         setIsServerStarting(false);
         setCompileError(null);
       }
@@ -771,13 +772,39 @@ export default function EditorPage() {
       }
     });
 
+    const resolvePreviewFilePath = (rawPath, errMsg = '', routeFallback = currentPreviewRoute) => {
+      const msgStr = String(errMsg || '');
+      const chunkFromMsg = msgStr.match(/\/_next\/static\/chunks\/(app|pages)\/(.+?)(?:-[0-9a-f]{8,})?\.(?:m?js)/i);
+      const raw = String(rawPath || '').replace(/\\/g, '/').trim();
+      const chunkFromPath = raw.match(/\/_next\/static\/chunks\/(app|pages)\/(.+?)(?:-[0-9a-f]{8,})?\.(?:m?js)/i);
+      const chunkMatch = chunkFromPath || chunkFromMsg;
+      if (chunkMatch) {
+        const kind = chunkMatch[1];
+        const stem = chunkMatch[2].replace(/^\/+|\/+$/g, '');
+        if (!['_app', '_document', '_error', '_not-found', 'webpack', 'main', 'framework', 'polyfills'].includes(stem)) {
+          const candidateBase = kind === 'app' ? `app/${stem}` : `pages/${stem}`;
+          return `src/${candidateBase}.tsx`;
+        }
+      }
+      if (!raw || raw.includes('node_modules/') || raw.startsWith('webpack-internal:') || /^https?:\/\//i.test(raw)) {
+        return resolveRouteToFile(routeFallback)?.path || null;
+      }
+      return raw.replace(/^\.\//, '');
+    };
+
     const unsubCompileError = window.electronAPI.server.onCompileError((errorData) => {
+      if (!errorData) return;
+      const safeFilePath = resolvePreviewFilePath(errorData.filePath, errorData.errorMessage, currentPreviewRoute);
+      if (!safeFilePath) {
+        return;
+      }
+      const normalizedError = { ...errorData, filePath: safeFilePath };
       setCompileError(prev => {
-        if (prev && prev.filePath === errorData?.filePath && prev.errorMessage === errorData?.errorMessage) {
+        if (prev && prev.filePath === normalizedError.filePath && prev.errorMessage === normalizedError.errorMessage) {
           return prev;
         }
-        console.log('[Editor] Received compilation error:', errorData);
-        return errorData;
+        console.log('[Editor] Received compilation error:', normalizedError);
+        return normalizedError;
       });
       setShowTerminal(prev => prev ? prev : true);
     });
@@ -931,16 +958,28 @@ export default function EditorPage() {
 
     let targetFile = activeTab;
     if (!explicitPrompt && (compileError?.filePath || previewRuntimeError)) {
-      const errFilePath = compileError?.filePath
-        || previewRuntimeError?.sourceFile
-        || resolveRouteToFile(previewRuntimeError?.path || currentPreviewRoute)?.path
-        || activePreviewFile?.path
-        || targetFile?.path
-        || 'src/app/page.tsx';
       const errMessage = compileError?.errorMessage
         || previewRuntimeError?.details
         || previewRuntimeError?.message
         || 'Runtime error in preview';
+      const rawCandidate = compileError?.filePath
+        || previewRuntimeError?.sourceFile
+        || '';
+      const chunkFromMsg = String(errMessage).match(/\/_next\/static\/chunks\/(app|pages)\/(.+?)(?:-[0-9a-f]{8,})?\.(?:m?js)/i);
+      const isNonProjectPath = !rawCandidate
+        || rawCandidate.includes('node_modules/')
+        || rawCandidate.startsWith('webpack-internal:')
+        || /^https?:\/\//i.test(rawCandidate);
+      let errFilePath = rawCandidate;
+      if (chunkFromMsg && !['_app', '_document', '_error', '_not-found', 'webpack', 'main', 'framework', 'polyfills'].includes(chunkFromMsg[2])) {
+        errFilePath = `src/${chunkFromMsg[1]}/${chunkFromMsg[2]}.tsx`;
+      } else if (isNonProjectPath) {
+        errFilePath = resolveRouteToFile(previewRuntimeError?.path || currentPreviewRoute)?.path
+          || activePreviewFile?.path
+          || targetFile?.path
+          || 'src/app/page.tsx';
+      }
+      errFilePath = errFilePath.replace(/\\/g, '/').replace(/^\.\//, '');
 
       const errNode = files?.find(f => f.path.replace(/\\/g, '/') === errFilePath)
         || { path: errFilePath, name: errFilePath.split('/').pop() };
@@ -1237,18 +1276,53 @@ export default function EditorPage() {
       if (data && data.channel === 'axiom-preview-error') {
         console.log('[Editor] Preview runtime error caught:', data);
         window.electronAPI?.debugLog?.(`[Preview RuntimeError] project=${projectId} route=${data.path || currentPreviewRoute} source=${data.sourceFile || 'none'} msg=${data.message}`);
-        const cleanSourceFile = data.sourceFile
-          ? data.sourceFile.replace(/\\/g, '/').replace(/^\.\//, '')
-          : null;
+        const resolvePreviewSourceFile = (rawSourceFile, routeFallback) => {
+          if (!rawSourceFile) return null;
+          let cleaned = String(rawSourceFile).replace(/\\/g, '/').trim();
+          if (!cleaned) return null;
+          if (cleaned.includes('node_modules/') || cleaned.startsWith('webpack-internal:')) {
+            return resolveRouteToFile(routeFallback)?.path || null;
+          }
+          const chunkMatch = cleaned.match(/\/_next\/static\/chunks\/(app|pages)\/(.+?)(?:-[0-9a-f]{8,})?\.(?:m?js)(?:[?#].*)?$/i);
+          if (chunkMatch) {
+            const kind = chunkMatch[1];
+            const stem = chunkMatch[2].replace(/^\/+|\/+$/g, '');
+            if (['_app', '_document', '_error', '_not-found', 'webpack', 'main', 'framework', 'polyfills'].includes(stem)) {
+              return resolveRouteToFile(routeFallback)?.path || null;
+            }
+            const candidateBase = kind === 'app' ? `app/${stem}` : `pages/${stem}`;
+            const found = files.find(f => {
+              const p = (f.path || '').replace(/\\/g, '/');
+              return [
+                `src/${candidateBase}.tsx`,
+                `src/${candidateBase}.jsx`,
+                `src/${candidateBase}.ts`,
+                `src/${candidateBase}.js`,
+                `${candidateBase}.tsx`,
+                `${candidateBase}.jsx`,
+              ].includes(p);
+            });
+            return found?.path || `src/${candidateBase}.tsx`;
+          }
+          if (/^https?:\/\//i.test(cleaned)) {
+            return resolveRouteToFile(routeFallback)?.path || null;
+          }
+          cleaned = cleaned.replace(/^\.\//, '');
+          const exact = files.find(f => (f.path || '').replace(/\\/g, '/') === cleaned);
+          return exact ? exact.path : cleaned;
+        };
+
+        const routeRef = data.path || currentPreviewRoute;
+        const cleanSourceFile = resolvePreviewSourceFile(data.sourceFile, routeRef);
         setPreviewRuntimeError({
           message: data.message || 'Nepoznata runtime greška',
           details: data.details || data.message || '',
           sourceFile: cleanSourceFile,
-          path: data.path || currentPreviewRoute,
+          path: routeRef,
           time: Date.now()
         });
         const targetFilePath = cleanSourceFile
-          || resolveRouteToFile(data.path || currentPreviewRoute)?.path
+          || resolveRouteToFile(routeRef)?.path
           || resolveRouteToFile(currentPreviewRoute)?.path
           || 'src/app/page.tsx';
         if (targetFilePath) {

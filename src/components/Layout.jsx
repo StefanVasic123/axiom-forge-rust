@@ -148,6 +148,7 @@ function Header() {
     const path = location.pathname;
     if (path === '/') return t('nav.dashboard');
     if (path === '/agency-dashboard') return t('nav.agencyReview');
+    if (path === '/ai-optimizer') return t('nav.aiOptimizer');
     if (path === '/settings') return t('nav.settings');
     if (path.startsWith('/projects/')) return t('dashboard.viewDetails');
     return 'Axiom Forge';

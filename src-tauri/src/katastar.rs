@@ -1224,22 +1224,27 @@ pub fn get_error_katastar() -> Result<Value, String> {
     }))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FileHealAttemptRecord {
+    #[serde(default)]
     pub round: usize,
+    #[serde(default)]
     pub source: String,
+    #[serde(default)]
     pub outcome: String,
     #[serde(default)]
     pub resolved: Vec<String>,
     #[serde(default)]
     pub unresolved: Vec<String>,
+    #[serde(default)]
     pub summary: String,
+    #[serde(default)]
     pub timestamp: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FileErrorLedger {
-    #[serde(rename = "filePath")]
+    #[serde(default, rename = "filePath")]
     pub file_path: String,
     #[serde(default)]
     pub resolved: Vec<String>,
@@ -1251,9 +1256,9 @@ pub struct FileErrorLedger {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectHealLedger {
-    #[serde(rename = "schemaVersion")]
+    #[serde(default, rename = "schemaVersion")]
     pub schema_version: u32,
-    #[serde(rename = "updatedAt")]
+    #[serde(default, rename = "updatedAt")]
     pub updated_at: String,
     #[serde(default)]
     pub files: std::collections::BTreeMap<String, FileErrorLedger>,
@@ -1509,4 +1514,689 @@ pub fn format_chain_of_information_prompt(
     }
     out.push_str("-------------------------------------------------------------------\n");
     out
+}
+
+pub fn infer_app_version_from_timestamp(created_at: &str) -> String {
+    let Ok(dt) = chrono::DateTime::parse_from_rfc3339(created_at.trim()) else {
+        return env!("CARGO_PKG_VERSION").to_string();
+    };
+    let ts = dt.timestamp();
+    let cutoff = |iso: &str| -> i64 {
+        chrono::DateTime::parse_from_rfc3339(iso)
+            .map(|d| d.timestamp())
+            .unwrap_or(i64::MAX)
+    };
+    if ts < cutoff("2026-11-09T14:16:00+01:00") {
+        "0.1.42".to_string()
+    } else if ts < cutoff("2026-11-09T21:31:00+01:00") {
+        "0.1.43".to_string()
+    } else if ts < cutoff("2026-11-10T07:00:00+01:00") {
+        "0.1.44".to_string()
+    } else if ts < cutoff("2026-11-10T11:21:00+01:00") {
+        "0.1.45".to_string()
+    } else if ts < cutoff("2026-11-10T14:52:00+01:00") {
+        "0.1.46".to_string()
+    } else if ts < cutoff("2026-11-10T17:35:00+01:00") {
+        "0.1.47".to_string()
+    } else if ts < cutoff("2026-11-11T12:33:00+01:00") {
+        "0.1.48".to_string()
+    } else if ts < cutoff("2026-11-11T14:40:00+01:00") {
+        "0.1.49".to_string()
+    } else if ts < cutoff("2026-11-11T21:59:00+01:00") {
+        "0.1.50".to_string()
+    } else {
+        "0.1.51".to_string()
+    }
+}
+
+fn semver_sort_key(ver: &str) -> (u32, u32, u32, String) {
+    let clean = ver.trim().trim_start_matches('v');
+    let mut parts = clean.split('.');
+    let maj = parts.next().and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
+    let min = parts.next().and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
+    let pat = parts
+        .next()
+        .and_then(|p| p.split('-').next())
+        .and_then(|p| p.parse::<u32>().ok())
+        .unwrap_or(0);
+    (maj, min, pat, clean.to_string())
+}
+
+fn classify_error_domain(text: &str) -> &'static str {
+    let low = text.to_lowercase();
+    if low.contains("prisma") || low.contains("schema.prisma") || low.contains("p1012") || low.contains("ts2551") {
+        "Prisma & DB"
+    } else if low.contains("stripe") || low.contains("webhook") || low.contains("checkout") || low.contains("latestapiversion") || low.contains("constructevent") {
+        "Stripe & API"
+    } else if low.contains("middleware") || low.contains("path-to-regexp") || low.contains("nextrequest") || low.contains("nextresponse") {
+        "Middleware & Edge"
+    } else if low.contains("next-auth") || low.contains("nextauth") || low.contains("useSession".to_lowercase().as_str()) || low.contains("/api/") || low.contains("app router") || low.contains("default export") {
+        "NextAuth & Routing"
+    } else if low.contains("children") || low.contains("jsx") || low.contains("layout.tsx") || low.contains(".tsx") || low.contains("react") || low.contains("chunkloaderror") || low.contains("tailwind") {
+        "React UI & JSX"
+    } else {
+        "Types & Imports"
+    }
+}
+
+fn extract_error_count_from_warnings(warnings: &[String]) -> usize {
+    let mut total = 0usize;
+    let re_paren = regex::Regex::new(r"TypeScript greške\s*\((\d+)\)").ok();
+    let re_prijavila = regex::Regex::new(r"prijavila\s+(\d+)\s+greš").ok();
+    for w in warnings {
+        let mut matched_num = None;
+        if let Some(ref re) = re_paren {
+            if let Some(c) = re.captures(w) {
+                matched_num = c.get(1).and_then(|m| m.as_str().parse::<usize>().ok());
+            }
+        }
+        if matched_num.is_none() {
+            if let Some(ref re) = re_prijavila {
+                if let Some(c) = re.captures(w) {
+                    matched_num = c.get(1).and_then(|m| m.as_str().parse::<usize>().ok());
+                }
+            }
+        }
+        total += matched_num.unwrap_or(1);
+    }
+    total
+}
+
+fn count_workspace_code_files(proj_dir: &std::path::Path) -> usize {
+    let mut count = 0usize;
+    let mut stack = vec![proj_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                let n = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if !matches!(n, "node_modules" | ".next" | ".git" | ".axiom") {
+                    stack.push(p);
+                }
+            } else if p.is_file() {
+                let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
+                if matches!(ext, "ts" | "tsx" | "js" | "jsx" | "prisma") {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}
+
+#[derive(Default)]
+struct DomainStatAccum {
+    total_errors: usize,
+    resolved_heals: usize,
+    unresolved_errors: usize,
+}
+
+pub fn compute_model_progress_telemetry_at(
+    projects_file: &std::path::Path,
+    projects_dir: &std::path::Path,
+    katastar_path: &std::path::Path,
+    settings_path: &std::path::Path,
+    model_filter: Option<&str>,
+) -> Result<Value, String> {
+    let normalized_filter = model_filter
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"));
+    let projects_raw = std::fs::read_to_string(projects_file).unwrap_or_else(|_| "[]".to_string());
+    let projects_list: Vec<Value> = serde_json::from_str(&projects_raw).unwrap_or_default();
+
+    let katastar_store: KatastarStore = if katastar_path.is_file() {
+        std::fs::read_to_string(katastar_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    } else {
+        KatastarStore::default()
+    };
+
+    let settings_val: Value = if settings_path.is_file() {
+        std::fs::read_to_string(settings_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    let default_model = settings_val
+        .get("ollamaModel")
+        .or_else(|| settings_val.get("builderModel"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("qwen2.5-coder:7b")
+        .to_string();
+
+    let all_domains = [
+        "Prisma & DB",
+        "Types & Imports",
+        "React UI & JSX",
+        "NextAuth & Routing",
+        "Stripe & API",
+        "Middleware & Edge",
+    ];
+    let mut domain_map: std::collections::BTreeMap<String, DomainStatAccum> = std::collections::BTreeMap::new();
+    for d in all_domains {
+        domain_map.insert(d.to_string(), DomainStatAccum::default());
+    }
+
+    let mut available_models: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    available_models.insert(default_model.clone());
+
+    let mut project_records: Vec<Value> = Vec::new();
+    #[derive(Clone)]
+    struct CohortPoint {
+        version: String,
+        model_id: String,
+        f100: f64,
+        bug_scope: f64,
+        accuracy: f64,
+        warnings_count: usize,
+        residual_errors: usize,
+    }
+    let mut points: Vec<CohortPoint> = Vec::new();
+
+    for proj in &projects_list {
+        let pid = proj.get("id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if pid.is_empty() {
+            continue;
+        }
+        let name = proj.get("name").and_then(|v| v.as_str()).unwrap_or(&pid).to_string();
+        let created_at = proj.get("createdAt").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let proj_dir = proj
+            .get("localPath")
+            .and_then(|v| v.as_str())
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| projects_dir.join(&pid));
+
+        let gen_state: Value = {
+            let p = proj_dir.join(".axiom/generation_state.json");
+            if p.is_file() {
+                std::fs::read_to_string(&p)
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_else(|| serde_json::json!({}))
+            } else {
+                serde_json::json!({})
+            }
+        };
+
+        let heal_ledger: ProjectHealLedger = {
+            let p = proj_dir.join(".axiom/heal-ledger.json");
+            if p.is_file() {
+                std::fs::read_to_string(&p)
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default()
+            } else {
+                ProjectHealLedger::default()
+            }
+        };
+
+        let features_val: Value = {
+            let p = proj_dir.join("axiom-features.json");
+            if p.is_file() {
+                std::fs::read_to_string(&p)
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_else(|| serde_json::json!({}))
+            } else {
+                serde_json::json!({})
+            }
+        };
+
+        let explicit_ver = proj
+            .get("metadata")
+            .and_then(|m| m.get("appVersion"))
+            .and_then(|v| v.as_str())
+            .or_else(|| gen_state.get("appVersion").and_then(|v| v.as_str()))
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string());
+        let version = explicit_ver.unwrap_or_else(|| infer_app_version_from_timestamp(&created_at));
+
+        let model_id = proj
+            .get("metadata")
+            .and_then(|m| m.get("modelId"))
+            .and_then(|v| v.as_str())
+            .or_else(|| gen_state.get("modelId").and_then(|v| v.as_str()))
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&default_model)
+            .to_string();
+        available_models.insert(model_id.clone());
+        if let Some(f) = normalized_filter {
+            if !model_id.eq_ignore_ascii_case(f) {
+                continue;
+            }
+        }
+
+        let mut warnings: Vec<String> = proj
+            .get("metadata")
+            .and_then(|m| m.get("warnings"))
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default();
+        if warnings.is_empty() {
+            warnings = gen_state
+                .get("warnings")
+                .and_then(|a| a.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default();
+        }
+
+        let completed_files_len = gen_state
+            .get("completedFiles")
+            .and_then(|a| a.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let disk_files_len = if proj_dir.is_dir() {
+            count_workspace_code_files(&proj_dir)
+        } else {
+            0
+        };
+        let total_files = disk_files_len.max(completed_files_len).max(1);
+
+        let mut affected_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let file_ref_re = regex::Regex::new(r"(?:src/)?[A-Za-z0-9_.\-/\[\]]+\.(?:tsx|ts|jsx|js|prisma)").ok();
+        for w in &warnings {
+            let dom = classify_error_domain(w);
+            if let Some(acc) = domain_map.get_mut(dom) {
+                acc.total_errors += 1;
+                acc.unresolved_errors += 1;
+            }
+            if let Some(ref re) = file_ref_re {
+                for m in re.find_iter(w) {
+                    affected_files.insert(m.as_str().to_lowercase());
+                }
+            }
+        }
+
+        let mut healed_files_count = 0usize;
+        let mut ledger_resolved_count = 0usize;
+        for (fpath, entry) in &heal_ledger.files {
+            if !entry.resolved.is_empty() {
+                healed_files_count += 1;
+                ledger_resolved_count += entry.resolved.len();
+                for res_item in &entry.resolved {
+                    let dom = classify_error_domain(&format!("{} {}", fpath, res_item));
+                    if let Some(acc) = domain_map.get_mut(dom) {
+                        acc.total_errors += 1;
+                        acc.resolved_heals += 1;
+                    }
+                }
+            }
+            if !entry.unresolved.is_empty() {
+                affected_files.insert(fpath.to_lowercase());
+                for unres in &entry.unresolved {
+                    let dom = classify_error_domain(&format!("{} {}", fpath, unres));
+                    if let Some(acc) = domain_map.get_mut(dom) {
+                        acc.total_errors += 1;
+                        acc.unresolved_errors += 1;
+                    }
+                }
+            }
+        }
+
+        let residual_errors = extract_error_count_from_warnings(&warnings);
+        let total_features = features_val
+            .get("features")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| (total_files / 3).max(1));
+
+        let unresolved_file_count = if affected_files.is_empty() && !warnings.is_empty() {
+            1
+        } else {
+            affected_files.len()
+        };
+        let bug_scope = ((unresolved_file_count as f64) / (total_files as f64)).clamp(0.0, 1.0);
+        let clean_first_pass_files = total_files.saturating_sub(healed_files_count + unresolved_file_count);
+        let f100 = if warnings.is_empty() && unresolved_file_count == 0 {
+            if healed_files_count == 0 {
+                1.0
+            } else {
+                // Features clean at first pass weighted with complete final healing
+                (0.45 * (clean_first_pass_files as f64 / total_files as f64) + 0.55).clamp(0.0, 1.0)
+            }
+        } else {
+            let buggy_features = (unresolved_file_count + (residual_errors / 8)).min(total_features);
+            ((total_features.saturating_sub(buggy_features)) as f64 / (total_features as f64)).clamp(0.0, 1.0)
+        };
+
+        let mu = (residual_errors as f64) / (total_files as f64);
+        let phi = 1.0 / (1.0 + 0.25 * mu);
+        let accuracy = ((0.55 * f100 + 0.45 * (1.0 - bug_scope)) * phi).clamp(0.0, 1.0);
+
+        points.push(CohortPoint {
+            version: version.clone(),
+            model_id: model_id.clone(),
+            f100,
+            bug_scope,
+            accuracy,
+            warnings_count: warnings.len(),
+            residual_errors,
+        });
+
+        project_records.push(serde_json::json!({
+            "id": pid,
+            "name": name,
+            "appVersion": version,
+            "modelId": model_id,
+            "totalFiles": total_files,
+            "totalFeatures": total_features,
+            "firstPassCleanRatePct": ((clean_first_pass_files as f64 / total_files as f64) * 1000.0).round() / 10.0,
+            "f100Pct": (f100 * 1000.0).round() / 10.0,
+            "bugScopePct": (bug_scope * 1000.0).round() / 10.0,
+            "accuracyPct": (accuracy * 1000.0).round() / 10.0,
+            "warningsCount": warnings.len(),
+            "residualErrors": residual_errors,
+            "healedIssuesCount": ledger_resolved_count,
+            "createdAt": created_at,
+        }));
+    }
+
+    let mut katastar_total_entries = 0usize;
+    let mut katastar_verified = 0usize;
+    for entry in &katastar_store.entries {
+        let entry_model = entry.model_id.trim();
+        if !entry_model.is_empty() {
+            available_models.insert(entry_model.to_string());
+        }
+        if let Some(f) = normalized_filter {
+            let effective_entry_model = if entry_model.is_empty() {
+                default_model.as_str()
+            } else {
+                entry_model
+            };
+            if !effective_entry_model.eq_ignore_ascii_case(f) {
+                continue;
+            }
+        }
+        katastar_total_entries += 1;
+        if entry.status == "verified" {
+            katastar_verified += 1;
+        }
+        let dom = classify_error_domain(&format!(
+            "{} {} {}",
+            entry.category, entry.error_signature, entry.normalized_sample
+        ));
+        if let Some(acc) = domain_map.get_mut(dom) {
+            acc.total_errors += (entry.success_count + entry.fail_count).max(1) as usize;
+            acc.resolved_heals += entry.success_count as usize;
+            acc.unresolved_errors += entry.fail_count as usize;
+        }
+    }
+
+    // Group points by AppVersion and compute Exponential Accuracy Growth Equation
+    let mut by_version: std::collections::BTreeMap<(u32, u32, u32, String), Vec<CohortPoint>> =
+        std::collections::BTreeMap::new();
+    for pt in &points {
+        by_version
+            .entry(semver_sort_key(&pt.version))
+            .or_default()
+            .push(pt.clone());
+    }
+
+    let mut versions_timeline: Vec<Value> = Vec::new();
+    let mut prev_accuracy: Option<f64> = None;
+    let mut best_accuracy: Option<f64> = None;
+    let mut ema_accuracy: Option<f64> = None;
+
+    for ((_, _, _, ver_str), cohort) in by_version {
+        let n = cohort.len().max(1) as f64;
+        let mean_acc = cohort.iter().map(|p| p.accuracy).sum::<f64>() / n;
+        let mean_f100 = cohort.iter().map(|p| p.f100).sum::<f64>() / n;
+        let mean_bug_scope = cohort.iter().map(|p| p.bug_scope).sum::<f64>() / n;
+        let total_residual: usize = cohort.iter().map(|p| p.residual_errors).sum();
+        let clean_projects = cohort.iter().filter(|p| p.warnings_count == 0).count();
+
+        let delta_vs_prev = prev_accuracy.map(|p| mean_acc - p).unwrap_or(0.0);
+        let delta_vs_best = best_accuracy.map(|b| mean_acc - b).unwrap_or(0.0);
+
+        let alpha = 0.45_f64;
+        let next_ema = match ema_accuracy {
+            Some(prev_ema) => alpha * mean_acc + (1.0 - alpha) * prev_ema,
+            None => mean_acc,
+        };
+        let momentum_boost = 0.35_f64 * delta_vs_best.max(0.0) * (1.0 - next_ema);
+        let exp_index = ((next_ema + momentum_boost).clamp(0.0, 1.0)) * 100.0;
+
+        let mut cohort_models: Vec<String> = cohort
+            .iter()
+            .map(|p| p.model_id.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        cohort_models.sort();
+
+        versions_timeline.push(serde_json::json!({
+            "version": format!("v{}", ver_str),
+            "rawVersion": ver_str,
+            "projectCount": cohort.len(),
+            "cleanProjectsCount": clean_projects,
+            "models": cohort_models,
+            "rawAccuracyPct": (mean_acc * 1000.0).round() / 10.0,
+            "exponentialIndexPct": (exp_index * 10.0).round() / 10.0,
+            "f100Pct": (mean_f100 * 1000.0).round() / 10.0,
+            "bugScopePct": (mean_bug_scope * 1000.0).round() / 10.0,
+            "deltaVsPrevPct": (delta_vs_prev * 1000.0).round() / 10.0,
+            "deltaVsBestPct": (delta_vs_best * 1000.0).round() / 10.0,
+            "totalResidualErrors": total_residual,
+        }));
+
+        prev_accuracy = Some(mean_acc);
+        best_accuracy = Some(best_accuracy.map_or(mean_acc, |b| b.max(mean_acc)));
+        ema_accuracy = Some(next_ema);
+    }
+
+    let sum_domain_errors: usize = domain_map.values().map(|a| a.total_errors).sum::<usize>().max(1);
+    let mut domain_breakdown: Vec<Value> = domain_map
+        .into_iter()
+        .map(|(domain, acc)| {
+            let share_pct = (acc.total_errors as f64 / sum_domain_errors as f64) * 100.0;
+            let heal_rate = if acc.resolved_heals + acc.unresolved_errors > 0 {
+                (acc.resolved_heals as f64 / (acc.resolved_heals + acc.unresolved_errors) as f64) * 100.0
+            } else {
+                100.0
+            };
+            let strength_score = (100.0 - share_pct * 0.65 - (100.0 - heal_rate) * 0.35).clamp(0.0, 100.0);
+            serde_json::json!({
+                "domain": domain,
+                "totalErrors": acc.total_errors,
+                "resolvedHeals": acc.resolved_heals,
+                "unresolvedErrors": acc.unresolved_errors,
+                "errorSharePct": (share_pct * 10.0).round() / 10.0,
+                "healSuccessPct": (heal_rate * 10.0).round() / 10.0,
+                "strengthScore": (strength_score * 10.0).round() / 10.0,
+            })
+        })
+        .collect();
+    domain_breakdown.sort_by(|a, b| {
+        let sa = a.get("totalErrors").and_then(|v| v.as_u64()).unwrap_or(0);
+        let sb = b.get("totalErrors").and_then(|v| v.as_u64()).unwrap_or(0);
+        sb.cmp(&sa)
+    });
+
+    let latest_summary = versions_timeline.last().cloned().unwrap_or_else(|| {
+        serde_json::json!({
+            "version": format!("v{}", env!("CARGO_PKG_VERSION")),
+            "rawAccuracyPct": 0.0,
+            "exponentialIndexPct": 0.0,
+            "f100Pct": 0.0,
+            "bugScopePct": 0.0,
+            "deltaVsPrevPct": 0.0,
+            "deltaVsBestPct": 0.0,
+        })
+    });
+
+    Ok(serde_json::json!({
+        "success": true,
+        "currentAppVersion": env!("CARGO_PKG_VERSION"),
+        "selectedModelFilter": normalized_filter.unwrap_or("all"),
+        "defaultModel": default_model,
+        "availableModels": available_models.into_iter().collect::<Vec<String>>(),
+        "totalProjects": project_records.len(),
+        "katastarTotalEntries": katastar_total_entries,
+        "katastarVerifiedEntries": katastar_verified,
+        "summary": latest_summary,
+        "versionsTimeline": versions_timeline,
+        "domainBreakdown": domain_breakdown,
+        "projects": project_records,
+    }))
+}
+
+#[tauri::command]
+pub fn get_model_progress_telemetry(model_filter: Option<String>) -> Result<Value, String> {
+    compute_model_progress_telemetry_at(
+        &get_projects_file(),
+        &get_projects_dir(),
+        &get_katastar_path(),
+        &get_base_dir().join("axiom-settings.json"),
+        model_filter.as_deref(),
+    )
+}
+
+pub fn export_mini_llm_training_dataset_at(
+    projects_dir: &std::path::Path,
+    katastar_path: &std::path::Path,
+    output_dir: &std::path::Path,
+    model_base: &str,
+) -> Result<Value, String> {
+    std::fs::create_dir_all(output_dir).map_err(|e| e.to_string())?;
+    let mut sft_lines: Vec<String> = Vec::new();
+    let system_msg = "You are Axiom-Mini-Coder, a specialized TypeScript, Next.js App Router, Prisma, NextAuth v4, and Stripe engineer. Produce strictly compilable code with zero placeholders or broken imports.";
+
+    let push_sample = |lines: &mut Vec<String>, user_msg: &str, assistant_msg: &str| {
+        let u = scrub_sensitive_text(user_msg);
+        let a = scrub_sensitive_text(assistant_msg);
+        if u.trim().is_empty() || a.trim().is_empty() {
+            return;
+        }
+        let item = serde_json::json!({
+            "messages": [
+                { "role": "system", "content": system_msg },
+                { "role": "user", "content": u },
+                { "role": "assistant", "content": a }
+            ]
+        });
+        if let Ok(serialized) = serde_json::to_string(&item) {
+            lines.push(serialized);
+        }
+    };
+
+    // 1. Export Verified Katastar fixes
+    if katastar_path.is_file() {
+        if let Ok(raw) = std::fs::read_to_string(katastar_path) {
+            if let Ok(store) = serde_json::from_str::<KatastarStore>(&raw) {
+                for entry in store.entries.iter().filter(|e| e.status == "verified" || e.success_count > e.fail_count) {
+                    let user_prompt = format!(
+                        "Fix verified {} diagnostic in role `{}`:\nSignature: {}\nSample:\n{}",
+                        entry.category, entry.file_role, entry.error_signature, entry.normalized_sample
+                    );
+                    let assistant_resp = if let Some(ref patch) = entry.patch {
+                        format!(
+                            "Apply atomic fix ({}):\nSearch:\n```ts\n{}\n```\nReplace:\n```ts\n{}\n```\nRule: {}",
+                            entry.strategy, patch.search, patch.replace, entry.hint
+                        )
+                    } else {
+                        format!("Verified remediation rule ({}): {}", entry.strategy, entry.hint)
+                    };
+                    push_sample(&mut sft_lines, &user_prompt, &assistant_resp);
+                }
+            }
+        }
+    }
+
+    // 2. Export verified heal-ledger resolutions across generated workspaces
+    if projects_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(projects_dir) {
+            for ent in entries.flatten() {
+                let p = ent.path();
+                let ledger_path = p.join(".axiom/heal-ledger.json");
+                if ledger_path.is_file() {
+                    if let Ok(raw) = std::fs::read_to_string(&ledger_path) {
+                        if let Ok(ledger) = serde_json::from_str::<ProjectHealLedger>(&raw) {
+                            for (fpath, frec) in ledger.files {
+                                if !frec.resolved.is_empty() {
+                                    let resolved_list = frec.resolved.iter().take(6).cloned().collect::<Vec<_>>().join("\n- ");
+                                    let summary_att = frec
+                                        .attempts
+                                        .iter()
+                                        .rev()
+                                        .find(|a| a.outcome == "verified" || a.outcome == "partial_progress")
+                                        .map(|a| a.summary.as_str())
+                                        .unwrap_or("Resolved diagnostics cleanly.");
+                                    push_sample(
+                                        &mut sft_lines,
+                                        &format!("Repair `{}` diagnostics:\n- {}", fpath, resolved_list),
+                                        &format!("Verified resolution applied on `{}`: {}", fpath, summary_att),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Seed high-signal Axiom Core Stack Rulepacks for mini-LLM distillation
+    let core_lessons = [
+        (
+            "Generate a valid Next.js App Router RootLayout (`src/app/layout.tsx`) with Navbar, Footer, and NextAuth.",
+            "Wrap `{children}` inside `<SessionProvider><Navbar /><main className=\"flex-1 flex flex-col w-full\">{children}</main><Footer /></SessionProvider>` inside `<html><body>...</body></html>`. NEVER embed dashboard tables or page KPI cards inside RootLayout.",
+        ),
+        (
+            "Fix TS2322 under \"strict\": false when passing Zod parsed data into prisma.<model>.create({ data }).",
+            "Construct an explicit typed `data: { ... }` payload assigning every required Prisma field with explicit fallbacks/defaults and `z.nativeEnum(EnumName)` for enums; never spread `validatedBody` directly into Prisma `create`.",
+        ),
+        (
+            "Write a resource-optimized Next.js Edge Middleware (`src/middleware.ts`).",
+            "Layer A: Exclude `/api`, `/_next/static`, `/_next/image`, `/_vercel`, `favicon.ico`, and `.*\\..*` inside `config.matcher` (never use `/*` wildcards). Layer B: Keep the middleware body free of duplicate static checks, bypass Stripe webhooks, check maintenance/i18n env flags before auth, and use `NextResponse.rewrite` instead of `redirect` for internal API rewrites.",
+        ),
+    ];
+    for (u, a) in core_lessons {
+        push_sample(&mut sft_lines, u, a);
+    }
+
+    let dataset_path = output_dir.join("axiom_sft_dataset.jsonl");
+    let modelfile_path = output_dir.join("Modelfile");
+
+    std::fs::write(&dataset_path, format!("{}\n", sft_lines.join("\n"))).map_err(|e| e.to_string())?;
+
+    let modelfile_content = format!(
+        "FROM {}\nPARAMETER temperature 0.15\nPARAMETER top_p 0.9\nPARAMETER num_ctx 16384\nSYSTEM \"\"\"{}\"\"\"\n",
+        model_base.trim(),
+        system_msg
+    );
+    std::fs::write(&modelfile_path, modelfile_content).map_err(|e| e.to_string())?;
+
+    Ok(serde_json::json!({
+        "success": true,
+        "sampleCount": sft_lines.len(),
+        "datasetPath": dataset_path.to_string_lossy().replace('\\', "/"),
+        "modelfilePath": modelfile_path.to_string_lossy().replace('\\', "/"),
+        "ollamaCommand": format!("ollama create axiom-mini-coder -f \"{}\"", modelfile_path.to_string_lossy().replace('\\', "/")),
+    }))
+}
+
+#[tauri::command]
+pub fn export_mini_llm_training_dataset(
+    output_dir: Option<String>,
+    model_base: Option<String>,
+) -> Result<Value, String> {
+    let dir = output_dir
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| get_base_dir().join("training-exports"));
+    let base_model = model_base
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "qwen2.5-coder:3b".to_string());
+    export_mini_llm_training_dataset_at(&get_projects_dir(), &get_katastar_path(), &dir, &base_model)
 }

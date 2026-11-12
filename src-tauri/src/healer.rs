@@ -1252,6 +1252,35 @@ pub fn detect_destructive_code_drop(file_path: &str, before: &str, after: &str) 
     if before.trim().len() < 400 {
         return None;
     }
+    // Recovery exemption: restoring missing `{children}` inside a broken/dashboard-stuffed RootLayout
+    let is_root_layout = lower == "layout.tsx"
+        || lower == "layout.jsx"
+        || lower.ends_with("/layout.tsx")
+        || lower.ends_with("/layout.jsx");
+    if is_root_layout {
+        let has_jsx_children = |src: &str| -> bool {
+            if let Ok(re) = regex::Regex::new(r"\{\s*children\s*\}") {
+                for m in re.find_iter(src) {
+                    let next_ch = src[m.end()..].chars().find(|c| !c.is_whitespace());
+                    if !matches!(next_ch, Some(':') | Some(',') | Some('=') | Some(')')) {
+                        return true;
+                    }
+                }
+                false
+            } else {
+                src.contains("{children}")
+            }
+        };
+        let before_has_children = has_jsx_children(before);
+        let after_has_children = has_jsx_children(after);
+        if !before_has_children
+            && after_has_children
+            && after.contains("<html")
+            && after.contains("<body")
+        {
+            return None;
+        }
+    }
     let before_non_empty = before.lines().filter(|l| !l.trim().is_empty()).count();
     let after_non_empty = after.lines().filter(|l| !l.trim().is_empty()).count();
     if before_non_empty >= 20 && after_non_empty * 5 < before_non_empty * 2 {

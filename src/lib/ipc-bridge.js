@@ -807,6 +807,52 @@ window.electronAPI = {
       invoke('debug_log_to_file', { message: String(message) }).catch(() => {});
     } catch {}
   },
+  aiOptimizer: {
+    getTelemetry: async (modelFilter = null) => {
+      try {
+        return await invoke('get_model_progress_telemetry', { modelFilter });
+      } catch (e) {
+        console.error('Failed to get model progress telemetry:', e);
+        throw e;
+      }
+    },
+    exportTrainingDataset: async (outputDir = null, modelBase = null) => {
+      try {
+        return await invoke('export_mini_llm_training_dataset', { outputDir, modelBase });
+      } catch (e) {
+        console.error('Failed to export mini-LLM dataset:', e);
+        throw e;
+      }
+    },
+    getConfig: async () => {
+      try {
+        const res = await invoke('get_axiom_settings');
+        const settings = res?.settings || res || {};
+        return settings.aiOptimizerConfig || {};
+      } catch (e) {
+        console.error('Failed to load AI optimizer config:', e);
+        return {};
+      }
+    },
+    saveConfig: async (config) => {
+      try {
+        const res = await invoke('get_axiom_settings');
+        const settings = res?.settings || res || {};
+        const merged = {
+          ...settings,
+          aiOptimizerConfig: {
+            ...(settings.aiOptimizerConfig || {}),
+            ...(config || {}),
+          },
+        };
+        await invoke('save_axiom_settings', { settings: merged });
+        return { success: true, config: merged.aiOptimizerConfig };
+      } catch (e) {
+        console.error('Failed to save AI optimizer config:', e);
+        return { success: false, error: e?.message || String(e) };
+      }
+    }
+  },
   agentBridge: {
     updateLiveState: async (stateJson) => {
       try {

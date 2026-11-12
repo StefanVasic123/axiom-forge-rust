@@ -1249,7 +1249,8 @@ pub fn reconcile_server_prisma_enum_usage(
             let t = l.trim();
             t == "\"use client\";" || t == "\"use client\"" || t == "'use client';" || t == "'use client'"
         });
-    let is_hook_file = (path_low.contains("/hooks/") || path_low.starts_with("hooks/")) && !path_low.contains("/api/");
+    let is_app_route = is_app_router_route_file(file_path);
+    let is_hook_file = !is_app_route && (path_low.contains("/hooks/") || path_low.starts_with("hooks/")) && !path_low.contains("/api/");
     if is_client_file || is_hook_file {
         return content.to_string();
     }
@@ -1870,15 +1871,32 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
                 | "DialogTitle"
                 | "DialogDescription"
                 | "Alert"
+                | "AlertTitle"
+                | "AlertDescription"
                 | "Avatar"
                 | "Spinner"
                 | "Skeleton"
+                | "Separator"
                 | "MetricCard"
                 | "Table"
+                | "TableHeader"
+                | "TableBody"
+                | "TableFooter"
+                | "TableRow"
+                | "TableHead"
+                | "TableCell"
+                | "TableCaption"
+                | "Link"
         )
+    };
+    let is_auto_synthesizable_ui_tag = |sym: &str| -> bool {
+        is_standard_ui_primitive(sym) && !matches!(sym, "Link" | "Option")
     };
 
     let mut demanded: std::collections::BTreeMap<std::path::PathBuf, std::collections::BTreeSet<String>> = std::collections::BTreeMap::new();
+    let mut demanded_syms_anywhere: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut already_exported_syms: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut unimported_standard_tags: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut compound_demands: std::collections::BTreeMap<
         std::path::PathBuf,
         std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
@@ -1888,6 +1906,15 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
     )
     .ok();
     let compound_jsx_re = regex::Regex::new(r"<([A-Z][A-Za-z0-9_]*)\.([A-Z][A-Za-z0-9_]*)\b").ok();
+    let export_decl_sym_re = regex::Regex::new(
+        r#"(?m)\bexport\s+(?:async\s+)?(?:function|const|let|var|class)\s+([A-Z][A-Za-z0-9_]*)\b"#,
+    )
+    .ok();
+    let export_list_sym_re = regex::Regex::new(r#"(?m)\bexport\s*\{([^}]+)\}"#).ok();
+    let export_def_sym_re = regex::Regex::new(
+        r#"(?m)\bexport\s+default\s+(?:async\s+)?(?:function\s+|class\s+)?([A-Z][A-Za-z0-9_]*)\b"#,
+    )
+    .ok();
 
     let mut stack = vec![src_dir.clone()];
     while let Some(dir) = stack.pop() {
@@ -1998,6 +2025,7 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
                                             && !components_dir.join(format!("{}.ts", sym)).is_file()
                                         {
                                             file_imported_targets.insert(sym.clone(), target.clone());
+                                            demanded_syms_anywhere.insert(sym.clone());
                                             demanded.entry(target.clone()).or_default().insert(sym);
                                         }
                                     }
@@ -2007,7 +2035,55 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
                                 let set = demanded.entry(target.clone()).or_default();
                                 for sym in parsed_pascal {
                                     file_imported_targets.insert(sym.clone(), target.clone());
+                                    demanded_syms_anywhere.insert(sym.clone());
                                     set.insert(sym);
+                                }
+                            }
+
+                            let rel_low = p
+                                .strip_prefix(proj_dir)
+                                .map(|r| r.to_string_lossy().replace('\\', "/").to_lowercase())
+                                .unwrap_or_default();
+                            if !is_app_router_route_file(&rel_low) && !rel_low.contains("/api/") && !rel_low.starts_with("api/") {
+                                if let Some(ref re) = export_decl_sym_re {
+                                    for cap in re.captures_iter(&content) {
+                                        if let Some(m) = cap.get(1) {
+                                            already_exported_syms.insert(m.as_str().to_string());
+                                        }
+                                    }
+                                }
+                                if let Some(ref re) = export_list_sym_re {
+                                    for cap in re.captures_iter(&content) {
+                                        let list = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+                                        for item in list.split(',') {
+                                            let t = item.trim();
+                                            let exp_name = if let Some((_, rhs)) = t.split_once(" as ") {
+                                                rhs.trim()
+                                            } else {
+                                                t.split_whitespace().next().unwrap_or("")
+                                            };
+                                            if exp_name.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
+                                                already_exported_syms.insert(exp_name.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(ref re) = export_def_sym_re {
+                                    for cap in re.captures_iter(&content) {
+                                        if let Some(m) = cap.get(1) {
+                                            already_exported_syms.insert(m.as_str().to_string());
+                                        }
+                                    }
+                                }
+                            }
+
+                            if matches!(ext, "tsx" | "jsx") && content.contains('<') {
+                                let known = crate::self_healing::collect_declared_or_imported_idents(&content);
+                                let missing_jsx = crate::self_healing::extract_unimported_jsx_components(&content, &known, true, &[]);
+                                for sym in missing_jsx {
+                                    if is_auto_synthesizable_ui_tag(&sym) {
+                                        unimported_standard_tags.insert(sym);
+                                    }
                                 }
                             }
 
@@ -2041,6 +2117,27 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
                     }
                 }
             }
+        }
+    }
+
+    // Synthesize genuinely unimported standard JSX primitives (e.g. <Spinner />) only when no non-route module already exports them
+    if !unimported_standard_tags.is_empty() {
+        let ui_tsx_path = src_dir.join("components/ui.tsx");
+        let ui_index_tsx = ui_dir.join("index.tsx");
+        for sym in unimported_standard_tags {
+            if already_exported_syms.contains(&sym) || demanded_syms_anywhere.contains(&sym) {
+                continue;
+            }
+            let target = if ui_tsx_path.is_file() {
+                ui_tsx_path.clone()
+            } else if ui_index_tsx.is_file() {
+                ui_index_tsx.clone()
+            } else if ui_dir.is_dir() {
+                ui_dir.join(format!("{}.tsx", sym.to_lowercase()))
+            } else {
+                ui_tsx_path.clone()
+            };
+            demanded.entry(target).or_default().insert(sym);
         }
     }
 
@@ -2097,6 +2194,40 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
             content = widen_narrow_ui_props_interfaces(&content);
             content = repair_bare_react_fc_signatures(&content, true);
             content = repair_ui_fc_missing_children_prop(&content);
+
+            // Upgrade legacy catch-all `<div ...>` / non-`asChild` stubs previously emitted by older Axiom versions
+            for (sym_up, semantic_def) in [
+                ("Table", "export const Table = ({ children, className = '', ...props }: any) => <table className={`w-full caption-bottom text-sm ${className}`} {...props}>{children}</table>;"),
+                ("TableHeader", "export const TableHeader = ({ children, className = '', ...props }: any) => <thead className={className} {...props}>{children}</thead>;"),
+                ("TableBody", "export const TableBody = ({ children, className = '', ...props }: any) => <tbody className={className} {...props}>{children}</tbody>;"),
+                ("TableFooter", "export const TableFooter = ({ children, className = '', ...props }: any) => <tfoot className={className} {...props}>{children}</tfoot>;"),
+                ("TableRow", "export const TableRow = ({ children, className = '', ...props }: any) => <tr className={`border-b border-slate-200 transition-colors ${className}`} {...props}>{children}</tr>;"),
+                ("TableHead", "export const TableHead = ({ children, className = '', ...props }: any) => <th className={`px-3 py-2 text-left font-medium text-slate-600 ${className}`} {...props}>{children}</th>;"),
+                ("TableCell", "export const TableCell = ({ children, className = '', ...props }: any) => <td className={`px-3 py-2 align-middle ${className}`} {...props}>{children}</td>;"),
+                ("TableCaption", "export const TableCaption = ({ children, className = '', ...props }: any) => <caption className={`mt-2 text-sm text-slate-500 ${className}`} {...props}>{children}</caption>;"),
+                ("Label", "export const Label = ({ children, className = '', ...props }: any) => <label className={`text-sm font-medium text-slate-700 ${className}`} {...props}>{children}</label>;"),
+                ("Spinner", "export const Spinner = ({ className = '', ...props }: any) => <span role=\"status\" aria-label=\"Loading\" className={`inline-block h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent ${className}`} {...props} />;"),
+                ("Separator", "export const Separator = ({ className = '', ...props }: any) => <hr className={`my-2 border-slate-200 ${className}`} {...props} />;"),
+                ("Link", "export const Link = ({ children, href = '#', prefetch, replace, scroll, shallow, locale, legacyBehavior, className = '', ...props }: any) => <a href={typeof href === 'string' ? href : '#'} className={className} {...props}>{children}</a>;"),
+                ("CardDescription", "export const CardDescription = ({ children, className = '', ...props }: any) => <p className={`text-sm text-slate-500 ${className}`} {...props}>{children}</p>;"),
+                ("DialogDescription", "export const DialogDescription = ({ children, className = '', ...props }: any) => <p className={`text-sm text-slate-500 ${className}`} {...props}>{children}</p>;"),
+                ("AlertDescription", "export const AlertDescription = ({ children, className = '', ...props }: any) => <p className={`text-sm text-slate-600 ${className}`} {...props}>{children}</p>;"),
+                ("DialogTitle", "export const DialogTitle = ({ children, className = '', ...props }: any) => <h4 className={`text-base font-semibold text-slate-900 ${className}`} {...props}>{children}</h4>;"),
+                ("AlertTitle", "export const AlertTitle = ({ children, className = '', ...props }: any) => <h4 className={`text-base font-semibold text-slate-900 ${className}`} {...props}>{children}</h4>;"),
+            ] {
+                let legacy_div = format!(
+                    "export const {} = ({{ children, className = '', ...props }}: any) => <div className={{className}} {{...props}}>{{children}}</div>;",
+                    sym_up
+                );
+                if content.contains(&legacy_div) {
+                    content = content.replace(&legacy_div, semantic_def);
+                }
+            }
+            let legacy_btn = "export const Button = ({ children, variant = 'primary', size = 'md', className = '', ...props }: any) => <button className={`inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-medium transition-colors ${className}`} {...props}>{children}</button>;";
+            let upgraded_btn = "export const Button = ({ children, variant = 'primary', size = 'md', asChild = false, className = '', ...props }: any) => { const cls = `inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-medium transition-colors ${className}`; return asChild ? <span className={cls} {...props}>{children}</span> : <button className={cls} {...props}>{children}</button>; };";
+            if content.contains(legacy_btn) {
+                content = content.replace(legacy_btn, upgraded_btn);
+            }
         }
 
         // Ensure compound sub-components (`<Tabs.List>` -> `TabsList` + `(Tabs as any).List = TabsList`)
@@ -2123,19 +2254,38 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
                 if !has_named_export_symbol(&content, sym) {
                     let fallback = match sym.as_str() {
                         "Option" => "export const Option = ({ children, ...props }: any) => <option {...props}>{children}</option>;\n".to_string(),
-                        "Button" => "export const Button = ({ children, variant = 'primary', size = 'md', className = '', ...props }: any) => <button className={`inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-medium transition-colors ${className}`} {...props}>{children}</button>;\n".to_string(),
+                        "Button" => "export const Button = ({ children, variant = 'primary', size = 'md', asChild = false, className = '', ...props }: any) => { const cls = `inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-medium transition-colors ${className}`; return asChild ? <span className={cls} {...props}>{children}</span> : <button className={cls} {...props}>{children}</button>; };\n".to_string(),
                         "Card" | "CardContent" => format!("export const {} = ({{ children, className = '', ...props }}: any) => <div className={{`rounded-xl border border-slate-200 bg-white p-4 shadow-sm ${{className}}`}} {{...props}}>{{children}}</div>;\n", sym),
                         "CardHeader" => "export const CardHeader = ({ children, className = '', ...props }: any) => <div className={`mb-3 flex flex-col gap-1 ${className}`} {...props}>{children}</div>;\n".to_string(),
                         "CardTitle" => "export const CardTitle = ({ children, className = '', ...props }: any) => <h3 className={`text-base font-semibold text-slate-900 ${className}`} {...props}>{children}</h3>;\n".to_string(),
+                        "CardDescription" | "DialogDescription" => format!("export const {} = ({{ children, className = '', ...props }}: any) => <p className={{`text-sm text-slate-500 ${{className}}`}} {{...props}}>{{children}}</p>;\n", sym),
                         "Badge" => "export const Badge = ({ children, variant = 'default', className = '', ...props }: any) => <span className={`inline-flex items-center rounded-full bg-slate-100 px-2.5 py-0.5 text-xs font-medium text-slate-800 ${className}`} {...props}>{children}</span>;\n".to_string(),
                         "Input" => "export const Input = ({ label, error, className = '', ...props }: any) => <input className={`w-full rounded-lg border border-slate-300 px-3 py-2 text-sm ${className}`} {...props} />;\n".to_string(),
                         "Textarea" => "export const Textarea = ({ label, error, className = '', ...props }: any) => <textarea className={`w-full rounded-lg border border-slate-300 px-3 py-2 text-sm ${className}`} {...props} />;\n".to_string(),
                         "Select" => "export const Select = ({ children, options, label, className = '', ...props }: any) => <select className={`w-full rounded-lg border border-slate-300 px-3 py-2 text-sm ${className}`} {...props}>{Array.isArray(options) ? options.map((opt: any, idx: number) => <option key={idx} value={opt?.value ?? opt}>{opt?.label ?? opt}</option>) : children}</select>;\n".to_string(),
+                        "Label" => "export const Label = ({ children, className = '', ...props }: any) => <label className={`text-sm font-medium text-slate-700 ${className}`} {...props}>{children}</label>;\n".to_string(),
+                        "Checkbox" => "export const Checkbox = ({ className = '', ...props }: any) => <input type=\"checkbox\" className={`h-4 w-4 rounded border-slate-300 ${className}`} {...props} />;\n".to_string(),
+                        "Switch" => "export const Switch = ({ children, className = '', ...props }: any) => <button type=\"button\" role=\"switch\" className={`inline-flex h-5 w-9 items-center rounded-full bg-slate-200 transition-colors ${className}`} {...props}>{children}</button>;\n".to_string(),
                         "TabsList" => "export const TabsList = ({ children, className = '', ...props }: any) => <div role=\"tablist\" className={`inline-flex items-center gap-1 rounded-lg bg-slate-100 p-1 ${className}`} {...props}>{children}</div>;\n".to_string(),
                         "TabsTrigger" => "export const TabsTrigger = ({ children, value, className = '', ...props }: any) => <button type=\"button\" role=\"tab\" data-value={value} className={`rounded-md px-3 py-1.5 text-sm font-medium transition-colors hover:bg-white ${className}`} {...props}>{children}</button>;\n".to_string(),
                         "TabsContent" => "export const TabsContent = ({ children, value, className = '', ...props }: any) => <div role=\"tabpanel\" data-value={value} className={className} {...props}>{children}</div>;\n".to_string(),
                         "MetricCard" => "export const MetricCard = ({ title, label, value, subtitle, trend, className = '', children, ...props }: any) => <div className={`rounded-xl border border-slate-200 bg-white p-4 shadow-sm ${className}`} {...props}><div className=\"text-xs font-medium text-slate-500\">{title || label}</div><div className=\"mt-1 text-2xl font-bold text-slate-900\">{value}</div>{subtitle ? <div className=\"mt-1 text-xs text-slate-500\">{subtitle}</div> : null}{children}</div>;\n".to_string(),
                         "Modal" => "export const Modal = ({ isOpen = true, open = true, onClose, title, children, className = '', ...props }: any) => (!isOpen && !open) ? null : <div className=\"fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4\"><div className={`w-full max-w-lg rounded-xl bg-white p-6 shadow-xl ${className}`} {...props}>{title ? <div className=\"mb-4 flex items-center justify-between\"><h3 className=\"text-lg font-semibold\">{title}</h3>{onClose ? <button type=\"button\" onClick={onClose} className=\"text-slate-400 hover:text-slate-600\">×</button> : null}</div> : null}{children}</div></div>;\n".to_string(),
+                        "DialogTitle" | "AlertTitle" => format!("export const {} = ({{ children, className = '', ...props }}: any) => <h4 className={{`text-base font-semibold text-slate-900 ${{className}}`}} {{...props}}>{{children}}</h4>;\n", sym),
+                        "Alert" => "export const Alert = ({ children, className = '', ...props }: any) => <div role=\"alert\" className={`rounded-lg border border-slate-200 bg-slate-50 p-4 text-sm text-slate-800 ${className}`} {...props}>{children}</div>;\n".to_string(),
+                        "AlertDescription" => "export const AlertDescription = ({ children, className = '', ...props }: any) => <p className={`text-sm text-slate-600 ${className}`} {...props}>{children}</p>;\n".to_string(),
+                        "Spinner" => "export const Spinner = ({ className = '', ...props }: any) => <span role=\"status\" aria-label=\"Loading\" className={`inline-block h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent ${className}`} {...props} />;\n".to_string(),
+                        "Skeleton" => "export const Skeleton = ({ children, className = '', ...props }: any) => <div className={`animate-pulse rounded-md bg-slate-200 ${className}`} {...props}>{children}</div>;\n".to_string(),
+                        "Separator" => "export const Separator = ({ className = '', ...props }: any) => <hr className={`my-2 border-slate-200 ${className}`} {...props} />;\n".to_string(),
+                        "Table" => "export const Table = ({ children, className = '', ...props }: any) => <table className={`w-full caption-bottom text-sm ${className}`} {...props}>{children}</table>;\n".to_string(),
+                        "TableHeader" => "export const TableHeader = ({ children, className = '', ...props }: any) => <thead className={className} {...props}>{children}</thead>;\n".to_string(),
+                        "TableBody" => "export const TableBody = ({ children, className = '', ...props }: any) => <tbody className={className} {...props}>{children}</tbody>;\n".to_string(),
+                        "TableFooter" => "export const TableFooter = ({ children, className = '', ...props }: any) => <tfoot className={className} {...props}>{children}</tfoot>;\n".to_string(),
+                        "TableRow" => "export const TableRow = ({ children, className = '', ...props }: any) => <tr className={`border-b border-slate-200 transition-colors ${className}`} {...props}>{children}</tr>;\n".to_string(),
+                        "TableHead" => "export const TableHead = ({ children, className = '', ...props }: any) => <th className={`px-3 py-2 text-left font-medium text-slate-600 ${className}`} {...props}>{children}</th>;\n".to_string(),
+                        "TableCell" => "export const TableCell = ({ children, className = '', ...props }: any) => <td className={`px-3 py-2 align-middle ${className}`} {...props}>{children}</td>;\n".to_string(),
+                        "TableCaption" => "export const TableCaption = ({ children, className = '', ...props }: any) => <caption className={`mt-2 text-sm text-slate-500 ${className}`} {...props}>{children}</caption>;\n".to_string(),
+                        "Link" => "export const Link = ({ children, href = '#', prefetch, replace, scroll, shallow, locale, legacyBehavior, className = '', ...props }: any) => <a href={typeof href === 'string' ? href : '#'} className={className} {...props}>{children}</a>;\n".to_string(),
                         _ => format!("export const {} = ({{ children, className = '', ...props }}: any) => <div className={{className}} {{...props}}>{{children}}</div>;\n", sym),
                     };
                     appended.push_str(&fallback);
@@ -2349,6 +2499,207 @@ pub fn ensure_valid_tsconfig(proj_dir: &std::path::Path) {
             let _ = std::fs::write(&tsconfig_path, serde_json::to_string_pretty(&standard_tsconfig).unwrap_or_default());
         }
     }
+}
+
+/// Checks whether a byte mask of code positions (outside strings and comments, while keeping `${...}` expressions active) applies.
+fn compute_ts_code_mask(src: &str) -> Vec<bool> {
+    let bytes = src.as_bytes();
+    let mut mask = vec![true; bytes.len()];
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let mut tmpl_brace_stack: Vec<usize> = Vec::new();
+    let mut in_tmpl_text = false;
+    let mut brace_depth = 0usize;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_line_comment {
+            mask[i] = false;
+            if b == b'\n' {
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_block_comment {
+            mask[i] = false;
+            if b == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                mask[i + 1] = false;
+                in_block_comment = false;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if in_single {
+            mask[i] = false;
+            if b == b'\\' && i + 1 < bytes.len() {
+                mask[i + 1] = false;
+                i += 2;
+                continue;
+            }
+            if b == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            mask[i] = false;
+            if b == b'\\' && i + 1 < bytes.len() {
+                mask[i + 1] = false;
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_tmpl_text {
+            mask[i] = false;
+            if b == b'\\' && i + 1 < bytes.len() {
+                mask[i + 1] = false;
+                i += 2;
+                continue;
+            }
+            if b == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                mask[i + 1] = false;
+                tmpl_brace_stack.push(brace_depth);
+                brace_depth += 1;
+                in_tmpl_text = false;
+                i += 2;
+                continue;
+            }
+            if b == b'`' {
+                in_tmpl_text = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            mask[i] = false;
+            mask[i + 1] = false;
+            in_line_comment = true;
+            i += 2;
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            mask[i] = false;
+            mask[i + 1] = false;
+            in_block_comment = true;
+            i += 2;
+            continue;
+        }
+        if b == b'\'' {
+            mask[i] = false;
+            in_single = true;
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            mask[i] = false;
+            in_double = true;
+            i += 1;
+            continue;
+        }
+        if b == b'`' {
+            mask[i] = false;
+            in_tmpl_text = true;
+            i += 1;
+            continue;
+        }
+        if b == b'{' {
+            brace_depth += 1;
+        } else if b == b'}' && brace_depth > 0 {
+            brace_depth -= 1;
+            if let Some(&entry_depth) = tmpl_brace_stack.last() {
+                if brace_depth == entry_depth {
+                    tmpl_brace_stack.pop();
+                    in_tmpl_text = true;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    mask
+}
+
+/// Rewrites uncast optional credential field accesses on Prisma/auth user records
+/// (e.g. `user.hashedPassword || user.password`) to `(user as any)?.hashedPassword || (user as any)?.password`,
+/// eliminating TS2339 when `schema.prisma` defines only one of the two password field names.
+/// Skips comments, string literals, chained member accesses (`req.user.password`), existing casts (`(user as any).password`),
+/// and assignment LHS targets (`user.password = ...`).
+pub fn sanitize_optional_user_password_access(content: &str) -> String {
+    let has_auth_ctx = content.contains("hashedPassword")
+        || content.contains("passwordHash")
+        || content.contains("CredentialsProvider")
+        || content.contains("bcrypt")
+        || (content.contains("prisma.") && content.contains(".password"));
+    if !has_auth_ctx || (!content.contains("user") && !content.contains("User")) {
+        return content.to_string();
+    }
+
+    let Ok(re) = regex::Regex::new(
+        r"\b(user|foundUser|existingUser|dbUser|authUser|targetUser)\s*(\??\.)\s*(hashedPassword|passwordHash|password)\b",
+    ) else {
+        return content.to_string();
+    };
+
+    let code_mask = compute_ts_code_mask(content);
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+
+    for cap in re.captures_iter(content) {
+        let Some(full_m) = cap.get(0) else { continue };
+        let (Some(ident_m), Some(field_m)) = (cap.get(1), cap.get(3)) else {
+            continue;
+        };
+        let start = full_m.start();
+        let end = full_m.end();
+        if start >= code_mask.len() || end > code_mask.len() || !code_mask[start..end].iter().all(|&ok| ok) {
+            continue;
+        }
+
+        let before_trim = content[..start].trim_end();
+        if before_trim.ends_with('.') {
+            continue;
+        }
+
+        let after_ws = content[end..].trim_start_matches([' ', '\t']);
+        if (after_ws.starts_with('=') && !after_ws.starts_with("==") && !after_ws.starts_with("=>"))
+            || after_ws.starts_with("??=")
+            || after_ws.starts_with("+=")
+            || after_ws.starts_with("-=")
+        {
+            continue;
+        }
+
+        let repl = format!("({} as any)?.{}", ident_m.as_str(), field_m.as_str());
+        replacements.push((start, end, repl));
+    }
+
+    if replacements.is_empty() {
+        return content.to_string();
+    }
+
+    let mut out = String::with_capacity(content.len() + replacements.len() * 12);
+    let mut cursor = 0usize;
+    for (start, end, repl) in replacements {
+        if start >= cursor && end <= content.len() {
+            out.push_str(&content[cursor..start]);
+            out.push_str(&repl);
+            cursor = end;
+        }
+    }
+    out.push_str(&content[cursor..]);
+    out
 }
 
 pub fn sanitize_react_icons_imports(content: &str) -> String {
@@ -3685,18 +4036,23 @@ pub fn post_process_generated_file(
                 processed.push_str("\nexport default prisma;\n");
             }
         }
+        let is_app_route = is_app_router_route_file(&normalized_path);
         let is_nextjs_app_file = normalized_path.contains("/app/") || normalized_path.contains("app/")
             || normalized_path.contains("/components/") || normalized_path.contains("components/");
-        let is_client_logic_file = normalized_path.contains("/hooks/") || normalized_path.starts_with("hooks/")
+        let is_client_logic_file = !is_app_route && (normalized_path.contains("/hooks/") || normalized_path.starts_with("hooks/")
             || normalized_path.contains("/context/") || normalized_path.starts_with("context/")
             || normalized_path.contains("/contexts/") || normalized_path.starts_with("contexts/")
-            || normalized_path.contains("/providers/") || normalized_path.starts_with("providers/");
+            || normalized_path.contains("/providers/") || normalized_path.starts_with("providers/"));
         let is_api_or_route = path_lower.contains("/api/")
             || path_lower.ends_with("route.ts")
             || path_lower.ends_with("route.js");
 
         if (is_nextjs_app_file || is_client_logic_file) && !is_api_or_route {
-            if path_lower.contains("/hooks/") || path_lower.contains("hook") {
+            if !is_app_route
+                && !path_lower.contains("/components/")
+                && !path_lower.starts_with("components/")
+                && (path_lower.contains("/hooks/") || path_lower.starts_with("hooks/") || path_lower.contains("useauth") || path_lower.ends_with("hook.ts") || path_lower.ends_with("hook.tsx"))
+            {
                 processed = sanitize_custom_hook_functions(&processed);
             }
 
@@ -4032,6 +4388,7 @@ pub fn post_process_generated_file(
                 processed = format!("\"use client\";\n\n{}", processed);
             }
             processed = hoist_use_client_directive(&processed);
+            processed = sanitize_root_layout_missing_children(&processed, &normalized_path, false);
         }
 
         // NextAuth v3 vs v4 rewrite for route handlers
@@ -4292,7 +4649,9 @@ export default function Home() {
 
         // Enforce client & custom-hook boundaries AFTER all `"use client"` directives and import normalizations have run
         let is_client_file = processed.contains("\"use client\"") || processed.contains("'use client'");
-        let is_hook_file = (path_lower.contains("/hooks/") || path_lower.starts_with("hooks/")) && !path_lower.contains("/api/");
+        let is_hook_file = !is_app_router_route_file(&normalized_path)
+            && (path_lower.contains("/hooks/") || path_lower.starts_with("hooks/"))
+            && !path_lower.contains("/api/");
         let is_route_handler = path_lower.ends_with("route.ts") || path_lower.ends_with("route.js");
 
         // Normalize `@/prisma/schema` & `@/prisma/client` imports to `@prisma/client` (as `import type` on client/hook files)
@@ -4519,7 +4878,7 @@ export default function Home() {
 
         // Safe default parameter for custom hooks with destructured object props:
         // `const useTasks = ({ boardId }: UseTasksProps)` -> `const useTasks = ({ boardId }: UseTasksProps = {} as any)`
-        if normalized_path.contains("hooks/") && processed.contains("({") {
+        if !is_app_router_route_file(&normalized_path) && (normalized_path.contains("/hooks/") || normalized_path.starts_with("hooks/")) && processed.contains("({") {
             if let Ok(re) = regex::Regex::new(r"(const\s+use\w+\s*=\s*\(\s*\{[^}]+\}\s*:\s*\w+)(\s*\))") {
                 processed = re.replace_all(&processed, "$1 = {} as any$2").to_string();
             }
@@ -4527,6 +4886,9 @@ export default function Home() {
                 processed = re.replace_all(&processed, "$1 = {} as any$2").to_string();
             }
         }
+        processed = ensure_hook_type_exports(&processed, &normalized_path);
+
+        processed = sanitize_optional_user_password_access(&processed);
     }
 
     processed
@@ -6951,4 +7313,136 @@ pub fn ensure_bcrypt_imports(content: &str) -> String {
     }
 
     insert_import_after_use_client(content, "import bcrypt from 'bcryptjs';")
+}
+
+/// Promotes local unexported `interface Foo` / `type Foo = ...` declarations inside custom hook
+/// files (`src/hooks/*.ts`) to `export interface Foo` / `export type Foo = ...` whenever `Foo`
+/// appears inside an exported declaration or signature, so consumers importing `{ Foo }` succeed.
+pub fn ensure_hook_type_exports(content: &str, rel_path: &str) -> String {
+    let norm = rel_path.replace('\\', "/").to_lowercase();
+    let is_hook = !is_app_router_route_file(rel_path)
+        && !norm.contains("/api/")
+        && (norm.contains("/hooks/") || norm.starts_with("hooks/"));
+    if !is_hook || (!content.contains("interface ") && !content.contains("type ")) {
+        return content.to_string();
+    }
+
+    let exported_section: String = content
+        .lines()
+        .filter(|l| l.contains("export "))
+        .collect::<Vec<&str>>()
+        .join("\n");
+
+    let Ok(decl_re) = regex::Regex::new(r"(?m)^([ \t]*)(interface|type)\s+([A-Z][A-Za-z0-9_]*)\b") else {
+        return content.to_string();
+    };
+
+    let mut to_export: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for cap in decl_re.captures_iter(content) {
+        let indent = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        if !indent.is_empty() {
+            continue;
+        }
+        let Some(name_m) = cap.get(3) else { continue };
+        let sym = name_m.as_str();
+        // Promote if used inside an export line OR if there is no `export interface <sym>` / `export type <sym>` anywhere yet
+        let already_exported = content.contains(&format!("export interface {}", sym))
+            || content.contains(&format!("export type {}", sym));
+        if already_exported {
+            continue;
+        }
+        let word_re = regex::Regex::new(&format!(r"\b{}\b", regex::escape(sym))).ok();
+        let used_in_export = word_re
+            .as_ref()
+            .map(|r| r.is_match(&exported_section))
+            .unwrap_or(false);
+        let match_count = word_re
+            .as_ref()
+            .map(|r| r.find_iter(content).count())
+            .unwrap_or(0);
+        if used_in_export || match_count >= 2 {
+            to_export.insert(sym.to_string());
+        }
+    }
+
+    if to_export.is_empty() {
+        return content.to_string();
+    }
+
+    let mut out_lines: Vec<String> = Vec::new();
+    for line in content.lines() {
+        let mut next_line = line.to_string();
+        if let Some(cap) = decl_re.captures(line) {
+            let indent = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let kw = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+            let sym = cap.get(3).map(|m| m.as_str()).unwrap_or("");
+            if indent.is_empty() && to_export.contains(sym) {
+                next_line = format!("export {} {}", kw, &line[kw.len()..].trim_start());
+            }
+        }
+        out_lines.push(next_line);
+    }
+
+    let mut joined = out_lines.join("\n");
+    if content.ends_with('\n') && !joined.ends_with('\n') {
+        joined.push('\n');
+    }
+    joined
+}
+
+/// Ensures Next.js App Router `layout.tsx` / `layout.jsx` accepts `{ children }: { children: React.ReactNode }`
+/// and actually renders `{children}` in its JSX tree. When `allow_even_if_table` is false, a
+/// dashboard-stuffed RootLayout with `<table>` is left intact so generation validation can reject & retry it.
+pub fn sanitize_root_layout_missing_children(content: &str, rel_path: &str, allow_even_if_table: bool) -> String {
+    let norm = rel_path.replace('\\', "/").to_lowercase();
+    let is_layout = norm == "layout.tsx"
+        || norm == "layout.jsx"
+        || norm.ends_with("/layout.tsx")
+        || norm.ends_with("/layout.jsx");
+    if !is_layout {
+        return content.to_string();
+    }
+
+    let already_has_children = if let Ok(re) = regex::Regex::new(r"\{\s*children\s*\}") {
+        re.find_iter(content).any(|m| {
+            let next_ch = content[m.end()..].chars().find(|c| !c.is_whitespace());
+            !matches!(next_ch, Some(':') | Some(',') | Some('=') | Some(')'))
+        })
+    } else {
+        content.contains("{children}")
+    };
+    if already_has_children {
+        return content.to_string();
+    }
+    if !allow_even_if_table && norm.ends_with("/app/layout.tsx") && content.to_lowercase().contains("<table") {
+        return content.to_string();
+    }
+    if !allow_even_if_table && norm.ends_with("/app/layout.jsx") && content.to_lowercase().contains("<table") {
+        return content.to_string();
+    }
+
+    let mut out = content.to_string();
+    if let Ok(empty_fn_re) = regex::Regex::new(r"(export\s+default\s+(?:async\s+)?function\s+\w+\s*)\(\s*\)") {
+        out = empty_fn_re
+            .replace(&out, "${1}({ children }: { children: React.ReactNode })")
+            .to_string();
+    }
+
+    if let Some(pos) = out.rfind("</main>") {
+        out.insert_str(pos, "{children}\n        ");
+        return out;
+    }
+    if let Some(pos) = out.rfind("</SessionProvider>") {
+        out.insert_str(pos, "{children}\n        ");
+        return out;
+    }
+    if let Some(pos) = out.rfind("</body>") {
+        out.insert_str(pos, "<main className=\"flex-1 flex flex-col w-full\">{children}</main>\n      ");
+        return out;
+    }
+    if let Some(pos) = out.rfind("</div>") {
+        out.insert_str(pos, "{children}\n      ");
+        return out;
+    }
+    out
 }

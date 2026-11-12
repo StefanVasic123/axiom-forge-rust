@@ -54,20 +54,81 @@ pub fn strip_ansi_codes(input: &str) -> String {
     output
 }
 
-pub fn extract_file_path_from_line(line: &str) -> Option<String> {
-    // Next.js route-based runtime errors, e.g. 'Error: The default export is not a React Component in page: "/"'
-    let route_extracted = if let Some(start) = line.find("in page: \"") {
-        let sub = &line[start + "in page: \"".len()..];
-        sub.find('\"').map(|end| sub[..end].to_string())
-    } else if let Some(start) = line.find("in page: '") {
-        let sub = &line[start + "in page: '".len()..];
-        sub.find('\'').map(|end| sub[..end].to_string())
+/// Maps Next.js browser chunk URLs/paths (e.g. `http://localhost:3000/_next/static/chunks/app/layout.js`
+/// or `/_next/static/chunks/app/dashboard/page-a1b2c3d4.js`) back to workspace source paths.
+pub fn map_next_chunk_url_to_source(raw: &str) -> Option<String> {
+    let norm = raw.trim().replace('\\', "/");
+    let no_query = norm.split(['?', '#']).next().unwrap_or(&norm);
+    let idx = no_query.find("/_next/static/chunks/")?;
+    let after = &no_query[idx + "/_next/static/chunks/".len()..];
+    let (router_kind, rest) = if let Some(r) = after.strip_prefix("app/") {
+        ("app", r)
+    } else if let Some(r) = after.strip_prefix("pages/") {
+        ("pages", r)
     } else {
-        None
+        return None;
     };
 
+    let stem_with_ext = rest
+        .strip_suffix(".mjs")
+        .or_else(|| rest.strip_suffix(".js"))?;
+    let mut stem = stem_with_ext.to_string();
+    if let Some(dash_idx) = stem.rfind('-') {
+        let suffix = &stem[dash_idx + 1..];
+        if suffix.len() >= 8 && suffix.chars().all(|c| c.is_ascii_hexdigit()) {
+            stem.truncate(dash_idx);
+        }
+    }
+    let trimmed_stem = stem.trim_matches('/');
+    if trimmed_stem.is_empty()
+        || matches!(
+            trimmed_stem,
+            "_app" | "_document" | "_error" | "_not-found" | "webpack" | "main" | "framework" | "polyfills"
+        )
+    {
+        return None;
+    }
+
+    if router_kind == "app" {
+        Some(format!("src/app/{}.tsx", trimmed_stem))
+    } else {
+        Some(format!("src/pages/{}.tsx", trimmed_stem))
+    }
+}
+
+pub fn extract_file_path_from_line(line: &str) -> Option<String> {
+    if let Some(mapped_chunk) = map_next_chunk_url_to_source(line) {
+        return Some(mapped_chunk);
+    }
+
+    // Next.js route-based runtime and build/prerender errors, e.g.:
+    // - 'Error: The default export is not a React Component in page: "/"'
+    // - 'Error occurred prerendering page "/models". Read more: ...'
+    let route_extracted = [
+        ("in page: \"", "\""),
+        ("in page: '", "'"),
+        ("prerendering page \"", "\""),
+        ("prerendering page '", "'"),
+        ("not a React Component in \"", "\""),
+        ("not a React Component in '", "'"),
+        ("page: \"", "\""),
+        ("page: '", "'"),
+    ]
+    .iter()
+    .find_map(|(prefix, end_delim)| {
+        let start = line.find(prefix)?;
+        let sub = &line[start + prefix.len()..];
+        let end = sub.find(end_delim)?;
+        let candidate = sub[..end].trim();
+        if matches!(*prefix, "page: \"" | "page: '") && !candidate.starts_with('/') {
+            return None;
+        }
+        Some(candidate.to_string())
+    });
+
     if let Some(route) = route_extracted {
-        let clean_route = route.trim_matches('/');
+        let route_no_query = route.split(['?', '#']).next().unwrap_or(&route);
+        let clean_route = route_no_query.trim_matches('/');
         if clean_route.is_empty() {
             return Some("src/app/page.tsx".to_string());
         } else if clean_route.starts_with("api/") || clean_route == "api" {
@@ -80,7 +141,14 @@ pub fn extract_file_path_from_line(line: &str) -> Option<String> {
 
     let cleaned = line.replace("⨯", " ");
     for word in cleaned.split_whitespace() {
-        let word_clean = word.trim_matches(|c| c == '[' || c == ']' || c == ',' || c == '`' || c == '(' || c == ')');
+        let word_clean = word.trim_matches(|c| c == '[' || c == ']' || c == ',' || c == '`' || c == '(' || c == ')' || c == '"' || c == '\'');
+        if let Some(mapped_chunk) = map_next_chunk_url_to_source(word_clean) {
+            return Some(mapped_chunk);
+        }
+        let word_low = word_clean.to_lowercase();
+        if word_low.starts_with("http://") || word_low.starts_with("https://") {
+            continue;
+        }
         for ext in &[".tsx", ".ts", ".jsx", ".js", ".css"] {
             if let Some(idx) = word_clean.find(ext) {
                 let end_pos = idx + ext.len();
@@ -103,12 +171,45 @@ pub fn extract_file_path_from_line(line: &str) -> Option<String> {
                     path_str = path_str[2..].to_string();
                 }
 
-                // Preskoči biblioteke treće strane, bild izlaz, keš i git foldere
-                if path_str.contains("node_modules") 
-                    || path_str.contains(".next") 
-                    || path_str.contains("dist") 
-                    || path_str.contains("build") 
-                    || path_str.contains(".git") 
+                // Map Next.js typed routes (`.next/types/app/.../*.ts`) back to App Router source files
+                let norm_for_next = path_str.replace('\\', "/");
+                if let Some(types_idx) = norm_for_next.find(".next/types/") {
+                    let sub = norm_for_next[types_idx + ".next/types/".len()..].trim_start_matches('/');
+                    if sub.starts_with("app/") {
+                        let mapped = if sub.contains("/api/") && (sub.ends_with("/route.ts") || sub.ends_with("/route.js")) {
+                            format!("src/{}", sub)
+                        } else if let Some(stem_path) = sub.strip_suffix(".ts") {
+                            let file_name = stem_path.rsplit('/').next().unwrap_or("");
+                            if matches!(
+                                file_name,
+                                "page" | "layout" | "loading" | "error" | "not-found" | "template" | "default" | "global-error"
+                            ) {
+                                format!("src/{}.tsx", stem_path)
+                            } else {
+                                format!("src/{}", sub)
+                            }
+                        } else {
+                            format!("src/{}", sub)
+                        };
+                        return Some(mapped);
+                    }
+                }
+
+                // Preskoči biblioteke treće strane, bild izlaz (osim već mapiranih `.next/types/`), keš, HTTP URL-ove i git foldere
+                let norm_low = norm_for_next.to_lowercase();
+                if norm_low.starts_with("http://")
+                    || norm_low.starts_with("https://")
+                    || norm_low.contains("node_modules/")
+                    || norm_low.ends_with("/node_modules")
+                    || norm_low.contains("_next/")
+                    || norm_low.contains(".next/")
+                    || norm_low.starts_with(".next")
+                    || norm_low.contains("/dist/")
+                    || norm_low.starts_with("dist/")
+                    || norm_low.contains("/build/")
+                    || norm_low.starts_with("build/")
+                    || norm_low.contains(".git/")
+                    || norm_low.starts_with(".git")
                 {
                     continue;
                 }
@@ -116,6 +217,35 @@ pub fn extract_file_path_from_line(line: &str) -> Option<String> {
             }
         }
     }
+
+    // Fallback: extensionless source paths emitted in TypeScript/Next build errors (e.g. `typeof import(".../src/app/models/page")`)
+    for token in cleaned.split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '(' | ')' | '`' | ',' | '<' | '>')) {
+        let norm = token.replace('\\', "/");
+        let norm_trim = norm.trim_matches(|c: char| matches!(c, '[' | ']' | ':' | ';'));
+        if norm_trim.is_empty() {
+            continue;
+        }
+        let low = norm_trim.to_lowercase();
+        if low.starts_with("http://")
+            || low.starts_with("https://")
+            || low.contains("node_modules/")
+            || low.contains(".next/")
+            || low.contains(".git/")
+        {
+            continue;
+        }
+        if let Some(src_idx) = low.find("/src/") {
+            let candidate = norm_trim[src_idx + 1..].trim_end_matches('/');
+            if candidate.matches('/').count() >= 1 {
+                return Some(candidate.to_string());
+            }
+        } else if low.starts_with("src/") && norm_trim.matches('/').count() >= 1 {
+            return Some(norm_trim.trim_end_matches('/').to_string());
+        } else if low.starts_with("./src/") && norm_trim.matches('/').count() >= 2 {
+            return Some(norm_trim[2..].trim_end_matches('/').to_string());
+        }
+    }
+
     None
 }
 
@@ -169,7 +299,21 @@ pub fn extract_package_name_from_error(line: &str) -> Option<String> {
 }
 
 pub fn resolve_project_file_candidate(proj_dir: &Path, rel_path: &str) -> Option<String> {
+    if let Some(mapped_chunk) = map_next_chunk_url_to_source(rel_path) {
+        if mapped_chunk != rel_path {
+            return resolve_project_file_candidate(proj_dir, &mapped_chunk);
+        }
+    }
     let mut norm_rel = rel_path.replace('\\', "/");
+    let norm_low = norm_rel.trim().to_lowercase();
+    if norm_low.starts_with("http://")
+        || norm_low.starts_with("https://")
+        || norm_low.starts_with("webpack-internal:")
+        || norm_low.contains("node_modules/")
+        || norm_low.ends_with("/node_modules")
+    {
+        return None;
+    }
     let proj_dir_norm = proj_dir.to_string_lossy().replace('\\', "/");
     if let Some(stripped) = norm_rel.strip_prefix(&format!("{}/", proj_dir_norm)) {
         norm_rel = stripped.to_string();
@@ -197,22 +341,40 @@ pub fn resolve_project_file_candidate(proj_dir: &Path, rel_path: &str) -> Option
         return Some(with_src);
     }
 
-    // Try alternative file extensions (.tsx, .jsx, .ts, .js)
+    // Try file extensions (.tsx, .jsx, .ts, .js) when replacing extension OR resolving extensionless specifier (e.g. `src/app/models/page` or `[...nextauth]/route`)
+    let last_slash = rel_path.rfind('/');
+    let ext_dot_idx = rel_path.rfind('.').filter(|&dot_idx| last_slash.map_or(true, |sl| dot_idx > sl));
+    let base_no_ext = match ext_dot_idx {
+        Some(dot_idx) => &rel_path[..dot_idx],
+        None => rel_path,
+    };
     for ext in &[".tsx", ".jsx", ".ts", ".js"] {
-        if let Some(dot_idx) = rel_path.rfind('.') {
-            let base = &rel_path[..dot_idx];
-            let candidate = format!("{}{}", base, ext);
-            if proj_dir.join(&candidate).is_file() {
-                return Some(candidate);
+        let candidate = format!("{}{}", base_no_ext, ext);
+        if proj_dir.join(&candidate).is_file() {
+            return Some(candidate);
+        }
+        if let Some(stripped) = candidate.strip_prefix("src/") {
+            if proj_dir.join(stripped).is_file() {
+                return Some(stripped.to_string());
             }
-            if let Some(stripped) = candidate.strip_prefix("src/") {
+        }
+        let with_src = format!("src/{}", candidate);
+        if proj_dir.join(&with_src).is_file() {
+            return Some(with_src);
+        }
+        if ext_dot_idx.is_none() {
+            let index_cand = format!("{}/index{}", base_no_ext, ext);
+            if proj_dir.join(&index_cand).is_file() {
+                return Some(index_cand);
+            }
+            if let Some(stripped) = index_cand.strip_prefix("src/") {
                 if proj_dir.join(stripped).is_file() {
                     return Some(stripped.to_string());
                 }
             }
-            let with_src = format!("src/{}", candidate);
-            if proj_dir.join(&with_src).is_file() {
-                return Some(with_src);
+            let with_src_idx = format!("src/{}", index_cand);
+            if proj_dir.join(&with_src_idx).is_file() {
+                return Some(with_src_idx);
             }
         }
     }
@@ -547,6 +709,9 @@ pub async fn server_start(
 
     // Ensure package.json has all required Next.js, Prisma, and Tailwind dependencies and scripts
     repair_package_json_dependencies(&proj_dir);
+
+    // Ensure NextAuth projects have NEXTAUTH_URL & NEXTAUTH_SECRET configured before server boot
+    crate::self_healing::ensure_nextauth_env_vars(&proj_dir);
 
     // Auto-resolve route collisions between Pages Router and App Router
     if proj_dir.join("src/app/api").exists() && proj_dir.join("src/pages/api").exists() {

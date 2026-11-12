@@ -198,5 +198,28 @@
     "viewProject": "View Generated Project",
     "hideTooltip": "Hide status card (background process will continue)",
     "progress": "Progress"
+  },
+  "aiOptimizer": {
+    "title": "AI Model Progress & Local Trainer",
+    "subtitle": "Exponential accuracy tracking across Axiom versions, LLM domain strengths/weaknesses, and mini-LLM fine-tuning dataset export.",
+    "allModels": "All Local Models",
+    "expIndex": "Exponential Accuracy Index",
+    "cleanFeatures": "100%-Clean Feature Rate",
+    "avgBugScope": "Mean Bug Scope",
+    "vsPrev": "vs Prev Version",
+    "vsBest": "vs Historical Best",
+    "katastarVerified": "Verified Katastar Rules",
+    "equationTitle": "Exponential Accuracy Growth Equation",
+    "equationDesc": "Combines first-pass 100%-clean feature rate (F100), untouched file scope (1 - b_p), error density attenuation (phi_p), historical deltas, and recency-weighted exponential compounding.",
+    "chartTitle": "Version-by-Version Accuracy Trajectory",
+    "versionTableTitle": "Release Cohort Breakdown",
+    "domainAnalysisTitle": "Error Frequency (učestalost_greske) — LLM Strength & Weakness Map",
+    "trainerTitle": "Mini-LLM SFT Dataset & Modelfile Trainer",
+    "trainerDesc": "Export verified Katastar fixes, heal-ledger pairs, and Axiom Stack Rulepacks as scrubbed JSONL + Ollama Modelfile to specialize a fast local coding model.",
+    "exportBtn": "Generate SFT Dataset & Modelfile",
+    "exporting": "Exporting...",
+    "projectsTableTitle": "Generated Projects Telemetry",
+    "tuningTitle": "Local AI Inference Directives & Tuning",
+    "saveDirectiveSuccess": "Optimizer preferences saved locally."
   }
 }

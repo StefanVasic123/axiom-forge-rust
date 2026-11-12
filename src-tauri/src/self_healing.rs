@@ -943,21 +943,23 @@ pub fn parse_tsc_diagnostics(tsc_output: &str) -> Vec<TscDiagnostic> {
 
 pub fn file_dependency_layer_priority(rel_path: &str) -> u8 {
     let lower = rel_path.replace('\\', "/").to_lowercase();
+    let is_app_route = crate::sanitizer::is_app_router_route_file(rel_path);
+    let is_api_path = lower.contains("/api/") || lower.starts_with("api/");
     if lower.contains("schema.prisma") || lower.starts_with("prisma/") {
         0
-    } else if lower.contains("/models/") || lower.starts_with("models/") || lower.contains("/types/") || lower.starts_with("types/") {
+    } else if !is_app_route && !is_api_path && (lower.contains("/models/") || lower.starts_with("models/") || lower.contains("/types/") || lower.starts_with("types/")) {
         1
-    } else if lower.contains("/lib/") || lower.starts_with("lib/") || lower.contains("/utils/") || lower.starts_with("utils/") || lower.contains("/config/") || lower.contains("/services/") {
+    } else if !is_app_route && (lower.contains("/lib/") || lower.starts_with("lib/") || lower.contains("/utils/") || lower.starts_with("utils/") || lower.contains("/config/") || lower.contains("/services/")) {
         2
     } else if lower.contains("/components/ui") {
         3
-    } else if lower.contains("/hooks/") || lower.starts_with("hooks/") || lower.contains("/context") || lower.contains("/providers") {
+    } else if !is_app_route && !is_api_path && (lower.contains("/hooks/") || lower.starts_with("hooks/") || lower.contains("/context") || lower.contains("/providers")) {
         4
-    } else if lower.contains("/api/") || lower.ends_with("route.ts") || lower.ends_with("route.js") || lower.ends_with("middleware.ts") {
+    } else if is_api_path || lower.ends_with("route.ts") || lower.ends_with("route.js") || lower.ends_with("middleware.ts") {
         5
-    } else if lower.contains("/components/") {
+    } else if !is_app_route && (lower.contains("/components/") || lower.starts_with("components/")) {
         6
-    } else if lower.contains("/app/") {
+    } else if is_app_route || lower.contains("/app/") || lower.starts_with("app/") {
         7
     } else {
         8
@@ -1106,6 +1108,10 @@ pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
                                 let is_ui_mod = rel_lower.contains("/components/ui") || rel_lower.ends_with("/ui.tsx") || rel_lower.ends_with("/ui.jsx");
                                 next = crate::sanitizer::repair_bare_react_fc_signatures(&next, is_ui_mod);
                             }
+                            next = crate::sanitizer::sanitize_optional_user_password_access(&next);
+                            next = crate::sanitizer::ensure_hook_type_exports(&next, &rel);
+                            next = crate::sanitizer::sanitize_root_layout_missing_children(&next, &rel, true);
+                            next = reconcile_external_icon_imports_in_content(proj_dir, &next);
                             next = crate::sanitizer::reconcile_server_prisma_enum_usage(proj_dir, &rel, &next);
                             if crate::sanitizer::is_app_router_route_file(&rel) {
                                 next = crate::sanitizer::sanitize_app_router_route_exports(&next, &rel);
@@ -1146,6 +1152,7 @@ pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
     crate::apply_ast_sanity_pass_to_project(proj_dir);
     crate::sanitizer::ensure_ui_primitives_reconciled(proj_dir);
     crate::sanitizer::ensure_directory_barrel_files(proj_dir);
+    ensure_nextauth_env_vars(proj_dir);
     let _ = auto_import_missing_symbols_in_project(proj_dir);
 }
 
@@ -1166,14 +1173,14 @@ pub fn extract_prisma_schema_summary_for_healing(proj_dir: &std::path::Path) -> 
     let mut out = String::new();
     if let Some(enums_obj) = contract.get("enums").and_then(|e| e.as_object()) {
         if !enums_obj.is_empty() {
-            out.push_str("Prisma Enums (import from '@prisma/client' when typing or validating with z.nativeEnum):\n");
+            out.push_str("Prisma Enums (type/value enums ONLY — NO `prisma.<enum>` delegate exists on PrismaClient! Never write `prisma.subscriptionPlan` etc.; import enums from '@prisma/client' for typing or z.nativeEnum):\n");
             for (ename, evals) in enums_obj {
                 let vals: Vec<&str> = evals
                     .as_array()
                     .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
                     .unwrap_or_default();
                 if !vals.is_empty() {
-                    out.push_str(&format!("- {}: {}\n", ename, vals.join(" | ")));
+                    out.push_str(&format!("- enum {}: {}\n", ename, vals.join(" | ")));
                 }
             }
         }
@@ -1417,6 +1424,19 @@ pub fn resolve_external_dts_path(proj_dir: &std::path::Path, spec: &str) -> Opti
                             .map(|s| s.to_string())
                             .or_else(|| extract_types_path_from_export_val(target_val))
                         {
+                            if let Some(p) = resolve_dts_entry_in_dir(&pkg_dir, &types_rel) {
+                                return Some(p);
+                            }
+                        }
+                    } else if subpath.is_empty()
+                        && (exports_obj.contains_key("types")
+                            || exports_obj.contains_key("import")
+                            || exports_obj.contains_key("default")
+                            || exports_obj.contains_key("require")
+                            || exports_obj.contains_key("node"))
+                    {
+                        // Conditional root exports without `"."` key (e.g. `stripe@23.1.0`: `{ "import": {...}, "default": {...} }`)
+                        if let Some(types_rel) = extract_types_path_from_export_val(&Value::Object(exports_obj.clone())) {
                             if let Some(p) = resolve_dts_entry_in_dir(&pkg_dir, &types_rel) {
                                 return Some(p);
                             }
@@ -1916,7 +1936,7 @@ pub fn extract_missing_ident_candidates_from_error(err_ctx: &str) -> Vec<String>
     out
 }
 
-fn collect_declared_or_imported_idents(content: &str) -> std::collections::HashSet<String> {
+pub fn collect_declared_or_imported_idents(content: &str) -> std::collections::HashSet<String> {
     let mut known: std::collections::HashSet<String> = [
         "React", "Fragment", "Suspense", "StrictMode", "Component", "PureComponent",
         "Promise", "Error", "TypeError", "SyntaxError", "Array", "Object", "Date",
@@ -2013,7 +2033,7 @@ fn collect_declared_or_imported_idents(content: &str) -> std::collections::HashS
     known
 }
 
-fn extract_unimported_jsx_components(
+pub fn extract_unimported_jsx_components(
     content: &str,
     known: &std::collections::HashSet<String>,
     is_jsx_file: bool,
@@ -2191,6 +2211,332 @@ fn find_unique_local_module_for_symbol(
     }
 }
 
+fn match_react_icons_prefix(sym: &str) -> Option<(&'static str, &str)> {
+    const PREFIXES: &[(&str, &str)] = &[
+        ("HiOutline", "react-icons/hi"),
+        ("HiMini", "react-icons/hi2"),
+        ("IoLogo", "react-icons/io"),
+        ("IoIos", "react-icons/io"),
+        ("IoMd", "react-icons/io"),
+        ("FaReg", "react-icons/fa"),
+        ("Hi2", "react-icons/hi2"),
+        ("Io5", "react-icons/io5"),
+        ("Vsc", "react-icons/vsc"),
+        ("Lia", "react-icons/lia"),
+        ("Tfi", "react-icons/tfi"),
+        ("Hi", "react-icons/hi"),
+        ("Fa", "react-icons/fa"),
+        ("Fi", "react-icons/fi"),
+        ("Md", "react-icons/md"),
+        ("Io", "react-icons/io5"),
+        ("Ai", "react-icons/ai"),
+        ("Bs", "react-icons/bs"),
+        ("Ri", "react-icons/ri"),
+        ("Bi", "react-icons/bi"),
+        ("Tb", "react-icons/tb"),
+        ("Lu", "react-icons/lu"),
+        ("Ci", "react-icons/ci"),
+        ("Si", "react-icons/si"),
+        ("Gi", "react-icons/gi"),
+        ("Ti", "react-icons/ti"),
+        ("Wi", "react-icons/wi"),
+        ("Pi", "react-icons/pi"),
+        ("Go", "react-icons/go"),
+        ("Gr", "react-icons/gr"),
+        ("Sl", "react-icons/sl"),
+        ("Im", "react-icons/im"),
+        ("Cg", "react-icons/cg"),
+        ("Rx", "react-icons/rx"),
+    ];
+    for &(prefix, subpath) in PREFIXES {
+        if let Some(rest) = sym.strip_prefix(prefix) {
+            if let Some(first_c) = rest.chars().next() {
+                if first_c.is_ascii_uppercase() || first_c.is_ascii_digit() {
+                    return Some((subpath, rest));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn candidate_react_icon_subpaths(primary: &str) -> Vec<&'static str> {
+    match primary {
+        "react-icons/hi" => vec!["react-icons/hi", "react-icons/hi2"],
+        "react-icons/hi2" => vec!["react-icons/hi2", "react-icons/hi"],
+        "react-icons/fa" => vec!["react-icons/fa", "react-icons/fa6"],
+        "react-icons/fa6" => vec!["react-icons/fa6", "react-icons/fa"],
+        "react-icons/io5" => vec!["react-icons/io5", "react-icons/io"],
+        "react-icons/io" => vec!["react-icons/io", "react-icons/io5"],
+        "react-icons/fi" => vec!["react-icons/fi"],
+        "react-icons/md" => vec!["react-icons/md"],
+        "react-icons/ai" => vec!["react-icons/ai"],
+        "react-icons/bs" => vec!["react-icons/bs"],
+        "react-icons/ri" => vec!["react-icons/ri"],
+        "react-icons/bi" => vec!["react-icons/bi"],
+        "react-icons/tb" => vec!["react-icons/tb"],
+        "react-icons/lu" => vec!["react-icons/lu"],
+        "react-icons/ci" => vec!["react-icons/ci"],
+        "react-icons/si" => vec!["react-icons/si"],
+        "react-icons/gi" => vec!["react-icons/gi"],
+        "react-icons/ti" => vec!["react-icons/ti"],
+        "react-icons/wi" => vec!["react-icons/wi"],
+        "react-icons/pi" => vec!["react-icons/pi"],
+        "react-icons/go" => vec!["react-icons/go"],
+        "react-icons/gr" => vec!["react-icons/gr"],
+        "react-icons/sl" => vec!["react-icons/sl"],
+        "react-icons/im" => vec!["react-icons/im"],
+        "react-icons/cg" => vec!["react-icons/cg"],
+        "react-icons/rx" => vec!["react-icons/rx"],
+        "react-icons/vsc" => vec!["react-icons/vsc"],
+        "react-icons/lia" => vec!["react-icons/lia"],
+        "react-icons/tfi" => vec!["react-icons/tfi"],
+        _ => Vec::new(),
+    }
+}
+
+/// Verifies `lucide-react` and `react-icons/*` named imports against the installed `.d.ts`
+/// definitions in `node_modules/` and repairs cross-library hallucinations (e.g.
+/// `import { FiServer } from 'lucide-react'` -> `react-icons/fi`, or aliased `Server as FiServer`
+/// from `lucide-react` when `react-icons/fi` is not installed).
+pub fn reconcile_external_icon_imports_in_content(proj_dir: &std::path::Path, content: &str) -> String {
+    if !proj_dir.join("node_modules").is_dir()
+        || (!content.contains("lucide-react") && !content.contains("react-icons/"))
+    {
+        return content.to_string();
+    }
+
+    let raw_lines: Vec<&str> = content.lines().collect();
+    let mut out_lines: Vec<String> = Vec::with_capacity(raw_lines.len());
+    let mut moved_imports: Vec<(String, String)> = Vec::new();
+    let mut any_changed = false;
+    let mut idx = 0usize;
+
+    while idx < raw_lines.len() {
+        let line_trim = raw_lines[idx].trim();
+        let is_import_start = (line_trim.starts_with("import ") || line_trim.starts_with("import{"))
+            && !line_trim.starts_with("import type ")
+            && !line_trim.starts_with("import type{")
+            && !line_trim.starts_with("import '")
+            && !line_trim.starts_with("import \"");
+        if !is_import_start {
+            out_lines.push(raw_lines[idx].to_string());
+            idx += 1;
+            continue;
+        }
+
+        let mut end_idx = idx;
+        let mut stmt = raw_lines[idx].to_string();
+        while !stmt.contains(" from ")
+            && !stmt.contains("from'")
+            && !stmt.contains("from\"")
+            && !stmt.trim_end().ends_with(';')
+            && end_idx + 1 < raw_lines.len()
+            && end_idx - idx < 60
+        {
+            end_idx += 1;
+            stmt.push('\n');
+            stmt.push_str(raw_lines[end_idx]);
+        }
+
+        let flat = stmt.replace('\n', " ");
+        let flat_trim = flat.trim();
+        let spec_opt = crate::sanitizer::extract_import_specifier(flat_trim);
+        let Some(spec) = spec_opt else {
+            for k in idx..=end_idx {
+                out_lines.push(raw_lines[k].to_string());
+            }
+            idx = end_idx + 1;
+            continue;
+        };
+
+        let is_icon_spec = spec == "lucide-react" || spec.starts_with("react-icons/");
+        if !is_icon_spec || resolve_external_dts_path(proj_dir, &spec).is_none() {
+            for k in idx..=end_idx {
+                out_lines.push(raw_lines[k].to_string());
+            }
+            idx = end_idx + 1;
+            continue;
+        }
+
+        let Some(after_import) = flat_trim.strip_prefix("import").map(|s| s.trim_start()) else {
+            for k in idx..=end_idx {
+                out_lines.push(raw_lines[k].to_string());
+            }
+            idx = end_idx + 1;
+            continue;
+        };
+        let (Some(ob), Some(cb)) = (after_import.find('{'), after_import.find('}')) else {
+            for k in idx..=end_idx {
+                out_lines.push(raw_lines[k].to_string());
+            }
+            idx = end_idx + 1;
+            continue;
+        };
+        if ob >= cb {
+            for k in idx..=end_idx {
+                out_lines.push(raw_lines[k].to_string());
+            }
+            idx = end_idx + 1;
+            continue;
+        }
+
+        let default_part = after_import[..ob].trim().trim_end_matches(',').trim();
+        let inner = &after_import[ob + 1..cb];
+        let mut kept_items: Vec<String> = Vec::new();
+        let mut stmt_changed = false;
+
+        for raw_item in inner.split(',') {
+            let item = raw_item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            if item.starts_with("type ") {
+                kept_items.push(item.to_string());
+                continue;
+            }
+            let (orig_sym, alias_opt) = if let Some((lhs, rhs)) = item.split_once(" as ") {
+                (lhs.trim(), Some(rhs.trim()))
+            } else {
+                (item, None)
+            };
+            if orig_sym.is_empty()
+                || !orig_sym
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+            {
+                kept_items.push(item.to_string());
+                continue;
+            }
+
+            if dts_package_exports_symbol(proj_dir, &spec, orig_sym) {
+                kept_items.push(item.to_string());
+                continue;
+            }
+
+            let prefix_match = match_react_icons_prefix(orig_sym);
+            let mut resolved = false;
+
+            if spec == "lucide-react" {
+                if let Some((base_sub, rest)) = prefix_match {
+                    for cand_sub in candidate_react_icon_subpaths(base_sub) {
+                        if dts_package_exports_symbol(proj_dir, cand_sub, orig_sym) {
+                            moved_imports.push((cand_sub.to_string(), item.to_string()));
+                            stmt_changed = true;
+                            resolved = true;
+                            break;
+                        }
+                    }
+                    if !resolved && dts_package_exports_symbol(proj_dir, "lucide-react", rest) {
+                        let local_name = alias_opt.unwrap_or(orig_sym);
+                        let rewritten = if rest == local_name {
+                            rest.to_string()
+                        } else {
+                            format!("{} as {}", rest, local_name)
+                        };
+                        if !kept_items.iter().any(|k| k == &rewritten) {
+                            kept_items.push(rewritten);
+                        }
+                        stmt_changed = true;
+                        resolved = true;
+                    }
+                }
+            } else if spec.starts_with("react-icons/") {
+                if let Some((base_sub, rest)) = prefix_match {
+                    for cand_sub in candidate_react_icon_subpaths(base_sub) {
+                        if cand_sub != spec && dts_package_exports_symbol(proj_dir, cand_sub, orig_sym) {
+                            moved_imports.push((cand_sub.to_string(), item.to_string()));
+                            stmt_changed = true;
+                            resolved = true;
+                            break;
+                        }
+                    }
+                    if !resolved && dts_package_exports_symbol(proj_dir, "lucide-react", orig_sym) {
+                        moved_imports.push(("lucide-react".to_string(), item.to_string()));
+                        stmt_changed = true;
+                        resolved = true;
+                    }
+                    if !resolved && dts_package_exports_symbol(proj_dir, "lucide-react", rest) {
+                        let local_name = alias_opt.unwrap_or(orig_sym);
+                        let rewritten = if rest == local_name {
+                            rest.to_string()
+                        } else {
+                            format!("{} as {}", rest, local_name)
+                        };
+                        moved_imports.push(("lucide-react".to_string(), rewritten));
+                        stmt_changed = true;
+                        resolved = true;
+                    }
+                } else if dts_package_exports_symbol(proj_dir, "lucide-react", orig_sym) {
+                    moved_imports.push(("lucide-react".to_string(), item.to_string()));
+                    stmt_changed = true;
+                    resolved = true;
+                }
+            }
+
+            if !resolved {
+                kept_items.push(item.to_string());
+            }
+        }
+
+        if !stmt_changed {
+            for k in idx..=end_idx {
+                out_lines.push(raw_lines[k].to_string());
+            }
+            idx = end_idx + 1;
+            continue;
+        }
+
+        any_changed = true;
+        let indent_len = raw_lines[idx].len() - raw_lines[idx].trim_start().len();
+        let indent = &raw_lines[idx][..indent_len];
+        let quote = if flat_trim.contains(&format!("\"{}\"", spec)) { '"' } else { '\'' };
+        let semi = if flat_trim.ends_with(';') { ";" } else { "" };
+
+        if !kept_items.is_empty() && !default_part.is_empty() {
+            out_lines.push(format!(
+                "{}import {}, {{ {} }} from {}{}{}{}",
+                indent,
+                default_part,
+                kept_items.join(", "),
+                quote,
+                spec,
+                quote,
+                semi
+            ));
+        } else if !kept_items.is_empty() {
+            out_lines.push(format!(
+                "{}import {{ {} }} from {}{}{}{}",
+                indent,
+                kept_items.join(", "),
+                quote,
+                spec,
+                quote,
+                semi
+            ));
+        } else if !default_part.is_empty() {
+            out_lines.push(format!(
+                "{}import {} from {}{}{}{}",
+                indent, default_part, quote, spec, quote, semi
+            ));
+        }
+        idx = end_idx + 1;
+    }
+
+    if !any_changed && moved_imports.is_empty() {
+        return content.to_string();
+    }
+
+    let mut result = out_lines.join("\n");
+    if content.ends_with('\n') && !result.is_empty() && !result.ends_with('\n') {
+        result.push('\n');
+    }
+    for (target_spec, sym_item) in moved_imports {
+        result = merge_or_insert_import_statement(&result, &target_spec, &sym_item, false);
+    }
+    result
+}
+
 pub fn merge_or_insert_import_statement(
     content: &str,
     module_spec: &str,
@@ -2211,7 +2557,7 @@ pub fn merge_or_insert_import_statement(
                 if !prefix.starts_with("import type") {
                     let already_in = existing
                         .split(',')
-                        .any(|s| s.trim().split_whitespace().next() == Some(sym));
+                        .any(|s| s.trim() == sym || s.trim().split_whitespace().next() == Some(sym));
                     if already_in {
                         return content.to_string();
                     }
@@ -2236,6 +2582,234 @@ pub fn merge_or_insert_import_statement(
     crate::sanitizer::hoist_use_client_directive(&with_imp)
 }
 
+fn reconcile_ui_barrel_hook_imports(
+    proj_dir: &std::path::Path,
+    abs_file: &std::path::Path,
+    content: &str,
+) -> String {
+    let raw_lines: Vec<&str> = content.lines().collect();
+    let mut out_lines: Vec<String> = Vec::with_capacity(raw_lines.len());
+    let mut moved_hooks: Vec<(String, String)> = Vec::new();
+    let mut changed = false;
+    let mut idx = 0usize;
+
+    while idx < raw_lines.len() {
+        let trim = raw_lines[idx].trim();
+        let is_imp = (trim.starts_with("import ") || trim.starts_with("import{"))
+            && !trim.starts_with("import type ")
+            && !trim.starts_with("import type{")
+            && !trim.starts_with("import '")
+            && !trim.starts_with("import \"");
+        if !is_imp {
+            out_lines.push(raw_lines[idx].to_string());
+            idx += 1;
+            continue;
+        }
+        let mut end_idx = idx;
+        let mut stmt = raw_lines[idx].to_string();
+        while !stmt.contains(" from ")
+            && !stmt.contains("from'")
+            && !stmt.contains("from\"")
+            && !stmt.trim_end().ends_with(';')
+            && end_idx + 1 < raw_lines.len()
+            && end_idx - idx < 40
+        {
+            end_idx += 1;
+            stmt.push('\n');
+            stmt.push_str(raw_lines[end_idx]);
+        }
+        let flat = stmt.replace('\n', " ");
+        let flat_trim = flat.trim();
+        let spec_opt = crate::sanitizer::extract_import_specifier(flat_trim);
+        let is_ui_barrel = matches!(
+            spec_opt.as_deref(),
+            Some("@/components/ui" | "@/components" | "~/components/ui" | "~/components")
+        );
+        if !is_ui_barrel {
+            for k in idx..=end_idx {
+                out_lines.push(raw_lines[k].to_string());
+            }
+            idx = end_idx + 1;
+            continue;
+        }
+        let spec = spec_opt.unwrap_or_default();
+        if let (Some(ob), Some(cb)) = (flat_trim.find('{'), flat_trim.find('}')) {
+            if ob < cb {
+                let before_brace = flat_trim[..ob].trim().trim_start_matches("import").trim().trim_end_matches(',').trim();
+                let inner = &flat_trim[ob + 1..cb];
+                let mut kept = Vec::new();
+                let mut stmt_changed = false;
+                for raw_item in inner.split(',') {
+                    let item = raw_item.trim();
+                    if item.is_empty() {
+                        continue;
+                    }
+                    let orig_sym = item.split(" as ").next().unwrap_or(item).trim();
+                    let is_hook_ident = orig_sym.starts_with("use")
+                        && orig_sym.chars().nth(3).map_or(false, |c| c.is_ascii_uppercase());
+                    if is_hook_ident {
+                        if let Some((hook_mod, _is_def)) = find_unique_local_module_for_symbol(proj_dir, abs_file, orig_sym) {
+                            if hook_mod.contains("/hooks/") {
+                                moved_hooks.push((hook_mod, item.to_string()));
+                                stmt_changed = true;
+                                continue;
+                            }
+                        }
+                    }
+                    kept.push(item.to_string());
+                }
+                if stmt_changed {
+                    changed = true;
+                    let quote = if flat_trim.contains(&format!("\"{}\"", spec)) { '"' } else { '\'' };
+                    let semi = if flat_trim.ends_with(';') { ";" } else { "" };
+                    if !kept.is_empty() && !before_brace.is_empty() {
+                        out_lines.push(format!("import {}, {{ {} }} from {}{}{}{}", before_brace, kept.join(", "), quote, spec, quote, semi));
+                    } else if !kept.is_empty() {
+                        out_lines.push(format!("import {{ {} }} from {}{}{}{}", kept.join(", "), quote, spec, quote, semi));
+                    } else if !before_brace.is_empty() {
+                        out_lines.push(format!("import {} from {}{}{}{}", before_brace, quote, spec, quote, semi));
+                    }
+                    idx = end_idx + 1;
+                    continue;
+                }
+            }
+        }
+        for k in idx..=end_idx {
+            out_lines.push(raw_lines[k].to_string());
+        }
+        idx = end_idx + 1;
+    }
+
+    if !changed && moved_hooks.is_empty() {
+        return content.to_string();
+    }
+    let mut res = out_lines.join("\n");
+    if content.ends_with('\n') && !res.is_empty() && !res.ends_with('\n') {
+        res.push('\n');
+    }
+    for (hook_mod, item) in moved_hooks {
+        res = merge_or_insert_import_statement(&res, &hook_mod, &item, false);
+    }
+    res
+}
+
+fn collect_prisma_schema_symbol_names(proj_dir: &std::path::Path) -> (std::collections::HashSet<String>, std::collections::HashSet<String>) {
+    let mut models = std::collections::HashSet::new();
+    let mut enums = std::collections::HashSet::new();
+    let schema_path = [
+        proj_dir.join("prisma/schema.prisma"),
+        proj_dir.join("schema.prisma"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file());
+    let Some(sp) = schema_path else {
+        return (models, enums);
+    };
+    let Ok(src) = std::fs::read_to_string(&sp) else {
+        return (models, enums);
+    };
+    let contract = crate::orchestrator::extract_prisma_schema_contract(&src);
+    if let Some(m_obj) = contract.get("models").and_then(|v| v.as_object()) {
+        for k in m_obj.keys() {
+            models.insert(k.clone());
+        }
+    }
+    if let Some(e_obj) = contract.get("enums").and_then(|v| v.as_object()) {
+        for k in e_obj.keys() {
+            enums.insert(k.clone());
+        }
+    }
+    (models, enums)
+}
+
+fn extract_missing_type_ident_candidates(
+    content: &str,
+    known: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let pats = [
+        r"(?m)(?::\s*|\bas\s+|\|\s*|&\s*)([A-Z][A-Za-z0-9_]*)(?:\[\])?\b",
+        r"(?m)(?:<|,\s*)([A-Z][A-Za-z0-9_]*)\s*\[\s*\]",
+        r"(?m)\buseState\s*<\s*([A-Z][A-Za-z0-9_]*)",
+        r"(?m)\b([A-Z][A-Za-z0-9_]*)\[\]",
+        r"(?m)\bz\.nativeEnum\s*\(\s*([A-Z][A-Za-z0-9_]*)\s*\)",
+    ];
+    for pat in &pats {
+        if let Ok(re) = regex::Regex::new(pat) {
+            for cap in re.captures_iter(content) {
+                if let Some(m) = cap.get(1) {
+                    let sym = m.as_str();
+                    if !known.contains(sym) && !out.iter().any(|x| x == sym) {
+                        out.push(sym.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn reconcile_hook_generic_array_args(proj_dir: &std::path::Path, content: &str) -> String {
+    let Ok(call_re) = regex::Regex::new(r"\b(use[A-Z][A-Za-z0-9_]*)<\s*([A-Z][A-Za-z0-9_]*)\s*\[\s*\]\s*>") else {
+        return content.to_string();
+    };
+    if !call_re.is_match(content) {
+        return content.to_string();
+    }
+    let hooks_dirs = [proj_dir.join("src/hooks"), proj_dir.join("hooks")];
+    let mut out = content.to_string();
+    let caps: Vec<(String, String, String)> = call_re
+        .captures_iter(content)
+        .filter_map(|c| {
+            let full = c.get(0)?.as_str().to_string();
+            let hook = c.get(1)?.as_str().to_string();
+            let ty = c.get(2)?.as_str().to_string();
+            Some((full, hook, ty))
+        })
+        .collect();
+
+    for (full, hook_name, ty_name) in caps {
+        let mut needs_unwrap = false;
+        for hd in &hooks_dirs {
+            if !hd.is_dir() {
+                continue;
+            }
+            for ext in ["ts", "tsx", "js", "jsx"] {
+                let hp = hd.join(format!("{}.{}", hook_name, ext));
+                if hp.is_file() {
+                    if let Ok(hook_src) = std::fs::read_to_string(&hp) {
+                        let constraint_pat = format!(
+                            r"(?m)\b{}<\s*[A-Za-z_]\w*\s+extends\s+{}\b",
+                            regex::escape(&hook_name),
+                            regex::escape(&ty_name)
+                        );
+                        let array_constraint_pat = format!(
+                            r"(?m)\b{}<\s*[A-Za-z_]\w*\s+extends\s+{}\s*\[\s*\]",
+                            regex::escape(&hook_name),
+                            regex::escape(&ty_name)
+                        );
+                        let has_item_constraint = regex::Regex::new(&constraint_pat)
+                            .map(|r| r.is_match(&hook_src))
+                            .unwrap_or(false);
+                        let has_array_constraint = regex::Regex::new(&array_constraint_pat)
+                            .map(|r| r.is_match(&hook_src))
+                            .unwrap_or(false);
+                        if has_item_constraint && !has_array_constraint {
+                            needs_unwrap = true;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        if needs_unwrap {
+            let fixed = format!("{}<{}>", hook_name, ty_name);
+            out = out.replace(&full, &fixed);
+        }
+    }
+    out
+}
+
 pub fn auto_import_missing_symbols_in_content(
     proj_dir: &std::path::Path,
     abs_file: &std::path::Path,
@@ -2253,24 +2827,36 @@ pub fn auto_import_missing_symbols_in_content(
         return None;
     }
 
+    let mut content = reconcile_external_icon_imports_in_content(proj_dir, orig_content);
+    content = reconcile_ui_barrel_hook_imports(proj_dir, abs_file, &content);
+    content = reconcile_hook_generic_array_args(proj_dir, &content);
+
     let mut existing_specs: Vec<String> = regex::Regex::new(
         r#"(?ms)(?:import\s+(?:type\s+)?[\s\S]*?\s+from\s+|import\s+|require\s*\(\s*)['"]([^'"]+)['"]"#,
     )
     .ok()
     .map(|re| {
-        re.captures_iter(orig_content)
+        re.captures_iter(&content)
             .filter_map(|c| c.get(1).map(|m| m.as_str().trim().to_string()))
             .collect()
     })
     .unwrap_or_default();
 
-    let mut content = orig_content.to_string();
     let known = collect_declared_or_imported_idents(&content);
-    let missing_syms = extract_unimported_jsx_components(&content, &known, is_jsx, extra_missing_idents);
+    let mut missing_syms = extract_unimported_jsx_components(&content, &known, is_jsx, extra_missing_idents);
 
-    if missing_syms.is_empty() {
-        return None;
+    let (prisma_models, prisma_enums) = collect_prisma_schema_symbol_names(proj_dir);
+    let type_candidates = extract_missing_type_ident_candidates(&content, &known);
+    for tc in type_candidates {
+        if (prisma_models.contains(&tc) || prisma_enums.contains(&tc)) && !missing_syms.iter().any(|m| m == &tc) {
+            missing_syms.push(tc);
+        }
     }
+
+    let is_client_or_hook = content.contains("\"use client\"")
+        || content.contains("'use client'")
+        || lower.contains("/hooks/")
+        || lower.starts_with("hooks/");
 
     for sym in missing_syms {
         if let Some(pkg_spec) = find_installed_dts_package_for_symbol(proj_dir, &existing_specs, &sym) {
@@ -2280,6 +2866,22 @@ pub fn auto_import_missing_symbols_in_content(
             }
         } else if let Some((local_spec, is_def)) = find_unique_local_module_for_symbol(proj_dir, abs_file, &sym) {
             content = merge_or_insert_import_statement(&content, &local_spec, &sym, is_def);
+        } else if prisma_models.contains(&sym) || prisma_enums.contains(&sym) {
+            let used_as_value = !is_client_or_hook
+                && prisma_enums.contains(&sym)
+                && (content.contains(&format!("{}.", sym))
+                    || content.contains(&format!("nativeEnum({})", sym)));
+            let already_has_prisma_imp = content.contains("from '@prisma/client'")
+                || content.contains("from \"@prisma/client\"");
+            if used_as_value {
+                content = merge_or_insert_import_statement(&content, "@prisma/client", &sym, false);
+            } else if !already_has_prisma_imp {
+                let imp_line = format!("import type {{ {} }} from '@prisma/client';", sym);
+                content = crate::sanitizer::insert_import_after_use_client(&content, &imp_line);
+                content = crate::sanitizer::hoist_use_client_directive(&content);
+            } else {
+                content = merge_or_insert_import_statement(&content, "@prisma/client", &format!("type {}", sym), false);
+            }
         }
     }
 
@@ -2310,12 +2912,12 @@ pub fn auto_import_missing_symbols_in_project(proj_dir: &std::path::Path) -> usi
             let p = entry.path();
             if p.is_dir() {
                 let n = p.file_name().and_then(|x| x.to_str()).unwrap_or("");
-                if n != "node_modules" && n != ".next" && n != ".git" && n != ".axiom" && n != "prisma" {
+                if n != "node_modules" && n != ".next" && n != ".git" && n != ".axiom" && n != "prisma" && n != "api" {
                     walk_tsx(&p, proj_dir, updated);
                 }
             } else if p.is_file() {
                 let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if matches!(ext, "tsx" | "jsx") {
+                if matches!(ext, "tsx" | "jsx" | "ts" | "js") {
                     if let Ok(rel) = p.strip_prefix(proj_dir) {
                         let rel_str = rel.to_string_lossy().replace('\\', "/");
                         if let Some(next_content) = auto_import_missing_symbols_in_file(proj_dir, &p, &rel_str, &[]) {
@@ -2522,6 +3124,57 @@ pub fn inspect_dts_exports_for_file(proj_dir: &std::path::Path, file_content: &s
                 "- `stripe.paymentIntents.create`: do NOT pass both `payment_method_types` and `automatic_payment_methods` together (Stripe rejects conflicting parameters).".to_string(),
             );
         }
+
+        // Stripe v20-v23 breaking changes verified on disk in node_modules/stripe
+        let has_webhooks = file_content.contains("constructEvent") || err_lower.contains("constructevent") || err_lower.contains("readablestream");
+        if has_webhooks && (file_content.contains("request.body") || file_content.contains("req.body") || err_lower.contains("readablestream")) {
+            lines.push(
+                "- `stripe.webhooks.constructEvent`: NEVER pass `request.body` (`ReadableStream | null`). In Next.js App Router route handlers, read `const rawBody = await request.text();` and pass `rawBody` (string).".to_string(),
+            );
+        }
+        if file_content.contains("z.nativeEnum(Stripe.") || err_lower.contains("stripe.paymentintent") {
+            lines.push(
+                "- `Stripe` Zod validation: `Stripe.PaymentIntent.Status` (and other `Stripe.*` namespaces) are TypeScript type definitions ONLY, NOT runtime JS enums. Replace `z.nativeEnum(Stripe....)` with `z.string()` or `z.enum([...])`.".to_string(),
+            );
+        }
+
+        let mut invoice_has_payment_intent = false;
+        for rel_inv in [
+            "esm/resources/Invoices.d.ts",
+            "cjs/resources/Invoices.d.ts",
+            "types/InvoicesResource.d.ts",
+        ] {
+            let cand = stripe_root.join(rel_inv);
+            if cand.is_file() {
+                if let Ok(inv_src) = std::fs::read_to_string(&cand) {
+                    if inv_src.contains("payment_intent:") || inv_src.contains("payment_intent?:") {
+                        invoice_has_payment_intent = true;
+                    }
+                    break;
+                }
+            }
+        }
+        if !invoice_has_payment_intent && (file_content.contains(".payment_intent") || err_lower.contains("payment_intent")) {
+            lines.push(
+                "- `Stripe.Invoice` on disk: `invoice.payment_intent` does NOT exist in this installed Stripe SDK version (v20+). Access `(invoice as any).payment_intent` or `invoice.payments` instead.".to_string(),
+            );
+        }
+
+        if file_content.contains(".plan") || err_lower.contains("subscriptionitem") || err_lower.contains("'plan'") {
+            lines.push(
+                "- `Stripe.SubscriptionItem` on disk: legacy `.plan` property is replaced by `.price` (`subscription.items.data[0]?.price?.id`).".to_string(),
+            );
+        }
+        if file_content.contains("checkout.sessions.create") && (err_lower.contains("payment_method_types") || file_content.contains("payment_method_types")) {
+            lines.push(
+                "- `stripe.checkout.sessions.create`: remove conflicting/deprecated `payment_method_types` literal typing (or let Stripe Checkout dynamically choose payment methods without `payment_method_types`).".to_string(),
+            );
+        }
+        if file_content.contains(".customer") && (err_lower.contains("deletedcustomer") || err_lower.contains("string | stripe.customer")) {
+            lines.push(
+                "- `subscription.customer` / `invoice.customer`: type is `string | Stripe.Customer | Stripe.DeletedCustomer | null`. Narrow with `typeof sub.customer === 'string' ? sub.customer : sub.customer?.id`.".to_string(),
+            );
+        }
     }
 
     // Resolve concrete installed package subpath for missing TS2304 / ReferenceError symbols
@@ -2683,7 +3336,7 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
         let mut stagnant_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
         for round in 1..=(MAX_TSC_ROUNDS + 1) {
-            let Ok((tsc_ok, tsc_log, diags)) = run_tsc_check(proj_dir, &local_tsc_js, &enriched_path) else {
+            let Ok((mut tsc_ok, mut tsc_log, mut diags)) = run_tsc_check(proj_dir, &local_tsc_js, &enriched_path) else {
                 break;
             };
 
@@ -2699,7 +3352,8 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                     .or_default()
                     .push(format!("Line {}, Col {}: [{}] {}", d.line, d.col, d.code, d.message));
             }
-            let total_errors = diags.len();
+            let mut total_errors = diags.len();
+            let mut rolled_back_this_round = false;
 
             // Verify previous Tier 1 fixes with diff-based partial progress retention & rollback protection
             if !pending_tsc_fixes.is_empty() {
@@ -2789,6 +3443,7 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                             tried_katastar_ids.push(pf.entry_id);
                         }
                         restore_pending_file_snapshot(proj_dir, &pf.path, &pf.before);
+                        rolled_back_this_round = true;
                         if pf.source == "ai" {
                             *rollback_counts.entry(pf_key.clone()).or_insert(0) += 1;
                         }
@@ -2813,6 +3468,27 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                             pf.source, pf.path, pf.prev_file_errors, cur_errs, diff.introduced.len(), total_spiked
                         ));
                     }
+                }
+            }
+
+            if rolled_back_this_round {
+                if let Ok((fresh_ok, fresh_log, fresh_diags)) = run_tsc_check(proj_dir, &local_tsc_js, &enriched_path) {
+                    tsc_ok = fresh_ok;
+                    tsc_log = fresh_log;
+                    diags = fresh_diags;
+                    file_err_counts.clear();
+                    per_file_diag_lines.clear();
+                    for d in &diags {
+                        let key = resolve_project_file_candidate(proj_dir, &d.file)
+                            .unwrap_or_else(|| d.file.clone())
+                            .to_lowercase();
+                        *file_err_counts.entry(key.clone()).or_insert(0) += 1;
+                        per_file_diag_lines
+                            .entry(key)
+                            .or_default()
+                            .push(format!("Line {}, Col {}: [{}] {}", d.line, d.col, d.code, d.message));
+                    }
+                    total_errors = diags.len();
                 }
             }
 
@@ -2943,7 +3619,7 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                     || path_low.ends_with("route.js")
                     || orig_content.contains("@prisma/client")
                     || orig_content.contains("@/lib/prisma")
-                    || file_diags.iter().any(|d| matches!(d.code.as_str(), "TS2322" | "TS2353" | "TS2339" | "TS2305") || d.message.to_lowercase().contains("prisma"))
+                    || file_diags.iter().any(|d| matches!(d.code.as_str(), "TS2322" | "TS2353" | "TS2339" | "TS2305" | "TS2551") || d.message.to_lowercase().contains("prisma"))
                 {
                     batch_needs_prisma_contract = true;
                 }
@@ -2987,6 +3663,12 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                 let rp = get_stack_rulepacks(path_str, &orig_content, Some(&tsc_log));
                 if !rp.is_empty() && extra_rulepacks.is_empty() {
                     extra_rulepacks = rp;
+                }
+                if path_low.ends_with("middleware.ts") || path_low.ends_with("middleware.js") {
+                    let mw_meta = crate::orchestrator::get_middleware_metacognitive_rules(Some(proj_dir), &diag_summary);
+                    if !extra_rulepacks.contains("METACOGNITIVE MIDDLEWARE CHECKLIST") {
+                        extra_rulepacks.push_str(&mw_meta);
+                    }
                 }
                 batch_payload.push(serde_json::json!({
                     "path": path_str,
@@ -3371,7 +4053,32 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
         }
         for path_str in &candidate_paths {
             let path_lower = path_str.to_lowercase().replace('\\', "/");
-            if build_lower.contains(&path_lower) && !tier2_priority_paths.contains(path_str) {
+            let no_ext_lower = std::path::Path::new(&path_lower)
+                .with_extension("")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let boundary_hit = no_ext_lower.contains('/') && {
+                let mut hit = false;
+                let mut offset = 0usize;
+                while let Some(rel_idx) = build_lower[offset..].find(&no_ext_lower) {
+                    let pos = offset + rel_idx;
+                    let left_ok = pos == 0
+                        || !build_lower.as_bytes()[pos - 1].is_ascii_alphanumeric()
+                            && build_lower.as_bytes()[pos - 1] != b'_';
+                    let end = pos + no_ext_lower.len();
+                    let right_ok = end >= build_lower.len()
+                        || (!build_lower.as_bytes()[end].is_ascii_alphanumeric()
+                            && build_lower.as_bytes()[end] != b'_'
+                            && build_lower.as_bytes()[end] != b'/');
+                    if left_ok && right_ok {
+                        hit = true;
+                        break;
+                    }
+                    offset = pos + 1;
+                }
+                hit
+            };
+            if (build_lower.contains(&path_lower) || boundary_hit) && !tier2_priority_paths.contains(path_str) {
                 tier2_priority_paths.push(path_str.clone());
             }
         }
@@ -3924,6 +4631,60 @@ pub async fn setup_local_postgres(_proj_dir: &std::path::Path, db_name: &str) ->
     Ok(format!("postgresql://postgres@localhost:54321/{}?schema=public", db_name))
 }
 
+pub fn ensure_nextauth_env_vars(proj_dir: &std::path::Path) {
+    let has_auth_route = proj_dir.join("src/app/api/auth").exists()
+        || proj_dir.join("app/api/auth").exists()
+        || proj_dir.join("src/pages/api/auth").exists();
+    let has_pkg_nextauth = std::fs::read_to_string(proj_dir.join("package.json"))
+        .map(|s| s.contains("\"next-auth\""))
+        .unwrap_or(false);
+    if !has_auth_route && !has_pkg_nextauth {
+        return;
+    }
+
+    let env_paths = [proj_dir.join(".env"), proj_dir.join(".env.local")];
+    for env_path in env_paths {
+        let existed = env_path.exists();
+        let content = std::fs::read_to_string(&env_path).unwrap_or_default();
+        let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+        let mut changed = false;
+
+        for (key, default_val) in [
+            ("NEXTAUTH_URL", "http://localhost:3000"),
+            ("NEXTAUTH_SECRET", "axiom-dev-secret-change-in-production"),
+        ] {
+            let mut found = false;
+            for line in lines.iter_mut() {
+                let t = line.trim_start();
+                if t.starts_with(&format!("{}=", key)) {
+                    let cur_val = t[key.len() + 1..]
+                        .trim()
+                        .trim_matches('"')
+                        .trim_matches('\'');
+                    if cur_val.is_empty() {
+                        *line = format!("{}=\"{}\"", key, default_val);
+                        changed = true;
+                    }
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                lines.push(format!("{}=\"{}\"", key, default_val));
+                changed = true;
+            }
+        }
+
+        if changed || !existed {
+            let mut out = lines.join("\n");
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            let _ = std::fs::write(&env_path, out);
+        }
+    }
+}
+
 pub fn update_env_database_url(proj_dir: &std::path::Path, db_url: &str) {
     let env_paths = [proj_dir.join(".env"), proj_dir.join(".env.local")];
     for env_path in env_paths {
@@ -3946,6 +4707,7 @@ pub fn update_env_database_url(proj_dir: &std::path::Path, db_url: &str) {
             let _ = std::fs::write(&env_path, format!("DATABASE_URL=\"{}\"\n", db_url));
         }
     }
+    ensure_nextauth_env_vars(proj_dir);
 }
 
 pub fn fallback_to_sqlite(proj_dir: &std::path::Path) -> Result<(), String> {
@@ -3995,6 +4757,7 @@ pub fn fallback_to_sqlite(proj_dir: &std::path::Path) -> Result<(), String> {
         }
     }
     
+    ensure_nextauth_env_vars(proj_dir);
     Ok(())
 }
 
@@ -4096,7 +4859,16 @@ pub async fn run_generation_auto_test_suite(
                                 updated = crate::sanitizer::sanitize_use_effect_deps(&updated);
 
                                 // If inside hooks directory or defines custom hooks, also memoize action functions
-                                if path_str.contains("/hooks/") || path_str.contains("hook") {
+                                let rel_low = rel_str.to_lowercase();
+                                if !crate::sanitizer::is_app_router_route_file(&rel_str)
+                                    && !rel_low.contains("/components/")
+                                    && !rel_low.starts_with("components/")
+                                    && (rel_low.contains("/hooks/")
+                                        || rel_low.starts_with("hooks/")
+                                        || rel_low.contains("useauth")
+                                        || rel_low.ends_with("hook.ts")
+                                        || rel_low.ends_with("hook.tsx"))
+                                {
                                     updated = crate::sanitizer::sanitize_custom_hook_functions(&updated);
                                 }
 

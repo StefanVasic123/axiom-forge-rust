@@ -20,7 +20,7 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
     let mut needs_write = !db_path.exists();
     if db_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&db_path) {
-            if !content.contains("\"dbVersion\": 4") {
+            if !content.contains("\"dbVersion\": 5") {
                 needs_write = true;
             }
         }
@@ -28,7 +28,7 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
     
     if needs_write {
         let default_db = serde_json::json!({
-            "dbVersion": 4,
+            "dbVersion": 5,
             "packages": [
                 {
                     "name": "resend",
@@ -300,7 +300,17 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
                     "compatibility": {
                         "node": ">=18.0.0"
                     },
-                    "bestPractices": "Instantiate `new Stripe(process.env.STRIPE_SECRET_KEY || 'sk_test_dummy')` WITHOUT hardcoding an outdated `apiVersion` literal (let the installed SDK use its default `apiVersion`). Cancel subscriptions via `await stripe.subscriptions.cancel(id)` (NEVER `.del(...)`, removed in Stripe v17+). When reading webhook `Stripe.Invoice` / `Stripe.Subscription` legacy fields or constructing `PaymentIntentCreateParams`, match the installed SDK `.d.ts` contract without specifying both `automatic_payment_methods` and `payment_method_types`."
+                    "bestPractices": "Instantiate `new Stripe(process.env.STRIPE_SECRET_KEY || 'sk_test_dummy')` WITHOUT hardcoding an outdated `apiVersion` literal. For Next.js App Router webhooks, ALWAYS read raw body string via `const rawBody = await request.text();` before `stripe.webhooks.constructEvent(rawBody, sig, secret)` (NEVER pass `request.body` ReadableStream). Never pass `Stripe.*` type namespaces into `z.nativeEnum(...)` (use `z.string()` or `z.enum([...])`). In Stripe v17–v23: cancel subscriptions with `stripe.subscriptions.cancel(id)` (no `.del`), read price via `item.price?.id` (no `.plan.id`), resolve customer ID via `typeof sub.customer === 'string' ? sub.customer : sub.customer?.id`, avoid deprecated `invoice.payment_intent`, and avoid forcing `payment_method_types` if dynamic Checkout payment methods suffice."
+                },
+                {
+                    "name": "next-intl",
+                    "version": "^3.15.0",
+                    "aliases": [],
+                    "importExamples": ["import { NextIntlClientProvider, useTranslations } from 'next-intl';"],
+                    "compatibility": {
+                        "next": ">=13.0.0"
+                    },
+                    "bestPractices": "Call useTranslations('Namespace') with a namespace string only (never pass message objects as a second arg). Store messages in src/messages/<locale>.json and mount NextIntlClientProvider cleanly."
                 }
             ]
         });

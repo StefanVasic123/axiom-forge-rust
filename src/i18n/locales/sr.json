@@ -198,5 +198,28 @@
     "viewProject": "Pogledaj generisani projekat",
     "hideTooltip": "Sakrij karticu statusa (proces u pozadini nastavlja sa radom)",
     "progress": "Napredak"
+  },
+  "aiOptimizer": {
+    "title": "Napredak AI Modela i Trener Mini-LLM-a",
+    "subtitle": "Eksponencijalno praćenje tačnosti kroz Axiom verzije, analiza slabosti LLM-a po oblastima i izvoz SFT skupa za trening sopstvenog mini-LLM-a.",
+    "allModels": "Svi lokalni modeli",
+    "expIndex": "Eksponencijalni Indeks Tačnosti",
+    "cleanFeatures": "100% Čiste Funkcionalnosti",
+    "avgBugScope": "Prosečan Opseg Baga",
+    "vsPrev": "u odnosu na prošlu verziju",
+    "vsBest": "u odnosu na najbolju ikad",
+    "katastarVerified": "Verifikovana Katastar Pravila",
+    "equationTitle": "Jednačina Eksponencijalnog Rasta Tačnosti",
+    "equationDesc": "Spaja procenat 100%-čistih funkcionalnosti (F100), opseg nezahvaćenog koda (1 - b_p), faktor gustine grešaka (phi_p), rast u odnosu na prethodnu/najbolju verziju i eksponencijalno ubrzanje skorijih rezultata.",
+    "chartTitle": "Krivulja Tačnosti po Verziji Alata",
+    "versionTableTitle": "Pregled Poboljšanja po Verzijama",
+    "domainAnalysisTitle": "Učestalost Grešaka — Mapa Snage i Slabosti LLM-a",
+    "trainerTitle": "Trening Mini-LLM-a (SFT JSONL + Ollama Modelfile)",
+    "trainerDesc": "Izvezite anonimizovani skup proverenih popravki iz Katastra, Heal Ledger-a i Axiom pravila u SFT JSONL + Modelfile za treniranje lokalnog specijalizovanog mini-LLM-a.",
+    "exportBtn": "Generiši SFT Dataset i Modelfile",
+    "exporting": "Izvoz u toku...",
+    "projectsTableTitle": "Telemetrija Generisanih Projekata",
+    "tuningTitle": "Kontrola Inferencije i Prilagođene Direktive",
+    "saveDirectiveSuccess": "Podešavanja optimizatora su sačuvana lokalno."
   }
 }

@@ -91,6 +91,9 @@ pub fn get_generation_phase(file_path: &str, project_type: &str) -> GenerationPh
         || path_lower.contains("/config/")
         || path_lower.contains(".config.");
 
+    let is_app_route = crate::sanitizer::is_app_router_route_file(file_path);
+    let is_api_path = path_lower.starts_with("api/") || path_lower.contains("/api/");
+
     match project_type {
         "nextjs" | "mern" => {
             if path_lower == "package.json"
@@ -103,11 +106,15 @@ pub fn get_generation_phase(file_path: &str, project_type: &str) -> GenerationPh
                 || is_root_json
             {
                 GenerationPhase::Config
-            } else if path_lower.contains("schema.prisma") || path_lower.contains("prisma") || path_lower.contains("models/") || path_lower.contains("types/") || path_lower.contains("database") {
+            } else if path_lower.contains("schema.prisma")
+                || path_lower.contains("prisma")
+                || path_lower.contains("database")
+                || (!is_app_route && !is_api_path && (path_lower.contains("models/") || path_lower.contains("types/")))
+            {
                 GenerationPhase::DatabaseOrMain
-            } else if path_lower.contains("hooks/") || path_lower.contains("utils/") || path_lower.contains("lib/") {
+            } else if !is_app_route && !is_api_path && (path_lower.contains("hooks/") || path_lower.contains("utils/") || path_lower.contains("lib/")) {
                 GenerationPhase::LogicOrHooks
-            } else if path_lower.contains("api/") || path_lower.contains("auth") || path_lower.contains("router") {
+            } else if is_api_path || path_lower.contains("api/") || (!is_app_route && (path_lower.contains("auth") || path_lower.contains("router"))) {
                 GenerationPhase::ApiOrState
             } else if path_lower.contains("layout.tsx") || path_lower.contains("layout.jsx") || path_lower.contains("layout.js") || 
                       path_lower.contains("globals.css") || path_lower.contains("styles/") || path_lower.contains("navigation") {
@@ -151,19 +158,22 @@ pub fn get_generation_phase(file_path: &str, project_type: &str) -> GenerationPh
 pub fn get_context_files_for(file_path: &str, proj_dir: &std::path::Path) -> String {
     let mut context = String::new();
     let path_lower = file_path.to_lowercase().replace('\\', "/");
+    let is_app_route = crate::sanitizer::is_app_router_route_file(file_path);
 
     let is_backend_or_db = path_lower.contains("/api/")
         || path_lower.ends_with("route.ts")
         || path_lower.ends_with("route.js")
         || path_lower.contains("prisma")
         || path_lower.contains("server.")
-        || path_lower.contains("/models/")
+        || (!is_app_route && (path_lower.contains("/models/") || path_lower.starts_with("models/")))
         || path_lower.contains("seed.");
 
     let is_auth_file = path_lower.contains("/login")
         || path_lower.contains("/register")
         || path_lower.contains("/signup")
-        || path_lower.contains("auth");
+        || path_lower.contains("useauth")
+        || path_lower.contains("/api/auth")
+        || (!is_app_route && path_lower.contains("auth"));
 
     // 1. Database Schema & Prisma Singleton: strictly isolated to backend/API/database files.
     // Never leak raw Prisma schemas into UI components or client pages!
@@ -721,8 +731,10 @@ pub async fn validate_file_with_abstract_rules(
         return Ok(());
     }
 
+    let is_app_route = crate::sanitizer::is_app_router_route_file(file_path);
+
     // 3. Domain model isolation: never instantiate PrismaClient or import @/lib/prisma in src/models/*
-    if (path_lower.contains("/models/") || path_lower.starts_with("models/")) && !path_lower.contains("/api/") {
+    if !is_app_route && (path_lower.contains("/models/") || path_lower.starts_with("models/")) && !path_lower.contains("/api/") {
         if trimmed.contains("new PrismaClient") || trimmed.contains("@/lib/prisma") {
             return Err("Files under src/models/ must define pure TypeScript types/interfaces ONLY. Do NOT import @/lib/prisma or instantiate new PrismaClient().".to_string());
         }
@@ -745,6 +757,18 @@ pub async fn validate_file_with_abstract_rules(
         if !has_valid_export {
             return Err("Next.js middleware must export function `middleware` or default middleware.".to_string());
         }
+        // Reject unnamed glob wildcards like '/dashboard/*' or '/**' (path-to-regexp crashes at runtime)
+        if let Ok(bad_glob_re) = regex::Regex::new(r#"['"][^'"]*?/(\*\*|\*)['"]"#) {
+            if let Some(m) = bad_glob_re.find(trimmed) {
+                let lit = m.as_str();
+                if !lit.contains("((") && !lit.contains(":path*") {
+                    return Err(format!(
+                        "Next.js middleware `config.matcher` entry {} uses invalid glob wildcard syntax (`/*`). Use named catch-all `/:path*` or regex negative lookahead `/((?!api|_next|_vercel|.*\\..*).*)'`.",
+                        lit
+                    ));
+                }
+            }
+        }
     }
 
     // 5. Client component & hook boundary validation
@@ -754,7 +778,7 @@ pub async fn validate_file_with_abstract_rules(
             let t = l.trim();
             t == "\"use client\";" || t == "\"use client\"" || t == "'use client';" || t == "'use client'"
         });
-    let is_hook_file = (path_lower.contains("/hooks/") || path_lower.starts_with("hooks/")) && !path_lower.contains("/api/");
+    let is_hook_file = !is_app_route && (path_lower.contains("/hooks/") || path_lower.starts_with("hooks/")) && !path_lower.contains("/api/");
     let is_route_handler = path_lower.ends_with("route.ts") || path_lower.ends_with("route.js");
     if (is_client_file || is_hook_file) && !is_route_handler {
         if is_client_file && trimmed.contains("export default async function") {
@@ -836,6 +860,158 @@ pub async fn validate_file_with_abstract_rules(
                 continue;
             }
             idx_l += 1;
+        }
+    }
+
+    // 5b. App Router route boundary: forbid importing App Router page/layout route modules from any non-test TS/JS file
+    let is_test_file = path_lower.contains(".test.")
+        || path_lower.contains(".spec.")
+        || path_lower.contains("__tests__");
+    if !is_test_file {
+        let is_app_router_route_import_spec = |spec: &str| -> bool {
+            let raw = spec.split(['?', '#']).next().unwrap_or(spec).trim().replace('\\', "/");
+            let s_low = raw.to_lowercase();
+            let resolved_opt = if let Some(sub) = s_low.strip_prefix("@/app/") {
+                Some(format!("src/app/{}", sub))
+            } else if let Some(sub) = s_low.strip_prefix("~/app/") {
+                Some(format!("src/app/{}", sub))
+            } else if s_low.starts_with("src/app/") || s_low.starts_with("app/") {
+                Some(s_low.clone())
+            } else if s_low.starts_with("./") || s_low.starts_with("../") {
+                let norm_cur = path_lower.trim_start_matches("./");
+                let parent = std::path::Path::new(norm_cur).parent().unwrap_or_else(|| std::path::Path::new(""));
+                let joined = parent.join(&s_low);
+                let mut parts: Vec<String> = Vec::new();
+                for comp in joined.components() {
+                    match comp {
+                        std::path::Component::Normal(c) => parts.push(c.to_string_lossy().to_string()),
+                        std::path::Component::ParentDir => {
+                            parts.pop();
+                        }
+                        _ => {}
+                    }
+                }
+                let joined_str = parts.join("/");
+                if joined_str.starts_with("src/app/") || joined_str.starts_with("app/") {
+                    Some(joined_str)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let Some(resolved) = resolved_opt else {
+                return false;
+            };
+            if resolved.starts_with("src/app/api/")
+                || resolved.starts_with("app/api/")
+                || resolved.contains("/api/")
+            {
+                return false;
+            }
+            let last_seg = resolved.rsplit('/').next().unwrap_or("");
+            let stem = last_seg
+                .strip_suffix(".tsx")
+                .or_else(|| last_seg.strip_suffix(".ts"))
+                .or_else(|| last_seg.strip_suffix(".jsx"))
+                .or_else(|| last_seg.strip_suffix(".js"))
+                .unwrap_or(last_seg);
+            matches!(
+                stem,
+                "page" | "layout" | "loading" | "error" | "not-found" | "template" | "default" | "global-error"
+            )
+        };
+
+        let raw_lines: Vec<&str> = trimmed.lines().collect();
+        let mut idx_l = 0usize;
+        while idx_l < raw_lines.len() {
+            let t = raw_lines[idx_l].trim();
+            if t.starts_with("import ") || t.starts_with("import{") || (t.starts_with("export ") && t.contains(" from ")) {
+                let mut end_l = idx_l;
+                let mut stmt = raw_lines[idx_l].to_string();
+                let is_side_effect = t.starts_with("import '") || t.starts_with("import \"");
+                if !is_side_effect {
+                    while !stmt.contains(" from ") && !stmt.contains("from'") && !stmt.contains("from\"") && !stmt.trim_end().ends_with(';') && end_l + 1 < raw_lines.len() {
+                        end_l += 1;
+                        stmt.push('\n');
+                        stmt.push_str(raw_lines[end_l]);
+                    }
+                }
+                let flat = stmt.replace('\n', " ");
+                if let Some(spec) = crate::sanitizer::extract_import_specifier(flat.trim()) {
+                    if is_app_router_route_import_spec(&spec) {
+                        return Err(format!(
+                            "Forbidden import from Next.js App Router route module `{}`. Move shared types/components into `src/types/` or `src/components/` and import from there.",
+                            spec
+                        ));
+                    }
+                }
+                idx_l = end_l + 1;
+                continue;
+            }
+            idx_l += 1;
+        }
+    }
+
+    // 5c. App Router page/layout/error/loading files MUST export a default React Component
+    if is_app_route && !is_route_handler {
+        let uncommented = strip_ts_js_comments_preserving_strings(trimmed);
+        let has_default_export = regex::Regex::new(r"(?m)(?:^\s*|\b)export\s+default\b")
+            .map(|re| re.is_match(&uncommented))
+            .unwrap_or_else(|_| uncommented.contains("export default"))
+            || regex::Regex::new(r"(?m)^\s*export\s*\{[^}]*\bdefault\b")
+                .map(|re| re.is_match(&uncommented))
+                .unwrap_or(false);
+        if !has_default_export {
+            return Err(format!(
+                "Next.js App Router route `{}` MUST export a default React Component (`export default function ...`). Never put standalone interfaces/types/logic without a default component export; move shared types into `src/types/`.",
+                file_path
+            ));
+        }
+        if let Ok(re_non_comp_default) = regex::Regex::new(
+            r#"(?m)^\s*export\s+default\s*(\{|\[|null\b|undefined\b|true\b|false\b|['"`\d])"#,
+        ) {
+            if re_non_comp_default.is_match(&uncommented) {
+                return Err(format!(
+                    "Next.js App Router route `{}` default export must be a React Component function/class, not a plain object, array, or literal.",
+                    file_path
+                ));
+            }
+        }
+        let is_layout_route = path_lower == "layout.tsx"
+            || path_lower == "layout.jsx"
+            || path_lower.ends_with("/layout.tsx")
+            || path_lower.ends_with("/layout.jsx");
+        if is_layout_route {
+            let has_children = if let Ok(r) = regex::Regex::new(r"\{\s*children\s*\}") {
+                r.find_iter(&uncommented).any(|m| {
+                    let next_ch = uncommented[m.end()..].chars().find(|c| !c.is_whitespace());
+                    !matches!(next_ch, Some(':') | Some(',') | Some('=') | Some(')'))
+                })
+            } else {
+                uncommented.contains("{children}")
+            };
+            if !has_children {
+                return Err(format!(
+                    "Next.js App Router layout `{}` MUST render `{{children}}` inside its JSX layout wrapper (`<main>{{children}}</main>`).",
+                    file_path
+                ));
+            }
+            if (path_lower == "src/app/layout.tsx"
+                || path_lower == "src/app/layout.jsx"
+                || path_lower == "app/layout.tsx"
+                || path_lower == "app/layout.jsx"
+                || path_lower == "layout.tsx"
+                || path_lower == "layout.jsx")
+                && (uncommented.to_lowercase().contains("<table")
+                    || uncommented.contains("from '@/hooks/")
+                    || uncommented.contains("from \"@/hooks/"))
+            {
+                return Err(format!(
+                    "RootLayout `{}` must contain ONLY global shell (Navbar/Footer/Providers/`{{children}}`) — NEVER embed `<table>`, page dashboards, or domain data hooks (`@/hooks/*`) inside RootLayout.",
+                    file_path
+                ));
+            }
         }
     }
 
@@ -1368,12 +1544,64 @@ pub const NEXT_LINK_RULEPACK: &str = r#"NEXT.JS LINK COMPONENT RULES:
 2. PREFETCH OPTIMIZATION: Always add `prefetch={false}` to <Link> components (e.g. `<Link href="/dashboard" prefetch={false}>`) to prevent aggressive edge request amplification on Vercel.
 3. ROUTE INTEGRITY & NO PATH FLATTENING: In Next.js App Router, the `href` attribute in `<Link>` MUST match the exact folder structure under `src/app/` (or `app/`). If a page file is located at `src/app/dashboard/data-grid/page.tsx`, the link MUST be `<Link href="/dashboard/data-grid">`. NEVER flatten nested routes to the root (e.g. NEVER write `<Link href="/data-grid">` when the page is in `src/app/dashboard/data-grid/`). Root-flattened links result in fatal 404 (Not Found) runtime errors. Always include the full parent folder prefix (e.g. `/dashboard/...`) for all nested subpages. Route groups in parentheses (e.g. `(auth)` or `(marketing)`) do not appear in the URL path, but all regular directory folders MUST be preserved."#;
 
-pub const NEXTJS_MIDDLEWARE_RULEPACK: &str = r#"NEXT.JS MIDDLEWARE & EDGE ROUTING RULES:
-1. PATH-TO-REGEXP MATCHERS: In `src/middleware.ts` or root `middleware.ts`, `config.matcher` strictly parses paths using `path-to-regexp`. Wildcards for subpaths MUST use named parameters (e.g. `'/dashboard/:path*'`, `'/profile/:path*'`, `'/admin/:path*'`) or regex filters (e.g. `'/((?!api|_next|_vercel|.*\\..*).*)'`). NEVER write glob wildcards like `'/dashboard/*'` or `'/profile/*'`. Unnamed wildcards (`/*` or `/**`) throw fatal syntax crashes: "Error parsing /.../* Reason: Unexpected MODIFIER, expected END: Invalid middlewares found".
-2. SINGLE ROOT/SRC MIDDLEWARE FILE: Next.js allows only ONE middleware file per project located strictly at `src/middleware.ts` (or `middleware.ts` at the root). Never create nested middleware files inside app subfolders.
-3. EDGE RUNTIME BOUNDARY: Next.js middleware executes exclusively in the Edge Runtime. NEVER import Node.js native packages (`fs`, `path`, `child_process`, `crypto`) or database drivers/Prisma Client in middleware files. Database operations belong in Server Components, Route Handlers, or Server Actions.
-4. WITHAUTH & NEXTAUTH SESSIONS: For NextAuth route protection in middleware, either wrap the handler with `withAuth` from `'next-auth/middleware'` or inspect the JWT via `await getToken({ req: request, secret: process.env.NEXTAUTH_SECRET })`. For unauthenticated access to protected routes, redirect using `NextResponse.redirect(new URL('/login', request.url))`.
-5. ASSET BYPASS OPTIMIZATION: Always filter out or bypass static resources (`/_next/static`, `/_next/image`, `/favicon.ico`, and files with extensions like `.png`, `.svg`, `.css`) in the matcher configuration to avoid redundant middleware execution on static assets."#;
+pub const NEXTJS_MIDDLEWARE_RULEPACK: &str = r#"NEXT.JS MIDDLEWARE & EDGE ROUTING RULES (TWO-LAYER METACOGNITIVE HANDBOOK):
+LAYER A — ALWAYS IGNORE IN `config.matcher` (ZERO BODY DUPLICATION):
+1. PATH-TO-REGEXP MATCHERS: `config.matcher` strictly parses paths using `path-to-regexp`. Wildcards MUST use named catch-alls (`'/dashboard/:path*'`) or negative lookahead regex (`'/((?!api|_next/static|_next/image|_vercel|favicon\\.ico|robots\\.txt|sitemap\\.xml|.*\\..*).*)'`). NEVER write unnamed globs (`'/dashboard/*'`, `'/**'`) which crash at startup.
+2. STATIC ASSETS AT MATCHER LEVEL ONLY: Exclude `/_next/static`, `/_next/image`, `/_vercel`, `favicon.ico`, `robots.txt`, `sitemap.xml`, and dotted static files (`.*\\..*`) strictly inside `config.matcher`. Once excluded in `config.matcher`, do NOT repeat redundant `pathname.includes('/_next/')` or `pathname.includes('.')` branches in the `middleware()` body — keeping Edge CPU/latency minimal.
+3. SINGLE ROOT/SRC MIDDLEWARE FILE & EDGE RUNTIME BOUNDARY: Next.js allows strictly ONE middleware file at `src/middleware.ts` (or root `middleware.ts`). NEVER import Node core packages (`fs`, `path`, `child_process`, `crypto`) or PrismaClient inside middleware.
+
+LAYER B — SERVICE-SPECIFIC {metakognitivan_spisak_pravila}:
+4. NEXT-AUTH SESSIONS: Inspect JWT via `withAuth` or `getToken({ req: request, secret: process.env.NEXTAUTH_SECRET })`. Run auth ONLY on protected prefixes (`/dashboard`, `/admin`, `/profile`, `/settings`) and explicitly allow public/auth routes (`/login`, `/register`, `/api/auth`).
+5. PAYMENT WEBHOOK BYPASS (STRIPE / PADDLE): When webhooks are present, NEVER redirect, rewrite, or inject auth walls on `/api/stripe/webhook` or `/api/webhooks` — webhooks require unauthenticated POSTs with untouched raw request bodies for HMAC signature verification.
+6. MULTI-LANGUAGE & MULTI-TENANT OPTIMIZATION: Check fast env gates (`MAINTENANCE_MODE`, `WAITLIST_MODE`) BEFORE expensive auth checks; strip or resolve locale/tenant prefixes once; if internal `/api/` translation/rewrite is needed across locale or tenant subdomains, use `NextResponse.rewrite(...)` — NEVER `NextResponse.redirect(...)` (redirects break API methods & CORS preflights). Set only lightweight routing headers (`x-locale` / `x-tenant`) without gratuitous cookies on non-HTML fetches."#;
+
+/// Builds dynamic Layer-B middleware rules (`{metakognitivan_spisak_pravila}`) tailored to
+/// services and files actually detected in the current workspace or prompt context.
+pub fn get_middleware_metacognitive_rules(proj_dir: Option<&std::path::Path>, context_text: &str) -> String {
+    let mut pkg_json = String::new();
+    let mut has_translations_dir = false;
+    let mut has_stripe_webhook = false;
+    if let Some(dir) = proj_dir {
+        if let Ok(raw) = std::fs::read_to_string(dir.join("package.json")) {
+            pkg_json = raw.to_lowercase();
+        }
+        has_translations_dir = dir.join("src/i18n").is_dir()
+            || dir.join("src/messages").is_dir()
+            || dir.join("src/translations").is_dir()
+            || dir.join("messages").is_dir();
+        has_stripe_webhook = dir.join("src/app/api/stripe").is_dir()
+            || dir.join("src/app/api/webhooks").is_dir()
+            || dir.join("app/api/stripe").is_dir();
+    }
+
+    let ctx_low = context_text.to_lowercase();
+    let has_nextauth = pkg_json.contains("\"next-auth\"") || ctx_low.contains("next-auth") || ctx_low.contains("withauth") || ctx_low.contains("gettoken");
+    let has_stripe = has_stripe_webhook || pkg_json.contains("\"stripe\"") || ctx_low.contains("stripe") || ctx_low.contains("webhook");
+    let has_i18n = has_translations_dir
+        || pkg_json.contains("\"next-intl\"")
+        || pkg_json.contains("\"next-i18next\"")
+        || ctx_low.contains("next-intl")
+        || ctx_low.contains("locale")
+        || ctx_low.contains("tenant");
+
+    let mut rules = Vec::new();
+    rules.push("- Layer A (Always Ignore via `config.matcher`): exclude `/api` (unless scoped webhook/i18n API routing is needed), `/_next/static`, `/_next/image`, `/_vercel`, `favicon.ico`, `robots.txt`, `sitemap.xml`, and `.*\\..*` directly in `export const config = { matcher: [...] }`. Keep the `middleware()` function body free of duplicate static-extension checks.".to_string());
+
+    if has_nextauth {
+        rules.push("- Service Detected (`next-auth`): Protect dashboard/admin/profile prefixes while keeping `/login`, `/register`, `/api/auth`, and public marketing routes accessible without redirect loops.".to_string());
+    }
+    if has_stripe {
+        rules.push("- Service Detected (`stripe` / webhooks): Ensure `/api/stripe/webhook` and `/api/webhooks` bypass auth/locale middleware completely so Stripe signatures verify cleanly.".to_string());
+    }
+    if has_i18n {
+        rules.push("- Service Detected (`next-intl` / i18n / multi-tenant): Evaluate `process.env.MAINTENANCE_MODE` / `WAITLIST_MODE` env flags first, resolve locale or tenant host in O(1), and rewrite internal API calls with `NextResponse.rewrite` (never `NextResponse.redirect`).".to_string());
+    }
+
+    format!(
+        "\nMETACOGNITIVE MIDDLEWARE CHECKLIST ({{metakognitivan_spisak_pravila}}):\n{}\n",
+        rules.join("\n")
+    )
+}
 
 pub const MERN_STACK_RULEPACK: &str = r#"MERN STACK (EXPRESS + MONGOOSE + VITE/REACT) RULES:
 1. EXPRESS ASYNC ROUTE SAFETY: Wrap every async route handler body in try/catch. Always return explicit status codes: `res.status(200).json(data)` for success, `res.status(201).json(data)` for created, `res.status(400)` for invalid input, `res.status(404)` for missing resources, `res.status(500).json({ error: err.message })` in catch. Immediately return after sending response to prevent 'Cannot set headers after they are sent'.
@@ -1988,8 +2216,10 @@ pub fn get_stack_rulepacks(file_path: &str, file_content: &str, error_msg: Optio
         || content_lower.contains("from \"react-router-dom\"")
         || err_lower.contains("cannot set headers");
 
+    let is_app_route_file = crate::sanitizer::is_app_router_route_file(file_path);
     let is_mern = has_express_or_mongoose
         || (!is_nextjs_signal
+            && !is_app_route_file
             && (path_lower.ends_with("server.js")
                 || ((path_lower.contains("/routes/") || path_lower.contains("/models/"))
                     && (path_lower.ends_with(".js") || path_lower.ends_with(".jsx")))));
@@ -2241,6 +2471,7 @@ pub fn harvest_file_contract_to_lbg(proj_dir: &std::path::Path, file_path: &str,
     }
 
     let path_lower = file_path.to_lowercase().replace('\\', "/");
+    let is_app_route = crate::sanitizer::is_app_router_route_file(file_path);
 
     // 1. Prisma schema
     if path_lower.ends_with("schema.prisma") {
@@ -2266,7 +2497,7 @@ pub fn harvest_file_contract_to_lbg(proj_dir: &std::path::Path, file_path: &str,
         }
     }
     // 3. Custom Hooks
-    else if path_lower.contains("hooks/") && (path_lower.ends_with(".ts") || path_lower.ends_with(".tsx")) && !path_lower.ends_with("index.ts") {
+    else if !is_app_route && (path_lower.contains("/hooks/") || path_lower.starts_with("hooks/")) && !path_lower.contains("/api/") && (path_lower.ends_with(".ts") || path_lower.ends_with(".tsx")) && !path_lower.ends_with("index.ts") {
         let hooks = extract_hook_contract(file_path, content);
         if let Some(shared) = lbg.get_mut("sharedContracts") {
             if let Some(hooks_obj) = shared.get_mut("hooks") {
@@ -2417,6 +2648,7 @@ fn upsert_file_contract_into_root(
 
     let norm_path = file_path.replace('\\', "/");
     let path_lower = norm_path.to_lowercase();
+    let is_app_route = crate::sanitizer::is_app_router_route_file(&norm_path);
 
     // Determine role
     let role = if path_lower.ends_with("schema.prisma") {
@@ -2425,11 +2657,15 @@ fn upsert_file_contract_into_root(
         && (path_lower.ends_with("route.ts") || path_lower.ends_with("route.js"))
     {
         "api-route"
-    } else if path_lower.contains("/hooks/") || path_lower.starts_with("hooks/") || path_lower.contains("hook") {
+    } else if !is_app_route
+        && !path_lower.contains("/components/")
+        && !path_lower.starts_with("components/")
+        && (path_lower.contains("/hooks/") || path_lower.starts_with("hooks/") || path_lower.ends_with("hook.ts") || path_lower.ends_with("hook.tsx") || path_lower.ends_with("hooks.ts") || path_lower.ends_with("hooks.tsx"))
+    {
         "client-hook"
     } else if path_lower.ends_with("layout.tsx") || path_lower.ends_with("layout.jsx") {
         "layout"
-    } else if path_lower.ends_with("page.tsx") || path_lower.ends_with("page.jsx") || path_lower.ends_with("page.js") {
+    } else if is_app_route || path_lower.ends_with("page.tsx") || path_lower.ends_with("page.jsx") || path_lower.ends_with("page.js") {
         "page-route"
     } else if path_lower.contains("/components/") || path_lower.starts_with("components/") {
         "ui-component"
@@ -2928,18 +3164,27 @@ pub fn format_axiom_contracts_prompt(proj_dir: &std::path::Path, current_file_pa
         if role == "configuration" {
             continue;
         }
-        let exports: Vec<&str> = entry
-            .get("capabilities")
-            .and_then(|c| c.get("exports"))
-            .and_then(|e| e.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-            .unwrap_or_default();
-        let members: Vec<&str> = entry
-            .get("capabilities")
-            .and_then(|c| c.get("members"))
-            .and_then(|e| e.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-            .unwrap_or_default();
+        let is_app_route_role = role == "page-route" || role == "layout";
+        let exports: Vec<&str> = if is_app_route_role {
+            Vec::new()
+        } else {
+            entry
+                .get("capabilities")
+                .and_then(|c| c.get("exports"))
+                .and_then(|e| e.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default()
+        };
+        let members: Vec<&str> = if is_app_route_role {
+            Vec::new()
+        } else {
+            entry
+                .get("capabilities")
+                .and_then(|c| c.get("members"))
+                .and_then(|e| e.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default()
+        };
         let endpoints: Vec<&str> = entry
             .get("capabilities")
             .and_then(|c| c.get("endpoints"))
@@ -3722,16 +3967,22 @@ pub fn get_expert_system_prompt(
 
     // 7b. FILE-SCOPED PROMPT: Next.js Edge Middleware (middleware.ts / middleware.js)
     if path_lower.ends_with("middleware.ts") || path_lower.ends_with("middleware.js") {
+        let meta_rules = get_middleware_metacognitive_rules(Some(proj_dir), context_ref);
         return format!(
-            "You are a Senior Next.js Edge Architecture Engineer. Write only clean, production-ready Next.js Middleware code wrapped in markdown code blocks. No explanations.\n\n{}\n\
+            "You are a Senior Next.js Edge Architecture Engineer. Write only clean, production-ready Next.js Middleware code wrapped in markdown code blocks. No explanations.\n\n{}\n{}\n\
              - NEVER import from 'express' (no Request, Response, NextFunction from 'express'). Always import `{{ NextResponse }}` and `type {{ NextRequest }}` from `'next/server'`.\n\
              - Always export `function middleware(request: NextRequest)` and `export const config = {{ matcher: [...] }}`.\n",
-            NEXTJS_MIDDLEWARE_RULEPACK
+            NEXTJS_MIDDLEWARE_RULEPACK,
+            meta_rules
         );
     }
 
     // 7c. FILE-SCOPED PROMPT: Custom React Hooks (src/hooks/**)
-    let is_custom_hook = path_lower.contains("hooks/") && (path_lower.ends_with(".ts") || path_lower.ends_with(".tsx"));
+    let is_app_route_prompt = crate::sanitizer::is_app_router_route_file(file_path);
+    let is_custom_hook = !is_app_route_prompt
+        && (path_lower.contains("/hooks/") || path_lower.starts_with("hooks/"))
+        && !path_lower.contains("/api/")
+        && (path_lower.ends_with(".ts") || path_lower.ends_with(".tsx"));
     if is_custom_hook {
         let mut prompt = format!(
             "You are a Senior React Hooks & State Management Architect. Write only clean, production-ready React hook TypeScript code wrapped in markdown code blocks. No explanations.\n\n\
@@ -3762,7 +4013,8 @@ pub fn get_expert_system_prompt(
     }
 
     // 7d. FILE-SCOPED PROMPT: Domain Models & Types (src/models/**, src/types/**)
-    let is_model_or_type_file = (path_lower.contains("/models/") || path_lower.starts_with("models/") || path_lower.contains("/types/") || path_lower.starts_with("types/"))
+    let is_model_or_type_file = !is_app_route_prompt
+        && (path_lower.contains("/models/") || path_lower.starts_with("models/") || path_lower.contains("/types/") || path_lower.starts_with("types/"))
         && (path_lower.ends_with(".ts") || path_lower.ends_with(".tsx"))
         && !path_lower.contains("/api/");
     if is_model_or_type_file {
@@ -3818,8 +4070,9 @@ pub fn get_expert_system_prompt(
             prompt.push_str(
                 "ROOT LAYOUT ARCHITECTURE RULES:\n\
                  - DOM HIERARCHY: Outermost elements returned MUST be `<html lang=\"en\"><body className=\"min-h-screen flex flex-col bg-slate-50 text-slate-900 antialiased selection:bg-indigo-600 selection:text-white\">...</body></html>`.\n\
-                 - GLOBAL PROVIDERS: Wrap all global providers inside `<body>` around `{children}`. If NextAuth is configured, wrap with `<SessionProvider>`.\n\
-                 - PERSISTENT NAVIGATION & STICKY FOOTER: Always import and mount `<Navbar />` (from `@/components/Navbar`) at the top, wrap `{children}` in `<main className=\"flex-1 flex flex-col w-full\">{children}</main>`, and mount `<Footer />` (from `@/components/Footer`) at the bottom.\n\
+                 - MANDATORY `{children}` SLOT: RootLayout MUST render `{children}` inside `<main className=\"flex-1 flex flex-col w-full\">{children}</main>` inside `<body>` (wrapped by `<SessionProvider>` if NextAuth is configured).\n\
+                 - STRICT SHELL-ONLY DISCIPLINE: NEVER put KPI cards, `<table>` elements, page forms, or domain hooks (`useAlerts`, `useDroneFeed`, etc.) inside `layout.tsx`! Page content belongs inside `src/app/page.tsx` and child route pages, NEVER inside RootLayout.\n\
+                 - PERSISTENT NAVIGATION & STICKY FOOTER: Always import and mount `<Navbar />` (from `@/components/Navbar`) above `<main>`, and `<Footer />` (from `@/components/Footer`) below `<main>`.\n\
                  - MANDATORY DEFAULT EXPORT: RootLayout MUST have `export default function RootLayout({ children }: { children: React.ReactNode })` and MUST NOT emit arbitrary named value exports.\n\
                  - Mark the layout file with 'use client'; at line 1.\n\n"
             );
@@ -3943,7 +4196,7 @@ pub fn get_expert_system_prompt(
         prompt.push_str(&format!("ROLE: Expert TypeScript / JavaScript Developer\nFILE: {}\n- Always import local modules using the '@/...' alias (never bare 'src/...').\n- Never clone new PrismaClient() outside src/lib/prisma.ts.\n", file_path));
         let path_low_fallback = file_path.to_lowercase().replace('\\', "/");
         if path_low_fallback.contains("nextauth") || path_low_fallback.ends_with("/auth.ts") || path_low_fallback.ends_with("/auth.js") || path_low_fallback == "auth.ts" {
-            prompt.push_str("- NEXTAUTH V4 ONLY: Import `type { NextAuthOptions }` from `'next-auth'` and `CredentialsProvider` from `'next-auth/providers/credentials'` (NEVER deprecated v3 `'next-auth/providers'`). Use `PrismaAdapter` from `'@auth/prisma-adapter'` with `prisma` from `'@/lib/prisma'`.\n");
+            prompt.push_str("- NEXTAUTH V4 ONLY: Import `type { NextAuthOptions }` from `'next-auth'` and `CredentialsProvider` from `'next-auth/providers/credentials'` (NEVER deprecated v3 `'next-auth/providers'`). Use `PrismaAdapter` from `'@auth/prisma-adapter'` with `prisma` from `'@/lib/prisma'`.\n- AUTH UTILITY BOUNDARY: Export `authOptions: NextAuthOptions` and auth helpers ONLY from utility files (`src/utils/auth.ts`, `src/lib/auth.ts`); NEVER export NextAuth App Router `{ handler as GET, handler as POST }` outside `src/app/api/auth/[...nextauth]/route.ts`.\n- OPTIONAL USER FIELDS: Access optional credential hashes via safe cast `(user as any)?.hashedPassword || (user as any)?.password || ''` so `tsc` passes even when `User` schema uses either field name.\n");
         }
     }
     if !context_ref.is_empty() {
@@ -4291,6 +4544,10 @@ pub async fn run_orchestrator(
         "name": name,
         "description": project_description,
         "status": "generating",
+        "metadata": {
+            "appVersion": env!("CARGO_PKG_VERSION"),
+            "modelId": model_id
+        },
         "createdAt": chrono::Utc::now().to_rfc3339(),
         "updatedAt": chrono::Utc::now().to_rfc3339(),
     });
@@ -4378,13 +4635,13 @@ pub async fn run_orchestrator(
                 },
                 {
                     "path": "src/middleware.ts",
-                    "description": "Resource-optimized middleware that bypasses static asset queries.",
+                    "description": "Resource-optimized middleware that bypasses static asset queries at the matcher layer.",
                     "language": "typescript",
                     "defaultContent": r#"import { withAuth } from "next-auth/middleware";
 import { NextRequest, NextResponse } from "next/server";
 
 const authMiddleware = withAuth(
-  function middleware(req: NextRequest) {
+  function middleware(_req: NextRequest) {
     return NextResponse.next();
   },
   {
@@ -4400,20 +4657,10 @@ const authMiddleware = withAuth(
 export default function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
 
-  // 1. Skip middleware for API, internal assets, and static files with extensions
-  if (
-    pathname.includes("/api/") ||
-    pathname.includes("/_next/") ||
-    pathname.includes("/_vercel/") ||
-    pathname.includes(".")
-  ) {
-    return NextResponse.next();
-  }
-
-  // 2. Protect dashboard, admin and profile routes
-  const isProtectedPage = 
-    pathname.startsWith("/dashboard") || 
-    pathname.startsWith("/admin") || 
+  // Protected user & admin routes (static assets & /api are already excluded in config.matcher)
+  const isProtectedPage =
+    pathname.startsWith("/dashboard") ||
+    pathname.startsWith("/admin") ||
     pathname.startsWith("/profile");
 
   if (isProtectedPage) {
@@ -4424,7 +4671,9 @@ export default function middleware(req: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/((?!api|_next|_vercel|.*\\..*).*)"]
+  matcher: [
+    "/((?!api|_next/static|_next/image|_vercel|favicon\\.ico|robots\\.txt|sitemap\\.xml|.*\\..*).*)",
+  ],
 };"#
                 },
                 {
@@ -5020,6 +5269,8 @@ export default function RootLayout({
          - Stick strictly to Next.js + React + TypeScript. NEVER add Vue, Svelte, or Angular files (`.vue`, `.svelte`, `vue-i18n`, `vue-router`).\n\
          - NEVER expand a matrix of dozens of regional locale/translation JSON files (`translations/*.json`, `locales/*.json`); keep at most 1-2 locale files if localization is needed.\n\
          - NEVER duplicate shared folders inside `src/app/` (`src/app/components/...`, `src/app/utils/...`, `src/app/config/...`); keep shared code in `src/components/`, `src/lib/`, `src/hooks/`, `src/utils/`.\n\
+         - API ROUTE COMPLETENESS: Ensure EVERY core domain entity in `prisma/schema.prisma` and every `/api/...` endpoint called by hooks or pages has a real matching App Router handler (`src/app/api/<resource>/route.ts`).\n\
+         - SHARED TYPES PLACEMENT: Keep shared TypeScript interfaces, types, and enums in `src/types/...` or `src/models/...`, NEVER exported from `src/app/**/page.tsx`.\n\
          - Keep the expanded file list cohesive and lean (~15-30 essential files total).\n\
          Output a JSON array containing the expanded, complete list of files. For each file, provide 'path', 'description' (concise, 1-2 sentences), and 'language'.\n\
          Keep each file description concise (1-2 sentences) so the manifest generates quickly.\n\
@@ -5341,11 +5592,13 @@ export default function RootLayout({
     files_to_generate.sort_by_key(|file_spec| {
         let file_path = file_spec.get("path").and_then(|p| p.as_str()).unwrap_or("");
         let p_lower = file_path.replace('\\', "/").to_lowercase();
+        let is_app_route = crate::sanitizer::is_app_router_route_file(file_path);
+        let is_api_path = p_lower.starts_with("api/") || p_lower.contains("/api/");
         let db_sub_priority = if p_lower.contains("schema.prisma") {
             0u8
         } else if p_lower.ends_with("lib/prisma.ts") || p_lower.ends_with("lib/prisma.js") {
             1u8
-        } else if p_lower.contains("/models/") || p_lower.starts_with("models/") || p_lower.contains("/types/") || p_lower.starts_with("types/") {
+        } else if !is_app_route && !is_api_path && (p_lower.contains("/models/") || p_lower.starts_with("models/") || p_lower.contains("/types/") || p_lower.starts_with("types/")) {
             2u8
         } else {
             3u8
@@ -5373,6 +5626,7 @@ export default function RootLayout({
         "name": name,
         "projectDescription": project_description,
         "projectType": project_type,
+        "appVersion": env!("CARGO_PKG_VERSION"),
         "modelId": model_id,
         "token": token,
         "host": host,
@@ -6038,6 +6292,8 @@ export default function RootLayout({
         "description": project_description,
         "status": "ready",
         "metadata": {
+            "appVersion": env!("CARGO_PKG_VERSION"),
+            "modelId": model_id,
             "offlineWaiting": false,
             "hasWarnings": has_warnings,
             "warnings": completion_warnings
