@@ -446,7 +446,7 @@ pub fn filter_runaway_manifest_expansion(
 }
 
 pub fn get_axiom_inspector_script() -> &'static str {
-    "      <script dangerouslySetInnerHTML={{ __html: `\n        if (!window.__axiom_inspect_injected) {\n          window.__axiom_inspect_injected = true;\n          let isInspectActive = false;\n          let lastReportedOverlaySig = '';\n          function extractNextjsOverlay() {\n            try {\n              const portal = document.querySelector('nextjs-portal');\n              const root = (portal && portal.shadowRoot) ? portal.shadowRoot : document;\n              const dialog = root.querySelector('[data-nextjs-dialog], [role=\"dialog\"], #nextjs__container_errors_label');\n              let rawText = dialog ? (dialog.innerText || dialog.textContent || '').trim() : '';\n              if (!rawText && root !== document) {\n                rawText = Array.from(root.children || []).filter(el => el.tagName !== 'STYLE' && el.tagName !== 'SCRIPT').map(el => el.innerText || el.textContent || '').join(String.fromCharCode(10)).trim();\n              }\n              if (!rawText || (!rawText.includes('Error') && !rawText.includes('Failed to compile') && !rawText.includes('Module not found'))) return null;\n              const normText = rawText.split(String.fromCharCode(92)).join('/');\n              const fileMatch = normText.match(new RegExp('(?:src/|app/|pages/|components/)[A-Za-z0-9_/.+-]+[.](?:tsx|ts|jsx|js)'));\n              const sourceFile = fileMatch ? fileMatch[0] : null;\n              const lines = normText.split(String.fromCharCode(10)).map(l => l.trim()).filter(l => l && !l.startsWith(':host') && !l.startsWith('/*!'));\n              const errLine = lines.find(l => l.includes('Module not found:') || l.includes('Error:') || l.includes('Failed to compile')) || lines[0] || '';\n              const message = errLine.substring(0, 220);\n              return { hasError: true, message, sourceFile, rawText: rawText.substring(0, 1200) };\n            } catch (e) { return null; }\n          }\n          function collectAxiomUiSnapshot() {\n            try {\n              const isVis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };\n              const headings = Array.from(document.querySelectorAll('h1, h2, h3')).slice(0, 20).map(h => ({ tag: h.tagName.toLowerCase(), text: (h.innerText || '').trim().substring(0, 120) })).filter(h => h.text);\n              const buttons = Array.from(document.querySelectorAll('button, [role=\"button\"]')).slice(0, 35).map(b => ({ text: (b.innerText || '').trim().substring(0, 80), ariaLabel: b.getAttribute('aria-label') || '', disabled: !!b.disabled, visible: isVis(b) }));\n              const links = Array.from(document.querySelectorAll('a')).slice(0, 35).map(a => ({ text: (a.innerText || '').trim().substring(0, 80), href: a.getAttribute('href') || '', visible: isVis(a) }));\n              const inputs = Array.from(document.querySelectorAll('input, select, textarea')).slice(0, 25).map(i => ({ tag: i.tagName.toLowerCase(), type: i.getAttribute('type') || '', name: i.getAttribute('name') || '', placeholder: i.getAttribute('placeholder') || '', value: (i.value || '').substring(0, 80) }));\n              const overlay = extractNextjsOverlay();\n              const bodyText = (document.body ? document.body.innerText : '').trim();\n              return {\n                url: window.location.href,\n                pathname: window.location.pathname,\n                title: document.title || '',\n                nextjsOverlay: overlay,\n                headings,\n                buttons,\n                links,\n                inputs,\n                layout: {\n                  viewportWidth: window.innerWidth,\n                  viewportHeight: window.innerHeight,\n                  scrollWidth: document.documentElement ? document.documentElement.scrollWidth : 0,\n                  scrollHeight: document.documentElement ? document.documentElement.scrollHeight : 0,\n                  hasHorizontalOverflow: (document.documentElement ? document.documentElement.scrollWidth : 0) > window.innerWidth + 4,\n                  hasNavbar: !!document.querySelector('nav, header'),\n                  hasFooter: !!document.querySelector('footer'),\n                  visibleTextPreview: bodyText.substring(0, 600)\n                }\n              };\n            } catch (e) { return { error: String(e) }; }\n          }\n          function reportAxiomRoute() {\n            try {\n              const overlay = extractNextjsOverlay();\n              if (overlay && overlay.hasError) {\n                const sig = (overlay.sourceFile || '') + '::' + overlay.message;\n                if (sig !== lastReportedOverlaySig) {\n                  lastReportedOverlaySig = sig;\n                  window.parent.postMessage({ channel: 'axiom-preview-error', message: overlay.message, sourceFile: overlay.sourceFile, details: overlay.rawText, path: window.location.pathname }, '*');\n                }\n              }\n              window.parent.postMessage({ channel: 'axiom-preview-route', pathname: window.location.pathname, url: window.location.href, snapshot: collectAxiomUiSnapshot() }, '*');\n            } catch(e) {}\n          }\n          setTimeout(reportAxiomRoute, 400);\n          window.addEventListener('popstate', reportAxiomRoute);\n          setInterval(reportAxiomRoute, 2000);\n          window.addEventListener('error', function(e) { try { window.parent.postMessage({ channel: 'axiom-preview-error', message: e.message || 'Unknown runtime error', sourceFile: e.filename || null, path: window.location.pathname }, '*'); } catch(err) {} });\n          window.addEventListener('unhandledrejection', function(e) { try { window.parent.postMessage({ channel: 'axiom-preview-error', message: e.reason?.message || String(e.reason || 'Unhandled promise rejection'), path: window.location.pathname }, '*'); } catch(err) {} });\n          window.addEventListener('message', (e) => {\n            if (e.data && e.data.channel === 'axiom-toggle-inspect') {\n              isInspectActive = !!e.data.enabled;\n              if (!isInspectActive && highlightedElement) {\n                highlightedElement.classList.remove('axiom-inspect-highlight');\n                highlightedElement = null;\n              }\n            }\n            if (e.data && e.data.channel === 'axiom-agent-dom-cmd') {\n              const cmd = e.data;\n              try {\n                if (cmd.action === 'snapshot') {\n                  window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'ok', snapshot: collectAxiomUiSnapshot() }, '*');\n                } else if (cmd.action === 'click') {\n                  let el = cmd.selector ? document.querySelector(cmd.selector) : null;\n                  if (!el && cmd.text) {\n                    const needle = cmd.text.toLowerCase();\n                    const candidates = Array.from(document.querySelectorAll('button, a, [role=\"button\"], li, span'));\n                    el = candidates.find(c => ((c.innerText || '').trim().toLowerCase().includes(needle)) || ((c.getAttribute('aria-label') || '').toLowerCase().includes(needle)));\n                  }\n                  if (el) {\n                    el.click();\n                    setTimeout(() => {\n                      window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'clicked: ' + (el.innerText || el.tagName).trim().substring(0, 50), snapshot: collectAxiomUiSnapshot() }, '*');\n                    }, 600);\n                  } else {\n                    window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'element_not_found', snapshot: collectAxiomUiSnapshot() }, '*');\n                  }\n                } else if (cmd.action === 'type') {\n                  let el = cmd.selector ? document.querySelector(cmd.selector) : null;\n                  if (!el && cmd.placeholder) {\n                    const needle = cmd.placeholder.toLowerCase();\n                    el = Array.from(document.querySelectorAll('input, textarea')).find(i => (i.getAttribute('placeholder') || '').toLowerCase().includes(needle) || (i.getAttribute('name') || '').toLowerCase().includes(needle));\n                  }\n                  if (el) {\n                    const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;\n                    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;\n                    if (setter) setter.call(el, cmd.value || ''); else el.value = cmd.value || '';\n                    el.dispatchEvent(new Event('input', { bubbles: true }));\n                    el.dispatchEvent(new Event('change', { bubbles: true }));\n                    setTimeout(() => {\n                      window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'typed', snapshot: collectAxiomUiSnapshot() }, '*');\n                    }, 300);\n                  } else {\n                    window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'input_not_found', snapshot: collectAxiomUiSnapshot() }, '*');\n                  }\n                } else if (cmd.action === 'navigate' && cmd.route) {\n                  window.location.href = cmd.route;\n                }\n              } catch (err) {\n                window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'error: ' + String(err), snapshot: collectAxiomUiSnapshot() }, '*');\n              }\n            }\n          });\n          const styleEl = document.createElement('style');\n          styleEl.textContent = '.axiom-inspect-highlight { outline: 2px solid #6366f1 !important; outline-offset: -2px !important; cursor: crosshair !important; background-color: rgba(99, 102, 241, 0.12) !important; transition: all 0.1s ease; }';\n          document.head.appendChild(styleEl);\n          let highlightedElement = null;\n          function findAxiomTarget(el) {\n            if (!el || el === document.body || el === document.documentElement) return null;\n            let cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              if (cur.dataset && (cur.dataset.axiomFile || cur.dataset.axiomComponent)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            const validTags = ['h1','h2','h3','h4','h5','h6','p','button','a','input','textarea','select','header','footer','nav','section','article','aside','li'];\n            cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              const tag = cur.tagName.toLowerCase();\n              if (validTags.includes(tag) || (cur.innerText && cur.innerText.trim().length > 0 && cur.children.length === 0)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            return el !== document.body && el !== document.documentElement ? el : null;\n          }\n          document.addEventListener('mouseover', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (highlightedElement && highlightedElement !== target) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n            }\n            if (target) {\n              target.classList.add('axiom-inspect-highlight');\n              highlightedElement = target;\n            }\n          }, true);\n          document.addEventListener('mouseout', (e) => {\n            if (highlightedElement) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n              highlightedElement = null;\n            }\n          }, true);\n          document.addEventListener('click', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (target) {\n              e.preventDefault();\n              e.stopPropagation();\n              const payload = {\n                file: target.dataset?.axiomFile || null,\n                component: target.dataset?.axiomComponent || null,\n                tagName: target.tagName.toLowerCase(),\n                text: (target.innerText || target.value || '').trim().substring(0, 80),\n                path: window.location.pathname\n              };\n              window.parent.postMessage({ channel: 'axiom-inspect-click', payload }, '*');\n            }\n          }, true);\n        }\n      ` }} />"
+    "      <script dangerouslySetInnerHTML={{ __html: `\n        if (!window.__axiom_inspect_injected) {\n          window.__axiom_inspect_injected = true;\n          let isInspectActive = false;\n          let lastReportedOverlaySig = '';\n          function extractProjectFileFromStack(txt) {\n            try {\n              if (!txt) return null;\n              const norm = String(txt).split(String.fromCharCode(92)).join('/');\n              const m = norm.match(new RegExp('(?:src/(?:app|pages|components|hooks|lib|utils|services|models)/|(?:app|pages|components|hooks)/)[A-Za-z0-9_/.+-]+[.](?:tsx|ts|jsx|js)'));\n              return m ? m[0] : null;\n            } catch (e) { return null; }\n          }\n          function extractNextjsOverlay() {\n            try {\n              const portal = document.querySelector('nextjs-portal');\n              const root = (portal && portal.shadowRoot) ? portal.shadowRoot : document;\n              const dialog = root.querySelector('[data-nextjs-dialog], [role=\"dialog\"], #nextjs__container_errors_label');\n              let rawText = dialog ? (dialog.innerText || dialog.textContent || '').trim() : '';\n              if (!rawText && root !== document) {\n                rawText = Array.from(root.children || []).filter(el => el.tagName !== 'STYLE' && el.tagName !== 'SCRIPT').map(el => el.innerText || el.textContent || '').join(String.fromCharCode(10)).trim();\n              }\n              if (!rawText || (!rawText.includes('Error') && !rawText.includes('Failed to compile') && !rawText.includes('Module not found'))) return null;\n              const normText = rawText.split(String.fromCharCode(92)).join('/');\n              const sourceFile = extractProjectFileFromStack(normText);\n              const lines = normText.split(String.fromCharCode(10)).map(l => l.trim()).filter(l => l && !l.startsWith(':host') && !l.startsWith('/*!'));\n              const errLine = lines.find(l => l.includes('Module not found:') || l.includes('Error:') || l.includes('Failed to compile')) || lines[0] || '';\n              const message = errLine.substring(0, 220);\n              return { hasError: true, message, sourceFile, rawText: rawText.substring(0, 1200) };\n            } catch (e) { return null; }\n          }\n          function collectAxiomUiSnapshot() {\n            try {\n              const isVis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };\n              const headings = Array.from(document.querySelectorAll('h1, h2, h3')).slice(0, 20).map(h => ({ tag: h.tagName.toLowerCase(), text: (h.innerText || '').trim().substring(0, 120) })).filter(h => h.text);\n              const buttons = Array.from(document.querySelectorAll('button, [role=\"button\"]')).slice(0, 35).map(b => ({ text: (b.innerText || '').trim().substring(0, 80), ariaLabel: b.getAttribute('aria-label') || '', disabled: !!b.disabled, visible: isVis(b) }));\n              const links = Array.from(document.querySelectorAll('a')).slice(0, 35).map(a => ({ text: (a.innerText || '').trim().substring(0, 80), href: a.getAttribute('href') || '', visible: isVis(a) }));\n              const inputs = Array.from(document.querySelectorAll('input, select, textarea')).slice(0, 25).map(i => ({ tag: i.tagName.toLowerCase(), type: i.getAttribute('type') || '', name: i.getAttribute('name') || '', placeholder: i.getAttribute('placeholder') || '', value: (i.value || '').substring(0, 80) }));\n              const overlay = extractNextjsOverlay();\n              const bodyText = (document.body ? document.body.innerText : '').trim();\n              return {\n                url: window.location.href,\n                pathname: window.location.pathname,\n                title: document.title || '',\n                nextjsOverlay: overlay,\n                headings,\n                buttons,\n                links,\n                inputs,\n                layout: {\n                  viewportWidth: window.innerWidth,\n                  viewportHeight: window.innerHeight,\n                  scrollWidth: document.documentElement ? document.documentElement.scrollWidth : 0,\n                  scrollHeight: document.documentElement ? document.documentElement.scrollHeight : 0,\n                  hasHorizontalOverflow: (document.documentElement ? document.documentElement.scrollWidth : 0) > window.innerWidth + 4,\n                  hasNavbar: !!document.querySelector('nav, header'),\n                  hasFooter: !!document.querySelector('footer'),\n                  visibleTextPreview: bodyText.substring(0, 600)\n                }\n              };\n            } catch (e) { return { error: String(e) }; }\n          }\n          function reportAxiomRoute() {\n            try {\n              const overlay = extractNextjsOverlay();\n              if (overlay && overlay.hasError) {\n                const sig = window.location.pathname + '::' + (overlay.sourceFile || '') + '::' + overlay.message;\n                if (sig !== lastReportedOverlaySig) {\n                  lastReportedOverlaySig = sig;\n                  window.parent.postMessage({ channel: 'axiom-preview-error', message: overlay.message, sourceFile: overlay.sourceFile, details: overlay.rawText, path: window.location.pathname }, '*');\n                }\n              } else {\n                lastReportedOverlaySig = '';\n              }\n              window.parent.postMessage({ channel: 'axiom-preview-route', pathname: window.location.pathname, url: window.location.href, snapshot: collectAxiomUiSnapshot() }, '*');\n            } catch(e) {}\n          }\n          setTimeout(reportAxiomRoute, 400);\n          window.addEventListener('popstate', reportAxiomRoute);\n          setInterval(reportAxiomRoute, 2000);\n          window.addEventListener('error', function(e) { try { const srcFromStack = extractProjectFileFromStack(e.error && e.error.stack); const det = e.error && e.error.stack ? String(e.error.stack).substring(0, 1200) : (e.message || ''); window.parent.postMessage({ channel: 'axiom-preview-error', message: e.message || 'Unknown runtime error', sourceFile: srcFromStack || e.filename || null, details: det, path: window.location.pathname }, '*'); } catch(err) {} });\n          window.addEventListener('unhandledrejection', function(e) { try { const srcFromStack = extractProjectFileFromStack(e.reason && e.reason.stack); const det = e.reason && e.reason.stack ? String(e.reason.stack).substring(0, 1200) : ''; window.parent.postMessage({ channel: 'axiom-preview-error', message: e.reason?.message || String(e.reason || 'Unhandled promise rejection'), sourceFile: srcFromStack, details: det, path: window.location.pathname }, '*'); } catch(err) {} });\n          window.addEventListener('message', (e) => {\n            if (e.data && e.data.channel === 'axiom-toggle-inspect') {\n              isInspectActive = !!e.data.enabled;\n              if (!isInspectActive && highlightedElement) {\n                highlightedElement.classList.remove('axiom-inspect-highlight');\n                highlightedElement = null;\n              }\n            }\n            if (e.data && e.data.channel === 'axiom-agent-dom-cmd') {\n              const cmd = e.data;\n              try {\n                if (cmd.action === 'snapshot') {\n                  window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'ok', snapshot: collectAxiomUiSnapshot() }, '*');\n                } else if (cmd.action === 'click') {\n                  let el = cmd.selector ? document.querySelector(cmd.selector) : null;\n                  if (!el && cmd.text) {\n                    const needle = cmd.text.toLowerCase();\n                    const candidates = Array.from(document.querySelectorAll('button, a, [role=\"button\"], li, span'));\n                    el = candidates.find(c => ((c.innerText || '').trim().toLowerCase().includes(needle)) || ((c.getAttribute('aria-label') || '').toLowerCase().includes(needle)));\n                  }\n                  if (el) {\n                    el.click();\n                    setTimeout(() => {\n                      window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'clicked: ' + (el.innerText || el.tagName).trim().substring(0, 50), snapshot: collectAxiomUiSnapshot() }, '*');\n                    }, 600);\n                  } else {\n                    window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'element_not_found', snapshot: collectAxiomUiSnapshot() }, '*');\n                  }\n                } else if (cmd.action === 'type') {\n                  let el = cmd.selector ? document.querySelector(cmd.selector) : null;\n                  if (!el && cmd.placeholder) {\n                    const needle = cmd.placeholder.toLowerCase();\n                    el = Array.from(document.querySelectorAll('input, textarea')).find(i => (i.getAttribute('placeholder') || '').toLowerCase().includes(needle) || (i.getAttribute('name') || '').toLowerCase().includes(needle));\n                  }\n                  if (el) {\n                    const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;\n                    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;\n                    if (setter) setter.call(el, cmd.value || ''); else el.value = cmd.value || '';\n                    el.dispatchEvent(new Event('input', { bubbles: true }));\n                    el.dispatchEvent(new Event('change', { bubbles: true }));\n                    setTimeout(() => {\n                      window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'typed', snapshot: collectAxiomUiSnapshot() }, '*');\n                    }, 300);\n                  } else {\n                    window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'input_not_found', snapshot: collectAxiomUiSnapshot() }, '*');\n                  }\n                } else if (cmd.action === 'navigate' && cmd.route) {\n                  window.location.href = cmd.route;\n                }\n              } catch (err) {\n                window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'error: ' + String(err), snapshot: collectAxiomUiSnapshot() }, '*');\n              }\n            }\n          });\n          const styleEl = document.createElement('style');\n          styleEl.textContent = '.axiom-inspect-highlight { outline: 2px solid #6366f1 !important; outline-offset: -2px !important; cursor: crosshair !important; background-color: rgba(99, 102, 241, 0.12) !important; transition: all 0.1s ease; }';\n          document.head.appendChild(styleEl);\n          let highlightedElement = null;\n          function findAxiomTarget(el) {\n            if (!el || el === document.body || el === document.documentElement) return null;\n            let cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              if (cur.dataset && (cur.dataset.axiomFile || cur.dataset.axiomComponent)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            const validTags = ['h1','h2','h3','h4','h5','h6','p','button','a','input','textarea','select','header','footer','nav','section','article','aside','li'];\n            cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              const tag = cur.tagName.toLowerCase();\n              if (validTags.includes(tag) || (cur.innerText && cur.innerText.trim().length > 0 && cur.children.length === 0)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            return el !== document.body && el !== document.documentElement ? el : null;\n          }\n          document.addEventListener('mouseover', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (highlightedElement && highlightedElement !== target) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n            }\n            if (target) {\n              target.classList.add('axiom-inspect-highlight');\n              highlightedElement = target;\n            }\n          }, true);\n          document.addEventListener('mouseout', (e) => {\n            if (highlightedElement) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n              highlightedElement = null;\n            }\n          }, true);\n          document.addEventListener('click', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (target) {\n              e.preventDefault();\n              e.stopPropagation();\n              const payload = {\n                file: target.dataset?.axiomFile || null,\n                component: target.dataset?.axiomComponent || null,\n                tagName: target.tagName.toLowerCase(),\n                text: (target.innerText || target.value || '').trim().substring(0, 80),\n                path: window.location.pathname\n              };\n              window.parent.postMessage({ channel: 'axiom-inspect-click', payload }, '*');\n            }\n          }, true);\n        }\n      ` }} />"
 }
 
 pub fn strip_axiom_inspector_script(content: &str) -> String {
@@ -483,6 +483,7 @@ pub fn ensure_axiom_inspector_injected(proj_dir: &std::path::Path) {
         if full_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&full_path) {
                 let needs_upgrade = !content.contains("axiom-agent-dom-cmd")
+                    || !content.contains("extractProjectFileFromStack")
                     || content.contains("rawText.match(/(?:")
                     || content.contains("styleEl.textContent = \\`")
                     || content.contains("const rawText = (root !== document && root.textContent)");
@@ -612,12 +613,11 @@ pub fn ensure_directory_barrel_files(proj_dir: &std::path::Path) {
 
     if has_src {
         scan_demanded_barrels(&src_dir, &alias_root, &import_re, &mut demanded_dirs);
-    } else {
-        for sub_name in ["app", "components", "hooks", "lib", "utils", "models", "types", "services"] {
-            let sub_dir = proj_dir.join(sub_name);
-            if sub_dir.is_dir() {
-                scan_demanded_barrels(&sub_dir, &alias_root, &import_re, &mut demanded_dirs);
-            }
+    }
+    for sub_name in ["app", "components", "hooks", "lib", "utils", "models", "types", "services"] {
+        let sub_dir = proj_dir.join(sub_name);
+        if sub_dir.is_dir() {
+            scan_demanded_barrels(&sub_dir, proj_dir, &import_re, &mut demanded_dirs);
         }
     }
 
@@ -692,6 +692,27 @@ pub fn ensure_directory_barrel_files(proj_dir: &std::path::Path) {
 
         let dir_name = dir_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let is_component_dir = dir_name.eq_ignore_ascii_case("components") || dir_name.eq_ignore_ascii_case("ui");
+
+        // Detect type/interface names exported by 2+ siblings so barrel `export *` does not trigger TS2308
+        let mut exported_type_counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        if let Ok(type_exp_re) = regex::Regex::new(r"(?m)^\s*export\s+(?:interface|type)\s+([A-Za-z0-9_]+)\b") {
+            for (_, sib_content) in &siblings {
+                let mut seen_in_file = std::collections::HashSet::new();
+                for cap in type_exp_re.captures_iter(sib_content) {
+                    if let Some(m) = cap.get(1) {
+                        seen_in_file.insert(m.as_str().to_string());
+                    }
+                }
+                for sym in seen_in_file {
+                    *exported_type_counts.entry(sym).or_insert(0) += 1;
+                }
+            }
+        }
+        let colliding_type_syms: Vec<String> = exported_type_counts
+            .into_iter()
+            .filter(|(_, c)| *c >= 2)
+            .map(|(k, _)| k)
+            .collect();
 
         if let Some(existing_path) = existing_index_path {
             let Ok(existing_content) = std::fs::read_to_string(&existing_path) else {
@@ -780,7 +801,7 @@ pub fn ensure_directory_barrel_files(proj_dir: &std::path::Path) {
                 }
             }
 
-            if had_broken || !uncovered_syms.is_empty() {
+            if had_broken || !uncovered_syms.is_empty() || !colliding_type_syms.is_empty() {
                 let mut appended_lines: Vec<String> = Vec::new();
                 let mut handled_stems: std::collections::BTreeSet<String> = active_reexport_specs.into_iter().collect();
 
@@ -848,6 +869,15 @@ pub fn ensure_directory_barrel_files(proj_dir: &std::path::Path) {
                     }
                 }
 
+                for csym in &colliding_type_syms {
+                    if !has_named_export_symbol(&repaired, csym) {
+                        let line = format!("export type {} = any;", csym);
+                        if !appended_lines.contains(&line) {
+                            appended_lines.push(line);
+                        }
+                    }
+                }
+
                 if !appended_lines.is_empty() {
                     if !repaired.is_empty() && !repaired.ends_with('\n') {
                         repaired.push('\n');
@@ -880,6 +910,10 @@ pub fn ensure_directory_barrel_files(proj_dir: &std::path::Path) {
                 lines.push(format!("export {{ default as {} }} from './{}';", stem, stem));
             }
             lines.push(format!("export * from './{}';", stem));
+        }
+
+        for csym in &colliding_type_syms {
+            lines.push(format!("export type {} = any;", csym));
         }
 
         // For any demanded symbol not exported in any of its files:
@@ -1058,6 +1092,18 @@ pub fn ensure_next_server_imports(content: &str, path_lower: &str) -> String {
             }
         }
         result = format!("import {{ {} }} from 'next/server';\n{}", missing.join(", "), result);
+    }
+
+    // Also auto-import `prisma` from `@/lib/prisma` if the route calls `prisma.<model>` without importing or declaring `prisma`
+    if result.contains("prisma.") {
+        let has_prisma_decl = regex::Regex::new(
+            r"(?m)(?:import\s+[^\n;]*\bprisma\b|(?:const|let|var)\s+prisma\b)",
+        )
+        .map(|r| r.is_match(&result))
+        .unwrap_or(true);
+        if !has_prisma_decl {
+            result = format!("import prisma from '@/lib/prisma';\n{}", result);
+        }
     }
 
     result
@@ -3210,9 +3256,13 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
                 }
             }
             let legacy_btn = "export const Button = ({ children, variant = 'primary', size = 'md', className = '', ...props }: any) => <button className={`inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-medium transition-colors ${className}`} {...props}>{children}</button>;";
-            let upgraded_btn = "export const Button = ({ children, variant = 'primary', size = 'md', asChild = false, className = '', ...props }: any) => { const cls = `inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-medium transition-colors ${className}`; return asChild ? <span className={cls} {...props}>{children}</span> : <button className={cls} {...props}>{children}</button>; };";
+            let legacy_btn_v54 = "export const Button = ({ children, variant = 'primary', size = 'md', asChild = false, className = '', ...props }: any) => { const cls = `inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-medium transition-colors ${className}`; return asChild ? <span className={cls} {...props}>{children}</span> : <button className={cls} {...props}>{children}</button>; };";
+            let upgraded_btn = "export const Button = ({ children, variant = 'primary', size = 'md', asChild = false, className = '', ...props }: any) => { const hasBg = /\\bbg-/.test(className || ''); const vCls = hasBg ? '' : (variant === 'outline' || variant === 'secondary' ? 'border border-slate-300 bg-white text-slate-900 hover:bg-slate-50' : variant === 'ghost' ? 'text-slate-700 hover:bg-slate-100' : variant === 'destructive' ? 'bg-red-600 text-white hover:bg-red-500' : 'bg-indigo-600 text-white hover:bg-indigo-500'); const cls = `inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-medium transition-colors disabled:opacity-50 ${vCls} ${className}`; return asChild ? <span className={cls} {...props}>{children}</span> : <button className={cls} {...props}>{children}</button>; };";
             if content.contains(legacy_btn) {
                 content = content.replace(legacy_btn, upgraded_btn);
+            }
+            if content.contains(legacy_btn_v54) {
+                content = content.replace(legacy_btn_v54, upgraded_btn);
             }
         }
 
@@ -3240,7 +3290,7 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
                 if !has_named_export_symbol(&content, sym) {
                     let fallback = match sym.as_str() {
                         "Option" => "export const Option = ({ children, ...props }: any) => <option {...props}>{children}</option>;\n".to_string(),
-                        "Button" => "export const Button = ({ children, variant = 'primary', size = 'md', asChild = false, className = '', ...props }: any) => { const cls = `inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-medium transition-colors ${className}`; return asChild ? <span className={cls} {...props}>{children}</span> : <button className={cls} {...props}>{children}</button>; };\n".to_string(),
+                        "Button" => "export const Button = ({ children, variant = 'primary', size = 'md', asChild = false, className = '', ...props }: any) => { const hasBg = /\\bbg-/.test(className || ''); const vCls = hasBg ? '' : (variant === 'outline' || variant === 'secondary' ? 'border border-slate-300 bg-white text-slate-900 hover:bg-slate-50' : variant === 'ghost' ? 'text-slate-700 hover:bg-slate-100' : variant === 'destructive' ? 'bg-red-600 text-white hover:bg-red-500' : 'bg-indigo-600 text-white hover:bg-indigo-500'); const cls = `inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-medium transition-colors disabled:opacity-50 ${vCls} ${className}`; return asChild ? <span className={cls} {...props}>{children}</span> : <button className={cls} {...props}>{children}</button>; };\n".to_string(),
                         "Card" | "CardContent" => format!("export const {} = ({{ children, className = '', ...props }}: any) => <div className={{`rounded-xl border border-slate-200 bg-white p-4 shadow-sm ${{className}}`}} {{...props}}>{{children}}</div>;\n", sym),
                         "CardHeader" => "export const CardHeader = ({ children, className = '', ...props }: any) => <div className={`mb-3 flex flex-col gap-1 ${className}`} {...props}>{children}</div>;\n".to_string(),
                         "CardTitle" => "export const CardTitle = ({ children, className = '', ...props }: any) => <h3 className={`text-base font-semibold text-slate-900 ${className}`} {...props}>{children}</h3>;\n".to_string(),
@@ -3274,8 +3324,8 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
                         "TableCaption" => "export const TableCaption = ({ children, className = '', ...props }: any) => <caption className={`mt-2 text-sm text-slate-500 ${className}`} {...props}>{children}</caption>;\n".to_string(),
                         "Toast" => "export const Toast = ({ children, className = '', ...props }: any) => <div role=\"status\" className={`rounded-lg border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 shadow-md ${className}`} {...props}>{children}</div>;\n".to_string(),
                         "Toaster" => "export const Toaster = () => null;\n".to_string(),
-                        "toast" => "export const toast = (opts: any) => { if (typeof window !== 'undefined') console.info('[toast]', opts?.title || opts?.description || opts); return { id: 'axiom-toast', dismiss: () => {}, update: () => {} }; };\n".to_string(),
-                        "useToast" => "export const useToast = () => ({ toast: (opts: any) => { if (typeof window !== 'undefined') console.info('[toast]', opts?.title || opts?.description || opts); return { id: 'axiom-toast', dismiss: () => {}, update: () => {} }; }, toasts: [] as any[], dismiss: (_id?: string) => {} });\n".to_string(),
+                        "toast" => "export const toast: ((opts?: any) => any) & { success: (msg?: any, opts?: any) => any; error: (msg?: any, opts?: any) => any; info: (msg?: any, opts?: any) => any; warning: (msg?: any, opts?: any) => any; warn: (msg?: any, opts?: any) => any; loading: (msg?: any, opts?: any) => any; dismiss: (id?: string) => void } = Object.assign((opts?: any) => { if (typeof window !== 'undefined') console.info('[toast]', opts?.title || opts?.description || opts); return { id: 'axiom-toast', dismiss: () => {}, update: () => {} }; }, { success: (msg?: any) => ({ id: 'axiom-toast', message: msg }), error: (msg?: any) => ({ id: 'axiom-toast', message: msg }), info: (msg?: any) => ({ id: 'axiom-toast', message: msg }), warning: (msg?: any) => ({ id: 'axiom-toast', message: msg }), warn: (msg?: any) => ({ id: 'axiom-toast', message: msg }), loading: (msg?: any) => ({ id: 'axiom-toast', message: msg }), dismiss: () => {} });\n".to_string(),
+                        "useToast" => "export const useToast = () => { const fn: ((opts?: any) => any) & { success: (msg?: any, opts?: any) => any; error: (msg?: any, opts?: any) => any; info: (msg?: any, opts?: any) => any; warning: (msg?: any, opts?: any) => any; warn: (msg?: any, opts?: any) => any; loading: (msg?: any, opts?: any) => any; dismiss: (id?: string) => void } = Object.assign((opts?: any) => { if (typeof window !== 'undefined') console.info('[toast]', opts?.title || opts?.description || opts); return { id: 'axiom-toast', dismiss: () => {}, update: () => {} }; }, { success: (msg?: any) => ({ id: 'axiom-toast', message: msg }), error: (msg?: any) => ({ id: 'axiom-toast', message: msg }), info: (msg?: any) => ({ id: 'axiom-toast', message: msg }), warning: (msg?: any) => ({ id: 'axiom-toast', message: msg }), warn: (msg?: any) => ({ id: 'axiom-toast', message: msg }), loading: (msg?: any) => ({ id: 'axiom-toast', message: msg }), dismiss: () => {} }); return { toast: fn, toasts: [] as any[], dismiss: (_id?: string) => {} }; };\n".to_string(),
                         "Link" => "export const Link = ({ children, href = '#', prefetch, replace, scroll, shallow, locale, legacyBehavior, className = '', ...props }: any) => <a href={typeof href === 'string' ? href : '#'} className={className} {...props}>{children}</a>;\n".to_string(),
                         _ => format!("export const {} = ({{ children, className = '', ...props }}: any) => <div className={{className}} {{...props}}>{{children}}</div>;\n", sym),
                     };
@@ -3411,12 +3461,60 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
 pub fn ensure_valid_tsconfig(proj_dir: &std::path::Path) {
     let tsconfig_path = proj_dir.join("tsconfig.json");
     let has_src = proj_dir.join("src").exists();
-    let has_root_app_layout = !has_src
-        && (proj_dir.join("app").exists()
-            || proj_dir.join("components").exists()
-            || proj_dir.join("lib").exists()
-            || proj_dir.join("hooks").exists());
-    let expected_alias_target = if has_root_app_layout { "./*" } else { "./src/*" };
+    let has_root_dirs = proj_dir.join("app").exists()
+        || proj_dir.join("components").exists()
+        || proj_dir.join("lib").exists()
+        || proj_dir.join("hooks").exists()
+        || proj_dir.join("services").exists();
+    let expected_alias_targets: Vec<&str> = if has_src && has_root_dirs {
+        vec!["./src/*", "./*"]
+    } else if has_src {
+        vec!["./src/*"]
+    } else {
+        vec!["./*"]
+    };
+
+    // If next-auth is installed, emit `axiom-env.d.ts` so `session.user.id`, `session.user.role`, and `SignInResponse.user` type-check cleanly
+    if proj_dir.join("node_modules/next-auth").exists() {
+        let dts_path = proj_dir.join("axiom-env.d.ts");
+        if !dts_path.exists() {
+            let dts_content = r#"import 'next-auth';
+import 'next-auth/react';
+
+declare module 'next-auth' {
+  interface Session {
+    user: {
+      id?: string;
+      name?: string | null;
+      email?: string | null;
+      image?: string | null;
+      role?: string;
+      [key: string]: any;
+    };
+  }
+  interface User {
+    id?: string;
+    role?: string;
+    [key: string]: any;
+  }
+}
+
+declare module 'next-auth/react' {
+  interface SignInResponse {
+    user?: {
+      id?: string;
+      name?: string | null;
+      email?: string | null;
+      image?: string | null;
+      role?: string;
+      [key: string]: any;
+    };
+  }
+}
+"#;
+            let _ = std::fs::write(&dts_path, dts_content);
+        }
+    }
 
     if tsconfig_path.exists() {
         let mut needs_write = false;
@@ -3428,27 +3526,48 @@ pub fn ensure_valid_tsconfig(proj_dir: &std::path::Path) {
                         co.insert("baseUrl".to_string(), serde_json::json!("."));
                         needs_write = true;
                     }
-                    let has_alias = co.get("paths")
+                    let has_expected_aliases = co
+                        .get("paths")
                         .and_then(|p| p.get("@/*"))
                         .and_then(|a| a.as_array())
                         .map_or(false, |arr| {
-                            arr.iter().any(|x| {
-                                let s = x.as_str().unwrap_or("");
-                                if has_root_app_layout {
-                                    s == "./*" || s == "*"
-                                } else {
-                                    s == "./src/*" || s == "src/*"
-                                }
-                            })
+                            expected_alias_targets
+                                .iter()
+                                .all(|exp| arr.iter().any(|x| x.as_str() == Some(*exp)))
                         });
-                    if !has_alias {
+                    if !has_expected_aliases {
                         let paths = co.entry("paths").or_insert_with(|| serde_json::json!({}));
                         if let Some(paths_obj) = paths.as_object_mut() {
-                            paths_obj.insert("@/*".to_string(), serde_json::json!([expected_alias_target]));
+                            paths_obj.insert("@/*".to_string(), serde_json::json!(expected_alias_targets));
                             needs_write = true;
                         }
                     }
-                    parsed_val = Some(val);
+                }
+                if let Some(root_obj) = val.as_object_mut() {
+                    if root_obj.remove("files").is_some() {
+                        needs_write = true;
+                    }
+                    let has_valid_include = root_obj
+                        .get("include")
+                        .and_then(|inc| inc.as_array())
+                        .map_or(false, |arr| {
+                            arr.iter().any(|x| x.as_str() == Some("**/*.ts"))
+                                && arr.iter().any(|x| x.as_str() == Some("**/*.tsx"))
+                        });
+                    if !has_valid_include {
+                        root_obj.insert(
+                            "include".to_string(),
+                            serde_json::json!(["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"]),
+                        );
+                        needs_write = true;
+                    }
+                    if !root_obj.contains_key("exclude") {
+                        root_obj.insert("exclude".to_string(), serde_json::json!(["node_modules"]));
+                        needs_write = true;
+                    }
+                    if root_obj.contains_key("compilerOptions") {
+                        parsed_val = Some(val);
+                    }
                 }
             }
         }
@@ -3481,7 +3600,7 @@ pub fn ensure_valid_tsconfig(proj_dir: &std::path::Path) {
                         }
                     ],
                     "paths": {
-                        "@/*": [expected_alias_target]
+                        "@/*": expected_alias_targets
                     }
                 },
                 "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
@@ -5874,17 +5993,11 @@ export default function Home() {
             }
         }
 
-        // Safe default parameter for custom hooks with destructured object props:
-        // `const useTasks = ({ boardId }: UseTasksProps)` -> `const useTasks = ({ boardId }: UseTasksProps = {} as any)`
-        if !is_app_router_route_file(&normalized_path) && (normalized_path.contains("/hooks/") || normalized_path.starts_with("hooks/")) && processed.contains("({") {
-            if let Ok(re) = regex::Regex::new(r"(const\s+use\w+\s*=\s*\(\s*\{[^}]+\}\s*:\s*\w+)(\s*\))") {
-                processed = re.replace_all(&processed, "$1 = {} as any$2").to_string();
-            }
-            if let Ok(re) = regex::Regex::new(r"(function\s+use\w+\s*\(\s*\{[^}]+\}\s*:\s*\w+)(\s*\))") {
-                processed = re.replace_all(&processed, "$1 = {} as any$2").to_string();
-            }
-        }
+        // Safe default parameter for custom hooks with destructured object props
+        // (supports both named Prop types and inline object types `{ userId: string; ... }`):
+        processed = sanitize_hook_destructured_param_defaults(&processed, &normalized_path);
         processed = ensure_hook_type_exports(&processed, &normalized_path);
+        processed = ensure_common_formatting_helpers(&processed, &normalized_path);
 
         processed = sanitize_optional_user_password_access(&processed);
         processed = sanitize_try_catch_body_scope(&processed);
@@ -8346,6 +8459,26 @@ pub fn ensure_hook_type_exports(content: &str, rel_path: &str) -> String {
         }
         let Some(name_m) = cap.get(3) else { continue };
         let sym = name_m.as_str();
+        // Never auto-export generic parameter/return type names from individual hooks (causes TS2308 in hooks/index.ts barrel)
+        if matches!(
+            sym,
+            "HookOptions"
+                | "Options"
+                | "Props"
+                | "HookProps"
+                | "State"
+                | "HookState"
+                | "Params"
+                | "HookParams"
+                | "Config"
+                | "HookConfig"
+                | "Result"
+                | "HookResult"
+                | "Return"
+                | "HookReturn"
+        ) {
+            continue;
+        }
         // Promote if used inside an export line OR if there is no `export interface <sym>` / `export type <sym>` anywhere yet
         let already_exported = content.contains(&format!("export interface {}", sym))
             || content.contains(&format!("export type {}", sym));
@@ -8447,3 +8580,762 @@ pub fn sanitize_root_layout_missing_children(content: &str, rel_path: &str, allo
     }
     out
 }
+
+/// Ensures custom React hooks (`src/hooks/use*.ts(x)`) that take a single destructured
+/// object parameter (`const useX = ({ a, b }: { a: string; b: Foo[] }) => ...` or
+/// `function useX({ a }: Props)`) have a `= {} as any` default parameter so callers
+/// invoking `useX()` with zero arguments neither fail `TS2554` nor throw at runtime
+/// with `Cannot destructure property '...' of 'undefined'`.
+pub fn sanitize_hook_destructured_param_defaults(content: &str, rel_path: &str) -> String {
+    let norm = rel_path.replace('\\', "/").to_lowercase();
+    let is_hook_file = !is_app_router_route_file(rel_path)
+        && (norm.contains("/hooks/") || norm.starts_with("hooks/"));
+    if !is_hook_file || !content.contains('{') || !content.contains("use") {
+        return content.to_string();
+    }
+
+    let Ok(sig_re) = regex::Regex::new(
+        r"(?:const\s+use[A-Za-z0-9_]*\s*=\s*(?:async\s+)?\(|(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+use[A-Za-z0-9_]*\s*\()",
+    ) else {
+        return content.to_string();
+    };
+
+    let bytes = content.as_bytes();
+    let mut insertions: Vec<usize> = Vec::new();
+
+    for m in sig_re.find_iter(content) {
+        let mut idx = m.end();
+        while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+        if idx >= bytes.len() || bytes[idx] != b'{' {
+            continue;
+        }
+
+        // Balance outer `{ ... }` destructuring pattern
+        let mut brace_depth = 0usize;
+        let mut paren_depth = 0usize;
+        let mut angle_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut in_sq = false;
+        let mut in_dq = false;
+        let mut in_bt = false;
+        let mut escaped = false;
+
+        let mut i = idx;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if escaped {
+                escaped = false;
+                i += 1;
+                continue;
+            }
+            if b == b'\\' && (in_sq || in_dq || in_bt) {
+                escaped = true;
+                i += 1;
+                continue;
+            }
+            if b == b'\'' && !in_dq && !in_bt {
+                in_sq = !in_sq;
+            } else if b == b'"' && !in_sq && !in_bt {
+                in_dq = !in_dq;
+            } else if b == b'`' && !in_sq && !in_dq {
+                in_bt = !in_bt;
+            } else if !in_sq && !in_dq && !in_bt {
+                if b == b'{' {
+                    brace_depth += 1;
+                } else if b == b'}' {
+                    brace_depth = brace_depth.saturating_sub(1);
+                    if brace_depth == 0 {
+                        i += 1;
+                        break;
+                    }
+                }
+            }
+            i += 1;
+        }
+        if brace_depth != 0 {
+            continue;
+        }
+
+        // Scan optional `: <type>` up to top-level `)` (abort if `=` or `,` at param top level)
+        let mut saw_default_or_second_param = false;
+        let mut close_paren_pos: Option<usize> = None;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if escaped {
+                escaped = false;
+                i += 1;
+                continue;
+            }
+            if b == b'\\' && (in_sq || in_dq || in_bt) {
+                escaped = true;
+                i += 1;
+                continue;
+            }
+            if b == b'\'' && !in_dq && !in_bt {
+                in_sq = !in_sq;
+            } else if b == b'"' && !in_sq && !in_bt {
+                in_dq = !in_dq;
+            } else if b == b'`' && !in_sq && !in_dq {
+                in_bt = !in_bt;
+            } else if !in_sq && !in_dq && !in_bt {
+                match b {
+                    b'{' => brace_depth += 1,
+                    b'}' => brace_depth = brace_depth.saturating_sub(1),
+                    b'(' => paren_depth += 1,
+                    b')' => {
+                        if paren_depth == 0 && brace_depth == 0 && bracket_depth == 0 {
+                            close_paren_pos = Some(i);
+                            break;
+                        }
+                        paren_depth = paren_depth.saturating_sub(1);
+                    }
+                    b'<' => angle_depth += 1,
+                    b'>' => {
+                        if i > 0 && bytes[i - 1] != b'=' {
+                            angle_depth = angle_depth.saturating_sub(1);
+                        }
+                    }
+                    b'[' => bracket_depth += 1,
+                    b']' => bracket_depth = bracket_depth.saturating_sub(1),
+                    b'=' | b',' if brace_depth == 0 && paren_depth == 0 && bracket_depth == 0 && angle_depth == 0 => {
+                        saw_default_or_second_param = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+
+        if !saw_default_or_second_param {
+            if let Some(pos) = close_paren_pos {
+                insertions.push(pos);
+            }
+        }
+    }
+
+    if insertions.is_empty() {
+        return content.to_string();
+    }
+
+    let mut out = content.to_string();
+    for pos in insertions.into_iter().rev() {
+        out.insert_str(pos, " = {} as any");
+    }
+    out
+}
+
+/// Scans `src/` for callers destructuring `error` from a local `useX(...)` hook and
+/// ensures any `src/hooks/use*.ts(x)` file that infers `{ data, isLoading }` (without an
+/// explicit return type annotation or an `error` property) includes `error: null as string | null`.
+pub fn reconcile_hook_error_returns_in_project(proj_dir: &std::path::Path) {
+    let src_dir = if proj_dir.join("src").is_dir() {
+        proj_dir.join("src")
+    } else {
+        proj_dir.to_path_buf()
+    };
+    if !src_dir.is_dir() {
+        return;
+    }
+
+    let Ok(caller_re) = regex::Regex::new(r"\{[^}]*\berror(?:\s*:\s*[A-Za-z0-9_$]+)?[^}]*\}\s*=\s*(use[A-Z][A-Za-z0-9_]*)\s*\(") else {
+        return;
+    };
+
+    let mut demanded_hooks: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stack = vec![src_dir.clone()];
+    let mut hook_files: Vec<std::path::PathBuf> = Vec::new();
+
+    while let Some(dir) = stack.pop() {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if p.is_dir() {
+                    if !matches!(name, "node_modules" | ".next" | ".git" | ".axiom" | "prisma") {
+                        stack.push(p);
+                    }
+                } else if p.is_file() {
+                    let lower = name.to_lowercase();
+                    if lower.ends_with(".ts") || lower.ends_with(".tsx") || lower.ends_with(".js") || lower.ends_with(".jsx") {
+                        let norm = p.to_string_lossy().replace('\\', "/").to_lowercase();
+                        if norm.contains("/hooks/") {
+                            hook_files.push(p.clone());
+                        }
+                        if let Ok(text) = std::fs::read_to_string(&p) {
+                            for cap in caller_re.captures_iter(&text) {
+                                if let Some(h) = cap.get(1) {
+                                    demanded_hooks.insert(h.as_str().to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if demanded_hooks.is_empty() || hook_files.is_empty() {
+        return;
+    }
+
+    let Ok(return_obj_re) = regex::Regex::new(r"(return\s*\{)([^}]*)(\}\s*;?)") else {
+        return;
+    };
+    let Ok(explicit_ret_re) = regex::Regex::new(r"\)\s*:\s*[A-Za-z{][^\n=]*=>") else {
+        return;
+    };
+
+    for hf in hook_files {
+        let Ok(content) = std::fs::read_to_string(&hf) else {
+            continue;
+        };
+        let defines_demanded = demanded_hooks.iter().any(|h| content.contains(h));
+        if !defines_demanded || explicit_ret_re.is_match(&content) {
+            continue;
+        }
+        let next = return_obj_re
+            .replace_all(&content, |caps: &regex::Captures| {
+                let body = &caps[2];
+                let has_data_or_loading = body.contains("data") || body.contains("isLoading") || body.contains("loading");
+                let already_has_error = body.split(',').any(|seg| {
+                    let k = seg.split(':').next().unwrap_or("").trim();
+                    k == "error"
+                });
+                if !has_data_or_loading || already_has_error {
+                    return caps[0].to_string();
+                }
+                let trimmed_end = body.trim_end();
+                let sep = if trimmed_end.ends_with(',') || trimmed_end.is_empty() {
+                    ""
+                } else {
+                    ","
+                };
+                let suffix_ws = &body[trimmed_end.len()..];
+                format!(
+                    "{}{}{} error: null as string | null{}{}",
+                    &caps[1], trimmed_end, sep, suffix_ws, &caps[3]
+                )
+            })
+            .to_string();
+
+        if next != content {
+            let _ = std::fs::write(&hf, next);
+        }
+    }
+}
+
+///Injects safe local `formatCurrency` and/or `formatDate` helpers when a `.tsx`/`.ts` file calls
+/// `formatCurrency(...)` or `formatDate(...)` without importing or declaring them (`TS2304`).
+pub fn ensure_common_formatting_helpers(content: &str, rel_path: &str) -> String {
+    let norm = rel_path.replace('\\', "/").to_lowercase();
+    if norm.ends_with(".d.ts")
+        || !(norm.ends_with(".tsx") || norm.ends_with(".ts") || norm.ends_with(".jsx") || norm.ends_with(".js"))
+    {
+        return content.to_string();
+    }
+
+    let mut helpers_to_inject: Vec<&str> = Vec::new();
+
+    if content.contains("formatCurrency(") {
+        let already_declared = regex::Regex::new(
+            r"(?:function\s+formatCurrency\b|(?:const|let|var)\s+formatCurrency\b|import\s*\{[^}]*\bformatCurrency\b)",
+        )
+        .map(|r| r.is_match(content))
+        .unwrap_or(true);
+        if !already_declared {
+            helpers_to_inject.push(
+                "const formatCurrency = (amount: number | string = 0): string => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(Number(amount) || 0);",
+            );
+        }
+    }
+
+    if content.contains("formatDate(") {
+        let already_declared = regex::Regex::new(
+            r"(?:function\s+formatDate\b|(?:const|let|var)\s+formatDate\b|import\s*\{[^}]*\bformatDate\b)",
+        )
+        .map(|r| r.is_match(content))
+        .unwrap_or(true);
+        if !already_declared {
+            helpers_to_inject.push(
+                "const formatDate = (value: string | number | Date = new Date()): string => { const d = value instanceof Date ? value : new Date(value); return Number.isNaN(d.getTime()) ? String(value ?? '') : d.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }); };",
+            );
+        }
+    }
+
+    if helpers_to_inject.is_empty() {
+        return content.to_string();
+    }
+
+    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+    let mut insert_idx = 0usize;
+    for (idx, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t == "\"use client\";"
+            || t == "'use client';"
+            || t == "\"use client\""
+            || t == "'use client'"
+            || t.starts_with("import ")
+        {
+            insert_idx = idx + 1;
+        } else if !t.is_empty() && !t.starts_with("//") {
+            break;
+        }
+    }
+    for h in helpers_to_inject.into_iter().rev() {
+        lines.insert(insert_idx, h.to_string());
+    }
+    let mut out = lines.join("\n");
+    if content.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Truncates runaway LLM import repetition loops (e.g. an 8-line block of `import ...` repeated 4+ times
+/// until token exhaustion leaves a trailing cut-off line like `import { use`).
+pub fn sanitize_truncated_import_repetition_loop(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() < 12 {
+        return content.to_string();
+    }
+
+    let mut seen_imports: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut kept_lines: Vec<String> = Vec::new();
+    let mut duplicate_import_streak = 0usize;
+    let mut had_runaway_loop = false;
+
+    for (idx, &raw_line) in lines.iter().enumerate() {
+        let trimmed = raw_line.trim();
+        let is_last = idx + 1 == lines.len();
+
+        // Drop a trailing truncated import line at EOF (e.g. `import { use` or `import React from`)
+        if is_last
+            && trimmed.starts_with("import ")
+            && !trimmed.ends_with(';')
+            && !trimmed.ends_with('\'')
+            && !trimmed.ends_with('"')
+        {
+            had_runaway_loop = true;
+            continue;
+        }
+
+        if trimmed.starts_with("import ") && (trimmed.contains(" from ") || trimmed.ends_with(';')) {
+            let norm_key = trimmed.trim_end_matches(';').trim().to_string();
+            if !seen_imports.insert(norm_key) {
+                duplicate_import_streak += 1;
+                if duplicate_import_streak >= 2 {
+                    had_runaway_loop = true;
+                }
+                continue;
+            } else {
+                duplicate_import_streak = 0;
+            }
+        } else if !trimmed.is_empty() {
+            duplicate_import_streak = 0;
+        }
+
+        kept_lines.push(raw_line.to_string());
+    }
+
+    if !had_runaway_loop {
+        return content.to_string();
+    }
+
+    // If the file consisted ONLY of imports (because the LLM exhausted max_tokens repeating imports),
+    // append a safe default component export so Next.js / Electron / React Native can still mount it.
+    let has_any_export = kept_lines
+        .iter()
+        .any(|l| l.trim_start().starts_with("export "));
+    if !has_any_export {
+        kept_lines.push(String::new());
+        kept_lines.push("export default function AxiomRecoveredComponent() {".to_string());
+        kept_lines.push("  return <div className=\"p-6\">Loaded</div>;".to_string());
+        kept_lines.push("}".to_string());
+    }
+
+    let mut out = kept_lines.join("\n");
+    if content.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Converts `const body = ...` to `let body = ...` when the same file reassigns `body = ...` (`TS2588`).
+pub fn sanitize_const_body_reassignment(content: &str) -> String {
+    if !content.contains("const body") {
+        return content.to_string();
+    }
+    let has_reassignment = regex::Regex::new(r"(?m)^\s*body\s*=\s*[^=]")
+        .map(|r| r.is_match(content))
+        .unwrap_or(false);
+    if !has_reassignment {
+        return content.to_string();
+    }
+    if let Ok(decl_re) = regex::Regex::new(r"(?m)^(\s*)const(\s+body\b)") {
+        return decl_re.replace_all(content, "${1}let${2}").to_string();
+    }
+    content.to_string()
+}
+
+/// Replaces hallucinated `z.number().float()` with valid Zod `z.number()`,
+/// replaces hallucinated `Stripe.Connect` type references with `Stripe.Account`,
+/// and widens custom `useToast` `const toast = (` definitions to support `.success`/`.error` calls.
+pub fn sanitize_zod_number_float(content: &str) -> String {
+    let mut out = content.to_string();
+    if out.contains(".float()") {
+        out = out.replace(".float()", "");
+    }
+    if out.contains("Stripe.Connect") {
+        out = out.replace("Stripe.Connect", "Stripe.Account");
+    }
+    if out.contains("useToast") && out.contains("const toast = (") && !out.contains("toast.success") {
+        out = out.replace("const toast = (", "const toast: any = Object.assign((");
+        // If we opened `Object.assign((`, simpler & safer: just widen `const toast: any = (` and attach methods before `return {`
+        out = out.replace("const toast: any = Object.assign((", "const toast: any = (");
+        if let Some(ret_pos) = out.rfind("return {") {
+            let attach = "if (typeof toast === 'function' && !toast.success) { Object.assign(toast, { success: (m?: any, o?: any) => toast(typeof m === 'string' ? { title: m, ...o } : m), error: (m?: any, o?: any) => toast(typeof m === 'string' ? { title: m, variant: 'destructive', ...o } : m), info: (m?: any, o?: any) => toast(typeof m === 'string' ? { title: m, ...o } : m), warning: (m?: any, o?: any) => toast(typeof m === 'string' ? { title: m, ...o } : m), warn: (m?: any, o?: any) => toast(typeof m === 'string' ? { title: m, ...o } : m), loading: (m?: any, o?: any) => toast(typeof m === 'string' ? { title: m, ...o } : m), dismiss: () => {} }); }\n  ";
+            out.insert_str(ret_pos, attach);
+        }
+    }
+    out
+}
+
+/// Hoists top-level `export enum Foo { ... }` / `enum Foo { ... }` declarations above top-level
+/// `const` / `let` / `function` declarations when the enum is referenced as a runtime value earlier
+/// in the same file (`TS2450: Enum '...' used before its declaration`).
+pub fn hoist_enums_before_usage(content: &str) -> String {
+    if !content.contains("enum ") {
+        return content.to_string();
+    }
+    let Ok(enum_re) = regex::Regex::new(r"(?ms)^[ \t]*(?:export\s+)?enum\s+([A-Z][A-Za-z0-9_]*)\s*\{[^}]*\}[ \t]*\r?\n?") else {
+        return content.to_string();
+    };
+
+    let mut matches: Vec<(String, usize, usize, String)> = Vec::new();
+    for cap in enum_re.captures_iter(content) {
+        let Some(m) = cap.get(0) else { continue };
+        let Some(name_m) = cap.get(1) else { continue };
+        let enum_name = name_m.as_str().to_string();
+        let prefix = &content[..m.start()];
+        let usage_pat = format!(r"\b{}\.", regex::escape(&enum_name));
+        let used_before = regex::Regex::new(&usage_pat)
+            .map(|r| r.is_match(prefix))
+            .unwrap_or(false);
+        if used_before {
+            matches.push((enum_name, m.start(), m.end(), m.as_str().to_string()));
+        }
+    }
+
+    if matches.is_empty() {
+        return content.to_string();
+    }
+
+    // Remove matched enum blocks from bottom to top, then insert them right after the import block
+    let mut stripped = content.to_string();
+    for (_, start, end, _) in matches.iter().rev() {
+        stripped.replace_range(*start..*end, "");
+    }
+
+    let mut enum_bundle = String::new();
+    for (_, _, _, block) in &matches {
+        enum_bundle.push_str(block.trim_end());
+        enum_bundle.push_str("\n\n");
+    }
+
+    let lines: Vec<&str> = stripped.lines().collect();
+    let mut insert_line_idx = 0usize;
+    let mut in_multiline_import = false;
+    for (idx, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if in_multiline_import {
+            insert_line_idx = idx + 1;
+            if t.contains("from ") || t.ends_with(';') {
+                in_multiline_import = false;
+            }
+            continue;
+        }
+        if t == "\"use client\";"
+            || t == "'use client';"
+            || t == "\"use client\""
+            || t == "'use client'"
+            || t.starts_with("import ")
+        {
+            insert_line_idx = idx + 1;
+            if t.starts_with("import ") && !t.contains("from ") && !t.ends_with(';') && !t.ends_with('\'') && !t.ends_with('"') {
+                in_multiline_import = true;
+            }
+        } else if !t.is_empty() && !t.starts_with("//") {
+            break;
+        }
+    }
+
+    let mut out_lines: Vec<String> = lines.iter().map(|s| (*s).to_string()).collect();
+    out_lines.insert(insert_line_idx, enum_bundle.trim_end().to_string());
+    let mut out = out_lines.join("\n");
+    if content.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Removes imported specifiers that collide with a local top-level declaration of the same name
+/// in the same file (`TS2440: Import declaration conflicts with local declaration of '...'`).
+pub fn strip_self_conflicting_local_imports(content: &str) -> String {
+    if !content.contains("import ") {
+        return content.to_string();
+    }
+
+    let Ok(local_decl_re) = regex::Regex::new(
+        r"(?m)^[ \t]*(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|const|let|var|class|interface|type|enum)\s+([A-Za-z_$][A-Za-z0-9_$]*)\b",
+    ) else {
+        return content.to_string();
+    };
+
+    let mut local_decls: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for cap in local_decl_re.captures_iter(content) {
+        if let Some(m) = cap.get(1) {
+            local_decls.insert(m.as_str().to_string());
+        }
+    }
+    if local_decls.is_empty() {
+        return content.to_string();
+    }
+
+    let Ok(named_imp_re) = regex::Regex::new(
+        r#"(?m)^([ \t]*import\s+(?:type\s+)?)\{([^}]+)\}(\s+from\s+['"][^'"]+['"][ \t]*;?[ \t]*\r?\n?)"#,
+    ) else {
+        return content.to_string();
+    };
+
+    let next = named_imp_re
+        .replace_all(content, |caps: &regex::Captures| {
+            let prefix = &caps[1];
+            let inner = &caps[2];
+            let suffix = &caps[3];
+            let mut kept: Vec<String> = Vec::new();
+            let mut changed = false;
+            for part in inner.split(',') {
+                let t = part.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                let clean = t.trim_start_matches("type ").trim();
+                let local_name = if let Some((_, alias)) = clean.split_once(" as ") {
+                    alias.trim()
+                } else {
+                    clean
+                };
+                if local_decls.contains(local_name) {
+                    changed = true;
+                } else {
+                    kept.push(t.to_string());
+                }
+            }
+            if !changed {
+                return caps[0].to_string();
+            }
+            if kept.is_empty() {
+                String::new()
+            } else {
+                format!("{}{{ {} }}{}", prefix, kept.join(", "), suffix)
+            }
+        })
+        .to_string();
+
+    next
+}
+
+/// Rewrites legacy `openai@3` (`Configuration`, `OpenAIApi`, `createChatCompletion`, `createCompletion`)
+/// usage to `openai@4` (`import OpenAI from 'openai'`, `new OpenAI({ apiKey })`, `openai.chat.completions.create`)
+/// so projects with `openai@^4.x` compile without `TS2305` errors.
+pub fn sanitize_openai_v3_to_v4(content: &str) -> String {
+    if !content.contains("OpenAIApi") && !content.contains("Configuration") {
+        return content.to_string();
+    }
+    if !content.contains("'openai'") && !content.contains("\"openai\"") {
+        return content.to_string();
+    }
+
+    let mut out = content.to_string();
+    if let Ok(imp_re) = regex::Regex::new(
+        r#"(?m)^[ \t]*import\s*\{[^}]*\b(?:Configuration|OpenAIApi)\b[^}]*\}\s*from\s*['"]openai['"]\s*;?"#,
+    ) {
+        out = imp_re.replace_all(&out, "import OpenAI from 'openai';").to_string();
+    }
+    if let Ok(cfg_re) = regex::Regex::new(
+        r"(?s)(?:const|let|var)\s+[A-Za-z0-9_$]+\s*=\s*new\s+Configuration\s*\(\s*(\{[^)]*\})\s*\)\s*;?\s*(?:const|let|var)\s+([A-Za-z0-9_$]+)\s*=\s*new\s+OpenAIApi\s*\(\s*[A-Za-z0-9_$]+\s*\)\s*;?",
+    ) {
+        out = cfg_re.replace_all(&out, "const $2 = new OpenAI($1);").to_string();
+    }
+    if let Ok(api_re) = regex::Regex::new(r"\bnew\s+OpenAIApi\s*\(\s*new\s+Configuration\s*\(([^)]*)\)\s*\)") {
+        out = api_re.replace_all(&out, "new OpenAI($1)").to_string();
+    }
+    out = out.replace(".createChatCompletion(", ".chat.completions.create(");
+    out = out.replace(".createCompletion(", ".completions.create(");
+    out
+}
+
+/// Repairs `tailwind.config.js` / `tailwind.config.ts` when an LLM overrides standard Tailwind
+/// color scales (`gray`, `slate`, `zinc`, `neutral`, `stone`, `red`, `blue`, `green`, `indigo`,
+/// `purple`, `emerald`, `amber`, `yellow`, `teal`, `cyan`, `sky`, `rose`, `pink`, `orange`, `violet`)
+/// with a flat hex string (e.g. `gray: '#7f8c8d'`), which breaks `@apply bg-gray-100` in `globals.css`.
+/// Also ensures `./app/**/*.{js,ts,jsx,tsx,mdx}` and `./components/**/*.{js,ts,jsx,tsx,mdx}` are in `content`.
+pub fn sanitize_tailwind_config_in_project(proj_dir: &std::path::Path) {
+    for fname in ["tailwind.config.js", "tailwind.config.ts", "tailwind.config.mjs"] {
+        let p = proj_dir.join(fname);
+        if !p.is_file() {
+            continue;
+        }
+        let Ok(original) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        let mut next = original.clone();
+
+        // Remove flat string overrides of built-in Tailwind scale names (e.g. `gray: '#7f8c8d',`)
+        if let Ok(flat_scale_re) = regex::Regex::new(
+            r#"(?m)^[ \t]*['"]?(?:gray|slate|zinc|neutral|stone|red|blue|green|indigo|purple|emerald|amber|yellow|teal|cyan|sky|rose|pink|orange|violet)['"]?\s*:\s*['"]#[0-9a-fA-F]{3,8}['"]\s*,?[ \t]*\r?\n?"#,
+        ) {
+            next = flat_scale_re.replace_all(&next, "").to_string();
+        }
+
+        // Ensure content globs include both `./src/...` and root `./app/...`, `./components/...`
+        if next.contains("./src/app/**/*.{js,ts,jsx,tsx,mdx}")
+            && !next.contains("./app/**/*.{js,ts,jsx,tsx,mdx}")
+        {
+            next = next.replace(
+                "\"./src/app/**/*.{js,ts,jsx,tsx,mdx}\"",
+                "\"./src/app/**/*.{js,ts,jsx,tsx,mdx}\", \"./app/**/*.{js,ts,jsx,tsx,mdx}\", \"./components/**/*.{js,ts,jsx,tsx,mdx}\"",
+            );
+            next = next.replace(
+                "'./src/app/**/*.{js,ts,jsx,tsx,mdx}'",
+                "'./src/app/**/*.{js,ts,jsx,tsx,mdx}', './app/**/*.{js,ts,jsx,tsx,mdx}', './components/**/*.{js,ts,jsx,tsx,mdx}'",
+            );
+        }
+
+        if next != original {
+            let _ = std::fs::write(&p, next);
+        }
+    }
+}
+
+/// Bridges Desktop (Electron `src/renderer/App.tsx`) and Mobile (Expo / React Native root `app/` routes)
+/// into Next.js App Router (`src/app/page.tsx`, `src/app/layout.tsx`, `src/app/globals.css`) when
+/// `src/app/` exists without a root `src/app/page.tsx`, eliminating the initial-load `404` page in
+/// Desktop and Mobile projects!
+pub fn ensure_multiplatform_entry_routes_bridged(proj_dir: &std::path::Path) {
+    let src_app = proj_dir.join("src/app");
+    if !src_app.is_dir() && !proj_dir.join("src/renderer").is_dir() && !proj_dir.join("app").is_dir() {
+        return;
+    }
+
+    // If `src/app` exists (or `src/renderer` exists in an Electron project), Next.js uses `src/app`
+    // as the App Router root and ignores top-level `app/`.
+    let uses_src_app = src_app.is_dir() || proj_dir.join("src/renderer").is_dir();
+    if !uses_src_app {
+        return;
+    }
+
+    let _ = std::fs::create_dir_all(&src_app);
+
+    let globals_css = src_app.join("globals.css");
+    if !globals_css.exists() {
+        let _ = std::fs::write(
+            &globals_css,
+            "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n",
+        );
+    }
+
+    let layout_tsx = src_app.join("layout.tsx");
+    if !layout_tsx.exists() && !src_app.join("layout.jsx").exists() {
+        let layout_code = r#"import './globals.css';
+import React from 'react';
+
+export const metadata = {
+  title: 'Axiom Application',
+  description: 'Generated by Axiom Forge',
+};
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en">
+      <body className="min-h-screen bg-slate-950 text-slate-50 antialiased">
+        <main className="min-h-screen flex flex-col">{children}</main>
+      </body>
+    </html>
+  );
+}
+"#;
+        let _ = std::fs::write(&layout_tsx, layout_code);
+    }
+
+    let page_tsx = src_app.join("page.tsx");
+    let has_root_page = page_tsx.exists()
+        || src_app.join("page.jsx").exists()
+        || src_app.join("page.ts").exists()
+        || src_app.join("page.js").exists();
+
+    if !has_root_page {
+        if proj_dir.join("src/renderer/App.tsx").exists() || proj_dir.join("src/renderer/App.jsx").exists() {
+            // Desktop Electron project: mount `src/renderer/App` at `/`
+            let bridge_code = "\"use client\";\nimport React from 'react';\nimport App from '@/renderer/App';\n\nexport default function ElectronRootPage() {\n  return <App />;\n}\n";
+            let _ = std::fs::write(&page_tsx, bridge_code);
+        } else if proj_dir.join("app/(tabs)/index.tsx").exists() {
+            // Mobile Expo Router project with `app/(tabs)/index.tsx`
+            let bridge_code = "\"use client\";\nimport React from 'react';\nimport MobileTabsIndex from '../../app/(tabs)/index';\n\nexport default function MobileRootPage() {\n  return <MobileTabsIndex />;\n}\n";
+            let _ = std::fs::write(&page_tsx, bridge_code);
+        } else if proj_dir.join("app/index.tsx").exists() {
+            let bridge_code = "\"use client\";\nimport React from 'react';\nimport MobileIndex from '../../app/index';\n\nexport default function MobileRootPage() {\n  return <MobileIndex />;\n}\n";
+            let _ = std::fs::write(&page_tsx, bridge_code);
+        } else if proj_dir.join("app/dashboard.tsx").exists() {
+            let bridge_code = "\"use client\";\nimport React from 'react';\nimport MobileDashboard from '../../app/dashboard';\n\nexport default function MobileRootPage() {\n  return <MobileDashboard />;\n}\n";
+            let _ = std::fs::write(&page_tsx, bridge_code);
+        }
+    }
+
+    // Also bridge flat Expo Router routes (`app/dashboard.tsx`, `app/settings.tsx`, `app/(tabs)/*.tsx`)
+    // into `src/app/<route>/page.tsx` so navigating to `/dashboard` or `/settings` in Web Preview works!
+    for rel_dir in ["app", "app/(tabs)"] {
+        let dir = proj_dir.join(rel_dir);
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+            let Some(fname) = p.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !fname.ends_with(".tsx") && !fname.ends_with(".jsx") {
+                continue;
+            }
+            let stem = fname.trim_end_matches(".tsx").trim_end_matches(".jsx");
+            if stem.starts_with('_') || stem == "index" || stem == "layout" || stem == "page" {
+                continue;
+            }
+            let target_route_dir = src_app.join(stem);
+            let target_page = target_route_dir.join("page.tsx");
+            if !target_page.exists() {
+                let _ = std::fs::create_dir_all(&target_route_dir);
+                let import_rel = if rel_dir == "app" {
+                    format!("../../../app/{}", stem)
+                } else {
+                    format!("../../../app/(tabs)/{}", stem)
+                };
+                let bridge = format!(
+                    "\"use client\";\nimport React from 'react';\nimport Screen from '{}';\n\nexport default function BridgedRoutePage() {{\n  return <Screen />;\n}}\n",
+                    import_rel
+                );
+                let _ = std::fs::write(&target_page, bridge);
+            }
+        }
+    }
+}
+

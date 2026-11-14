@@ -14,29 +14,28 @@ pub fn detect_infinite_loop(content: &str) -> bool {
         }
     }
 
-    // 2. Check line block repetition (e.g. repeating a block of 1-5 lines 5 times)
+    // 2. Check line block repetition (e.g. repeating a block of 1-12 lines)
     let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
     let n = lines.len();
-    for block_size in 1..=5 {
-        if n >= block_size * 5 {
+    for block_size in 1..=12 {
+        let required_repeats = if block_size >= 6 { 4 } else { 5 };
+        if n >= block_size * required_repeats {
             let mut is_loop = true;
             for i in 0..block_size {
                 let idx_curr = n - block_size + i;
-                let idx_prev1 = n - 2 * block_size + i;
-                let idx_prev2 = n - 3 * block_size + i;
-                let idx_prev3 = n - 4 * block_size + i;
-                let idx_prev4 = n - 5 * block_size + i;
-                if lines[idx_curr] != lines[idx_prev1]
-                    || lines[idx_curr] != lines[idx_prev2]
-                    || lines[idx_curr] != lines[idx_prev3]
-                    || lines[idx_curr] != lines[idx_prev4]
-                {
-                    is_loop = false;
+                for rep in 1..required_repeats {
+                    let idx_prev = n - (rep + 1) * block_size + i;
+                    if lines[idx_curr] != lines[idx_prev] {
+                        is_loop = false;
+                        break;
+                    }
+                }
+                if !is_loop {
                     break;
                 }
             }
             if is_loop {
-                let block_content: String = lines[n-block_size..n].join(" ");
+                let block_content: String = lines[n - block_size..n].join(" ");
                 let trimmed = block_content.trim();
                 if trimmed.len() > 8 && trimmed.chars().any(|c| c.is_alphanumeric()) {
                     return true;
@@ -1116,10 +1115,18 @@ pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
                                 next = crate::sanitizer::sanitize_middleware_redundancy(&next, &rel);
                             }
                             next = crate::sanitizer::sanitize_optional_user_password_access(&next);
+                            next = crate::sanitizer::sanitize_hook_destructured_param_defaults(&next, &rel);
+                            next = crate::sanitizer::sanitize_truncated_import_repetition_loop(&next);
                             next = crate::sanitizer::ensure_hook_type_exports(&next, &rel);
+                            next = crate::sanitizer::ensure_common_formatting_helpers(&next, &rel);
                             next = crate::sanitizer::sanitize_root_layout_missing_children(&next, &rel, true);
                             next = reconcile_external_icon_imports_in_content(proj_dir, &next);
                             next = crate::sanitizer::sanitize_try_catch_body_scope(&next);
+                            next = crate::sanitizer::sanitize_const_body_reassignment(&next);
+                            next = crate::sanitizer::sanitize_zod_number_float(&next);
+                            next = crate::sanitizer::hoist_enums_before_usage(&next);
+                            next = crate::sanitizer::strip_self_conflicting_local_imports(&next);
+                            next = crate::sanitizer::sanitize_openai_v3_to_v4(&next);
                             next = crate::sanitizer::sanitize_stripe_client_init(&next);
                             next = crate::sanitizer::sanitize_tsx_ux_glitches(&next, &rel);
                             next = crate::sanitizer::reconcile_server_prisma_enum_usage(proj_dir, &rel, &next);
@@ -1137,14 +1144,17 @@ pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
         }
     }
 
+    crate::sanitizer::ensure_valid_tsconfig(proj_dir);
+    crate::sanitizer::sanitize_tailwind_config_in_project(proj_dir);
+    crate::sanitizer::ensure_multiplatform_entry_routes_bridged(proj_dir);
+
     if proj_dir.join("src").exists() {
         walk_hygiene(&proj_dir.join("src"), proj_dir);
-    } else {
-        for dir_name in ["app", "components", "hooks", "lib", "utils", "models", "types", "services", "styles"] {
-            let d = proj_dir.join(dir_name);
-            if d.is_dir() {
-                walk_hygiene(&d, proj_dir);
-            }
+    }
+    for dir_name in ["app", "components", "hooks", "lib", "utils", "models", "types", "services", "styles"] {
+        let d = proj_dir.join(dir_name);
+        if d.is_dir() {
+            walk_hygiene(&d, proj_dir);
         }
     }
     for root_candidate in ["middleware.ts", "middleware.js"] {
@@ -1162,6 +1172,8 @@ pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
     }
 
     crate::apply_ast_sanity_pass_to_project(proj_dir);
+    let _ = crate::ast_engine::reconcile_hook_contracts_in_project(proj_dir);
+    crate::sanitizer::reconcile_hook_error_returns_in_project(proj_dir);
     crate::sanitizer::ensure_ui_primitives_reconciled(proj_dir);
     crate::sanitizer::ensure_directory_barrel_files(proj_dir);
     ensure_nextauth_env_vars(proj_dir);
@@ -2156,9 +2168,6 @@ fn find_unique_local_module_for_symbol(
     sym: &str,
 ) -> Option<(String, bool)> {
     let raw_src = proj_dir.join("src");
-    let has_src = raw_src.exists();
-    let scan_root = if has_src { raw_src.clone() } else { proj_dir.to_path_buf() };
-
     let default_decl_re = regex::Regex::new(&format!(
         r#"(?m)\bexport\s+default\s+(?:async\s+)?(?:function\s+{}|class\s+{}|{};)"#,
         regex::escape(sym),
@@ -2168,7 +2177,20 @@ fn find_unique_local_module_for_symbol(
     .ok();
 
     let mut matches: Vec<(String, bool)> = Vec::new();
-    let mut stack = vec![scan_root.clone()];
+    let mut stack: Vec<std::path::PathBuf> = Vec::new();
+    if raw_src.is_dir() {
+        stack.push(raw_src.clone());
+    }
+    for root_dir in ["app", "components", "hooks", "lib", "utils", "models", "types", "services", "config"] {
+        let d = proj_dir.join(root_dir);
+        if d.is_dir() {
+            stack.push(d);
+        }
+    }
+    if stack.is_empty() {
+        stack.push(proj_dir.to_path_buf());
+    }
+
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for entry in entries.flatten() {
@@ -2195,7 +2217,11 @@ fn find_unique_local_module_for_symbol(
                             .map(|re| re.is_match(&c))
                             .unwrap_or(false);
                     if has_named || has_default_only {
-                        if let Ok(rel) = p.strip_prefix(&scan_root) {
+                        let rel_opt = p
+                            .strip_prefix(&raw_src)
+                            .ok()
+                            .or_else(|| p.strip_prefix(proj_dir).ok());
+                        if let Some(rel) = rel_opt {
                             let mut rel_str = rel.to_string_lossy().replace('\\', "/");
                             if let Some(dot_idx) = rel_str.rfind('.') {
                                 rel_str.truncate(dot_idx);
@@ -2204,9 +2230,12 @@ fn find_unique_local_module_for_symbol(
                                 rel_str = stripped.to_string();
                             }
                             if !rel_str.is_empty() {
-                                matches.push((format!("@/{}", rel_str), has_default_only));
-                                if matches.len() > 1 {
-                                    return None;
+                                let spec = format!("@/{}", rel_str);
+                                if !matches.iter().any(|(s, _)| s == &spec) {
+                                    matches.push((spec, has_default_only));
+                                    if matches.len() > 1 {
+                                        return None;
+                                    }
                                 }
                             }
                         }
@@ -2835,7 +2864,12 @@ pub fn auto_import_missing_symbols_in_content(
     if !is_jsx && !is_ts {
         return None;
     }
-    if lower.contains("/api/") && lower.ends_with("route.ts") {
+    if lower.contains("/api/") && (lower.ends_with("route.ts") || lower.ends_with("route.js")) {
+        let mut srv_content = crate::sanitizer::ensure_next_server_imports(orig_content, &lower);
+        srv_content = crate::sanitizer::reconcile_server_prisma_enum_usage(proj_dir, rel_path, &srv_content);
+        if srv_content != orig_content {
+            return Some(srv_content);
+        }
         return None;
     }
 
@@ -2945,12 +2979,11 @@ pub fn auto_import_missing_symbols_in_project(proj_dir: &std::path::Path) -> usi
 
     if proj_dir.join("src").is_dir() {
         walk_tsx(&proj_dir.join("src"), proj_dir, &mut updated);
-    } else {
-        for d_name in ["app", "components", "hooks", "lib", "pages"] {
-            let d = proj_dir.join(d_name);
-            if d.is_dir() {
-                walk_tsx(&d, proj_dir, &mut updated);
-            }
+    }
+    for d_name in ["app", "components", "hooks", "lib", "pages", "services", "models", "types", "utils"] {
+        let d = proj_dir.join(d_name);
+        if d.is_dir() {
+            walk_tsx(&d, proj_dir, &mut updated);
         }
     }
     updated
@@ -3235,7 +3268,32 @@ fn run_tsc_check(proj_dir: &std::path::Path, local_tsc_js: &std::path::Path, enr
     Ok((output.status.success() && diags.is_empty(), log, diags))
 }
 
-pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, files_list: &[Value]) -> Vec<String> {
+fn emit_self_heal_progress(
+    progress_ctx: &Option<(&tauri::Window, &str, &str)>,
+    phase: &str,
+    msg: &str,
+    progress: f64,
+) {
+    if let Some((window, task_id, project_id)) = progress_ctx {
+        use tauri::Manager;
+        let _ = window.app_handle().emit("task:progress", serde_json::json!({
+            "taskId": task_id,
+            "projectId": project_id,
+            "phase": phase,
+            "status": "generating",
+            "offlineWaiting": false,
+            "message": msg,
+            "progress": progress
+        }));
+    }
+}
+
+pub async fn perform_self_healing_loop(
+    proj_dir: &std::path::Path,
+    model: &str,
+    files_list: &[Value],
+    progress_ctx: Option<(&tauri::Window, &str, &str)>,
+) -> Vec<String> {
     let mut unresolved_warnings: Vec<String> = Vec::new();
     let has_tailwind = proj_dir.join("tailwind.config.js").exists() || proj_dir.join("tailwind.config.ts").exists();
     let is_nextjs = proj_dir.join("next.config.js").exists()
@@ -3293,12 +3351,11 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
     }
     if proj_dir.join("src").exists() {
         collect_src_candidates(&proj_dir.join("src"), proj_dir, &mut candidate_paths);
-    } else {
-        for dir_name in ["app", "components", "hooks", "lib", "utils", "models", "types", "services"] {
-            let d = proj_dir.join(dir_name);
-            if d.is_dir() {
-                collect_src_candidates(&d, proj_dir, &mut candidate_paths);
-            }
+    }
+    for dir_name in ["app", "components", "hooks", "lib", "utils", "models", "types", "services"] {
+        let d = proj_dir.join(dir_name);
+        if d.is_dir() {
+            collect_src_candidates(&d, proj_dir, &mut candidate_paths);
         }
     }
 
@@ -3348,6 +3405,17 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
         let mut stagnant_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
         for round in 1..=(MAX_TSC_ROUNDS + 1) {
+            let tsc_pct = (81.0 + ((round - 1) as f64) * 0.9).min(90.0);
+            emit_self_heal_progress(
+                &progress_ctx,
+                "compile-check",
+                &if round == 1 {
+                    "Verifying TypeScript types (Tier 1 tsc)...".to_string()
+                } else {
+                    format!("Healing TypeScript errors (round {}/{})...", round - 1, MAX_TSC_ROUNDS)
+                },
+                tsc_pct,
+            );
             let Ok((mut tsc_ok, mut tsc_log, mut diags)) = run_tsc_check(proj_dir, &local_tsc_js, &enriched_path) else {
                 break;
             };
@@ -3488,6 +3556,28 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
                     tsc_ok = fresh_ok;
                     tsc_log = fresh_log;
                     diags = fresh_diags;
+                    file_err_counts.clear();
+                    per_file_diag_lines.clear();
+                    for d in &diags {
+                        let key = resolve_project_file_candidate(proj_dir, &d.file)
+                            .unwrap_or_else(|| d.file.clone())
+                            .to_lowercase();
+                        *file_err_counts.entry(key.clone()).or_insert(0) += 1;
+                        per_file_diag_lines
+                            .entry(key)
+                            .or_default()
+                            .push(format!("Line {}, Col {}: [{}] {}", d.line, d.col, d.code, d.message));
+                    }
+                    total_errors = diags.len();
+                }
+            }
+
+            if !tsc_ok && diags.is_empty() && round == 1 {
+                crate::sanitizer::ensure_valid_tsconfig(proj_dir);
+                if let Ok((retry_ok, retry_log, retry_diags)) = run_tsc_check(proj_dir, &local_tsc_js, &enriched_path) {
+                    tsc_ok = retry_ok;
+                    tsc_log = retry_log;
+                    diags = retry_diags;
                     file_err_counts.clear();
                     per_file_diag_lines.clear();
                     for d in &diags {
@@ -3897,6 +3987,12 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
     }
 
     // Re-run fast deterministic hygiene pass before Tier 2 Next.js build
+    emit_self_heal_progress(
+        &progress_ctx,
+        "compile-check",
+        "Running pre-build static hygiene check...",
+        91.0,
+    );
     run_hygiene_pass_on_project(proj_dir);
 
     if !has_local_next {
@@ -3910,6 +4006,13 @@ pub async fn perform_self_healing_loop(proj_dir: &std::path::Path, model: &str, 
     let mut pending_fixes: Vec<PendingBuildFix> = Vec::new();
     const MAX_BUILD_REPAIRS: usize = 2;
     for attempt in 1..=(MAX_BUILD_REPAIRS + 1) {
+        let build_pct = (91.5 + ((attempt - 1) as f64) * 1.8).min(96.0);
+        emit_self_heal_progress(
+            &progress_ctx,
+            "compile-check",
+            &format!("Running Next.js production build (attempt {}/{})...", attempt, MAX_BUILD_REPAIRS + 1),
+            build_pct,
+        );
         debug_log_to_file(format!("[Self-Healing] Tier 2 Next.js build attempt {}/{}...", attempt, MAX_BUILD_REPAIRS + 1));
 
         let mut cmd = std::process::Command::new("node");
@@ -4936,15 +5039,31 @@ pub async fn run_generation_auto_test_suite(
                 }
             }
         }
-        audit_and_heal_dir(
-            &src_dir,
-            proj_dir,
-            &mut auto_healed_count,
-            &mut prose_leak_files,
-            &mut client_prisma_files,
-            &mut bare_src_import_files,
-            window,
-        );
+        if src_dir.exists() {
+            audit_and_heal_dir(
+                &src_dir,
+                proj_dir,
+                &mut auto_healed_count,
+                &mut prose_leak_files,
+                &mut client_prisma_files,
+                &mut bare_src_import_files,
+                window,
+            );
+        }
+        for root_dir in ["app", "components", "hooks", "lib", "utils", "models", "types", "services"] {
+            let d = proj_dir.join(root_dir);
+            if d.is_dir() {
+                audit_and_heal_dir(
+                    &d,
+                    proj_dir,
+                    &mut auto_healed_count,
+                    &mut prose_leak_files,
+                    &mut client_prisma_files,
+                    &mut bare_src_import_files,
+                    window,
+                );
+            }
+        }
 
         if !prose_leak_files.is_empty() {
             warnings.push(format!("detektovana proza u kodu ({})", prose_leak_files.join(", ")));
@@ -4956,10 +5075,12 @@ pub async fn run_generation_auto_test_suite(
             warnings.push(format!("nekonvertovani 'src/' importi ({})", bare_src_import_files.join(", ")));
         }
 
-        let mut remaining_missing = Vec::new();
-        collect_missing_imports(&src_dir, &src_dir, &mut remaining_missing);
-        if !remaining_missing.is_empty() {
-            warnings.push(format!("nerazrešeni lokalni importi ({})", remaining_missing.len()));
+        if src_dir.exists() {
+            let mut remaining_missing = Vec::new();
+            collect_missing_imports(&src_dir, &src_dir, &mut remaining_missing);
+            if !remaining_missing.is_empty() {
+                warnings.push(format!("nerazrešeni lokalni importi ({})", remaining_missing.len()));
+            }
         }
     }
 
@@ -4974,7 +5095,16 @@ pub async fn run_generation_auto_test_suite(
                 let enriched_path = ensure_node_toolchain_ready(None, "auto-test").await;
                 if let Ok((tsc_ok, _, diags)) = run_tsc_check(proj_dir, &local_tsc_js, &enriched_path) {
                     if !tsc_ok && !diags.is_empty() {
-                        warnings.push(format!("TypeScript provera prijavila {} grešaka", diags.len()));
+                        let sample: Vec<String> = diags
+                            .iter()
+                            .take(5)
+                            .map(|d| format!("{}:{} {}", d.file, d.line, d.code))
+                            .collect();
+                        warnings.push(format!(
+                            "TypeScript provera prijavila {} grešaka ({})",
+                            diags.len(),
+                            sample.join(" | ")
+                        ));
                     } else if tsc_ok {
                         if let Some(proj_id) = proj_dir.file_name().and_then(|n| n.to_str()) {
                             crate::katastar::complete_pending_project_repairs(
@@ -5039,7 +5169,7 @@ pub async fn run_generation_auto_test_suite(
     let _ = window.emit("orchestrator:progress", serde_json::json!({
         "phase": "auto-testing",
         "message": summary_msg,
-        "progress": 79.0
+        "progress": 98.0
     }));
     debug_log_to_file(format!(
         "[Auto-Test Suite] Verification finished. {} total routes, {} healed files, warnings={:?}.",

@@ -1,10 +1,10 @@
-# Axiom Forge Rust — Architecture Map (`v0.1.52+`)
+# Axiom Forge Rust — Architecture Map (`v0.1.55+`)
 
-Ovaj dokument predstavlja kanonsku mapu izvršavanja koda u **Axiom Forge** desktop aplikaciji (Tauri v2 + Rust backend + React/Vite frontend), sa ciljem jasnog pregleda svih faza, politika i memorije sistema tokom refaktorisanja (`v0.1.53+`).
+Ovaj dokument predstavlja kanonsku mapu izvršavanja koda u **Axiom Forge** desktop aplikaciji (Tauri v2 + Rust backend + React/Vite frontend), uključujući **Fazu 3 (`tree-sitter` AST Engine)**, **Univerzalni AI Edit/Heal sistem** i **Multi-Platform (Web / Desktop Electron / Mobile React Native)** arhitekturu.
 
 ---
 
-## 1. End-to-End Tok Generisanja i Učenja
+## 1. End-to-End Tok Generisanja, AST Rekoncilijacije i Učenja
 
 ```text
   [UI: ProjectConfig / Dashboard / Editor]
@@ -12,85 +12,103 @@ Ovaj dokument predstavlja kanonsku mapu izvršavanja koda u **Axiom Forge** desk
              (IPC: ipc-bridge.js)
                      ▼
      [1. Manifest & Phase Planner]          ──► orchestrator.rs / sanitizer.rs
-     - Sanitacija manifesta & runaway guard
-     - GenerationPhase (Config -> DB -> Api -> UI)
+     - Sanitacija manifesta & runaway guard (`detect_infinite_loop` 1..=12 linija)
+     - 6-fazni topološki raspored za SVE platforme (`nextjs`, `electron`, `react_native`):
+       Config -> DatabaseOrMain -> LogicOrHooks -> ApiOrState -> ShellOrWidgets -> PagesOrUi
                      │
                      ▼
-     [2. Prompt & Context Assembly]         ──► orchestrator.rs / packages.rs
-     - `get_expert_system_prompt()`
-     - Scoped Rulepacks + `{metakognitivan_spisak_pravila}`
-     - Axiom Contracts (`axiom-contracts.json`, LBG, Routes)
-     - Relevant `.d.ts` & package DB (`packages.json`)
+     [2. Prompt & Context Assembly]         ──► orchestrator.rs / packages.rs / policy_registry.rs
+     - `get_expert_system_prompt()` + Scoped Rulepacks (`policy_registry.rs`)
+     - Platform-aware šabloni (`main.js` / `preload.js` CommonJS za Electron, dual `@/*` alias)
+     - Axiom Contracts (`axiom-contracts.json`, AST potpis hook-ova i tipova)
+     - Relevant `.d.ts` & package DB (`packages.json` + blokada zastarelih `@types/*` paketa)
                      │
                      ▼
      [3. Local LLM Inference (Ollama)]      ──► ollama.rs / hardware.rs
      - Dynamic VRAM/context sizing (`num_ctx`, `temperature`)
                      │
                      ▼
-     [4. Pre-Save Validator]                ──► orchestrator.rs (`validate_file_with_*`)
-     - App Router route & default export guards
-     - RootLayout JSX `{children}` & no-table/hook guards
-     - Middleware matcher (`:path*`, bez `/*` globa)
+     [4. Pre-Save Reviewer & AST Validator] ──► reviewer.rs + ast_engine.rs + orchestrator.rs
+     - `tree-sitter` + `tree-sitter-typescript` AST syntax check (`syntax:ast-parse-error`)
+     - App Router route & default export guards, RootLayout `{children}` & Middleware matcher
                      │
                      ▼
      [5. Deterministic Sanitizer]           ──► sanitizer.rs (`post_process_generated_file`)
-     - `'use client'`, UI primitives, hook type exports
-     - Prisma relations, enums, FK scalars, datasource
-     - NextAuth v4 imports & optional password casts
-     - RootLayout `{children}` fallback recovery
+     - `'use client'`, UI primitives (`toast.success/.error`), hook type exports (bez `TS2308`)
+     - Prisma relacije, enum-i, FK skalari, auto-import `prisma` u `/api/` rutama
+     - NextAuth v4 + `axiom-env.d.ts` (`Session.user.id`, `SignInResponse.user`), OpenAI v3->v4
+     - `hoist_enums_before_usage` (`TS2450`), `strip_self_conflicting_local_imports` (`TS2440`)
                      │
                      ▼
-     [6. Contract Harvest & Maps]           ──► orchestrator.rs / healer.rs
+     [6. AST Contract Harvest & Maps]       ──► ast_engine.rs + orchestrator.rs
+     - `extract_exports`, `extract_hook_signatures`, `extract_hook_call_sites`, `extract_type_shapes`
      - `axiom-contracts.json`, `axiom-map.json`, `LiveBuilderGuide`
                      │
                      ▼
-     [7. Multi-Tier Self-Healing Loop]      ──► self_healing.rs / healer.rs / server.rs
-     ├── Tier 0: Hygiene + auto-import + Prisma push + `.d.ts` reconciler
-     ├── Tier 1: `tsc --noEmit` po slojevima prioriteta + Rollback + Stagnant-round breaker
+     [7. Multi-Tier Self-Healing Loop]      ──► self_healing.rs / ast_engine.rs / healer.rs / server.rs
+     ├── Tier 0: Hygiene (skenira i `src/` i root `app/`, `components/`, `hooks/`, `services/`)
+     │           + `ast_engine::reconcile_hook_contracts_in_project` (0-arg default `= {} as any` + `error`/`refetch`)
+     │           + `ensure_multiplatform_entry_routes_bridged` (eliminiše Electron/Mobile `404` na `/`)
+     │           + `sanitize_tailwind_config_in_project` + Prisma push + `.d.ts` reconciler
+     ├── Tier 1: `tsc --noEmit` (sa `tsconfig.json` auto-recovery kad `tsc` padne sa 0 dijagnostika)
      ├── Tier 2: `next build` + ekstrakcija ruta / extensionless & chunk URLs
-     └── Runtime: Preview DevLogs & Chunk/Webpack guard -> `project_heal_compile_error`
+     └── Runtime: Preview DevLogs & Fuzzy Multi-Line Patch Resolver -> `project_heal_compile_error`
                      │
                      ▼
      [8. Episodic Memory, Telemetry & SFT]  ──► katastar.rs + `/ai-optimizer`
      - Katastar (`katastar.json`, dvofazna verifikacija patch-a)
-     - `.axiom/heal-ledger.json` (DiagnosticDiff po fajlu)
-     - Exponential Accuracy Growth Equation & `učestalost_greske`
+     - `.axiom/heal-ledger.json` (realna `1st-Pass Clean` telemetrija — nikad `100%` kad postoje greške/upozorenja)
      - Export `axiom_sft_dataset.jsonl` + Ollama `Modelfile`
 ```
 
 ---
 
-## 2. Mapa Modula (Trenutno Stanje — Pred Refaktor)
+## 2. Mapa Modula (`v0.1.55`)
 
 ### Rust Backend (`src-tauri/src/`)
 
-| Modul | Veličina | Primarna uloga | Napomena za refaktor (`v0.1.53+`) |
+| Modul | Veličina | Primarna uloga | Status u `v0.1.55` |
 | :--- | :---: | :--- | :--- |
-| `lib.rs` | ~385 L* | Tauri ulaz, deep link (`axiom://`), agent bridge, IPC handler | *Testovi izmešteni u `src-tauri/src/tests/` (Faza 0)* |
-| `orchestrator.rs` | 6.592 L | Generisanje, manifest, rulepacks, validator, ugovori (`contracts`) | Podeliti u `pipeline/*` i `domains/*` |
-| `sanitizer.rs` | 7.448 L | Determinističko čišćenje TSX/TS/Prisma/CSS/JSON fajlova | Razdvojiti Prisma, UI/React, Auth i Manifest sanajzere + uvesti `tree-sitter` |
-| `self_healing.rs` | 5.022 L | Post-gen loop: Prisma DB, `.d.ts` inspekcija, Tier 1 (`tsc`), Tier 2 (`next build`) | Razdvojiti `verifier.rs` (`Tier 0/1/2`) i `dts_inspector.rs` |
-| `healer.rs` | 4.528 L | Single-file preview repair, Prisma heal loop, JSON/targeted edit parser, drop-guard | Izdvojiti `patch_parser.rs` i Prisma healer |
-| `packages.rs` | 2.402 L | Katalog verzija/praksi paketa + `npm install` offline/ETARGET recovery | Zadržati kao katalog + npm healer |
-| `katastar.rs` | 2.202 L | Katastar grešaka, `heal-ledger`, telemetrija tačnosti i SFT trainer | Dodata atribucija po `ruleId` potpisima preko `policy_registry.rs` |
-| `policy_registry.rs` | ~420 L | Kanonski **Policy Registry** (`ruleId`), prompt direktive i mapa 6 pipeline agenata | *Novo u Fazi 2 (`v0.1.54`)* — povezan sa `orchestrator.rs`, `reviewer.rs` i `/ai-optimizer` |
-| `reviewer.rs` | ~835 L | Pre-save token-aware AST-balans, Edge middleware matcher & API route audit | *Novo u Fazi 1 (`v0.1.54`)* — proverava `{}`/`()`/`[]` balans i stagnaciju |
-| `server.rs` | 1.047 L | Dev server runner, parsanje logova, `map_next_chunk_url_to_source` | Čisto izdvojen runtime modul |
-| `editor_ai.rs` | 926 L | Ručni AI asistent za pojedinačne fajlove/projekte | Čisto izdvojen editor modul |
-| `project.rs` | 789 L | CRUD projekata, podešavanja, keychain tokeni, import, `.env` detekcija | Stabilno |
-| `hardware.rs`, `ollama.rs`, `git_engine.rs`, `mode.rs`, `relay.rs` | ~1.490 L | GPU/VRAM profilisanje, Ollama klijent, Git grane/predlozi, Agency mode | Čisti, dobro izolovani moduli |
-
-### React Frontend (`src/`)
-
-- **Ključne stranice (`src/pages/`):** `Dashboard.jsx`, `ProjectConfig.jsx`, `ProjectDetail.jsx`, `Editor.jsx` (`116 KB` — kandidat za razbijanje u Fazi 4), `AiOptimizer.jsx` (sadrži i klikabilni **Pipeline Orchestrator & Policy Registry Inspector**), `Settings.jsx`, `AgencyDashboard.jsx`, `InstallationWizard.jsx`.
-- **Most (`src/lib/ipc-bridge.js`):** Mapira `window.electronAPI.*` pozive na Tauri `invoke(...)` i event listener-e.
+| `lib.rs` | ~385 L | Tauri ulaz, deep link (`axiom://`), agent bridge, IPC handler | Testovi u `src-tauri/src/tests/` (Faza 0) |
+| `ast_engine.rs` | ~1.220 L | **Faza 3 AST Engine (`tree-sitter` + `tree-sitter-typescript`)**: parsanje TS/TSX, ekstrakcija importa/eksporta, hook potpisa, call-site zahteva, AST rekoncilijacija ugovora i fuzzy multi-line target matcher | **Novo u Fazi 3 (`v0.1.55`)** |
+| `policy_registry.rs` | ~420 L | Kanonski **Policy Registry** (`ruleId`), prompt direktive i mapa 6 pipeline agenata | Faza 2 (`v0.1.54`) |
+| `reviewer.rs` | ~850 L | Pre-save AST + token-aware balans, Edge middleware matcher & API route audit | Faza 1 + Faza 3 AST integracija |
+| `orchestrator.rs` | ~6.780 L | Generisanje, manifest, 6-fazni topološki planer za Web/Desktop/Mobile, AST ugovori (`contracts`) | Proširen za Electron & React Native |
+| `sanitizer.rs` | ~9.300 L | Determinističko čišćenje TSX/TS/Prisma/CSS/JSON/Tailwind fajlova i multi-platform route bridging | Proširen za sve 13.11/14.11 obrasce |
+| `self_healing.rs` | ~5.130 L | Post-gen loop: Dual-root (`src/` + root) Hygiene, AST hook reconciler, Tier 1 (`tsc`), Tier 2 (`next build`) | Proširen za split-root projekte |
+| `healer.rs` | ~4.550 L | Single-file preview repair, Prisma heal loop, JSON/targeted edit parser + AST fuzzy target resolver | Povezan sa `ast_engine.rs` |
+| `packages.rs` | ~2.420 L | Katalog verzija/praksi paketa + blokada pokvarenih `@types/*` paketa + `npm install` recovery | Proširena `banned_always_pkgs` lista |
+| `katastar.rs` | ~2.220 L | Katastar grešaka, `heal-ledger`, istinita telemetrija tačnosti (`firstPassCleanRatePct`) i SFT trainer | Ispravljena `100% 1st-Pass Clean` distorzija |
+| `server.rs` | ~1.055 L | Dev server runner, pre-flight multi-platform route bridge, parsanje logova | Eliminiše `404` pri pokretanju Preview-a |
+| `editor_ai.rs` | ~935 L | Ručni AI asistent za pojedinačne fajlove/projekte sa AST/fuzzy target matchingom | Povezan sa `ast_engine.rs` |
+| `project.rs`, `hardware.rs`, `ollama.rs`, `git_engine.rs`, `mode.rs`, `relay.rs` | ~2.280 L | CRUD projekata, GPU/VRAM profilisanje, Ollama klijent, Git grane/predlozi, Agency mode | Stabilno |
 
 ---
 
-## 3. Plan Refaktora (`v0.1.53+`)
+## 3. Plan Razvoja Multi-Platform Generatora (Web / Desktop / Mobile) i Univerzalnog AI Edit/Heal Sistema
 
-- **Faza 0 (završena u `v0.1.53`):** `ARCHITECTURE.md` + izdvajanje svih testova iz `lib.rs` u `src-tauri/src/tests/`.
-- **Faza 1 (`v0.1.54`):** Uvođenje `reviewer.rs` (semantički/strukturni pregled + anti-stagnacija) i priprema za domensko cepanje u `domains/` / `pipeline/` / `healing/`.
-- **Faza 2 (završena u `v0.1.54`):** Jedinstveni **Policy Registry** (`policy_registry.rs`, `ruleId`) — svako pravilo na jednom mestu daje prompt direktive, pre-save validator, deterministički sanajzer, heal direktivu i klikabilan Pipeline Inspector sa Katastar statistikom u `/ai-optimizer`.
-- **Faza 3 (`v0.1.55`):** Uvođenje `tree-sitter` + `tree-sitter-typescript` AST engine-a umesto krhkih regex-a za import/export i JSX strukturu.
-- **Faza 4:** Razbijanje `Editor.jsx` u manje komponente i proširenje vizuelnog Pipeline/Policy Inspectora u UI.
+1. **Jedinstveni 6-fazni Topološki Redosled (`Config -> DatabaseOrMain -> LogicOrHooks -> ApiOrState -> ShellOrWidgets -> PagesOrUi`):**
+   - Sva tri generatora (`nextjs`, `electron`, `react_native`) sada generišu tipove, modele, servise i hook-ove **pre** komponenti i ekrana, dok se AST ugovori (`axiom-contracts.json`) sakupljaju iz svakog generisanog fajla i prosleđuju narednim fazama.
+2. **Dual-Root Svest (`src/` + root `app/`, `components/`, `hooks/`, `services/`):**
+   - Kod Mobile (Expo Router) i Desktop (Electron) projekata LLM često kombinuje fajlove u root direktorijumima (`app/(tabs)/index.tsx`, `components/`, `hooks/`, `services/`) sa fajlovima u `src/` (`src/app/api/`, `src/renderer/App.tsx`).
+   - `tsconfig.json` sada mapira `"@/*": ["./src/*", "./*"]`, a Hygiene, Barrel generator, AST Hook Reconciler, Auto-Importer i Auto-Test Suite skeniraju **oba** stabla.
+3. **Automatski Entry-Route Bridge (`ensure_multiplatform_entry_routes_bridged`):**
+   - Kada projekat ima `src/app/api/*`, Next.js ignoriše root `app/` i traži `src/app/page.tsx`.
+   - Za **Desktop (Electron)** automatski se generiše `src/app/page.tsx` koji montira `@/renderer/App`, čime se trajno eliminiše `404` stranica na inicijalnom učitavanju.
+   - Za **Mobile (React Native / Expo)** automatski se premošćuju `app/(tabs)/index.tsx`, `app/index.tsx` i ostali ekrani (`app/dashboard.tsx` -> `src/app/dashboard/page.tsx`) za trenutni prikaz u Live Preview-u.
+4. **Univerzalni AI Edit/Heal Sistem (čak i za polovično generisane projekte):**
+   - **Sloj 1 — Pre-Flight Strukturna Rekonstrukcija:** `ensure_valid_tsconfig`, `sanitize_tailwind_config_in_project`, `ensure_directory_barrel_files`, `ensure_ui_primitives_reconciled`, `ensure_multiplatform_entry_routes_bridged` i `sanitize_truncated_import_repetition_loop` oporavljaju čak i prekinute ili polovično generisane projekte.
+   - **Sloj 2 — AST Cross-File Contract Reconciler (`ast_engine.rs`):** `reconcile_hook_contracts_in_project` pomoću `tree-sitter` AST-a usklađuje potpise svih custom hook-ova i njihovih pozivalaca u projektu bez potrebe za LLM pozivom.
+   - **Sloj 3 — AST & Line-Normalized Fuzzy Patch Resolver (`find_best_fuzzy_target_match`):** Kada lokalni 7B model u `healer.rs` ili `editor_ai.rs` pošalje `target` blok koji se razlikuje u razmacima, tačka-zarezima ili navodnicima, AST/fuzzy resolver pronalazi tačan raspon u izvornom fajlu umesto odbijanja patch-a posle 3 pokušaja.
+
+---
+
+## 4. Status Faza Refaktora (`v0.1.53` – `v0.1.56+`)
+
+- **Faza 0 (`v0.1.53` — Završeno):** `ARCHITECTURE.md` + izdvajanje svih testova iz `lib.rs` u `src-tauri/src/tests/`.
+- **Faza 1 (`v0.1.54` — Završeno):** Uvođenje `reviewer.rs` (pre-save strukturni pregled + anti-stagnacija).
+- **Faza 2 (`v0.1.54` — Završeno):** Jedinstveni **Policy Registry** (`policy_registry.rs`, `ruleId`) + Pipeline Inspector u `/ai-optimizer`.
+- **Faza 3 (`v0.1.55` — Završeno):** Uvođenje `tree-sitter` + `tree-sitter-typescript` AST engine-a (`ast_engine.rs`) za parsanje TS/TSX, ekstrakciju ugovora, cross-file AST rekoncilijaciju hook-ova i fuzzy target matching u `healer.rs` / `editor_ai.rs`.
+- **Faza 4 (Pripremljeno za `v0.1.56`):**
+  1. Razbijanje monolitnog `src/pages/Editor.jsx` (`116 KB`) u modularne sub-komponente (`EditorPreviewPane.jsx`, `EditorCodePane.jsx`, `EditorAiAssistantPane.jsx`, `EditorDevLogsDrawer.jsx`, `EditorEnvBanner.jsx`).
+  2. Fizičko razdvajanje `sanitizer.rs` i `self_healing.rs` u podmodule (`domains/prisma_sanitizer.rs`, `domains/ui_reconciler.rs`, `healing/tier_runner.rs`) oslanjajući se na `ast_engine.rs`.

@@ -147,133 +147,177 @@ pub async fn resolve_valid_ollama_model(client: &reqwest::Client, requested: &st
     requested.to_string()
 }
 
-pub fn apply_targeted_edit(content: &str, target: &str, replacement: &str) -> Result<String, String> {
-    let target_trimmed = target.trim();
-    if target_trimmed.is_empty() {
-        return Err("Target block is empty".to_string());
-    }
-
-    let is_specific_target = |t: &str| -> bool {
-        let trimmed = t.trim();
-        trimmed.len() >= 15 
-            || trimmed.contains("<Link") 
-            || trimmed.contains("href=") 
-            || trimmed.contains('\n')
+fn verify_targeted_edit_axiom_attrs(before: &str, after: &str, target: &str) -> Result<(), String> {
+    let attr_re = regex::Regex::new(r#"(?i)data-axiom-(file|component)="([^"]*)""#).ok();
+    let Some(re) = attr_re else {
+        return Ok(());
     };
-
-    // 1. Try exact match
-    let exact_matches: Vec<_> = content.match_indices(target).collect();
-    if exact_matches.len() == 1 {
-        return Ok(content.replace(target, replacement));
-    } else if exact_matches.len() > 1 {
-        if is_specific_target(target) {
-            return Ok(content.replace(target, replacement));
+    let mut before_attrs: Vec<(String, String)> = Vec::new();
+    for cap in re.captures_iter(before) {
+        if let (Some(k), Some(v)) = (cap.get(1), cap.get(2)) {
+            before_attrs.push((k.as_str().to_lowercase(), v.as_str().to_string()));
         }
-        return Err(format!("Target block is duplicated ({}) in file. It must be unique.", exact_matches.len()));
     }
-
-    // 2. Try trimmed match
-    let trimmed_matches: Vec<_> = content.match_indices(target_trimmed).collect();
-    if trimmed_matches.len() == 1 {
-        return Ok(content.replace(target_trimmed, replacement.trim()));
-    } else if trimmed_matches.len() > 1 {
-        if is_specific_target(target_trimmed) {
-            return Ok(content.replace(target_trimmed, replacement.trim()));
-        }
-        return Err(format!("Trimmed target block is duplicated ({}) in file.", trimmed_matches.len()));
-    }
-
-    // 3. Whitespace-collapsed / normalized search
-    // Extract non-whitespace characters from target and match against content character positions
-    let target_chars: Vec<char> = target.chars().filter(|c| !c.is_whitespace()).collect();
-    if !target_chars.is_empty() {
-        let content_chars: Vec<(usize, char)> = content.char_indices().collect();
-        let n = content_chars.len();
-        let m = target_chars.len();
-        let mut matches_found = Vec::new();
-
-        for i in 0..n {
-            if content_chars[i].1.is_whitespace() {
-                continue;
+    let mut after_attrs: Vec<(String, String)> = Vec::new();
+    for cap in re.captures_iter(after) {
+        if let (Some(k), Some(v)) = (cap.get(1), cap.get(2)) {
+            let kind = k.as_str().to_lowercase();
+            let val = v.as_str();
+            if val.contains(';')
+                || val.contains('{')
+                || val.contains('}')
+                || val.contains("=>")
+                || (kind == "file" && val.chars().any(|c| c.is_whitespace()))
+            {
+                return Err(format!(
+                    "Edit rejected: would corrupt data-axiom-{} metadata attribute with code ({:?}). Copy actual code lines into 'target'.",
+                    kind, val
+                ));
             }
-            let mut target_idx = 0;
-            let mut j = i;
-            while j < n && target_idx < m {
-                let ch = content_chars[j].1;
-                if ch.is_whitespace() {
-                    j += 1;
+            after_attrs.push((kind, val.to_string()));
+        }
+    }
+    if !target.contains("data-axiom-") && !before_attrs.is_empty() && before_attrs != after_attrs {
+        return Err(
+            "Edit rejected: 'target' matched inside a data-axiom-file/data-axiom-component metadata attribute instead of source code."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+pub fn apply_targeted_edit(content: &str, target: &str, replacement: &str) -> Result<String, String> {
+    let apply_raw = |content: &str, target: &str, replacement: &str| -> Result<String, String> {
+        let target_trimmed = target.trim();
+        if target_trimmed.is_empty() {
+            return Err("Target block is empty".to_string());
+        }
+
+        let is_specific_target = |t: &str| -> bool {
+            let trimmed = t.trim();
+            trimmed.len() >= 15
+                || trimmed.contains("<Link")
+                || trimmed.contains("href=")
+                || trimmed.contains('\n')
+        };
+
+        // 1. Try exact match
+        let exact_matches: Vec<_> = content.match_indices(target).collect();
+        if exact_matches.len() == 1 {
+            return Ok(content.replace(target, replacement));
+        } else if exact_matches.len() > 1 {
+            if is_specific_target(target) {
+                return Ok(content.replace(target, replacement));
+            }
+            return Err(format!("Target block is duplicated ({}) in file. It must be unique.", exact_matches.len()));
+        }
+
+        // 2. Try trimmed match
+        let trimmed_matches: Vec<_> = content.match_indices(target_trimmed).collect();
+        if trimmed_matches.len() == 1 {
+            return Ok(content.replace(target_trimmed, replacement.trim()));
+        } else if trimmed_matches.len() > 1 {
+            if is_specific_target(target_trimmed) {
+                return Ok(content.replace(target_trimmed, replacement.trim()));
+            }
+            return Err(format!("Trimmed target block is duplicated ({}) in file.", trimmed_matches.len()));
+        }
+
+        // 3. Whitespace-collapsed / normalized search
+        let target_chars: Vec<char> = target.chars().filter(|c| !c.is_whitespace()).collect();
+        if !target_chars.is_empty() {
+            let content_chars: Vec<(usize, char)> = content.char_indices().collect();
+            let n = content_chars.len();
+            let m = target_chars.len();
+            let mut matches_found = Vec::new();
+
+            for i in 0..n {
+                if content_chars[i].1.is_whitespace() {
                     continue;
                 }
-                if ch == target_chars[target_idx] {
-                    target_idx += 1;
-                    j += 1;
-                } else {
-                    break;
+                let mut target_idx = 0;
+                let mut j = i;
+                while j < n && target_idx < m {
+                    let ch = content_chars[j].1;
+                    if ch.is_whitespace() {
+                        j += 1;
+                        continue;
+                    }
+                    if ch == target_chars[target_idx] {
+                        target_idx += 1;
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if target_idx == m && j > 0 {
+                    let start_byte = content_chars[i].0;
+                    let end_byte = content_chars[j - 1].0 + content_chars[j - 1].1.len_utf8();
+                    matches_found.push((start_byte, end_byte));
                 }
             }
-            if target_idx == m && j > 0 {
-                let start_byte = content_chars[i].0;
-                let end_byte = content_chars[j - 1].0 + content_chars[j - 1].1.len_utf8();
-                matches_found.push((start_byte, end_byte));
-            }
-        }
 
-        if matches_found.len() == 1 {
-            let (start, end) = matches_found[0];
-            let mut result = String::with_capacity(content.len() + replacement.len());
-            result.push_str(&content[..start]);
-            result.push_str(replacement);
-            result.push_str(&content[end..]);
-            return Ok(result);
-        } else if matches_found.len() > 1 {
-            if is_specific_target(target) {
-                let mut result = content.to_string();
-                for &(start, end) in matches_found.iter().rev() {
-                    result.replace_range(start..end, replacement);
-                }
+            if matches_found.len() == 1 {
+                let (start, end) = matches_found[0];
+                let mut result = String::with_capacity(content.len() + replacement.len());
+                result.push_str(&content[..start]);
+                result.push_str(replacement);
+                result.push_str(&content[end..]);
                 return Ok(result);
+            } else if matches_found.len() > 1 {
+                if is_specific_target(target) {
+                    let mut result = content.to_string();
+                    for &(start, end) in matches_found.iter().rev() {
+                        result.replace_range(start..end, replacement);
+                    }
+                    return Ok(result);
+                }
+                return Err(format!("Normalized target matches multiple ({}) places in file.", matches_found.len()));
             }
-            return Err(format!("Normalized target matches multiple ({}) places in file.", matches_found.len()));
         }
-    }
 
-    // 4. Line-trimmed sliding window match
-    let target_lines: Vec<&str> = target.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
-    if !target_lines.is_empty() {
-        let content_lines: Vec<&str> = content.lines().collect();
-        let mut line_matches = Vec::new();
+        // 4. Line-trimmed sliding window match
+        let target_lines: Vec<&str> = target.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+        if !target_lines.is_empty() {
+            let content_lines: Vec<&str> = content.lines().collect();
+            let mut line_matches = Vec::new();
 
-        for i in 0..=content_lines.len().saturating_sub(target_lines.len()) {
-            let mut matched = true;
-            for (k, t_line) in target_lines.iter().enumerate() {
-                if content_lines[i + k].trim() != *t_line {
-                    matched = false;
-                    break;
+            for i in 0..=content_lines.len().saturating_sub(target_lines.len()) {
+                let mut matched = true;
+                for (k, t_line) in target_lines.iter().enumerate() {
+                    if content_lines[i + k].trim() != *t_line {
+                        matched = false;
+                        break;
+                    }
+                }
+                if matched {
+                    line_matches.push(i);
                 }
             }
-            if matched {
-                line_matches.push(i);
+
+            if line_matches.len() == 1 {
+                let match_line_idx = line_matches[0];
+                let lines_before: String = content_lines[..match_line_idx].join("\n");
+                let prefix = if lines_before.is_empty() { String::new() } else { format!("{}\n", lines_before) };
+                let lines_after: String = content_lines[match_line_idx + target_lines.len()..].join("\n");
+                let suffix = if lines_after.is_empty() { String::new() } else { format!("\n{}", lines_after) };
+                return Ok(format!("{}{}{}", prefix, replacement, suffix));
+            } else if line_matches.len() > 1 && is_specific_target(target) {
+                let mut modified_lines = content_lines.clone();
+                let replacement_lines: Vec<&str> = replacement.lines().collect();
+                for &idx in line_matches.iter().rev() {
+                    modified_lines.splice(idx..idx + target_lines.len(), replacement_lines.clone());
+                }
+                return Ok(modified_lines.join("\n"));
             }
         }
 
-        if line_matches.len() == 1 {
-            let match_line_idx = line_matches[0];
-            let lines_before: String = content_lines[..match_line_idx].join("\n");
-            let prefix = if lines_before.is_empty() { String::new() } else { format!("{}\n", lines_before) };
-            let lines_after: String = content_lines[match_line_idx + target_lines.len()..].join("\n");
-            let suffix = if lines_after.is_empty() { String::new() } else { format!("\n{}", lines_after) };
-            return Ok(format!("{}{}{}", prefix, replacement, suffix));
-        } else if line_matches.len() > 1 && is_specific_target(target) {
-            let mut modified_lines = content_lines.clone();
-            let replacement_lines: Vec<&str> = replacement.lines().collect();
-            for &idx in line_matches.iter().rev() {
-                modified_lines.splice(idx..idx + target_lines.len(), replacement_lines.clone());
-            }
-            return Ok(modified_lines.join("\n"));
-        }
-    }
+        Err(format!("Target code block not found in file: {:?}", target))
+    };
 
-    Err(format!("Target code block not found in file: {:?}", target))
+    let edited = apply_raw(content, target, replacement)?;
+    verify_targeted_edit_axiom_attrs(content, &edited, target)?;
+    Ok(edited)
 }
 
 #[tauri::command]

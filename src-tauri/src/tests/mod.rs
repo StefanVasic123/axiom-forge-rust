@@ -6,3 +6,4 @@ mod packages_npm_tests;
 mod nextjs_ui_tests;
 mod healing_orchestrator_tests;
 mod v52_benchmarks;
+mod ast_engine_tests;

@@ -1934,10 +1934,21 @@ pub fn compute_model_progress_telemetry_at(
             .filter(|&n| n > 0)
             .unwrap_or_else(|| (total_files / 3).max(1));
 
-        let unresolved_file_count = if affected_files.is_empty() && (!warnings.is_empty() || warn_summary.has_prisma_failure) {
-            1
+        let unresolved_file_count = if affected_files.is_empty()
+            && (!warnings.is_empty()
+                || warn_summary.has_prisma_failure
+                || warn_summary.has_build_failure
+                || residual_errors > 0)
+        {
+            let est_from_errors = if residual_errors > 1 {
+                (residual_errors + 2) / 3
+            } else {
+                1
+            };
+            let prisma_bump = if warn_summary.has_prisma_failure { 1 } else { 0 };
+            (est_from_errors + prisma_bump).clamp(1, total_files)
         } else {
-            affected_files.len()
+            affected_files.len().min(total_files)
         };
 
         let telemetry_status = if is_in_progress {
@@ -1953,7 +1964,11 @@ pub fn compute_model_progress_telemetry_at(
         } else {
             ((unresolved_file_count as f64) / (total_files as f64)).clamp(0.0, 1.0)
         };
-        let clean_first_pass_files = total_files.saturating_sub(touched_files.len());
+        let dirty_first_pass_files = touched_files
+            .len()
+            .max(unresolved_file_count)
+            .min(total_files);
+        let clean_first_pass_files = total_files.saturating_sub(dirty_first_pass_files);
         let f100 = if !is_instrumented {
             0.0
         } else if warnings.is_empty() && unresolved_file_count == 0 && !warn_summary.has_prisma_failure && !warn_summary.has_build_failure {

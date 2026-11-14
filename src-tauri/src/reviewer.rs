@@ -757,6 +757,29 @@ pub fn review_generated_file(file_path: &str, content: &str) -> Vec<ReviewIssue>
 
     if let Err(issue) = check_delimiter_balance(content, false) {
         issues.push(issue);
+    } else if let Some(ast_issues) = crate::ast_engine::syntax_issues_for(file_path, content) {
+        if let Some(first) = ast_issues.first() {
+            let summary = ast_issues
+                .iter()
+                .take(3)
+                .map(|i| i.describe())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            issues.push(ReviewIssue {
+                rule_id: "syntax:ast-parse-error".to_string(),
+                severity: ReviewSeverity::Error,
+                message: format!(
+                    "AST syntax check found {} parse error(s) in `{}` ({}).",
+                    ast_issues.len(),
+                    file_path,
+                    summary
+                ),
+                repair_directive: format!(
+                    "Fix the TypeScript/TSX syntax error at line {}, col {} (`{}`). Ensure all statements, expressions, JSX tags, and type annotations are valid.",
+                    first.line, first.column, first.snippet
+                ),
+            });
+        }
     }
 
     if low.ends_with("middleware.ts") || low.ends_with("middleware.js") {

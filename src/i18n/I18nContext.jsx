@@ -68,9 +68,9 @@ export function I18nProvider({ children }) {
     if (text === null && locale !== 'en') {
       text = getNestedValue(translations.en, key);
     }
-    // 3. Fallback to key itself
+    // 3. Fallback to string default if provided, otherwise key itself
     if (text === null) {
-      return key;
+      return typeof params === 'string' && params.length > 0 ? params : key;
     }
     // Interpolate {param}
     if (params && typeof params === 'object') {

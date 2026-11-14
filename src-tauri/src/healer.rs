@@ -3628,6 +3628,16 @@ pub async fn project_heal_compile_error(
                     *file_content_mut = replacement.to_string();
                 }
             } else {
+                let norm_target_path = normalize_rel_path_str(target.trim());
+                if norm_target_path == edit_path
+                    || (!target.contains('\n') && edit_path.ends_with(&format!("/{}", norm_target_path)))
+                {
+                    edit_reject_reason = Some(format!(
+                        "Ciljani 'target' u '{}' ne sme biti putanja fajla ('{}'). Kopiraj tačne linije koda iz fajla u 'target'.",
+                        edit_path, target.trim()
+                    ));
+                    break;
+                }
                 match apply_single_targeted_edit_with_quote_fallback(file_content_mut, target, replacement) {
                     Ok(new_content) => {
                         *file_content_mut = new_content;

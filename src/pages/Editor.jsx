@@ -621,6 +621,7 @@ export default function EditorPage() {
 
   // Preview Route Tracking & Runtime Error Bridge
   const [currentPreviewRoute, setCurrentPreviewRoute] = useState('/');
+  const lastPreviewRouteRef = useRef('/');
   const [previewRuntimeError, setPreviewRuntimeError] = useState(null);
   const [aiExternalPrompt, setAiExternalPrompt] = useState(null);
 
@@ -798,7 +799,7 @@ export default function EditorPage() {
       if (!safeFilePath) {
         return;
       }
-      const normalizedError = { ...errorData, filePath: safeFilePath };
+      const normalizedError = { ...errorData, filePath: safeFilePath, source: 'server', route: currentPreviewRoute };
       setCompileError(prev => {
         if (prev && prev.filePath === normalizedError.filePath && prev.errorMessage === normalizedError.errorMessage) {
           return prev;
@@ -957,21 +958,29 @@ export default function EditorPage() {
       : '';
 
     let targetFile = activeTab;
-    if (!explicitPrompt && (compileError?.filePath || previewRuntimeError)) {
-      const errMessage = compileError?.errorMessage
-        || previewRuntimeError?.details
-        || previewRuntimeError?.message
-        || 'Runtime error in preview';
-      const rawCandidate = compileError?.filePath
-        || previewRuntimeError?.sourceFile
-        || '';
+    if (!explicitPrompt && (previewRuntimeError || compileError?.filePath)) {
+      const preferRuntime = !!previewRuntimeError && (
+        !compileError
+        || compileError.source === 'preview'
+        || Boolean(previewRuntimeError.sourceFile && previewRuntimeError.sourceFile !== compileError.filePath)
+        || Boolean(previewRuntimeError.path && previewRuntimeError.path === currentPreviewRoute && compileError.route && compileError.route !== currentPreviewRoute)
+      );
+      const errMessage = preferRuntime
+        ? (previewRuntimeError?.details || previewRuntimeError?.message || compileError?.errorMessage || 'Runtime error in preview')
+        : (compileError?.errorMessage || previewRuntimeError?.details || previewRuntimeError?.message || 'Runtime error in preview');
+      const rawCandidate = preferRuntime
+        ? (previewRuntimeError?.sourceFile || compileError?.filePath || '')
+        : (compileError?.filePath || previewRuntimeError?.sourceFile || '');
+      const stackFromMsg = String(errMessage).replace(/\\/g, '/').match(/(?:src\/(?:app|pages|components|hooks|lib|utils|services|models)\/)[A-Za-z0-9_/.[\]-]+\.(?:tsx|ts|jsx|js)/i);
       const chunkFromMsg = String(errMessage).match(/\/_next\/static\/chunks\/(app|pages)\/(.+?)(?:-[0-9a-f]{8,})?\.(?:m?js)/i);
       const isNonProjectPath = !rawCandidate
         || rawCandidate.includes('node_modules/')
         || rawCandidate.startsWith('webpack-internal:')
         || /^https?:\/\//i.test(rawCandidate);
       let errFilePath = rawCandidate;
-      if (chunkFromMsg && !['_app', '_document', '_error', '_not-found', 'webpack', 'main', 'framework', 'polyfills'].includes(chunkFromMsg[2])) {
+      if (stackFromMsg && (isNonProjectPath || !rawCandidate.startsWith('src/'))) {
+        errFilePath = stackFromMsg[0];
+      } else if (chunkFromMsg && !['_app', '_document', '_error', '_not-found', 'webpack', 'main', 'framework', 'polyfills'].includes(chunkFromMsg[2])) {
         errFilePath = `src/${chunkFromMsg[1]}/${chunkFromMsg[2]}.tsx`;
       } else if (isNonProjectPath) {
         errFilePath = resolveRouteToFile(previewRuntimeError?.path || currentPreviewRoute)?.path
@@ -1247,15 +1256,19 @@ export default function EditorPage() {
           previewUiSnapshotRef.current = data.snapshot;
         }
         if (data.pathname) {
+          const navigatedToNewRoute = lastPreviewRouteRef.current !== data.pathname;
+          lastPreviewRouteRef.current = data.pathname;
           setCurrentPreviewRoute(data.pathname);
-          // Only clear runtime error if the snapshot has clean DOM content AND no error reported in last 12 seconds
           if (!data.snapshot?.nextjsOverlay?.hasError) {
             setPreviewRuntimeError(prev => {
-              if (prev && Date.now() - prev.time < 12000) {
+              if (!navigatedToNewRoute && prev && Date.now() - prev.time < 12000) {
                 return prev;
               }
               return null;
             });
+            if (navigatedToNewRoute) {
+              setCompileError(prev => (prev && prev.source === 'preview' ? null : prev));
+            }
           }
         }
       }
@@ -1313,7 +1326,11 @@ export default function EditorPage() {
         };
 
         const routeRef = data.path || currentPreviewRoute;
-        const cleanSourceFile = resolvePreviewSourceFile(data.sourceFile, routeRef);
+        const detailsStackFile = String(data.details || '')
+          .replace(/\\/g, '/')
+          .match(/(?:src\/(?:app|pages|components|hooks|lib|utils|services|models)\/)[A-Za-z0-9_/.[\]-]+\.(?:tsx|ts|jsx|js)/i)?.[0] || null;
+        const cleanSourceFile = resolvePreviewSourceFile(data.sourceFile, routeRef)
+          || detailsStackFile;
         setPreviewRuntimeError({
           message: data.message || 'Nepoznata runtime greška',
           details: data.details || data.message || '',
@@ -1326,10 +1343,19 @@ export default function EditorPage() {
           || resolveRouteToFile(currentPreviewRoute)?.path
           || 'src/app/page.tsx';
         if (targetFilePath) {
-          setCompileError(prev => prev || {
+          const nextPreviewErr = {
             projectId,
             filePath: targetFilePath,
-            errorMessage: data.details || data.message || 'Runtime error in preview'
+            errorMessage: data.details || data.message || 'Runtime error in preview',
+            source: 'preview',
+            route: routeRef
+          };
+          setCompileError(prev => {
+            if (!prev) return nextPreviewErr;
+            if (prev.source !== 'server') return nextPreviewErr;
+            if (cleanSourceFile && prev.filePath !== cleanSourceFile) return nextPreviewErr;
+            if (prev.route && routeRef && prev.route !== routeRef) return nextPreviewErr;
+            return prev;
           });
           setShowTerminal(true);
         }

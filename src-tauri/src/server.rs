@@ -701,6 +701,10 @@ pub async fn server_start(
         proj_dir = proj_dir.join("src");
     }
     
+    // Ensure multi-platform entry routes (Electron src/renderer/App.tsx, Mobile app/ routes) are bridged into src/app/page.tsx
+    ensure_multiplatform_entry_routes_bridged(&proj_dir);
+    sanitize_tailwind_config_in_project(&proj_dir);
+
     // Ensure Axiom Live Visual Inspector is present in layout files for visual editing mode
     ensure_axiom_inspector_injected(&proj_dir);
 

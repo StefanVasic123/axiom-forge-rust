@@ -1214,5 +1214,92 @@ export default function ReviewsPage() {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    #[test]
+    fn test_v55_hook_inline_param_default_error_reconciliation_format_button_and_axiom_attr_guard() {
+        use crate::editor_ai::apply_targeted_edit;
+        use crate::sanitizer::{
+            ensure_common_formatting_helpers, ensure_ui_primitives_reconciled,
+            reconcile_hook_error_returns_in_project, sanitize_hook_destructured_param_defaults,
+        };
+
+        // 1. Inline-typed destructured hook parameter gets `= {} as any`
+        let hook_src = r#""use client";
+import { useState } from 'react';
+import { Reward } from '@/models';
+
+const useUserRewards = ({ userId, fallbackData }: { userId: string; fallbackData: Reward[] }) => {
+  const [rewards] = useState<Reward[]>(fallbackData);
+  return { data: rewards, isLoading: false };
+};
+export default useUserRewards;
+export { useUserRewards };
+"#;
+        let fixed_hook = sanitize_hook_destructured_param_defaults(hook_src, "src/hooks/useUserRewards.ts");
+        assert!(
+            fixed_hook.contains("{ userId: string; fallbackData: Reward[] } = {} as any)"),
+            "Expected balanced inline-type hook default param:\n{}",
+            fixed_hook
+        );
+
+        // 2. Demand-driven hook `.error` return reconciliation
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v55_hooks_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("src/hooks")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/app/community")).unwrap();
+        std::fs::write(temp_dir.join("src/hooks/useUserRewards.ts"), &fixed_hook).unwrap();
+
+        let page_src = r#""use client";
+import { useUserRewards } from '@/hooks/useUserRewards';
+import { Button } from '@/components/ui';
+
+export default function CommunityPage() {
+  const { data: rewards, isLoading, error } = useUserRewards();
+  return <div>{isLoading || error ? null : rewards?.length}<span>{formatCurrency(10)}</span><Button className="w-full">Sign In</Button></div>;
+}
+"#;
+        std::fs::write(temp_dir.join("src/app/community/page.tsx"), page_src).unwrap();
+
+        reconcile_hook_error_returns_in_project(&temp_dir);
+        let reconciled_hook = std::fs::read_to_string(temp_dir.join("src/hooks/useUserRewards.ts")).unwrap();
+        assert!(
+            reconciled_hook.contains("error: null as string | null"),
+            "Expected missing `error` field injected into hook return:\n{}",
+            reconciled_hook
+        );
+
+        // 3. `formatCurrency` helper injection when missing
+        let with_fmt = ensure_common_formatting_helpers(page_src, "src/app/community/page.tsx");
+        assert!(
+            with_fmt.contains("const formatCurrency ="),
+            "Expected formatCurrency helper injection:\n{}",
+            with_fmt
+        );
+
+        // 4. `Button` primitive has contrast classes when className omits `bg-`
+        ensure_ui_primitives_reconciled(&temp_dir);
+        let ui_src = std::fs::read_to_string(temp_dir.join("src/components/ui.tsx")).unwrap();
+        assert!(
+            ui_src.contains("bg-indigo-600 text-white"),
+            "Expected Button stub to define accessible default background & contrast:\n{}",
+            ui_src
+        );
+
+        // 5. `apply_targeted_edit` rejects overwriting `data-axiom-file` metadata attribute
+        let login_src = r#"export default function LoginPage() {
+  const result = { ok: true };
+  return <div data-axiom-component="Page" data-axiom-file="src/app/login/page.tsx" className="p-4">Login</div>;
+}
+"#;
+        let corrupt_attempt = apply_targeted_edit(login_src, "src/app/login/page.tsx", "const { userId } = result ?? {};");
+        assert!(
+            corrupt_attempt.is_err(),
+            "Must reject targeted edit matching inside data-axiom-file attribute"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
 
 

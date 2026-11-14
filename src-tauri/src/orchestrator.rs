@@ -95,7 +95,7 @@ pub fn get_generation_phase(file_path: &str, project_type: &str) -> GenerationPh
     let is_api_path = path_lower.starts_with("api/") || path_lower.contains("/api/");
 
     match project_type {
-        "nextjs" | "mern" => {
+        "nextjs" | "mern" | "electron" | "react_native" | "react-native" | "expo" => {
             if path_lower == "package.json"
                 || path_lower == "tsconfig.json"
                 || path_lower == "components.json"
@@ -109,25 +109,41 @@ pub fn get_generation_phase(file_path: &str, project_type: &str) -> GenerationPh
             } else if path_lower.contains("schema.prisma")
                 || path_lower.contains("prisma")
                 || path_lower.contains("database")
+                || path_lower.contains("main.js")
+                || path_lower.contains("main.ts")
+                || path_lower.contains("main/index.")
+                || path_lower.contains("preload.js")
+                || path_lower.contains("preload.ts")
                 || (!is_app_route && !is_api_path && (path_lower.contains("models/") || path_lower.contains("types/")))
             {
                 GenerationPhase::DatabaseOrMain
-            } else if !is_app_route && !is_api_path && (path_lower.contains("hooks/") || path_lower.contains("utils/") || path_lower.contains("lib/")) {
+            } else if !is_app_route
+                && !is_api_path
+                && (path_lower.contains("hooks/")
+                    || path_lower.contains("services/")
+                    || path_lower.contains("utils/")
+                    || path_lower.contains("lib/"))
+            {
                 GenerationPhase::LogicOrHooks
             } else if is_api_path || path_lower.contains("api/") || (!is_app_route && (path_lower.contains("auth") || path_lower.contains("router"))) {
                 GenerationPhase::ApiOrState
-            } else if path_lower.contains("layout.tsx") || path_lower.contains("layout.jsx") || path_lower.contains("layout.js") || 
-                      path_lower.contains("globals.css") || path_lower.contains("styles/") || path_lower.contains("navigation") {
+            } else if path_lower.contains("layout.tsx")
+                || path_lower.contains("layout.jsx")
+                || path_lower.contains("layout.js")
+                || path_lower.contains("_layout.tsx")
+                || path_lower.contains("globals.css")
+                || path_lower.contains("styles/")
+                || path_lower.contains("navigation")
+            {
                 GenerationPhase::ShellOrWidgets
             } else {
                 GenerationPhase::PagesOrUi
             }
         }
-        "electron" | "rust" => {
+        "rust" => {
             if path_lower == "package.json" || path_lower == "cargo.toml" || is_config_location || is_root_json {
                 GenerationPhase::Config
-            } else if path_lower.contains("main.js") || path_lower.contains("main.ts") || path_lower.contains("preload.js") || 
-                      path_lower.contains("main.rs") || path_lower.contains("commands") {
+            } else if path_lower.contains("main.rs") || path_lower.contains("commands") {
                 GenerationPhase::DatabaseOrMain
             } else {
                 GenerationPhase::PagesOrUi
@@ -249,18 +265,20 @@ pub fn get_context_files_for(file_path: &str, proj_dir: &std::path::Path) -> Str
         && !path_lower.contains("navbar");
 
     if is_feature_ui {
-        let hooks_dir = proj_dir.join("src/hooks");
-        if hooks_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(hooks_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_file() {
-                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                            if let Ok(content) = std::fs::read_to_string(&path) {
-                                context.push_str(&format!(
-                                    "\nReference: Hook (src/hooks/{}):\n```typescript\n{}\n```\n",
-                                    name, content
-                                ));
+        for rel_dir in ["src/hooks", "hooks"] {
+            let hooks_dir = proj_dir.join(rel_dir);
+            if hooks_dir.exists() {
+                if let Ok(entries) = std::fs::read_dir(hooks_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_file() {
+                            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                                if let Ok(content) = std::fs::read_to_string(&path) {
+                                    context.push_str(&format!(
+                                        "\nReference: Hook ({}/{}):\n```typescript\n{}\n```\n",
+                                        rel_dir, name, content
+                                    ));
+                                }
                             }
                         }
                     }
@@ -2981,6 +2999,50 @@ fn upsert_file_contract_into_root(
         }
     }
 
+    // AST-powered enrichment (Phase 3 tree-sitter engine): accurately extract exports,
+    // hook return keys, hook call sites, and interface/type property shapes even across
+    // nested braces/functions where regex heuristics truncate.
+    if let Some(tree) = crate::ast_engine::parse_source(&norm_path, content) {
+        let ast_exports = crate::ast_engine::extract_exports(&tree, content);
+        for named in ast_exports.named {
+            if !named.is_empty() && !exports.contains(&named) {
+                exports.push(named);
+            }
+        }
+        if let Some(def_id) = ast_exports.default_local {
+            if !def_id.is_empty() && !exports.contains(&def_id) {
+                exports.push(def_id);
+            }
+        }
+        for call in crate::ast_engine::extract_hook_call_sites(&tree, content) {
+            if !hook_calls.contains(&call.hook_name) {
+                hook_calls.push(call.hook_name);
+            }
+        }
+        for hook_sig in crate::ast_engine::extract_hook_signatures(&tree, content) {
+            if !exports.contains(&hook_sig.name) {
+                exports.push(hook_sig.name.clone());
+            }
+            for ro in &hook_sig.return_objects {
+                for k in &ro.keys {
+                    if !k.is_empty() && !members.contains(k) {
+                        members.push(k.clone());
+                    }
+                }
+            }
+        }
+        for shape in crate::ast_engine::extract_type_shapes(&tree, content) {
+            if shape.exported && !exports.contains(&shape.name) {
+                exports.push(shape.name.clone());
+            }
+            for prop in shape.properties {
+                if !prop.name.is_empty() && !members.contains(&prop.name) {
+                    members.push(prop.name);
+                }
+            }
+        }
+    }
+
     let file_entry = serde_json::json!({
         "path": norm_path,
         "role": role,
@@ -3945,17 +4007,44 @@ pub fn get_expert_system_prompt(
         );
     }
 
+    // 4b. FILE-SCOPED PROMPT: Electron Main & Preload process files
+    if path_lower == "main.js"
+        || path_lower.ends_with("/main.js")
+        || path_lower == "src/main/index.js"
+        || path_lower == "src/main/index.ts"
+    {
+        return "You are a Senior Electron Desktop Systems Architect. Write only valid CommonJS Electron main process code wrapped in markdown code blocks. No explanations.\n\n\
+                ELECTRON MAIN PROCESS RULES:\n\
+                - Use CommonJS `const { app, BrowserWindow, ipcMain } = require('electron');` and `const path = require('path');`.\n\
+                - NEVER import React hooks, UI components, Prisma, or `@/` path aliases inside the Electron main process.\n\
+                - Configure `webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false }`.\n\
+                - Load the web renderer URL via `const startUrl = process.env.ELECTRON_START_URL || 'http://localhost:3000'; mainWindow.loadURL(startUrl);`.\n".to_string();
+    }
+
+    if path_lower == "preload.js"
+        || path_lower.ends_with("/preload.js")
+        || path_lower.ends_with("/preload.ts")
+    {
+        return "You are a Senior Electron Security Engineer. Write only valid CommonJS Electron preload script code wrapped in markdown code blocks. No explanations.\n\n\
+                ELECTRON PRELOAD RULES:\n\
+                - Use CommonJS `const { contextBridge, ipcRenderer } = require('electron');`.\n\
+                - Expose a safe API via `contextBridge.exposeInMainWorld('electronAPI', { invoke: (channel, data) => ipcRenderer.invoke(channel, data), on: (channel, cb) => ipcRenderer.on(channel, (_e, ...args) => cb(...args)) });`.\n\
+                - NEVER import React, DOM components, or `@/` path aliases in preload.js.\n".to_string();
+    }
+
     // 5. FILE-SCOPED PROMPT: Web Configuration files
     if path_lower.ends_with("postcss.config.js") || path_lower.ends_with("postcss.config.mjs") {
         return "You are an expert build configuration engineer. Write only valid postcss.config.js code wrapped in markdown code blocks. No explanations.\n\nmodule.exports = {\n  plugins: {\n    tailwindcss: {},\n    autoprefixer: {},\n  },\n};\n".to_string();
     }
 
     if path_lower.ends_with("tailwind.config.js") || path_lower.ends_with("tailwind.config.ts") {
-        return "You are an expert Tailwind CSS configuration engineer. Write only valid tailwind.config.js code wrapped in markdown code blocks. No explanations.\n\n/** @type {import('tailwindcss').Config} */\nmodule.exports = {\n  content: [\n    './src/pages/**/*.{js,ts,jsx,tsx,mdx}',\n    './src/components/**/*.{js,ts,jsx,tsx,mdx}',\n    './src/app/**/*.{js,ts,jsx,tsx,mdx}',\n  ],\n  theme: {\n    extend: {},\n  },\n  plugins: [],\n};\n".to_string();
+        return "You are an expert Tailwind CSS configuration engineer. Write only valid tailwind.config.js code wrapped in markdown code blocks. No explanations.\n\
+                CRITICAL RULE: NEVER override built-in Tailwind color scales (`gray`, `slate`, `zinc`, `blue`, `indigo`, `red`, `green`, `emerald`, `amber`) with a single flat hex string (e.g. `gray: '#7f8c8d'`), because that deletes utility classes like `bg-gray-100` and `text-gray-700`! Keep `theme.extend` clean or define custom color objects with full 50..900 shades.\n\n\
+                /** @type {import('tailwindcss').Config} */\nmodule.exports = {\n  content: [\n    './src/**/*.{js,ts,jsx,tsx,mdx}',\n    './app/**/*.{js,ts,jsx,tsx,mdx}',\n    './components/**/*.{js,ts,jsx,tsx,mdx}',\n    './pages/**/*.{js,ts,jsx,tsx,mdx}',\n  ],\n  theme: {\n    extend: {},\n  },\n  plugins: [],\n};\n".to_string();
     }
 
     if path_lower.ends_with("tsconfig.json") {
-        return "You are a TypeScript Configuration Specialist. Output only a valid, concise Next.js tsconfig.json JSON object wrapped in markdown code blocks. Maximum 30 lines. No explanations.\n\n{\n  \"compilerOptions\": {\n    \"lib\": [\"dom\", \"dom.iterable\", \"esnext\"],\n    \"allowJs\": true,\n    \"skipLibCheck\": true,\n    \"strict\": false,\n    \"noEmit\": true,\n    \"esModuleInterop\": true,\n    \"module\": \"esnext\",\n    \"moduleResolution\": \"bundler\",\n    \"resolveJsonModule\": true,\n    \"isolatedModules\": true,\n    \"jsx\": \"preserve\",\n    \"incremental\": true,\n    \"paths\": {\n      \"@/*\": [\"./src/*\"]\n    }\n  },\n  \"include\": [\"next-env.d.ts\", \"**/*.ts\", \"**/*.tsx\", \".next/types/**/*.ts\"],\n  \"exclude\": [\"node_modules\"]\n}\n".to_string();
+        return "You are a TypeScript Configuration Specialist. Output only a valid, concise Next.js tsconfig.json JSON object wrapped in markdown code blocks. Maximum 30 lines. No explanations.\n\n{\n  \"compilerOptions\": {\n    \"lib\": [\"dom\", \"dom.iterable\", \"esnext\"],\n    \"allowJs\": true,\n    \"skipLibCheck\": true,\n    \"strict\": false,\n    \"noEmit\": true,\n    \"esModuleInterop\": true,\n    \"module\": \"esnext\",\n    \"moduleResolution\": \"bundler\",\n    \"resolveJsonModule\": true,\n    \"isolatedModules\": true,\n    \"jsx\": \"preserve\",\n    \"incremental\": true,\n    \"paths\": {\n      \"@/*\": [\"./src/*\", \"./*\"]\n    }\n  },\n  \"include\": [\"next-env.d.ts\", \"**/*.ts\", \"**/*.tsx\", \".next/types/**/*.ts\"],\n  \"exclude\": [\"node_modules\"]\n}\n".to_string();
     }
 
     if path_lower.contains("next.config") {
@@ -5570,33 +5659,193 @@ export default function RootLayout({
         });
     } else if project_type == "electron" {
         default_metamanifest = serde_json::json!({
-            "rootFiles": ["package.json"],
+            "rootFiles": ["package.json", "tsconfig.json", "next.config.js", "tailwind.config.js", "postcss.config.js", "next-env.d.ts", "main.js", "preload.js"],
             "rootFilesMoveFromSrc": true,
             "requiredFilesTemplates": [
                 {
                     "path": "package.json",
-                    "description": "Package settings for Electron desktop application.",
+                    "description": "Package settings for Electron + Next.js desktop application.",
                     "language": "json",
                     "mergeDependencies": {
+                        "dependencies": {
+                            "next": "14.2.35",
+                            "react": "^18.2.0",
+                            "react-dom": "^18.2.0",
+                            "next-auth": "^4.24.7",
+                            "@auth/prisma-adapter": "^1.0.12",
+                            "@prisma/client": "5.22.0",
+                            "lucide-react": "^0.460.0",
+                            "clsx": "^2.1.1",
+                            "tailwind-merge": "^2.3.0",
+                            "zod": "^3.23.8",
+                            "bcryptjs": "^2.4.3"
+                        },
                         "devDependencies": {
-                            "electron": "^30.0.0"
+                            "electron": "^30.0.0",
+                            "prisma": "5.22.0",
+                            "tailwindcss": "^3.4.0",
+                            "postcss": "^8.4.32",
+                            "autoprefixer": "^10.4.16",
+                            "typescript": "^5.3.3",
+                            "@types/react": "^18.2.45",
+                            "@types/react-dom": "^18.2.18",
+                            "@types/node": "^20.10.5",
+                            "@types/bcryptjs": "^2.4.6"
                         },
                         "scripts": {
-                            "start": "electron ."
+                            "dev": "next dev",
+                            "build": "next build",
+                            "start": "next start",
+                            "electron": "electron ."
                         }
                     }
                 },
                 {
+                    "path": "tsconfig.json",
+                    "description": "TypeScript compiler settings for Electron + Next.js.",
+                    "language": "json",
+                    "defaultContent": "{\n  \"compilerOptions\": {\n    \"lib\": [\"dom\", \"dom.iterable\", \"esnext\"],\n    \"allowJs\": true,\n    \"skipLibCheck\": true,\n    \"strict\": false,\n    \"noEmit\": true,\n    \"esModuleInterop\": true,\n    \"module\": \"esnext\",\n    \"moduleResolution\": \"bundler\",\n    \"resolveJsonModule\": true,\n    \"isolatedModules\": true,\n    \"jsx\": \"preserve\",\n    \"incremental\": true,\n    \"plugins\": [{ \"name\": \"next\" }],\n    \"paths\": {\n      \"@/*\": [\"./src/*\", \"./*\"]\n    }\n  },\n  \"include\": [\"next-env.d.ts\", \"**/*.ts\", \"**/*.tsx\", \".next/types/**/*.ts\"],\n  \"exclude\": [\"node_modules\"]\n}"
+                },
+                {
+                    "path": "tailwind.config.js",
+                    "description": "Configuration file for Tailwind CSS.",
+                    "language": "javascript",
+                    "defaultContent": "/** @type {import('tailwindcss').Config} */\nmodule.exports = {\n  content: [\n    \"./src/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./app/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./components/**/*.{js,ts,jsx,tsx,mdx}\"\n  ],\n  theme: {\n    extend: {},\n  },\n  plugins: [],\n}"
+                },
+                {
+                    "path": "postcss.config.js",
+                    "description": "Configuration file for PostCSS.",
+                    "language": "javascript",
+                    "defaultContent": "module.exports = {\n  plugins: {\n    tailwindcss: {},\n    autoprefixer: {},\n  },\n}"
+                },
+                {
+                    "path": "next.config.js",
+                    "description": "Next.js configuration.",
+                    "language": "javascript",
+                    "defaultContent": "/** @type {import('next').NextConfig} */\nconst nextConfig = {\n  reactStrictMode: true,\n  swcMinify: true,\n};\nmodule.exports = nextConfig;"
+                },
+                {
+                    "path": "src/app/globals.css",
+                    "description": "Global CSS file containing Tailwind directives.",
+                    "language": "css",
+                    "defaultContent": "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n\n"
+                },
+                {
+                    "path": "src/lib/prisma.ts",
+                    "description": "PrismaClient singleton generator.",
+                    "language": "typescript",
+                    "defaultContent": "import { PrismaClient } from \"@prisma/client\";\n\nconst globalForPrisma = globalThis as unknown as { prisma: PrismaClient | undefined };\n\nexport const prisma =\n  globalForPrisma.prisma ??\n  new PrismaClient({\n    log: [\"query\"],\n  });\n\nif (process.env.NODE_ENV !== \"production\") globalForPrisma.prisma = prisma;\n\nexport default prisma;"
+                },
+                {
+                    "path": "src/app/layout.tsx",
+                    "description": "Root layout for Electron Next.js renderer.",
+                    "language": "typescript",
+                    "defaultContent": "\"use client\";\n\nimport React from \"react\";\nimport { SessionProvider } from \"next-auth/react\";\nimport \"./globals.css\";\n\nexport default function RootLayout({ children }: { children: React.ReactNode }) {\n  return (\n    <html lang=\"en\">\n      <body className=\"flex flex-col min-h-screen bg-slate-50 text-slate-900 antialiased\">\n        <SessionProvider>\n          <main className=\"flex-1 flex flex-col w-full\">{children}</main>\n        </SessionProvider>\n      </body>\n    </html>\n  );\n}"
+                },
+                {
                     "path": "main.js",
                     "description": "Main process file for Electron app.",
-                    "language": "javascript"
+                    "language": "javascript",
+                    "defaultContent": "const { app, BrowserWindow, ipcMain } = require('electron');\nconst path = require('path');\n\nlet mainWindow = null;\n\nfunction createWindow() {\n  mainWindow = new BrowserWindow({\n    width: 1280,\n    height: 820,\n    webPreferences: {\n      preload: path.join(__dirname, 'preload.js'),\n      contextIsolation: true,\n      nodeIntegration: false,\n    },\n  });\n\n  const startUrl = process.env.ELECTRON_START_URL || 'http://localhost:3000';\n  mainWindow.loadURL(startUrl);\n\n  mainWindow.on('closed', () => {\n    mainWindow = null;\n  });\n}\n\napp.whenReady().then(createWindow);\n\napp.on('window-all-closed', () => {\n  if (process.platform !== 'darwin') app.quit();\n});\n\napp.on('activate', () => {\n  if (BrowserWindow.getAllWindows().length === 0) createWindow();\n});\n"
                 },
                 {
                     "path": "preload.js",
                     "description": "Preload script exposing secure APIs to renderer process.",
-                    "language": "javascript"
+                    "language": "javascript",
+                    "defaultContent": "const { contextBridge, ipcRenderer } = require('electron');\n\ncontextBridge.exposeInMainWorld('electronAPI', {\n  invoke: (channel, data) => ipcRenderer.invoke(channel, data),\n  on: (channel, callback) => ipcRenderer.on(channel, (_event, ...args) => callback(...args)),\n});\n"
                 }
-            ]
+            ],
+            "injectTailwindDirectives": {
+                "targetCssFiles": ["globals.css", "styles.css"]
+            }
+        });
+    } else if project_type == "react_native" || project_type == "react-native" || project_type == "expo" {
+        default_metamanifest = serde_json::json!({
+            "rootFiles": ["package.json", "tsconfig.json", "next.config.js", "tailwind.config.js", "postcss.config.js", "next-env.d.ts"],
+            "rootFilesMoveFromSrc": true,
+            "requiredFilesTemplates": [
+                {
+                    "path": "package.json",
+                    "description": "Package settings for Mobile + Next.js hybrid workspace.",
+                    "language": "json",
+                    "mergeDependencies": {
+                        "dependencies": {
+                            "next": "14.2.35",
+                            "react": "^18.2.0",
+                            "react-dom": "^18.2.0",
+                            "next-auth": "^4.24.7",
+                            "@auth/prisma-adapter": "^1.0.12",
+                            "@prisma/client": "5.22.0",
+                            "lucide-react": "^0.460.0",
+                            "clsx": "^2.1.1",
+                            "tailwind-merge": "^2.3.0",
+                            "zod": "^3.23.8",
+                            "bcryptjs": "^2.4.3"
+                        },
+                        "devDependencies": {
+                            "prisma": "5.22.0",
+                            "tailwindcss": "^3.4.0",
+                            "postcss": "^8.4.32",
+                            "autoprefixer": "^10.4.16",
+                            "typescript": "^5.3.3",
+                            "@types/react": "^18.2.45",
+                            "@types/react-dom": "^18.2.18",
+                            "@types/node": "^20.10.5",
+                            "@types/bcryptjs": "^2.4.6"
+                        },
+                        "scripts": {
+                            "dev": "next dev",
+                            "build": "next build",
+                            "start": "next start"
+                        }
+                    }
+                },
+                {
+                    "path": "tsconfig.json",
+                    "description": "TypeScript compiler settings for Mobile + Next.js workspace.",
+                    "language": "json",
+                    "defaultContent": "{\n  \"compilerOptions\": {\n    \"lib\": [\"dom\", \"dom.iterable\", \"esnext\"],\n    \"allowJs\": true,\n    \"skipLibCheck\": true,\n    \"strict\": false,\n    \"noEmit\": true,\n    \"esModuleInterop\": true,\n    \"module\": \"esnext\",\n    \"moduleResolution\": \"bundler\",\n    \"resolveJsonModule\": true,\n    \"isolatedModules\": true,\n    \"jsx\": \"preserve\",\n    \"incremental\": true,\n    \"plugins\": [{ \"name\": \"next\" }],\n    \"paths\": {\n      \"@/*\": [\"./src/*\", \"./*\"]\n    }\n  },\n  \"include\": [\"next-env.d.ts\", \"**/*.ts\", \"**/*.tsx\", \".next/types/**/*.ts\"],\n  \"exclude\": [\"node_modules\"]\n}"
+                },
+                {
+                    "path": "tailwind.config.js",
+                    "description": "Configuration file for Tailwind CSS.",
+                    "language": "javascript",
+                    "defaultContent": "/** @type {import('tailwindcss').Config} */\nmodule.exports = {\n  content: [\n    \"./src/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./app/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./components/**/*.{js,ts,jsx,tsx,mdx}\"\n  ],\n  theme: {\n    extend: {},\n  },\n  plugins: [],\n}"
+                },
+                {
+                    "path": "postcss.config.js",
+                    "description": "Configuration file for PostCSS.",
+                    "language": "javascript",
+                    "defaultContent": "module.exports = {\n  plugins: {\n    tailwindcss: {},\n    autoprefixer: {},\n  },\n}"
+                },
+                {
+                    "path": "next.config.js",
+                    "description": "Next.js configuration.",
+                    "language": "javascript",
+                    "defaultContent": "/** @type {import('next').NextConfig} */\nconst nextConfig = {\n  reactStrictMode: true,\n  swcMinify: true,\n};\nmodule.exports = nextConfig;"
+                },
+                {
+                    "path": "src/app/globals.css",
+                    "description": "Global CSS file containing Tailwind directives.",
+                    "language": "css",
+                    "defaultContent": "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n\n"
+                },
+                {
+                    "path": "src/lib/prisma.ts",
+                    "description": "PrismaClient singleton generator.",
+                    "language": "typescript",
+                    "defaultContent": "import { PrismaClient } from \"@prisma/client\";\n\nconst globalForPrisma = globalThis as unknown as { prisma: PrismaClient | undefined };\n\nexport const prisma =\n  globalForPrisma.prisma ??\n  new PrismaClient({\n    log: [\"query\"],\n  });\n\nif (process.env.NODE_ENV !== \"production\") globalForPrisma.prisma = prisma;\n\nexport default prisma;"
+                },
+                {
+                    "path": "src/app/layout.tsx",
+                    "description": "Root layout for Mobile Next.js preview.",
+                    "language": "typescript",
+                    "defaultContent": "\"use client\";\n\nimport React from \"react\";\nimport { SessionProvider } from \"next-auth/react\";\nimport \"./globals.css\";\n\nexport default function RootLayout({ children }: { children: React.ReactNode }) {\n  return (\n    <html lang=\"en\">\n      <body className=\"flex flex-col min-h-screen bg-slate-50 text-slate-900 antialiased\">\n        <SessionProvider>\n          <main className=\"flex-1 flex flex-col w-full\">{children}</main>\n        </SessionProvider>\n      </body>\n    </html>\n  );\n}"
+                }
+            ],
+            "injectTailwindDirectives": {
+                "targetCssFiles": ["globals.css", "styles.css"]
+            }
         });
     }
 
@@ -5975,7 +6224,12 @@ export default function RootLayout({
 
     normalize_project_structure(&mut files_to_generate, &metamanifest, &project_type);
 
-    if project_type == "nextjs" {
+    if project_type == "nextjs"
+        || project_type == "electron"
+        || project_type == "react_native"
+        || project_type == "react-native"
+        || project_type == "expo"
+    {
         let has_root_page = files_to_generate.iter().any(|f| {
             if let Some(p) = f.get("path").and_then(|path| path.as_str()) {
                 let p_lower = p.to_lowercase().replace('\\', "/");
@@ -5985,8 +6239,43 @@ export default function RootLayout({
                 false
             }
         });
-        
-        if !has_root_page {
+
+        let has_renderer_app = files_to_generate.iter().any(|f| {
+            f.get("path")
+                .and_then(|p| p.as_str())
+                .map(|p| {
+                    let pl = p.to_lowercase().replace('\\', "/");
+                    pl == "src/renderer/app.tsx" || pl == "src/renderer/app.jsx"
+                })
+                .unwrap_or(false)
+        });
+        let has_mobile_tabs_index = files_to_generate.iter().any(|f| {
+            f.get("path")
+                .and_then(|p| p.as_str())
+                .map(|p| {
+                    let pl = p.to_lowercase().replace('\\', "/");
+                    pl == "app/(tabs)/index.tsx" || pl == "src/app/(tabs)/index.tsx"
+                })
+                .unwrap_or(false)
+        });
+
+        if !has_root_page && has_renderer_app {
+            files_to_generate.push(serde_json::json!({
+                "path": "src/app/page.tsx",
+                "role": "logic",
+                "language": "typescript",
+                "description": "Root Next.js entry page mounting the Electron Desktop Renderer (<App /> from '@/renderer/App').",
+                "defaultContent": "\"use client\";\n\nimport React from 'react';\nimport App from '@/renderer/App';\n\nexport default function HomePage() {\n  return <App />;\n}\n"
+            }));
+        } else if !has_root_page && has_mobile_tabs_index {
+            files_to_generate.push(serde_json::json!({
+                "path": "src/app/page.tsx",
+                "role": "logic",
+                "language": "typescript",
+                "description": "Root Next.js entry page mounting the Mobile Tabs Home screen.",
+                "defaultContent": "\"use client\";\n\nimport React from 'react';\nimport MobileHomeScreen from '@/app/(tabs)/index';\n\nexport default function HomePage() {\n  return <MobileHomeScreen />;\n}\n"
+            }));
+        } else if !has_root_page {
             let mut has_dashboard = false;
             let mut has_auth = false;
             let mut has_public = false;
@@ -6706,6 +6995,7 @@ export default function RootLayout({
     }
 
     // Run pre-build hygiene pass (tsconfig, package.json, bare imports, CSS dedup, UI primitives, App Router route exports)
+    emit_progress("compile-check", "Running static hygiene & contract validation...", 80.0);
     crate::self_healing::run_hygiene_pass_on_project(&proj_dir);
 
     // Refresh structural graphs & cross-file contracts BEFORE compiler self-healing so healer gets complete disk state
@@ -6717,9 +7007,16 @@ export default function RootLayout({
     refresh_axiom_contracts_for_project(&proj_dir, &project_id, &files_to_generate);
 
     // Run self-healing compiler loop to automatically correct any compilation or syntax errors
-    let heal_warnings = perform_self_healing_loop(&proj_dir, &model_id, &files_to_generate).await;
+    let heal_warnings = perform_self_healing_loop(
+        &proj_dir,
+        &model_id,
+        &files_to_generate,
+        Some((&window, &task_id, &project_id)),
+    )
+    .await;
 
     // Run automated post-generation static, import, hook, and Prisma checks
+    emit_progress("auto-testing", "Verifying routes, imports, and Prisma schema...", 97.0);
     let auto_test_warnings = crate::self_healing::run_generation_auto_test_suite(&proj_dir, &window, &model_id).await;
 
     // Refresh route links and write final up-to-date project graphs & contracts after healing
@@ -6757,7 +7054,7 @@ export default function RootLayout({
     let has_warnings = !completion_warnings.is_empty();
 
     // 4. Save Project State
-    emit_progress("save-project", "Saving project files...", 80.0);
+    emit_progress("save-project", "Saving project files...", 99.0);
 
     let new_proj = serde_json::json!({
         "id": project_id,
