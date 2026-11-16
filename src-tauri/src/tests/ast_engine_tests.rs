@@ -2,8 +2,9 @@
 mod tests {
     use crate::ast_engine::{
         extract_exports, extract_hook_call_sites, extract_hook_signatures, extract_imports,
-        extract_type_shapes, parse_source, reconcile_hook_contracts_in_project, syntax_issues_for,
-        HookParamKind,
+        extract_type_shapes, parse_source, reconcile_hook_contracts_in_project,
+        reconcile_model_and_type_contracts_in_project, reconcile_model_and_type_contracts_in_source,
+        syntax_issues_for, HookParamKind,
     };
     use crate::sanitizer::{
         ensure_common_formatting_helpers, ensure_multiplatform_entry_routes_bridged,
@@ -188,6 +189,137 @@ export default function CommunityPage() {
         assert!(temp_dir.join("src/app/layout.tsx").is_file());
         let bridged_page = std::fs::read_to_string(temp_dir.join("src/app/page.tsx")).unwrap();
         assert!(bridged_page.contains("@/renderer/App"));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn reconciles_explicit_return_type_interface_and_return_object_without_overriding() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v56_hook_iface_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(temp_dir.join("src/hooks")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/app/register")).unwrap();
+
+        let hook_src = r#"import { useState } from 'react';
+export interface User { id: string; email: string; }
+export interface AuthState {
+  data: User | null;
+  isLoading: boolean;
+  error: string | null;
+}
+
+const useAuth = (): AuthState => {
+  const [data] = useState<User | null>(null);
+  const handleLogin = async () => {};
+  const handleLogout = async () => {};
+  return {
+    data,
+    isLoading: false,
+    error: null,
+    login: handleLogin,
+    logout: handleLogout,
+  };
+};
+
+export default useAuth;
+"#;
+        let caller_src = r#""use client";
+import React from 'react';
+import useAuth from '@/hooks/useAuth';
+
+export default function RegisterPage() {
+  const { login, register } = useAuth();
+  return <button onClick={() => { login(); register(); }}>Go</button>;
+}
+"#;
+        let hook_path = temp_dir.join("src/hooks/useAuth.ts");
+        std::fs::write(&hook_path, hook_src).unwrap();
+        std::fs::write(temp_dir.join("src/app/register/page.tsx"), caller_src).unwrap();
+
+        let report = reconcile_hook_contracts_in_project(&temp_dir);
+        assert!(!report.edited_files.is_empty());
+
+        let reconciled = std::fs::read_to_string(&hook_path).unwrap();
+        // Set-difference additive only: existing strict declarations must remain untouched
+        assert!(reconciled.contains("data: User | null;"), "{}", reconciled);
+        assert!(reconciled.contains("isLoading: boolean;"), "{}", reconciled);
+        assert!(reconciled.contains("error: string | null;"), "{}", reconciled);
+        // Returned + demanded missing keys added as optional `?: any;`
+        assert!(reconciled.contains("login?: any;"), "{}", reconciled);
+        assert!(reconciled.contains("logout?: any;"), "{}", reconciled);
+        assert!(reconciled.contains("register?: any;"), "{}", reconciled);
+        // Return object also synchronized with caller-demanded `register`
+        assert!(reconciled.contains("register:"), "{}", reconciled);
+        assert!(syntax_issues_for("src/hooks/useAuth.ts", &reconciled)
+            .unwrap()
+            .is_empty());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn reconciles_model_interfaces_with_index_signature_and_enum_widening() {
+        let model_src = r#"export enum Status {
+  PENDING,
+  COMPLETED,
+  CANCELLED,
+}
+
+export interface Kitchen {
+  id: string;
+  name: string;
+}
+
+export interface Subscription {
+  id: string;
+  status: Status;
+}
+
+export interface ETA_Prediction {
+  id: string;
+  kitchen: Kitchen;
+  status: Status;
+}
+"#;
+        let updated = reconcile_model_and_type_contracts_in_source(model_src, true)
+            .expect("Expected model contract reconciliation");
+        assert!(updated.contains("[key: string]: any;"), "{}", updated);
+        assert!(updated.contains("status: Status | string;"), "{}", updated);
+        assert!(syntax_issues_for("src/models/index.ts", &updated)
+            .unwrap()
+            .is_empty());
+        // Idempotent on second pass when no UI JSX/string relation mismatch exists
+        assert!(reconcile_model_and_type_contracts_in_source(&updated, true).is_none());
+
+        // Project-level pass also widens relation object `kitchen: Kitchen` when UI renders `{item.kitchen}`
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v56_model_rel_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(temp_dir.join("src/models")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/components")).unwrap();
+        std::fs::write(temp_dir.join("src/models/index.ts"), model_src).unwrap();
+        std::fs::write(
+            temp_dir.join("src/components/EtaList.tsx"),
+            "export default function EtaList({ items }: any) { return <div>{items.map((item: any) => <span key={item.id}>{item.kitchen}</span>)}</div>; }\n",
+        )
+        .unwrap();
+
+        let count = reconcile_model_and_type_contracts_in_project(&temp_dir);
+        assert_eq!(count, 1);
+        let model_out = std::fs::read_to_string(temp_dir.join("src/models/index.ts")).unwrap();
+        assert!(model_out.contains("kitchen?: any;"), "{}", model_out);
+        assert!(model_out.contains("status: Status | string;"), "{}", model_out);
+        assert!(model_out.contains("[key: string]: any;"), "{}", model_out);
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

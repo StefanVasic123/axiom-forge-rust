@@ -1020,4 +1020,24 @@ export default function HeroSection() {\n\
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    #[test]
+    fn sanitizes_undici_import_zod_map_parse_nextauth_request_and_value_type_collision() {
+        let fetch_src = "import { fetch } from 'next/dist/compiled/undici';\nexport async function getData(u: string) { return fetch(u); }\n";
+        let fixed_fetch = sanitize_nextjs_and_zod_hallucinations(fetch_src, "src/lib/fetch.ts");
+        assert!(!fixed_fetch.contains("next/dist/compiled/undici"), "{}", fixed_fetch);
+        assert!(fixed_fetch.contains("return fetch(u);"), "{}", fixed_fetch);
+
+        let route_src = "import { NextRequest } from 'next/server';\nexport async function GET(request: NextRequest) {\n  const rows = items.map(etaPredictionWithKitchenSchema.parse);\n  return Response.json({ uid: request.nextauth.user.id, rows });\n}\n";
+        let fixed_route = sanitize_nextjs_and_zod_hallucinations(route_src, "src/app/api/eta_prediction/route.ts");
+        assert!(fixed_route.contains(".map((item: any) => etaPredictionWithKitchenSchema.parse(item))"), "{}", fixed_route);
+        assert!(fixed_route.contains("(request as any).nextauth.user.id"), "{}", fixed_route);
+
+        let ts2749_src = "\"use client\";\nimport React, { useState } from 'react';\n\nconst SubscriptionPlan = () => {\n  const [selected, setSelected] = useState<SubscriptionPlan | null>(null);\n  return <div>{selected ? 'ok' : 'none'}</div>;\n};\nexport default SubscriptionPlan;\n";
+        let fixed_ts2749 = sanitize_nextjs_and_zod_hallucinations(ts2749_src, "src/components/SubscriptionPlan.tsx");
+        assert!(fixed_ts2749.contains("type SubscriptionPlan = Record<string, any>;"), "{}", fixed_ts2749);
+        assert!(crate::ast_engine::syntax_issues_for("src/components/SubscriptionPlan.tsx", &fixed_ts2749)
+            .unwrap()
+            .is_empty());
+    }
+
 

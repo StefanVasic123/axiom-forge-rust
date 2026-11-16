@@ -3458,6 +3458,76 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
     }
 }
 
+/// Emits or upgrades NextAuth TypeScript module augmentations (`axiom-env.d.ts`)
+/// so `session.userId`, `session.user.id`, `session.user.role`, `User`, `JWT`,
+/// and `SignInResponse.user` compile without `TS2551` / `TS2339`.
+pub fn ensure_nextauth_type_declarations(proj_dir: &std::path::Path) {
+    let has_pkg_nextauth = std::fs::read_to_string(proj_dir.join("package.json"))
+        .map(|s| s.contains("\"next-auth\""))
+        .unwrap_or(false);
+    let has_nextauth_dir = proj_dir.join("node_modules/next-auth").exists();
+    if !has_nextauth_dir && !has_pkg_nextauth {
+        return;
+    }
+
+    let dts_path = proj_dir.join("axiom-env.d.ts");
+    let existing = std::fs::read_to_string(&dts_path).unwrap_or_default();
+    if existing.contains("userId?: string;") && existing.contains("declare module 'next-auth/jwt'") {
+        return;
+    }
+
+    let dts_content = r#"import 'next-auth';
+import 'next-auth/react';
+
+declare module 'next-auth' {
+  interface Session {
+    userId?: string;
+    accessToken?: string;
+    user: {
+      id?: string;
+      userId?: string;
+      name?: string | null;
+      email?: string | null;
+      image?: string | null;
+      role?: string;
+      [key: string]: any;
+    };
+    [key: string]: any;
+  }
+  interface User {
+    id?: string;
+    userId?: string;
+    role?: string;
+    [key: string]: any;
+  }
+}
+
+declare module 'next-auth/jwt' {
+  interface JWT {
+    id?: string;
+    userId?: string;
+    role?: string;
+    [key: string]: any;
+  }
+}
+
+declare module 'next-auth/react' {
+  interface SignInResponse {
+    user?: {
+      id?: string;
+      userId?: string;
+      name?: string | null;
+      email?: string | null;
+      image?: string | null;
+      role?: string;
+      [key: string]: any;
+    };
+  }
+}
+"#;
+    let _ = std::fs::write(&dts_path, dts_content);
+}
+
 pub fn ensure_valid_tsconfig(proj_dir: &std::path::Path) {
     let tsconfig_path = proj_dir.join("tsconfig.json");
     let has_src = proj_dir.join("src").exists();
@@ -3474,47 +3544,7 @@ pub fn ensure_valid_tsconfig(proj_dir: &std::path::Path) {
         vec!["./*"]
     };
 
-    // If next-auth is installed, emit `axiom-env.d.ts` so `session.user.id`, `session.user.role`, and `SignInResponse.user` type-check cleanly
-    if proj_dir.join("node_modules/next-auth").exists() {
-        let dts_path = proj_dir.join("axiom-env.d.ts");
-        if !dts_path.exists() {
-            let dts_content = r#"import 'next-auth';
-import 'next-auth/react';
-
-declare module 'next-auth' {
-  interface Session {
-    user: {
-      id?: string;
-      name?: string | null;
-      email?: string | null;
-      image?: string | null;
-      role?: string;
-      [key: string]: any;
-    };
-  }
-  interface User {
-    id?: string;
-    role?: string;
-    [key: string]: any;
-  }
-}
-
-declare module 'next-auth/react' {
-  interface SignInResponse {
-    user?: {
-      id?: string;
-      name?: string | null;
-      email?: string | null;
-      image?: string | null;
-      role?: string;
-      [key: string]: any;
-    };
-  }
-}
-"#;
-            let _ = std::fs::write(&dts_path, dts_content);
-        }
-    }
+    ensure_nextauth_type_declarations(proj_dir);
 
     if tsconfig_path.exists() {
         let mut needs_write = false;
@@ -4672,6 +4702,181 @@ pub fn sanitize_app_router_route_exports(content: &str, file_path: &str) -> Stri
         }
     }
     result
+}
+
+/// Deterministically repairs common LLM Next.js / NextAuth / Zod / TypeScript hallucinations:
+/// 1. Strips hallucinated `next/dist/compiled/undici` imports so standard global `fetch` is used.
+/// 2. Rewrites `.map(schema.parse)` -> `.map((item: any) => schema.parse(item))` (`TS2345`).
+/// 3. Casts `request.nextauth` / `req.nextauth` on `NextRequest` -> `(request as any).nextauth` (`TS2339`).
+/// 4. Adds companion `type <Name> = Record<string, any>;` when a local value (`const <Name> =` / `function <Name>`)
+///    is used in a TypeScript type position without a matching type/interface/class/enum declaration (`TS2749`).
+pub fn sanitize_nextjs_and_zod_hallucinations(content: &str, rel_path: &str) -> String {
+    let low = rel_path.replace('\\', "/").to_ascii_lowercase();
+    if low.ends_with(".d.ts") {
+        return content.to_string();
+    }
+    let is_ts = low.ends_with(".ts") || low.ends_with(".tsx") || low.ends_with(".mts") || low.ends_with(".cts");
+    let is_js = low.ends_with(".js") || low.ends_with(".jsx");
+    if !is_ts && !is_js {
+        return content.to_string();
+    }
+
+    let mut out = content.to_string();
+
+    // 1. Strip `next/dist/compiled/undici` imports (Next.js ships internal compiled undici without TS types)
+    if out.contains("next/dist/compiled/undici") {
+        if let Ok(re_alias) = regex::Regex::new(
+            r#"(?m)^[ \t]*import\s+\{\s*fetch\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\}\s+from\s+['"]next/dist/compiled/undici['"];?[ \t]*\r?\n?"#,
+        ) {
+            out = re_alias.replace_all(&out, "const $1 = globalThis.fetch;\n").to_string();
+        }
+        if let Ok(re_undici) = regex::Regex::new(
+            r#"(?m)^[ \t]*import[^\r\n;]*from\s+['"]next/dist/compiled/undici['"];?[ \t]*\r?\n?"#,
+        ) {
+            out = re_undici.replace_all(&out, "").to_string();
+        }
+    }
+
+    // 2. `.map(schema.parse)` passes `(value, index, array)` to Zod's `.parse(data, params)` causing TS2345
+    if out.contains(".map(") && out.contains(".parse)") {
+        if let Ok(re_map_parse) = regex::Regex::new(
+            r"\.map\(\s*([A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*)\.parse\s*\)",
+        ) {
+            if is_ts {
+                out = re_map_parse.replace_all(&out, ".map((item: any) => $1.parse(item))").to_string();
+            } else {
+                out = re_map_parse.replace_all(&out, ".map((item) => $1.parse(item))").to_string();
+            }
+        }
+    }
+
+    // 3. `request.nextauth` / `req.nextauth` on NextRequest
+    if out.contains(".nextauth") && is_ts {
+        if let Ok(re_nextauth) = regex::Regex::new(r"(^|[^A-Za-z0-9_$.])(request|req)\.nextauth\b") {
+            out = re_nextauth.replace_all(&out, "${1}(${2} as any).nextauth").to_string();
+        }
+    }
+
+    // 4. TS2749: local value `const Foo =` / `function Foo(` also used in a type position without `type Foo` / `interface Foo`
+    if is_ts {
+        if let Ok(re_val_decl) = regex::Regex::new(
+            r"(?m)^[ \t]*(?:export\s+(?:default\s+)?)?(?:(?:async\s+)?function\s+([A-Z][A-Za-z0-9_]*)\s*[<\(]|(?:const|let|var)\s+([A-Z][A-Za-z0-9_]*)\s*(?::[^=\r\n]+)?=)",
+        ) {
+            let mut candidates: Vec<String> = Vec::new();
+            for cap in re_val_decl.captures_iter(&out) {
+                let name = cap.get(1).or_else(|| cap.get(2)).map(|m| m.as_str()).unwrap_or("");
+                if !name.is_empty() && !candidates.iter().any(|c| c == name) {
+                    candidates.push(name.to_string());
+                }
+            }
+            if !candidates.is_empty() {
+                let imported_names: std::collections::HashSet<String> = crate::ast_engine::parse_source(rel_path, &out)
+                    .map(|tree| {
+                        let mut set = std::collections::HashSet::new();
+                        for imp in crate::ast_engine::extract_imports(&tree, &out) {
+                            if let Some(d) = imp.default_local {
+                                set.insert(d);
+                            }
+                            if let Some(ns) = imp.namespace_local {
+                                set.insert(ns);
+                            }
+                            for b in imp.named {
+                                set.insert(b.local);
+                            }
+                        }
+                        set
+                    })
+                    .unwrap_or_default();
+
+                let mut to_inject: Vec<String> = Vec::new();
+                for name in candidates {
+                    if imported_names.contains(&name) {
+                        continue;
+                    }
+                    let esc = regex::escape(&name);
+                    let has_type_decl = regex::Regex::new(&format!(
+                        r"(?m)\b(?:type|interface|class|enum)\s+{}\b",
+                        esc
+                    ))
+                    .map(|re| re.is_match(&out))
+                    .unwrap_or(true);
+                    if has_type_decl {
+                        continue;
+                    }
+
+                    let used_as_generic_arg = regex::Regex::new(&format!(
+                        r"\b(?:useState|useRef|useMemo|useCallback|useReducer|Promise|Array|Set|Map|Partial|Required|Readonly|Record)\s*<\s*{}\b",
+                        esc
+                    ))
+                    .map(|re| re.is_match(&out))
+                    .unwrap_or(false);
+                    let used_as_var_type = regex::Regex::new(&format!(
+                        r"(?:const|let|var)\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s*:\s*{}(?:\[\]|\s*\|\s*(?:null|undefined))?\s*=",
+                        esc
+                    ))
+                    .map(|re| re.is_match(&out))
+                    .unwrap_or(false);
+                    let used_as_cast = regex::Regex::new(&format!(
+                        r"\bas\s+{}(?:\[\])?\s*[;,\)\]\}}]",
+                        esc
+                    ))
+                    .map(|re| re.is_match(&out))
+                    .unwrap_or(false);
+
+                    if used_as_generic_arg || used_as_var_type || used_as_cast {
+                        to_inject.push(format!("type {} = Record<string, any>;", name));
+                    }
+                }
+
+                if !to_inject.is_empty() {
+                    let insert_block = format!("{}\n", to_inject.join("\n"));
+                    // Insert safely after `'use client'` and all top-level imports
+                    let insert_byte = if let Some(tree) = crate::ast_engine::parse_source(rel_path, &out) {
+                        let mut pos = 0usize;
+                        let mut cursor = tree.root_node().walk();
+                        for child in tree.root_node().named_children(&mut cursor) {
+                            let kind = child.kind();
+                            if kind == "import_statement" {
+                                pos = child.end_byte();
+                            } else if kind == "expression_statement" {
+                                let txt = out.get(child.start_byte()..child.end_byte()).unwrap_or("").trim();
+                                if txt.contains("use client") || txt.contains("use server") {
+                                    pos = child.end_byte();
+                                } else {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        if pos > 0 && out[pos..].starts_with('\r') {
+                            pos += 1;
+                        }
+                        if pos > 0 && out[pos..].starts_with('\n') {
+                            pos += 1;
+                        }
+                        pos
+                    } else {
+                        0
+                    };
+                    if insert_byte <= out.len() && out.is_char_boundary(insert_byte) {
+                        let mut candidate = out.clone();
+                        let prefix = if insert_byte > 0 && !candidate[..insert_byte].ends_with('\n') {
+                            format!("\n{}", insert_block)
+                        } else {
+                            insert_block
+                        };
+                        candidate.insert_str(insert_byte, &prefix);
+                        if let Some(verified) = crate::ast_engine::verified_rewrite(rel_path, &out, candidate) {
+                            out = verified;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    out
 }
 
 pub fn post_process_generated_file(
@@ -6003,6 +6208,12 @@ export default function Home() {
         processed = sanitize_try_catch_body_scope(&processed);
         processed = sanitize_stripe_client_init(&processed);
         processed = sanitize_tsx_ux_glitches(&processed, &normalized_path);
+        processed = sanitize_nextjs_and_zod_hallucinations(&processed, &normalized_path);
+        if crate::ast_engine::is_model_or_type_rel_path(&normalized_path) {
+            if let Some(reconciled) = crate::ast_engine::reconcile_model_and_type_contracts_in_source(&processed, true) {
+                processed = reconciled;
+            }
+        }
     }
 
     processed

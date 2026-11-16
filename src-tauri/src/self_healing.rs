@@ -1134,6 +1134,7 @@ pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
                             if crate::sanitizer::is_app_router_route_file(&rel) {
                                 next = crate::sanitizer::sanitize_app_router_route_exports(&next, &rel);
                             }
+                            next = crate::sanitizer::sanitize_nextjs_and_zod_hallucinations(&next, &rel);
                             if next != c {
                                 let _ = std::fs::write(&p, next);
                             }
@@ -1164,6 +1165,7 @@ pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
                 let mut next = crate::sanitizer::normalize_bare_local_imports(&c);
                 next = crate::sanitizer::ensure_next_server_imports(&next, root_candidate);
                 next = crate::sanitizer::sanitize_middleware_redundancy(&next, root_candidate);
+                next = crate::sanitizer::sanitize_nextjs_and_zod_hallucinations(&next, root_candidate);
                 if next != c {
                     let _ = std::fs::write(&p, next);
                 }
@@ -1173,10 +1175,12 @@ pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
 
     crate::apply_ast_sanity_pass_to_project(proj_dir);
     let _ = crate::ast_engine::reconcile_hook_contracts_in_project(proj_dir);
+    let _ = crate::ast_engine::reconcile_model_and_type_contracts_in_project(proj_dir);
     crate::sanitizer::reconcile_hook_error_returns_in_project(proj_dir);
     crate::sanitizer::ensure_ui_primitives_reconciled(proj_dir);
     crate::sanitizer::ensure_directory_barrel_files(proj_dir);
     ensure_nextauth_env_vars(proj_dir);
+    crate::sanitizer::ensure_nextauth_type_declarations(proj_dir);
     let _ = auto_import_missing_symbols_in_project(proj_dir);
 }
 
@@ -3646,7 +3650,11 @@ pub async fn perform_self_healing_loop(
                 break;
             }
             sorted_files.retain(|(p, _)| attempts_failed_for(p) < 2);
-            sorted_files.truncate(4);
+            let top_has_prior_stagnation = sorted_files
+                .iter()
+                .take(2)
+                .any(|(p, _)| attempts_failed_for(p) >= 1);
+            sorted_files.truncate(if top_has_prior_stagnation { 1 } else { 2 });
 
             // Try Katastar verified patches first
             let mut katastar_hints: Vec<String> = Vec::new();
@@ -3867,6 +3875,8 @@ pub async fn perform_self_healing_loop(
             });
 
             let mut handled_or_counted: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut unchanged_paths: Vec<String> = Vec::new();
+            let mut any_file_modified_in_batch = false;
             if let Ok(resp) = client.post("http://127.0.0.1:11434/api/chat").json(&ollama_req).send().await {
                 if resp.status().is_success() {
                     if let Ok(resp_json) = resp.json::<Value>().await {
@@ -3890,7 +3900,7 @@ pub async fn perform_self_healing_loop(
                                     .unwrap_or_default();
                                 if processed == before {
                                     handled_or_counted.insert(path_key_low.clone());
-                                    *stagnant_counts.entry(path_key_low).or_insert(0) += 1;
+                                    unchanged_paths.push(path_key_low);
                                     crate::katastar::record_project_heal_round(
                                         proj_dir,
                                         &path_str,
@@ -3942,6 +3952,7 @@ pub async fn perform_self_healing_loop(
                                 }
                                 if std::fs::write(&full_path, &processed).is_ok() {
                                     handled_or_counted.insert(path_key_low.clone());
+                                    any_file_modified_in_batch = true;
                                     let prev_err = sorted_files
                                         .iter()
                                         .find(|(p, _)| p.eq_ignore_ascii_case(&path_str))
@@ -3977,10 +3988,15 @@ pub async fn perform_self_healing_loop(
                     }
                 }
             }
-            for ep in &expected_paths {
-                let ep_low = ep.to_lowercase();
-                if !handled_or_counted.contains(&ep_low) {
-                    *stagnant_counts.entry(ep_low).or_insert(0) += 1;
+            if !any_file_modified_in_batch || expected_paths.len() == 1 {
+                for up in unchanged_paths {
+                    *stagnant_counts.entry(up).or_insert(0) += 1;
+                }
+                for ep in &expected_paths {
+                    let ep_low = ep.to_lowercase();
+                    if !handled_or_counted.contains(&ep_low) {
+                        *stagnant_counts.entry(ep_low).or_insert(0) += 1;
+                    }
                 }
             }
         }
@@ -4061,6 +4077,7 @@ pub async fn perform_self_healing_loop(
 
         if !pending_fixes.is_empty() {
             let blocked_on_next_config = build_lower.contains("next.config");
+            let mut carried_over: Vec<PendingBuildFix> = Vec::new();
             for pf in pending_fixes.drain(..) {
                 let pf_lower = pf.path.to_lowercase().replace('\\', "/");
                 let still_failing = build_lower.contains(&pf_lower);
@@ -4083,20 +4100,9 @@ pub async fn perform_self_healing_loop(
                         tried_katastar_ids.push(pf.entry_id);
                     }
                 } else if !blocked_on_next_config || pf_lower.contains("next.config") {
-                    let atomic_patch = if pf.source == "ai" {
-                        crate::katastar::extract_safe_atomic_patch(&pf.path, &pf.before, &pf.after)
-                    } else {
-                        None
-                    };
-                    crate::katastar::finalize_katastar_outcome(
-                        &pf.entry_id,
-                        true,
-                        &pf.source,
-                        "error_disappeared",
-                        atomic_patch,
-                        None,
-                        model,
-                    );
+                    // Do NOT promote to verified Katastar yet: a failed `next build` may have aborted
+                    // on an earlier Webpack module before compiling `pf.path`. Carry over until `next build` passes.
+                    carried_over.push(pf);
                 } else {
                     crate::katastar::finalize_katastar_outcome(
                         &pf.entry_id,
@@ -4113,6 +4119,7 @@ pub async fn perform_self_healing_loop(
                     }
                 }
             }
+            pending_fixes = carried_over;
         }
 
         if attempt > MAX_BUILD_REPAIRS {
@@ -4433,6 +4440,18 @@ pub async fn perform_self_healing_loop(
                 }
             }
         }
+    }
+
+    for pf in pending_fixes.drain(..) {
+        crate::katastar::finalize_katastar_outcome(
+            &pf.entry_id,
+            false,
+            &pf.source,
+            "build_never_succeeded",
+            None,
+            None,
+            model,
+        );
     }
 
     unresolved_warnings

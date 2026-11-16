@@ -603,6 +603,7 @@ pub struct HookSignature {
     pub params_trailing_comma: bool,
     pub return_objects: Vec<ReturnObject>,
     pub has_explicit_return_type: bool,
+    pub explicit_return_type_name: Option<String>,
 }
 
 fn analyze_param(param: Node, src: &str) -> HookParam {
@@ -760,6 +761,85 @@ fn collect_return_objects(body: Node, src: &str, out: &mut Vec<ReturnObject>) {
     }
 }
 
+fn is_valid_js_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_' || first == '$')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
+fn extract_explicit_return_type_name(func: Node, src: &str) -> Option<String> {
+    let ret_ann = func.child_by_field_name("return_type")?;
+    let named = named_children_vec(ret_ann);
+    if named.len() == 1 && named[0].kind() == "type_identifier" {
+        return Some(node_text(named[0], src).to_string());
+    }
+    if ret_ann.kind() == "type_identifier" {
+        return Some(node_text(ret_ann, src).to_string());
+    }
+    None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalTypeContract {
+    pub name: String,
+    pub existing_keys: Vec<String>,
+    pub insert_byte: usize,
+}
+
+/// Izvlači top-level `interface X { ... }` i objektne `type X = { ... }` deklaracije u istom fajlu.
+pub fn extract_local_type_contracts(tree: &Tree, src: &str) -> Vec<LocalTypeContract> {
+    let mut contracts = Vec::new();
+    let make_contract = |name: String, body: Node| -> Option<LocalTypeContract> {
+        let end = body.end_byte();
+        if end == 0 || src.as_bytes().get(end - 1) != Some(&b'}') {
+            return None;
+        }
+        let existing_keys: Vec<String> = collect_object_type_properties(body, src)
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        Some(LocalTypeContract {
+            name,
+            existing_keys,
+            insert_byte: end - 1,
+        })
+    };
+
+    for stmt in named_children_vec(tree.root_node()) {
+        let decl = if stmt.kind() == "export_statement" {
+            match stmt.child_by_field_name("declaration") {
+                Some(d) => d,
+                None => continue,
+            }
+        } else {
+            stmt
+        };
+        match decl.kind() {
+            "interface_declaration" => {
+                let Some(name_node) = decl.child_by_field_name("name") else { continue };
+                let Some(body) = decl.child_by_field_name("body") else { continue };
+                if let Some(c) = make_contract(node_text(name_node, src).to_string(), body) {
+                    contracts.push(c);
+                }
+            }
+            "type_alias_declaration" => {
+                let Some(name_node) = decl.child_by_field_name("name") else { continue };
+                let Some(val) = decl.child_by_field_name("value") else { continue };
+                if val.kind() == "object_type" {
+                    if let Some(c) = make_contract(node_text(name_node, src).to_string(), val) {
+                        contracts.push(c);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    contracts
+}
+
 fn build_hook_signature(name: &str, decl_node: Node, func: Node, src: &str) -> HookSignature {
     let mut params = Vec::new();
     let mut params_close_byte = None;
@@ -787,6 +867,7 @@ fn build_hook_signature(name: &str, decl_node: Node, func: Node, src: &str) -> H
     if let Some(body) = func.child_by_field_name("body") {
         collect_return_objects(body, src, &mut return_objects);
     }
+    let explicit_return_type_name = extract_explicit_return_type_name(func, src);
     HookSignature {
         name: name.to_string(),
         line: decl_node.start_position().row + 1,
@@ -795,6 +876,7 @@ fn build_hook_signature(name: &str, decl_node: Node, func: Node, src: &str) -> H
         params_trailing_comma,
         return_objects,
         has_explicit_return_type: func.child_by_field_name("return_type").is_some(),
+        explicit_return_type_name,
     }
 }
 
@@ -1031,6 +1113,7 @@ struct ParsedProjectFile {
     abs: std::path::PathBuf,
     content: String,
     hooks: Vec<HookSignature>,
+    local_contracts: Vec<LocalTypeContract>,
     calls: Vec<HookCallSite>,
 }
 
@@ -1058,31 +1141,86 @@ fn collect_source_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>
     }
 }
 
-/// Planira AST izmene jednog hook fajla na osnovu svih poziva hook-a u projektu.
-pub fn plan_hook_contract_insertions(
+/// Planira AST izmene jednog hook fajla na osnovu svih poziva hook-a u projektu
+/// i lokalne `interface`/`type` deklaracije eksplicitnog povratnog tipa (Faza 4).
+pub fn plan_hook_and_interface_insertions(
     rel_path: &str,
     hook: &HookSignature,
+    local_contracts: &[LocalTypeContract],
     calls: &[&HookCallSite],
     actions: &mut Vec<String>,
 ) -> Vec<(usize, String)> {
     let typed = is_typed_path(rel_path);
     let mut insertions: Vec<(usize, String)> = Vec::new();
+
+    let mut demanded: Vec<String> = Vec::new();
+    for c in calls {
+        for k in &c.destructured_keys {
+            if is_valid_js_identifier(k) && !demanded.contains(k) {
+                demanded.push(k.clone());
+            }
+        }
+    }
+
+    // (a0) Eksplicitni return tip (`const useAuth = (): AuthState =>`) usklađuje se aditivno
+    // (Set-Difference samo za missing ključeve, uvek `prop?: any;`)
+    let matched_contract = hook
+        .explicit_return_type_name
+        .as_ref()
+        .and_then(|tname| local_contracts.iter().find(|c| &c.name == tname));
+
+    if let Some(contract) = matched_contract {
+        let mut required_iface_keys: Vec<String> = Vec::new();
+        for ret in &hook.return_objects {
+            for k in &ret.keys {
+                if is_valid_js_identifier(k) && !required_iface_keys.contains(k) {
+                    required_iface_keys.push(k.clone());
+                }
+            }
+        }
+        for k in &demanded {
+            if !required_iface_keys.contains(k) {
+                required_iface_keys.push(k.clone());
+            }
+        }
+        let missing_in_iface: Vec<&String> = required_iface_keys
+            .iter()
+            .filter(|k| !contract.existing_keys.contains(k))
+            .collect();
+        if !missing_in_iface.is_empty() {
+            let decls = missing_in_iface
+                .iter()
+                .map(|k| format!("  {}?: any;", k))
+                .collect::<Vec<_>>()
+                .join("\n");
+            insertions.push((contract.insert_byte, format!("\n{}\n", decls)));
+            actions.push(format!(
+                "{}: `{}` povratni tip `{}` dopunjen sa {}?: any",
+                rel_path,
+                hook.name,
+                contract.name,
+                missing_in_iface.iter().map(|k| format!("`{}`", k)).collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
+
     if calls.is_empty() {
         return insertions;
     }
 
     // (a) Ključevi koje pozivaoci destrukturiraju a hook ih ne vraća
-    if !hook.has_explicit_return_type && !hook.return_objects.is_empty() && hook.return_objects.iter().all(|r| !r.has_spread) {
-        let mut demanded: Vec<String> = Vec::new();
-        for c in calls {
-            for k in &c.destructured_keys {
-                if !demanded.contains(k) {
-                    demanded.push(k.clone());
-                }
-            }
-        }
+    let hook_param_keys: Vec<String> = hook
+        .params
+        .iter()
+        .flat_map(|p| p.object_keys.iter().cloned())
+        .collect();
+    let can_sync_return_objects = !hook.has_explicit_return_type || matched_contract.is_some();
+    if can_sync_return_objects && !hook.return_objects.is_empty() && hook.return_objects.iter().all(|r| !r.has_spread) {
         for ret in &hook.return_objects {
-            let missing: Vec<&String> = demanded.iter().filter(|k| !ret.keys.contains(k)).collect();
+            let missing: Vec<&String> = demanded
+                .iter()
+                .filter(|k| !ret.keys.contains(k) && !hook_param_keys.contains(k))
+                .collect();
             if missing.is_empty() {
                 continue;
             }
@@ -1191,13 +1329,24 @@ pub fn plan_hook_contract_insertions(
     insertions
 }
 
+/// Planira AST izmene jednog hook fajla na osnovu svih poziva hook-a u projektu.
+pub fn plan_hook_contract_insertions(
+    rel_path: &str,
+    hook: &HookSignature,
+    calls: &[&HookCallSite],
+    actions: &mut Vec<String>,
+) -> Vec<(usize, String)> {
+    plan_hook_and_interface_insertions(rel_path, hook, &[], calls, actions)
+}
+
 /// Projekat-nivo AST usklađivanje hook ↔ pozivalac ugovora:
-/// - dodaje ključeve koje pozivaoci destrukturiraju (`error`, `refetch`, ...),
+/// - dopunjuje lokalne povratne `interface`/`type` definicije (`AuthState`) opcionim `?: any;` ključevima,
+/// - dodaje ključeve koje pozivaoci destrukturiraju (`error`, `refetch`, `login`, ...),
 /// - podrazumevane/opcione parametre za pozive sa manje argumenata,
 /// - opcione parametre za pozive sa više argumenata,
 /// - opciona inline svojstva koja pozivaoci ne prosleđuju.
 ///
-/// Svaka izmena je čisto ubacivanje teksta i prihvata se samo ako re-parse ne uvede nove sintaksne greške.
+/// Svaka izmena se prihvata samo ako re-parse ne uvede nove sintaksne greške.
 pub fn reconcile_hook_contracts_in_project(proj_dir: &std::path::Path) -> HookContractReport {
     let mut report = HookContractReport::default();
     if !proj_dir.is_dir() {
@@ -1218,8 +1367,9 @@ pub fn reconcile_hook_contracts_in_project(proj_dir: &std::path::Path) -> HookCo
             .unwrap_or_else(|_| abs.to_string_lossy().replace('\\', "/"));
         let Some(tree) = parse_source(&rel, &content) else { continue };
         let hooks = extract_hook_signatures(&tree, &content);
+        let local_contracts = extract_local_type_contracts(&tree, &content);
         let calls = extract_hook_call_sites(&tree, &content);
-        parsed.push(ParsedProjectFile { rel, abs, content, hooks, calls });
+        parsed.push(ParsedProjectFile { rel, abs, content, hooks, local_contracts, calls });
     }
 
     // Hook ime → indeks fajla (samo jedinstvene definicije)
@@ -1231,6 +1381,7 @@ pub fn reconcile_hook_contracts_in_project(proj_dir: &std::path::Path) -> HookCo
     }
 
     let mut per_file_insertions: std::collections::BTreeMap<usize, Vec<(usize, String)>> = std::collections::BTreeMap::new();
+    let mut synced_contract_positions: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
     for (hook_name, defs) in &definitions {
         if defs.len() != 1 {
             continue;
@@ -1244,9 +1395,15 @@ pub fn reconcile_hook_contracts_in_project(proj_dir: &std::path::Path) -> HookCo
             .flat_map(|(_, f)| f.calls.iter().filter(|c| &c.hook_name == hook_name))
             .collect();
         let rel = parsed[def_idx].rel.clone();
-        let ins = plan_hook_contract_insertions(&rel, hook, &calls, &mut report.actions);
-        if !ins.is_empty() {
-            per_file_insertions.entry(def_idx).or_default().extend(ins);
+        let local_contracts = &parsed[def_idx].local_contracts;
+        let ins = plan_hook_and_interface_insertions(&rel, hook, local_contracts, &calls, &mut report.actions);
+        for (pos, txt) in ins {
+            // Ako dva hook-a u istom fajlu dele isti `interface AuthState`, ne dupliraj ubacivanje na istoj poziciji
+            let is_iface_pos = local_contracts.iter().any(|c| c.insert_byte == pos);
+            if is_iface_pos && !synced_contract_positions.insert((def_idx, pos)) {
+                continue;
+            }
+            per_file_insertions.entry(def_idx).or_default().push((pos, txt));
         }
     }
 
@@ -1260,6 +1417,223 @@ pub fn reconcile_hook_contracts_in_project(proj_dir: &std::path::Path) -> HookCo
         }
     }
     report
+}
+
+// ---------------------------------------------------------------------------
+// 6. Model & Type ugovori (`src/models/`, `src/types/`) — view-model & enum widening
+// ---------------------------------------------------------------------------
+
+pub fn apply_byte_edits(src: &str, mut edits: Vec<(usize, usize, String)>) -> String {
+    let mut indexed: Vec<(usize, usize, usize, String)> = edits
+        .drain(..)
+        .enumerate()
+        .map(|(i, (s, e, t))| (s, e, i, t))
+        .collect();
+    indexed.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(b.2.cmp(&a.2)));
+    let mut out = src.to_string();
+    for (start, end, _, text) in indexed {
+        if start <= end && end <= out.len() && out.is_char_boundary(start) && out.is_char_boundary(end) {
+            out.replace_range(start..end, &text);
+        }
+    }
+    out
+}
+
+pub fn is_model_or_type_rel_path(rel: &str) -> bool {
+    let low = rel.replace('\\', "/").to_ascii_lowercase();
+    let norm = low.trim_start_matches("./");
+    if norm.ends_with(".d.ts") || (!norm.ends_with(".ts") && !norm.ends_with(".tsx")) {
+        return false;
+    }
+    norm.starts_with("src/models/")
+        || norm.starts_with("models/")
+        || norm.starts_with("src/types/")
+        || norm.starts_with("types/")
+}
+
+fn reconcile_model_types_with_ui_hints(
+    source: &str,
+    is_model_or_type_file: bool,
+    ui_string_or_jsx_props: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if !is_model_or_type_file {
+        return None;
+    }
+    let tree = parse_source("src/models/index.ts", source)?;
+    let mut local_enums = std::collections::HashSet::new();
+    let mut local_object_types = std::collections::HashSet::new();
+
+    for stmt in named_children_vec(tree.root_node()) {
+        let decl = if stmt.kind() == "export_statement" {
+            match stmt.child_by_field_name("declaration") {
+                Some(d) => d,
+                None => continue,
+            }
+        } else {
+            stmt
+        };
+        match decl.kind() {
+            "enum_declaration" => {
+                if let Some(n) = decl.child_by_field_name("name") {
+                    local_enums.insert(node_text(n, source).to_string());
+                }
+            }
+            "interface_declaration" => {
+                if let Some(n) = decl.child_by_field_name("name") {
+                    local_object_types.insert(node_text(n, source).to_string());
+                }
+            }
+            "type_alias_declaration" => {
+                if let (Some(n), Some(v)) = (decl.child_by_field_name("name"), decl.child_by_field_name("value")) {
+                    if v.kind() == "object_type" {
+                        local_object_types.insert(node_text(n, source).to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    for stmt in named_children_vec(tree.root_node()) {
+        let decl = if stmt.kind() == "export_statement" {
+            match stmt.child_by_field_name("declaration") {
+                Some(d) => d,
+                None => continue,
+            }
+        } else {
+            stmt
+        };
+        let body = match decl.kind() {
+            "interface_declaration" => decl.child_by_field_name("body"),
+            "type_alias_declaration" => decl.child_by_field_name("value").filter(|v| v.kind() == "object_type"),
+            _ => None,
+        };
+        let Some(body) = body else { continue };
+
+        let members = named_children_vec(body);
+        let has_index_sig = members.iter().any(|m| m.kind() == "index_signature")
+            || node_text(body, source).contains("[key: string]");
+
+        if !has_index_sig && body.end_byte() > 0 && source.as_bytes().get(body.end_byte() - 1) == Some(&b'}') {
+            let pos = body.end_byte() - 1;
+            edits.push((pos, pos, "\n  [key: string]: any;\n".to_string()));
+        }
+
+        for member in members {
+            if member.kind() != "property_signature" {
+                continue;
+            }
+            let Some(name_node) = member.child_by_field_name("name") else { continue };
+            let Some(prop_name) = property_key_name(name_node, source) else { continue };
+            let Some(type_ann) = member.child_by_field_name("type") else { continue };
+            let type_children = named_children_vec(type_ann);
+            if type_children.len() != 1 || type_children[0].kind() != "type_identifier" {
+                continue;
+            }
+            let t_node = type_children[0];
+            let t_name = node_text(t_node, source);
+
+            let is_known_enum = local_enums.contains(t_name)
+                || (!local_object_types.contains(t_name)
+                    && matches!(
+                        t_name,
+                        "Status"
+                            | "SubscriptionStatus"
+                            | "OrderStatus"
+                            | "NotificationType"
+                            | "PredictionStatus"
+                            | "Role"
+                            | "UserRole"
+                    ));
+
+            if is_known_enum {
+                edits.push((t_node.start_byte(), t_node.end_byte(), format!("{} | string", t_name)));
+            } else if ui_string_or_jsx_props.contains(&prop_name) && local_object_types.contains(t_name) {
+                edits.push((name_node.end_byte(), t_node.end_byte(), "?: any".to_string()));
+            }
+        }
+    }
+
+    if edits.is_empty() {
+        return None;
+    }
+    let candidate = apply_byte_edits(source, edits);
+    verified_rewrite("src/models/index.ts", source, candidate)
+}
+
+/// Usklađuje `interface` i objektne `type` deklaracije u `src/models/` / `src/types/`:
+/// - dodaje `[key: string]: any;` za view-model svojstva koja UI čita van Prisma sheme,
+/// - proširuje enum polja (`status: Status` → `status: Status | string`) radi poređenja sa string literalima (`TS2367`).
+pub fn reconcile_model_and_type_contracts_in_source(source: &str, is_model_or_type_file: bool) -> Option<String> {
+    reconcile_model_types_with_ui_hints(source, is_model_or_type_file, &std::collections::HashSet::new())
+}
+
+fn collect_ui_string_and_jsx_member_props(proj_dir: &std::path::Path, paths: &[std::path::PathBuf]) -> std::collections::HashSet<String> {
+    let mut props = std::collections::HashSet::new();
+    let Ok(str_method_re) = regex::Regex::new(
+        r"\b[a-zA-Z_$][a-zA-Z0-9_$]*\.([a-zA-Z_$][a-zA-Z0-9_$]*)\.(?:toLowerCase|toUpperCase|trim|localeCompare|startsWith|endsWith)\s*\("
+    ) else {
+        return props;
+    };
+    let Ok(jsx_child_re) = regex::Regex::new(
+        r"\{[ \t]*[a-zA-Z_$][a-zA-Z0-9_$]*\.([a-zA-Z_$][a-zA-Z0-9_$]*)[ \t]*\}"
+    ) else {
+        return props;
+    };
+
+    for abs in paths {
+        let rel = abs
+            .strip_prefix(proj_dir)
+            .map(|r| r.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        if is_model_or_type_rel_path(&rel) {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(abs) else { continue };
+        for cap in str_method_re.captures_iter(&content) {
+            if let Some(m) = cap.get(1) {
+                props.insert(m.as_str().to_string());
+            }
+        }
+        let low = rel.to_ascii_lowercase();
+        if low.ends_with(".tsx") || low.ends_with(".jsx") {
+            for cap in jsx_child_re.captures_iter(&content) {
+                if let Some(m) = cap.get(1) {
+                    props.insert(m.as_str().to_string());
+                }
+            }
+        }
+    }
+    props
+}
+
+/// Projekat-nivo AST usklađivanje domenskih modela i tipova (`src/models/`, `src/types/`).
+pub fn reconcile_model_and_type_contracts_in_project(proj_dir: &std::path::Path) -> usize {
+    if !proj_dir.is_dir() {
+        return 0;
+    }
+    let mut paths = Vec::new();
+    collect_source_files(proj_dir, &mut paths);
+    let ui_props = collect_ui_string_and_jsx_member_props(proj_dir, &paths);
+    let mut edited = 0usize;
+
+    for abs in paths {
+        let rel = abs
+            .strip_prefix(proj_dir)
+            .map(|r| r.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        if !is_model_or_type_rel_path(&rel) {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&abs) else { continue };
+        if let Some(next) = reconcile_model_types_with_ui_hints(&content, true, &ui_props) {
+            if std::fs::write(&abs, &next).is_ok() {
+                edited += 1;
+            }
+        }
+    }
+    edited
 }
 
 /// Kratak, LLM-prijateljski sažetak oblika tipova (za prompt kontekst i `axiom-contracts.json`).

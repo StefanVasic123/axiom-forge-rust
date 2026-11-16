@@ -559,7 +559,17 @@ pub fn normalize_error_signature(category_hint: &str, raw_error: &str, file_path
 pub fn is_safe_auto_patch(file_path: &str, patch: &KatastarPatch) -> bool {
     let search_trimmed = patch.search.trim();
     let replace_trimmed = patch.replace.trim();
-    if search_trimmed.len() < 8 || search_trimmed == replace_trimmed {
+    if search_trimmed.len() < 8 || replace_trimmed.is_empty() || search_trimmed == replace_trimmed {
+        return false;
+    }
+    // Never allow deleting or replacing an `import` statement with non-import code across projects
+    if (search_trimmed.starts_with("import ") || search_trimmed.starts_with("import{"))
+        && !(replace_trimmed.starts_with("import ") || replace_trimmed.starts_with("import{"))
+    {
+        return false;
+    }
+    // Never allow stripping `export ` declarations into non-exports
+    if search_trimmed.starts_with("export ") && !replace_trimmed.starts_with("export ") {
         return false;
     }
     if patch.search.len() > 350 || patch.replace.len() > 350 {
@@ -666,7 +676,34 @@ pub fn extract_safe_atomic_patch(file_path: &str, before: &str, after: &str) -> 
 pub fn load_katastar_store_at(path: &std::path::Path) -> KatastarStore {
     if path.exists() {
         if let Ok(content) = std::fs::read_to_string(path) {
-            if let Ok(store) = serde_json::from_str::<KatastarStore>(&content) {
+            if let Ok(mut store) = serde_json::from_str::<KatastarStore>(&content) {
+                let mut purged_unsafe = false;
+                for entry in &mut store.entries {
+                    if entry.status == "verified" {
+                        if let Some(ref patch) = entry.patch {
+                            let sample_path = patch
+                                .extensions
+                                .first()
+                                .map(|e| format!("sample{}", e))
+                                .unwrap_or_else(|| {
+                                    if entry.category == "prisma" {
+                                        "prisma/schema.prisma".to_string()
+                                    } else {
+                                        "sample.ts".to_string()
+                                    }
+                                });
+                            if !is_safe_auto_patch(&sample_path, patch) {
+                                entry.status = "failed".to_string();
+                                entry.last_outcome = "failed".to_string();
+                                entry.patch = None;
+                                purged_unsafe = true;
+                            }
+                        }
+                    }
+                }
+                if purged_unsafe {
+                    let _ = save_katastar_store_at(path, &mut store);
+                }
                 return store;
             }
         }
@@ -997,7 +1034,7 @@ pub fn finalize_katastar_outcome_at(
             }
             if entry.patch.is_none() {
                 if let Some(p) = upgraded_patch {
-                    if !p.search.trim().is_empty() && p.search != p.replace {
+                    if !p.search.trim().is_empty() && !p.replace.trim().is_empty() && p.search != p.replace {
                         entry.patch = Some(p);
                     }
                 }

@@ -352,4 +352,70 @@ export default function BoardPage() {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    #[test]
+    fn rejects_empty_replace_and_import_deletion_in_is_safe_auto_patch() {
+        let empty_replace_patch = crate::katastar::KatastarPatch {
+            search: "import { useAuth } from '@/hooks/useAuth';".to_string(),
+            replace: "".to_string(),
+            extensions: vec![".ts".to_string()],
+        };
+        assert!(!crate::katastar::is_safe_auto_patch("src/app/register/page.tsx", &empty_replace_patch));
+
+        let import_delete_comment_patch = crate::katastar::KatastarPatch {
+            search: "import { useAuth } from '@/hooks/useAuth';".to_string(),
+            replace: "// removed".to_string(),
+            extensions: vec![".ts".to_string()],
+        };
+        assert!(!crate::katastar::is_safe_auto_patch("src/app/register/page.tsx", &import_delete_comment_patch));
+
+        let safe_import_fix_patch = crate::katastar::KatastarPatch {
+            search: "import Link from 'react-router-dom';".to_string(),
+            replace: "import Link from 'next/link';".to_string(),
+            extensions: vec![".tsx".to_string()],
+        };
+        assert!(crate::katastar::is_safe_auto_patch("src/components/Nav.tsx", &safe_import_fix_patch));
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v56_katastar_purge_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let store_path = temp_dir.join("axiom-error-katastar.json");
+        let mut store = crate::katastar::KatastarStore::default();
+        store.entries.push(crate::katastar::KatastarEntry {
+            id: "kat-compile-module-not-found-loc-bca25de7".to_string(),
+            category: "compile".to_string(),
+            error_code: None,
+            error_signature: "compile:module-not-found:local-import".to_string(),
+            normalized_sample: "Module not found".to_string(),
+            file_role: "page".to_string(),
+            fix_source: "ai".to_string(),
+            strategy: "search_replace".to_string(),
+            patch: Some(empty_replace_patch),
+            hint: String::new(),
+            status: "verified".to_string(),
+            success_count: 1,
+            fail_count: 0,
+            consecutive_failures: 0,
+            app_version: "0.1.55".to_string(),
+            model_id: "qwen2.5-coder:7b".to_string(),
+            first_seen_at: "2026-11-14T00:00:00Z".to_string(),
+            last_seen_at: "2026-11-14T00:00:00Z".to_string(),
+            last_verified_at: Some("2026-11-14T00:00:00Z".to_string()),
+            last_outcome: "passed".to_string(),
+            synced_at: None,
+            history: vec![],
+        });
+        crate::katastar::save_katastar_store_at(&store_path, &mut store).unwrap();
+
+        let reloaded = crate::katastar::load_katastar_store_at(&store_path);
+        assert_eq!(reloaded.entries[0].status, "failed");
+        assert!(reloaded.entries[0].patch.is_none());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
 
