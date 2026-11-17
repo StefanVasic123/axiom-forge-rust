@@ -195,35 +195,36 @@ pub fn scan_and_fix_imports(dir: &std::path::Path, src_root: &std::path::Path, i
                                     || lit_low.ends_with("/prisma/client")
                                     || lit_low.ends_with("/prisma/schema.prisma");
                                 if !literal.is_empty() && !is_prisma_pseudo_spec && (literal.starts_with('.') || literal.starts_with("@/")) {
-                                    let mut exists = false;
-                                    
-                                    let raw_target = if let Some(sub) = literal.strip_prefix("@/") {
-                                        src_root.join(sub)
-                                    } else if let Some(parent) = path.parent() {
-                                        parent.join(literal)
+                                    let proj_fallback = if src_root.file_name().and_then(|s| s.to_str()) == Some("src") {
+                                        src_root.parent()
                                     } else {
-                                        src_root.join(literal)
+                                        None
                                     };
-                                    let target_abs = normalize_path_components(&raw_target);
-                                    
-                                    let variations = [
-                                        target_abs.clone(),
-                                        target_abs.with_extension("ts"),
-                                        target_abs.with_extension("tsx"),
-                                        target_abs.with_extension("js"),
-                                        target_abs.with_extension("jsx"),
-                                        target_abs.join("index.ts"),
-                                        target_abs.join("index.tsx"),
-                                        target_abs.join("index.js"),
-                                        target_abs.join("index.jsx"),
-                                    ];
-                                    
-                                    for var_path in variations {
-                                        if var_path.is_file() {
-                                            exists = true;
-                                            break;
-                                        }
-                                    }
+                                    let check_target_exists = |base: &std::path::Path| -> bool {
+                                        let t = normalize_path_components(base);
+                                        [
+                                            t.clone(),
+                                            t.with_extension("ts"),
+                                            t.with_extension("tsx"),
+                                            t.with_extension("js"),
+                                            t.with_extension("jsx"),
+                                            t.join("index.ts"),
+                                            t.join("index.tsx"),
+                                            t.join("index.js"),
+                                            t.join("index.jsx"),
+                                        ]
+                                        .iter()
+                                        .any(|v| v.is_file())
+                                    };
+
+                                    let mut exists = if let Some(sub) = literal.strip_prefix("@/") {
+                                        check_target_exists(&src_root.join(sub))
+                                            || proj_fallback.map_or(false, |pr| check_target_exists(&pr.join(sub)))
+                                    } else if let Some(parent) = path.parent() {
+                                        check_target_exists(&parent.join(literal))
+                                    } else {
+                                        check_target_exists(&src_root.join(literal))
+                                    };
                                     
                                     if !exists {
                                         let parts: Vec<&str> = literal.split('/').collect();
@@ -253,15 +254,54 @@ pub fn scan_and_fix_imports(dir: &std::path::Path, src_root: &std::path::Path, i
                                                         if line.contains(&old_import_quote) {
                                                             *line = line.replace(&old_import_quote, &new_import_quote);
                                                             changed = true;
+                                                            exists = true;
                                                         } else if line.contains(&old_import_dquote) {
                                                             *line = line.replace(&old_import_dquote, &new_import_dquote);
                                                             changed = true;
+                                                            exists = true;
                                                         } else if line.contains(&old_import_backtick) {
                                                             *line = line.replace(&old_import_backtick, &new_import_backtick);
                                                             changed = true;
+                                                            exists = true;
                                                         }
                                                         
-                                                        debug_log_to_file(format!("[Import Fixer] Fixed broken import in {:?}: {} -> {}", path, literal, corrected_import));
+                                                        if exists {
+                                                            debug_log_to_file(format!("[Import Fixer] Fixed broken import in {:?}: {} -> {}", path, literal, corrected_import));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // Strip dead missing local imports whose imported symbols are never referenced in file body
+                                        if !exists && line.trim_start().starts_with("import ") && !is_reexport_from {
+                                            if let (Some(ob), Some(cb)) = (line.find('{'), line.find('}')) {
+                                                let syms: Vec<String> = line[ob + 1..cb]
+                                                    .split(',')
+                                                    .filter_map(|s| {
+                                                        let raw = s.trim().trim_start_matches("type ").trim();
+                                                        let local = if let Some((_, rhs)) = raw.split_once(" as ") {
+                                                            rhs.trim()
+                                                        } else {
+                                                            raw.split_whitespace().next().unwrap_or("")
+                                                        };
+                                                        if local.is_empty() { None } else { Some(local.to_string()) }
+                                                    })
+                                                    .collect();
+                                                if !syms.is_empty() {
+                                                    let line_ref = line.trim();
+                                                    let all_unused = syms.iter().all(|sym| {
+                                                        let pat = format!(r"\b{}\b", regex::escape(sym));
+                                                        regex::Regex::new(&pat)
+                                                            .map(|r| {
+                                                                let total = r.find_iter(&normalized_first).count();
+                                                                let in_line = r.find_iter(line_ref).count();
+                                                                total <= in_line
+                                                            })
+                                                            .unwrap_or(false)
+                                                    });
+                                                    if all_unused {
+                                                        *line = String::new();
+                                                        changed = true;
                                                     }
                                                 }
                                             }
@@ -339,8 +379,28 @@ pub fn collect_missing_imports(
                                     || lit_low.ends_with("/prisma/client")
                                     || lit_low.ends_with("/prisma/schema.prisma");
                                 if !literal.is_empty() && !is_prisma_pseudo_spec && crate::packages::is_local_import_specifier(literal) && !literal.ends_with(".css") && !literal.ends_with(".scss") && !literal.ends_with(".json") {
-                                    let mut exists = false;
-                                    
+                                    let proj_fallback = if src_root.file_name().and_then(|s| s.to_str()) == Some("src") {
+                                        src_root.parent()
+                                    } else {
+                                        None
+                                    };
+                                    let check_target_exists = |base: &std::path::Path| -> bool {
+                                        let t = normalize_path_components(base);
+                                        [
+                                            t.clone(),
+                                            t.with_extension("ts"),
+                                            t.with_extension("tsx"),
+                                            t.with_extension("js"),
+                                            t.with_extension("jsx"),
+                                            t.join("index.ts"),
+                                            t.join("index.tsx"),
+                                            t.join("index.js"),
+                                            t.join("index.jsx"),
+                                        ]
+                                        .iter()
+                                        .any(|v| v.is_file())
+                                    };
+
                                     let raw_target = if let Some(sub) = literal.strip_prefix("@/").or_else(|| literal.strip_prefix("~/")) {
                                         src_root.join(sub)
                                     } else if let Some(sub) = literal.strip_prefix("src/") {
@@ -362,31 +422,34 @@ pub fn collect_missing_imports(
                                     {
                                         continue;
                                     }
-                                    
-                                    let variations = [
-                                        target_abs.clone(),
-                                        target_abs.with_extension("ts"),
-                                        target_abs.with_extension("tsx"),
-                                        target_abs.with_extension("js"),
-                                        target_abs.with_extension("jsx"),
-                                        target_abs.join("index.ts"),
-                                        target_abs.join("index.tsx"),
-                                        target_abs.join("index.js"),
-                                        target_abs.join("index.jsx"),
-                                    ];
-                                    
-                                    for var_path in variations {
-                                        if var_path.is_file() {
-                                            exists = true;
-                                            break;
+
+                                    let mut exists = check_target_exists(&target_abs);
+                                    if !exists {
+                                        if let Some(sub) = literal.strip_prefix("@/").or_else(|| literal.strip_prefix("~/")) {
+                                            if let Some(pf) = proj_fallback {
+                                                exists = check_target_exists(&pf.join(sub));
+                                            }
                                         }
                                     }
                                     
                                     if !exists {
-                                        let target_file_path = if target_abs.is_dir() { target_abs.join("index.ts") } else if target_abs.extension().is_some() {
+                                        let target_file_path = if target_abs.is_dir() {
+                                            target_abs.join("index.ts")
+                                        } else if target_abs.extension().is_some() {
                                             target_abs.clone()
                                         } else {
-                                            let ext_str = path.extension().and_then(|e| e.to_str()).unwrap_or("tsx");
+                                            let is_logic_folder = target_norm.contains("/hooks/")
+                                                || target_norm.contains("/lib/")
+                                                || target_norm.contains("/utils/")
+                                                || target_norm.contains("/services/")
+                                                || target_norm.contains("/config/")
+                                                || target_norm.contains("/types/")
+                                                || target_norm.contains("/models/");
+                                            let ext_str = if is_logic_folder {
+                                                "ts"
+                                            } else {
+                                                path.extension().and_then(|e| e.to_str()).unwrap_or("tsx")
+                                            };
                                             target_abs.with_extension(ext_str)
                                         };
                                         
@@ -419,15 +482,16 @@ pub async fn repair_broken_imports(proj_dir: &std::path::Path, model: &str) {
     let has_tailwind = proj_dir.join("tailwind.config.js").exists() || proj_dir.join("tailwind.config.ts").exists();
     let src_dir = proj_dir.join("src");
     let has_src = src_dir.exists();
-    let scan_roots: Vec<std::path::PathBuf> = if has_src {
-        vec![src_dir.clone()]
-    } else {
-        ["app", "components", "hooks", "lib", "utils", "models", "types", "services"]
-            .iter()
-            .map(|d| proj_dir.join(d))
-            .filter(|p| p.is_dir())
-            .collect()
-    };
+    let mut scan_roots: Vec<std::path::PathBuf> = Vec::new();
+    if has_src {
+        scan_roots.push(src_dir.clone());
+    }
+    for sub in ["app", "components", "hooks", "lib", "utils", "models", "types", "services", "config"] {
+        let candidate = proj_dir.join(sub);
+        if candidate.is_dir() && !scan_roots.contains(&candidate) {
+            scan_roots.push(candidate);
+        }
+    }
     if scan_roots.is_empty() {
         return;
     }
@@ -437,7 +501,8 @@ pub async fn repair_broken_imports(proj_dir: &std::path::Path, model: &str) {
 
     let mut module_index = std::collections::HashMap::new();
     for root in &scan_roots {
-        index_modules(root, &alias_root, &mut module_index);
+        let base_root = if root.starts_with(&alias_root) { &alias_root } else { proj_dir };
+        index_modules(root, base_root, &mut module_index);
     }
     for root in &scan_roots {
         scan_and_fix_imports(root, &alias_root, &module_index);
@@ -1116,6 +1181,17 @@ pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
                             }
                             next = crate::sanitizer::sanitize_optional_user_password_access(&next);
                             next = crate::sanitizer::sanitize_hook_destructured_param_defaults(&next, &rel);
+                            if !crate::sanitizer::is_app_router_route_file(&rel)
+                                && (rel_lower.contains("/hooks/") || rel_lower.starts_with("hooks/") || rel_lower.ends_with("hook.ts") || rel_lower.ends_with("hook.tsx"))
+                            {
+                                next = crate::sanitizer::sanitize_custom_hook_functions(&next);
+                            }
+                            if (rel_lower.ends_with(".tsx") || rel_lower.ends_with(".jsx"))
+                                && !crate::sanitizer::is_app_router_route_file(&rel)
+                                && !rel_lower.contains("/api/")
+                            {
+                                next = crate::sanitizer::ensure_undeclared_toggle_states(&next);
+                            }
                             next = crate::sanitizer::sanitize_truncated_import_repetition_loop(&next);
                             next = crate::sanitizer::ensure_hook_type_exports(&next, &rel);
                             next = crate::sanitizer::ensure_common_formatting_helpers(&next, &rel);
@@ -2906,7 +2982,10 @@ pub fn auto_import_missing_symbols_in_content(
     let is_client_or_hook = content.contains("\"use client\"")
         || content.contains("'use client'")
         || lower.contains("/hooks/")
-        || lower.starts_with("hooks/");
+        || lower.starts_with("hooks/")
+        || lower.contains("/components/")
+        || lower.starts_with("components/")
+        || lower.contains("/renderer/");
 
     for sym in missing_syms {
         if let Some(pkg_spec) = find_installed_dts_package_for_symbol(proj_dir, &existing_specs, &sym) {
@@ -2917,6 +2996,33 @@ pub fn auto_import_missing_symbols_in_content(
         } else if let Some((local_spec, is_def)) = find_unique_local_module_for_symbol(proj_dir, abs_file, &sym) {
             content = merge_or_insert_import_statement(&content, &local_spec, &sym, is_def);
         } else if prisma_models.contains(&sym) || prisma_enums.contains(&sym) {
+            // In client UI components & hooks, prefer `@/types` view-model contract (with `[key: string]: any;`)
+            // over rigid `@prisma/client` DB types when `types/index.ts` already exists in the project.
+            let types_index_candidate = [proj_dir.join("src/types/index.ts"), proj_dir.join("types/index.ts")]
+                .into_iter()
+                .find(|p| p.is_file());
+            let mut handled_via_local_types = false;
+            if is_client_or_hook && prisma_models.contains(&sym) && !prisma_enums.contains(&sym) {
+                if let Some(ref types_path) = types_index_candidate {
+                    if let Ok(mut tsrc) = std::fs::read_to_string(types_path) {
+                        if !crate::sanitizer::has_named_export_symbol(&tsrc, &sym) {
+                            if !tsrc.ends_with('\n') {
+                                tsrc.push('\n');
+                            }
+                            tsrc.push_str(&format!(
+                                "\nexport interface {} {{\n  id?: string;\n  [key: string]: any;\n}}\n",
+                                sym
+                            ));
+                            let _ = std::fs::write(types_path, &tsrc);
+                        }
+                        content = merge_or_insert_import_statement(&content, "@/types", &sym, false);
+                        handled_via_local_types = true;
+                    }
+                }
+            }
+            if handled_via_local_types {
+                continue;
+            }
             let used_as_value = !is_client_or_hook
                 && prisma_enums.contains(&sym)
                 && (content.contains(&format!("{}.", sym))
@@ -3988,10 +4094,10 @@ pub async fn perform_self_healing_loop(
                     }
                 }
             }
+            for up in unchanged_paths {
+                *stagnant_counts.entry(up).or_insert(0) += 1;
+            }
             if !any_file_modified_in_batch || expected_paths.len() == 1 {
-                for up in unchanged_paths {
-                    *stagnant_counts.entry(up).or_insert(0) += 1;
-                }
                 for ep in &expected_paths {
                     let ep_low = ep.to_lowercase();
                     if !handled_or_counted.contains(&ep_low) {

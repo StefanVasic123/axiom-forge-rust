@@ -220,6 +220,7 @@
     "exporting": "Exporting...",
     "projectsTableTitle": "Generated Projects Telemetry",
     "tuningTitle": "Local AI Inference Directives & Tuning",
-    "saveDirectiveSuccess": "Optimizer preferences saved locally."
+    "saveDirectiveSuccess": "Optimizer preferences saved locally.",
+    "policyRegistryTitle": "Pipeline Orchestrator & Policy Registry (ruleId) Inspector"
   }
 }

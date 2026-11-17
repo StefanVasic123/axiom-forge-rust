@@ -220,6 +220,7 @@
     "exporting": "Izvoz u toku...",
     "projectsTableTitle": "Telemetrija Generisanih Projekata",
     "tuningTitle": "Kontrola Inferencije i Prilagođene Direktive",
-    "saveDirectiveSuccess": "Podešavanja optimizatora su sačuvana lokalno."
+    "saveDirectiveSuccess": "Podešavanja optimizatora su sačuvana lokalno.",
+    "policyRegistryTitle": "Inspektor Orkestratora i Registra Pravila (ruleId)"
   }
 }

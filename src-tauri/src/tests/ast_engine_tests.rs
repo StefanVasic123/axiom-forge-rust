@@ -322,4 +322,91 @@ export interface ETA_Prediction {
         assert!(model_out.contains("[key: string]: any;"), "{}", model_out);
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    #[test]
+    fn phase5_v57_general_rules_zero_regression_suite() {
+        // 1. Enum -> const + [key: string]: any + type (and numeric enum preserved untouched)
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v57_suite_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(temp_dir.join("src/types")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("app/(tabs)")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/components")).unwrap();
+        std::fs::write(
+            temp_dir.join("tsconfig.json"),
+            r#"{"compilerOptions":{"strict":false}}"#,
+        ).unwrap();
+        std::fs::write(
+            temp_dir.join("src/types/index.ts"),
+            "export enum Role { ADMIN, USER }\nexport enum Flags { READ = 1, WRITE = 2 }\nexport interface Robot {\n  id: string;\n  name: string;\n  createdAt: Date;\n  status: Role;\n}\n",
+        ).unwrap();
+
+        let edited = reconcile_model_and_type_contracts_in_project(&temp_dir);
+        assert_eq!(edited, 1);
+        let types_out = std::fs::read_to_string(temp_dir.join("src/types/index.ts")).unwrap();
+        assert!(types_out.contains("export const Role:"), "Pure enum should become Prisma-compatible const object:\n{}", types_out);
+        assert!(types_out.contains("ADMIN: 'ADMIN'"), "{}", types_out);
+        assert!(types_out.contains("export type Role = any;"), "{}", types_out);
+        assert!(types_out.contains("export enum Flags { READ = 1, WRITE = 2 }"), "Numeric enum must be preserved:\n{}", types_out);
+        assert!(types_out.contains("name?: string;"), "Non-id fields optional under strict:false:\n{}", types_out);
+        assert!(types_out.contains("createdAt?: any;"), "Date widened to any:\n{}", types_out);
+        // Idempotent second pass
+        assert_eq!(reconcile_model_and_type_contracts_in_project(&temp_dir), 0);
+
+        // 2. Dual-root UI primitive reconciliation (root app/(tabs)/ reconciles into src/components/ui.tsx)
+        std::fs::write(
+            temp_dir.join("app/(tabs)/alerts.tsx"),
+            "import { DataTable, EmptyState, LoadingSpinner, Modal } from '@/components/ui';\nexport default function Alerts() { return <Modal isOpen={true}><LoadingSpinner /><EmptyState /><DataTable /></Modal>; }\n",
+        ).unwrap();
+        crate::sanitizer::ensure_ui_primitives_reconciled(&temp_dir);
+        let ui_out = std::fs::read_to_string(temp_dir.join("src/components/ui.tsx")).unwrap();
+        for sym in ["DataTable", "EmptyState", "LoadingSpinner", "Modal"] {
+            assert!(ui_out.contains(&format!("export const {}", sym)), "Dual-root import {} missing in ui.tsx:\n{}", sym, ui_out);
+        }
+
+        // 3. Electron Window ambient declarations
+        std::fs::write(
+            temp_dir.join("src/components/Bridge.tsx"),
+            "export function Bridge() { window.electron.init(); return null; }\n",
+        ).unwrap();
+        crate::sanitizer::ensure_window_ambient_declarations(&temp_dir);
+        let win_dts = std::fs::read_to_string(temp_dir.join("axiom-window-env.d.ts")).unwrap();
+        assert!(win_dts.contains("electron?: any;"), "{}", win_dts);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        // 4. Tailwind circular @apply sanitizer
+        let css_in = "@layer utilities {\n  .transition-all {\n    @apply transition-all duration-300 ease-in-out;\n  }\n  .bg-white {\n    @apply bg-white;\n  }\n  .btn-primary {\n    @apply bg-blue-600 text-white;\n  }\n}\n";
+        let css_out = crate::sanitizer::sanitize_tailwind_css(css_in);
+        assert!(css_out.contains("@apply duration-300 ease-in-out;"), "Circular token must be removed:\n{}", css_out);
+        assert!(!css_out.contains(".bg-white"), "Empty self-referencing rule must be removed:\n{}", css_out);
+        assert!(css_out.contains(".btn-primary {\n    @apply bg-blue-600 text-white;\n  }"), "Legitimate custom rule preserved:\n{}", css_out);
+
+        // 5. General import hygiene + react-icons with trailing comment + Electron guard
+        let ts_in = "\"use client\";\nimport { fetch, NextResponse } from 'next/server';\nimport { z, zodResolver } from '@hookform/resolvers/zod';\nimport { CredentialsProvider, signIn } from 'next-auth/react';\nimport { HiOutlineSun } from 'react-icons'; // Example icon\nimport { Client } from '@supabase/supabase-js';\nconst url = import.meta.env.VITE_API;\nconst s = new Client(url, 'k');\nexport function cn(...args: ClassValue[]) { return twMerge(...args); }\nwindow.electron.init();\n";
+        let ts_hyg = crate::sanitizer::sanitize_react_icons_imports(
+            &crate::sanitizer::sanitize_nextjs_and_zod_hallucinations(ts_in, "src/lib/test.tsx"),
+        );
+        assert!(!ts_hyg.contains("import { fetch"), "fetch stripped from next/server:\n{}", ts_hyg);
+        assert!(ts_hyg.contains("import { NextResponse } from 'next/server'"), "{}", ts_hyg);
+        assert!(ts_hyg.contains("import { z } from 'zod';") && ts_hyg.contains("import { zodResolver } from '@hookform/resolvers/zod'"), "{}", ts_hyg);
+        assert!(!ts_hyg.contains("CredentialsProvider"), "{}", ts_hyg);
+        assert!(ts_hyg.contains("import { HiOutlineSun } from 'react-icons/hi'"), "react-icons split even with trailing comment:\n{}", ts_hyg);
+        assert!(ts_hyg.contains("import { createClient } from '@supabase/supabase-js'") && ts_hyg.contains("createClient(url, 'k')"), "{}", ts_hyg);
+        assert!(ts_hyg.contains("process.env.NEXT_PUBLIC_API"), "{}", ts_hyg);
+        assert!(ts_hyg.contains("from 'clsx'") && ts_hyg.contains("from 'tailwind-merge'"), "{}", ts_hyg);
+        assert!(ts_hyg.contains("(window as any).electron?.init?.()"), "{}", ts_hyg);
+
+        // 6. Hook FC strip + setter-only toggle state + handleCancel
+        let hook_in = "export const useAlerts: React.FC<Props> = ({ a }) => {\n  const [err, setErr] = useState<Error | null>(null);\n  return { err };\n};\n";
+        let hook_out = crate::sanitizer::sanitize_custom_hook_functions(hook_in);
+        assert!(hook_out.contains("export const useAlerts = ({ a }) =>"), "{}", hook_out);
+        assert!(hook_out.contains("useState<any>(null)"), "{}", hook_out);
+
+        let page_in = "const RobotsPage = () => {\n  const [isEditing, setIsEditing] = useState(false);\n  return <div><button onClick={() => setIsFormOpen(true)}>Add</button><button onClick={handleCancel}>Cancel</button></div>;\n};\n";
+        let page_out = crate::sanitizer::ensure_undeclared_toggle_states(page_in);
+        assert!(page_out.contains("const [isFormOpen, setIsFormOpen] = useState(false);"), "{}", page_out);
+        assert!(page_out.contains("const handleCancel = () => { setIsEditing(false); };"), "{}", page_out);
+    }
 }

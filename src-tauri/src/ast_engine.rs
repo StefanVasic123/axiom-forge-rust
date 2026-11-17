@@ -782,11 +782,33 @@ fn extract_explicit_return_type_name(func: Node, src: &str) -> Option<String> {
     None
 }
 
+fn extract_var_fn_return_type_name(declarator: Node, src: &str) -> Option<String> {
+    let type_ann = declarator.child_by_field_name("type")?;
+    let mut stack = named_children_vec(type_ann);
+    while let Some(n) = stack.pop() {
+        if n.kind() == "function_type" {
+            if let Some(rt) = n.child_by_field_name("return_type") {
+                if rt.kind() == "type_identifier" {
+                    return Some(node_text(rt, src).to_string());
+                }
+                let inner = named_children_vec(rt);
+                if inner.len() == 1 && inner[0].kind() == "type_identifier" {
+                    return Some(node_text(inner[0], src).to_string());
+                }
+            }
+        }
+        stack.extend(named_children_vec(n));
+    }
+    None
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalTypeContract {
     pub name: String,
     pub existing_keys: Vec<String>,
     pub insert_byte: usize,
+    pub has_index_sig: bool,
+    pub required_prop_name_ends: Vec<usize>,
 }
 
 /// Izvlači top-level `interface X { ... }` i objektne `type X = { ... }` deklaracije u istom fajlu.
@@ -801,10 +823,23 @@ pub fn extract_local_type_contracts(tree: &Tree, src: &str) -> Vec<LocalTypeCont
             .into_iter()
             .map(|p| p.name)
             .collect();
+        let members = named_children_vec(body);
+        let has_index_sig = members.iter().any(|m| m.kind() == "index_signature")
+            || node_text(body, src).contains("[key: string]");
+        let mut required_prop_name_ends = Vec::new();
+        for member in members {
+            if member.kind() == "property_signature" && !has_token_child(member, "?") {
+                if let Some(nn) = member.child_by_field_name("name") {
+                    required_prop_name_ends.push(nn.end_byte());
+                }
+            }
+        }
         Some(LocalTypeContract {
             name,
             existing_keys,
             insert_byte: end - 1,
+            has_index_sig,
+            required_prop_name_ends,
         })
     };
 
@@ -840,7 +875,7 @@ pub fn extract_local_type_contracts(tree: &Tree, src: &str) -> Vec<LocalTypeCont
     contracts
 }
 
-fn build_hook_signature(name: &str, decl_node: Node, func: Node, src: &str) -> HookSignature {
+fn build_hook_signature(name: &str, decl_node: Node, func: Node, var_ret_type: Option<String>, src: &str) -> HookSignature {
     let mut params = Vec::new();
     let mut params_close_byte = None;
     let mut params_trailing_comma = false;
@@ -867,7 +902,7 @@ fn build_hook_signature(name: &str, decl_node: Node, func: Node, src: &str) -> H
     if let Some(body) = func.child_by_field_name("body") {
         collect_return_objects(body, src, &mut return_objects);
     }
-    let explicit_return_type_name = extract_explicit_return_type_name(func, src);
+    let explicit_return_type_name = extract_explicit_return_type_name(func, src).or(var_ret_type);
     HookSignature {
         name: name.to_string(),
         line: decl_node.start_position().row + 1,
@@ -875,7 +910,7 @@ fn build_hook_signature(name: &str, decl_node: Node, func: Node, src: &str) -> H
         params_close_byte,
         params_trailing_comma,
         return_objects,
-        has_explicit_return_type: func.child_by_field_name("return_type").is_some(),
+        has_explicit_return_type: func.child_by_field_name("return_type").is_some() || explicit_return_type_name.is_some(),
         explicit_return_type_name,
     }
 }
@@ -897,7 +932,7 @@ pub fn extract_hook_signatures(tree: &Tree, src: &str) -> Vec<HookSignature> {
                 if let Some(n) = decl.child_by_field_name("name") {
                     let name = node_text(n, src);
                     if is_hook_name(name) {
-                        hooks.push(build_hook_signature(name, decl, decl, src));
+                        hooks.push(build_hook_signature(name, decl, decl, None, src));
                     }
                 }
             }
@@ -914,7 +949,8 @@ pub fn extract_hook_signatures(tree: &Tree, src: &str) -> Vec<HookSignature> {
                     if is_hook_name(name)
                         && matches!(func.kind(), "arrow_function" | "function_expression" | "function")
                     {
-                        hooks.push(build_hook_signature(name, decl, func, src));
+                        let var_ret = extract_var_fn_return_type_name(d, src);
+                        hooks.push(build_hook_signature(name, decl, func, var_ret, src));
                     }
                 }
             }
@@ -1187,13 +1223,14 @@ pub fn plan_hook_and_interface_insertions(
             .iter()
             .filter(|k| !contract.existing_keys.contains(k))
             .collect();
+        let mut block_parts: Vec<String> = Vec::new();
         if !missing_in_iface.is_empty() {
             let decls = missing_in_iface
                 .iter()
                 .map(|k| format!("  {}?: any;", k))
                 .collect::<Vec<_>>()
                 .join("\n");
-            insertions.push((contract.insert_byte, format!("\n{}\n", decls)));
+            block_parts.push(decls);
             actions.push(format!(
                 "{}: `{}` povratni tip `{}` dopunjen sa {}?: any",
                 rel_path,
@@ -1201,6 +1238,16 @@ pub fn plan_hook_and_interface_insertions(
                 contract.name,
                 missing_in_iface.iter().map(|k| format!("`{}`", k)).collect::<Vec<_>>().join(", ")
             ));
+        }
+        if typed && !contract.has_index_sig {
+            block_parts.push("  [key: string]: any;".to_string());
+            actions.push(format!(
+                "{}: `{}` povratni tip `{}` dopunjen sa `[key: string]: any;`",
+                rel_path, hook.name, contract.name
+            ));
+        }
+        if !block_parts.is_empty() {
+            insertions.push((contract.insert_byte, format!("\n{}\n", block_parts.join("\n"))));
         }
     }
 
@@ -1451,10 +1498,83 @@ pub fn is_model_or_type_rel_path(rel: &str) -> bool {
         || norm.starts_with("types/")
 }
 
+fn project_uses_strict_ts(proj_dir: &std::path::Path) -> bool {
+    let tsconfig = proj_dir.join("tsconfig.json");
+    let Ok(raw) = std::fs::read_to_string(&tsconfig) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("compilerOptions")?.get("strict")?.as_bool())
+        .unwrap_or(false)
+}
+
+fn convert_enum_declaration_node(stmt: Node, decl: Node, is_exported: bool, source: &str, existing_type_aliases: &std::collections::HashSet<String>) -> Option<(usize, usize, String)> {
+    let name_node = decl.child_by_field_name("name")?;
+    let body = decl.child_by_field_name("body")?;
+    let enum_name = node_text(name_node, source);
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for child in named_children_vec(body) {
+        match child.kind() {
+            "property_identifier" | "identifier" => {
+                let k = node_text(child, source).trim().to_string();
+                if !is_valid_js_identifier(&k) {
+                    return None;
+                }
+                entries.push((k.clone(), format!("'{}'", k)));
+            }
+            "enum_assignment" => {
+                let k_node = child.child_by_field_name("name")?;
+                let v_node = child.child_by_field_name("value")?;
+                let k = node_text(k_node, source).trim().to_string();
+                if !is_valid_js_identifier(&k) {
+                    return None;
+                }
+                match v_node.kind() {
+                    "string" => {
+                        let s_val = strip_string_quotes(node_text(v_node, source));
+                        let escaped = s_val.replace('\'', "\\'");
+                        entries.push((k, format!("'{}'", escaped)));
+                    }
+                    "number" => return None,
+                    _ => return None,
+                }
+            }
+            _ => {}
+        }
+    }
+    if entries.is_empty() {
+        return None;
+    }
+    let type_fields: Vec<String> = entries
+        .iter()
+        .map(|(k, v)| format!("readonly {}: {}", k, v))
+        .collect();
+    let val_fields: Vec<String> = entries
+        .iter()
+        .map(|(k, v)| format!("  {}: {},", k, v))
+        .collect();
+    let prefix = if is_exported { "export " } else { "" };
+    let mut replacement = format!(
+        "{}const {}: {{ {}; [key: string]: any; }} = {{\n{}\n}};",
+        prefix,
+        enum_name,
+        type_fields.join("; "),
+        val_fields.join("\n")
+    );
+    if !existing_type_aliases.contains(enum_name) {
+        replacement.push_str(&format!("\n{}type {} = any;", prefix, enum_name));
+    }
+    let start = if is_exported { stmt.start_byte() } else { decl.start_byte() };
+    let end = if is_exported { stmt.end_byte() } else { decl.end_byte() };
+    Some((start, end, replacement))
+}
+
 fn reconcile_model_types_with_ui_hints(
     source: &str,
     is_model_or_type_file: bool,
     ui_string_or_jsx_props: &std::collections::HashSet<String>,
+    relax_optional_and_date: bool,
 ) -> Option<String> {
     if !is_model_or_type_file {
         return None;
@@ -1462,6 +1582,7 @@ fn reconcile_model_types_with_ui_hints(
     let tree = parse_source("src/models/index.ts", source)?;
     let mut local_enums = std::collections::HashSet::new();
     let mut local_object_types = std::collections::HashSet::new();
+    let mut local_type_aliases = std::collections::HashSet::new();
 
     for stmt in named_children_vec(tree.root_node()) {
         let decl = if stmt.kind() == "export_statement" {
@@ -1485,8 +1606,10 @@ fn reconcile_model_types_with_ui_hints(
             }
             "type_alias_declaration" => {
                 if let (Some(n), Some(v)) = (decl.child_by_field_name("name"), decl.child_by_field_name("value")) {
+                    let tname = node_text(n, source).to_string();
+                    local_type_aliases.insert(tname.clone());
                     if v.kind() == "object_type" {
-                        local_object_types.insert(node_text(n, source).to_string());
+                        local_object_types.insert(tname);
                     }
                 }
             }
@@ -1496,7 +1619,8 @@ fn reconcile_model_types_with_ui_hints(
 
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     for stmt in named_children_vec(tree.root_node()) {
-        let decl = if stmt.kind() == "export_statement" {
+        let is_exported = stmt.kind() == "export_statement";
+        let decl = if is_exported {
             match stmt.child_by_field_name("declaration") {
                 Some(d) => d,
                 None => continue,
@@ -1504,6 +1628,14 @@ fn reconcile_model_types_with_ui_hints(
         } else {
             stmt
         };
+
+        if decl.kind() == "enum_declaration" && relax_optional_and_date {
+            if let Some(edit) = convert_enum_declaration_node(stmt, decl, is_exported, source, &local_type_aliases) {
+                edits.push(edit);
+            }
+            continue;
+        }
+
         let body = match decl.kind() {
             "interface_declaration" => decl.child_by_field_name("body"),
             "type_alias_declaration" => decl.child_by_field_name("value").filter(|v| v.kind() == "object_type"),
@@ -1526,31 +1658,57 @@ fn reconcile_model_types_with_ui_hints(
             }
             let Some(name_node) = member.child_by_field_name("name") else { continue };
             let Some(prop_name) = property_key_name(name_node, source) else { continue };
+            let has_opt = has_token_child(member, "?");
             let Some(type_ann) = member.child_by_field_name("type") else { continue };
             let type_children = named_children_vec(type_ann);
-            if type_children.len() != 1 || type_children[0].kind() != "type_identifier" {
-                continue;
+            let single_type_ident = if type_children.len() == 1 && type_children[0].kind() == "type_identifier" {
+                Some(type_children[0])
+            } else {
+                None
+            };
+
+            if let Some(t_node) = single_type_ident {
+                let t_name = node_text(t_node, source);
+                let is_known_enum = local_enums.contains(t_name)
+                    || (!local_object_types.contains(t_name)
+                        && matches!(
+                            t_name,
+                            "Status"
+                                | "SubscriptionStatus"
+                                | "OrderStatus"
+                                | "NotificationType"
+                                | "PredictionStatus"
+                                | "Role"
+                                | "UserRole"
+                                | "Priority"
+                        ));
+
+                if is_known_enum {
+                    edits.push((t_node.start_byte(), t_node.end_byte(), format!("{} | string", t_name)));
+                    continue;
+                }
+                if ui_string_or_jsx_props.contains(&prop_name) && local_object_types.contains(t_name) {
+                    edits.push((name_node.end_byte(), t_node.end_byte(), "?: any".to_string()));
+                    continue;
+                }
+                if relax_optional_and_date && t_name == "Date" {
+                    if has_opt {
+                        edits.push((t_node.start_byte(), t_node.end_byte(), "any".to_string()));
+                    } else {
+                        edits.push((name_node.end_byte(), t_node.end_byte(), "?: any".to_string()));
+                    }
+                    continue;
+                }
             }
-            let t_node = type_children[0];
-            let t_name = node_text(t_node, source);
 
-            let is_known_enum = local_enums.contains(t_name)
-                || (!local_object_types.contains(t_name)
-                    && matches!(
-                        t_name,
-                        "Status"
-                            | "SubscriptionStatus"
-                            | "OrderStatus"
-                            | "NotificationType"
-                            | "PredictionStatus"
-                            | "Role"
-                            | "UserRole"
-                    ));
-
-            if is_known_enum {
-                edits.push((t_node.start_byte(), t_node.end_byte(), format!("{} | string", t_name)));
-            } else if ui_string_or_jsx_props.contains(&prop_name) && local_object_types.contains(t_name) {
-                edits.push((name_node.end_byte(), t_node.end_byte(), "?: any".to_string()));
+            if relax_optional_and_date && !has_opt && prop_name != "id" {
+                let is_already_any = type_children.len() == 1
+                    && type_children[0].kind() == "predefined_type"
+                    && node_text(type_children[0], source) == "any";
+                let is_enum_union = node_text(type_ann, source).contains("| string");
+                if !is_enum_union && !(is_already_any && prop_name == "id") {
+                    edits.push((name_node.end_byte(), name_node.end_byte(), "?".to_string()));
+                }
             }
         }
     }
@@ -1566,7 +1724,7 @@ fn reconcile_model_types_with_ui_hints(
 /// - dodaje `[key: string]: any;` za view-model svojstva koja UI čita van Prisma sheme,
 /// - proširuje enum polja (`status: Status` → `status: Status | string`) radi poređenja sa string literalima (`TS2367`).
 pub fn reconcile_model_and_type_contracts_in_source(source: &str, is_model_or_type_file: bool) -> Option<String> {
-    reconcile_model_types_with_ui_hints(source, is_model_or_type_file, &std::collections::HashSet::new())
+    reconcile_model_types_with_ui_hints(source, is_model_or_type_file, &std::collections::HashSet::new(), false)
 }
 
 fn collect_ui_string_and_jsx_member_props(proj_dir: &std::path::Path, paths: &[std::path::PathBuf]) -> std::collections::HashSet<String> {
@@ -1613,6 +1771,7 @@ pub fn reconcile_model_and_type_contracts_in_project(proj_dir: &std::path::Path)
     if !proj_dir.is_dir() {
         return 0;
     }
+    let relax_optional_and_date = !project_uses_strict_ts(proj_dir);
     let mut paths = Vec::new();
     collect_source_files(proj_dir, &mut paths);
     let ui_props = collect_ui_string_and_jsx_member_props(proj_dir, &paths);
@@ -1627,7 +1786,7 @@ pub fn reconcile_model_and_type_contracts_in_project(proj_dir: &std::path::Path)
             continue;
         }
         let Ok(content) = std::fs::read_to_string(&abs) else { continue };
-        if let Some(next) = reconcile_model_types_with_ui_hints(&content, true, &ui_props) {
+        if let Some(next) = reconcile_model_types_with_ui_hints(&content, true, &ui_props, relax_optional_and_date) {
             if std::fs::write(&abs, &next).is_ok() {
                 edited += 1;
             }
