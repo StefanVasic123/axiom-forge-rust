@@ -446,7 +446,7 @@ pub fn filter_runaway_manifest_expansion(
 }
 
 pub fn get_axiom_inspector_script() -> &'static str {
-    "      <script dangerouslySetInnerHTML={{ __html: `\n        if (!window.__axiom_inspect_injected) {\n          window.__axiom_inspect_injected = true;\n          let isInspectActive = false;\n          let lastReportedOverlaySig = '';\n          function extractProjectFileFromStack(txt) {\n            try {\n              if (!txt) return null;\n              const norm = String(txt).split(String.fromCharCode(92)).join('/');\n              const m = norm.match(new RegExp('(?:src/(?:app|pages|components|hooks|lib|utils|services|models)/|(?:app|pages|components|hooks)/)[A-Za-z0-9_/.+-]+[.](?:tsx|ts|jsx|js)'));\n              return m ? m[0] : null;\n            } catch (e) { return null; }\n          }\n          function extractNextjsOverlay() {\n            try {\n              const portal = document.querySelector('nextjs-portal');\n              const root = (portal && portal.shadowRoot) ? portal.shadowRoot : document;\n              const dialog = root.querySelector('[data-nextjs-dialog], [role=\"dialog\"], #nextjs__container_errors_label');\n              let rawText = dialog ? (dialog.innerText || dialog.textContent || '').trim() : '';\n              if (!rawText && root !== document) {\n                rawText = Array.from(root.children || []).filter(el => el.tagName !== 'STYLE' && el.tagName !== 'SCRIPT').map(el => el.innerText || el.textContent || '').join(String.fromCharCode(10)).trim();\n              }\n              if (!rawText || (!rawText.includes('Error') && !rawText.includes('Failed to compile') && !rawText.includes('Module not found'))) return null;\n              const normText = rawText.split(String.fromCharCode(92)).join('/');\n              const sourceFile = extractProjectFileFromStack(normText);\n              const lines = normText.split(String.fromCharCode(10)).map(l => l.trim()).filter(l => l && !l.startsWith(':host') && !l.startsWith('/*!'));\n              const errLine = lines.find(l => l.includes('Module not found:') || l.includes('Error:') || l.includes('Failed to compile')) || lines[0] || '';\n              const message = errLine.substring(0, 220);\n              return { hasError: true, message, sourceFile, rawText: rawText.substring(0, 1200) };\n            } catch (e) { return null; }\n          }\n          function collectAxiomUiSnapshot() {\n            try {\n              const isVis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };\n              const headings = Array.from(document.querySelectorAll('h1, h2, h3')).slice(0, 20).map(h => ({ tag: h.tagName.toLowerCase(), text: (h.innerText || '').trim().substring(0, 120) })).filter(h => h.text);\n              const buttons = Array.from(document.querySelectorAll('button, [role=\"button\"]')).slice(0, 35).map(b => ({ text: (b.innerText || '').trim().substring(0, 80), ariaLabel: b.getAttribute('aria-label') || '', disabled: !!b.disabled, visible: isVis(b) }));\n              const links = Array.from(document.querySelectorAll('a')).slice(0, 35).map(a => ({ text: (a.innerText || '').trim().substring(0, 80), href: a.getAttribute('href') || '', visible: isVis(a) }));\n              const inputs = Array.from(document.querySelectorAll('input, select, textarea')).slice(0, 25).map(i => ({ tag: i.tagName.toLowerCase(), type: i.getAttribute('type') || '', name: i.getAttribute('name') || '', placeholder: i.getAttribute('placeholder') || '', value: (i.value || '').substring(0, 80) }));\n              const overlay = extractNextjsOverlay();\n              const bodyText = (document.body ? document.body.innerText : '').trim();\n              return {\n                url: window.location.href,\n                pathname: window.location.pathname,\n                title: document.title || '',\n                nextjsOverlay: overlay,\n                headings,\n                buttons,\n                links,\n                inputs,\n                layout: {\n                  viewportWidth: window.innerWidth,\n                  viewportHeight: window.innerHeight,\n                  scrollWidth: document.documentElement ? document.documentElement.scrollWidth : 0,\n                  scrollHeight: document.documentElement ? document.documentElement.scrollHeight : 0,\n                  hasHorizontalOverflow: (document.documentElement ? document.documentElement.scrollWidth : 0) > window.innerWidth + 4,\n                  hasNavbar: !!document.querySelector('nav, header'),\n                  hasFooter: !!document.querySelector('footer'),\n                  visibleTextPreview: bodyText.substring(0, 600)\n                }\n              };\n            } catch (e) { return { error: String(e) }; }\n          }\n          function reportAxiomRoute() {\n            try {\n              const overlay = extractNextjsOverlay();\n              if (overlay && overlay.hasError) {\n                const sig = window.location.pathname + '::' + (overlay.sourceFile || '') + '::' + overlay.message;\n                if (sig !== lastReportedOverlaySig) {\n                  lastReportedOverlaySig = sig;\n                  window.parent.postMessage({ channel: 'axiom-preview-error', message: overlay.message, sourceFile: overlay.sourceFile, details: overlay.rawText, path: window.location.pathname }, '*');\n                }\n              } else {\n                lastReportedOverlaySig = '';\n              }\n              window.parent.postMessage({ channel: 'axiom-preview-route', pathname: window.location.pathname, url: window.location.href, snapshot: collectAxiomUiSnapshot() }, '*');\n            } catch(e) {}\n          }\n          setTimeout(reportAxiomRoute, 400);\n          window.addEventListener('popstate', reportAxiomRoute);\n          setInterval(reportAxiomRoute, 2000);\n          window.addEventListener('error', function(e) { try { const srcFromStack = extractProjectFileFromStack(e.error && e.error.stack); const det = e.error && e.error.stack ? String(e.error.stack).substring(0, 1200) : (e.message || ''); window.parent.postMessage({ channel: 'axiom-preview-error', message: e.message || 'Unknown runtime error', sourceFile: srcFromStack || e.filename || null, details: det, path: window.location.pathname }, '*'); } catch(err) {} });\n          window.addEventListener('unhandledrejection', function(e) { try { const srcFromStack = extractProjectFileFromStack(e.reason && e.reason.stack); const det = e.reason && e.reason.stack ? String(e.reason.stack).substring(0, 1200) : ''; window.parent.postMessage({ channel: 'axiom-preview-error', message: e.reason?.message || String(e.reason || 'Unhandled promise rejection'), sourceFile: srcFromStack, details: det, path: window.location.pathname }, '*'); } catch(err) {} });\n          window.addEventListener('message', (e) => {\n            if (e.data && e.data.channel === 'axiom-toggle-inspect') {\n              isInspectActive = !!e.data.enabled;\n              if (!isInspectActive && highlightedElement) {\n                highlightedElement.classList.remove('axiom-inspect-highlight');\n                highlightedElement = null;\n              }\n            }\n            if (e.data && e.data.channel === 'axiom-agent-dom-cmd') {\n              const cmd = e.data;\n              try {\n                if (cmd.action === 'snapshot') {\n                  window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'ok', snapshot: collectAxiomUiSnapshot() }, '*');\n                } else if (cmd.action === 'click') {\n                  let el = cmd.selector ? document.querySelector(cmd.selector) : null;\n                  if (!el && cmd.text) {\n                    const needle = cmd.text.toLowerCase();\n                    const candidates = Array.from(document.querySelectorAll('button, a, [role=\"button\"], li, span'));\n                    el = candidates.find(c => ((c.innerText || '').trim().toLowerCase().includes(needle)) || ((c.getAttribute('aria-label') || '').toLowerCase().includes(needle)));\n                  }\n                  if (el) {\n                    el.click();\n                    setTimeout(() => {\n                      window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'clicked: ' + (el.innerText || el.tagName).trim().substring(0, 50), snapshot: collectAxiomUiSnapshot() }, '*');\n                    }, 600);\n                  } else {\n                    window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'element_not_found', snapshot: collectAxiomUiSnapshot() }, '*');\n                  }\n                } else if (cmd.action === 'type') {\n                  let el = cmd.selector ? document.querySelector(cmd.selector) : null;\n                  if (!el && cmd.placeholder) {\n                    const needle = cmd.placeholder.toLowerCase();\n                    el = Array.from(document.querySelectorAll('input, textarea')).find(i => (i.getAttribute('placeholder') || '').toLowerCase().includes(needle) || (i.getAttribute('name') || '').toLowerCase().includes(needle));\n                  }\n                  if (el) {\n                    const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;\n                    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;\n                    if (setter) setter.call(el, cmd.value || ''); else el.value = cmd.value || '';\n                    el.dispatchEvent(new Event('input', { bubbles: true }));\n                    el.dispatchEvent(new Event('change', { bubbles: true }));\n                    setTimeout(() => {\n                      window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'typed', snapshot: collectAxiomUiSnapshot() }, '*');\n                    }, 300);\n                  } else {\n                    window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'input_not_found', snapshot: collectAxiomUiSnapshot() }, '*');\n                  }\n                } else if (cmd.action === 'navigate' && cmd.route) {\n                  window.location.href = cmd.route;\n                }\n              } catch (err) {\n                window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'error: ' + String(err), snapshot: collectAxiomUiSnapshot() }, '*');\n              }\n            }\n          });\n          const styleEl = document.createElement('style');\n          styleEl.textContent = '.axiom-inspect-highlight { outline: 2px solid #6366f1 !important; outline-offset: -2px !important; cursor: crosshair !important; background-color: rgba(99, 102, 241, 0.12) !important; transition: all 0.1s ease; }';\n          document.head.appendChild(styleEl);\n          let highlightedElement = null;\n          function findAxiomTarget(el) {\n            if (!el || el === document.body || el === document.documentElement) return null;\n            let cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              if (cur.dataset && (cur.dataset.axiomFile || cur.dataset.axiomComponent)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            const validTags = ['h1','h2','h3','h4','h5','h6','p','button','a','input','textarea','select','header','footer','nav','section','article','aside','li'];\n            cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              const tag = cur.tagName.toLowerCase();\n              if (validTags.includes(tag) || (cur.innerText && cur.innerText.trim().length > 0 && cur.children.length === 0)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            return el !== document.body && el !== document.documentElement ? el : null;\n          }\n          document.addEventListener('mouseover', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (highlightedElement && highlightedElement !== target) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n            }\n            if (target) {\n              target.classList.add('axiom-inspect-highlight');\n              highlightedElement = target;\n            }\n          }, true);\n          document.addEventListener('mouseout', (e) => {\n            if (highlightedElement) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n              highlightedElement = null;\n            }\n          }, true);\n          document.addEventListener('click', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (target) {\n              e.preventDefault();\n              e.stopPropagation();\n              const payload = {\n                file: target.dataset?.axiomFile || null,\n                component: target.dataset?.axiomComponent || null,\n                tagName: target.tagName.toLowerCase(),\n                text: (target.innerText || target.value || '').trim().substring(0, 80),\n                path: window.location.pathname\n              };\n              window.parent.postMessage({ channel: 'axiom-inspect-click', payload }, '*');\n            }\n          }, true);\n        }\n      ` }} />"
+    "      <script dangerouslySetInnerHTML={{ __html: `\n        if (!window.__axiom_inspect_injected) {\n          window.__axiom_inspect_injected = true;\n          let isInspectActive = false;\n          let lastReportedOverlaySig = '';\n          function extractProjectFileFromStack(txt) {\n            try {\n              if (!txt) return null;\n              const norm = String(txt).split(String.fromCharCode(92)).join('/');\n              const ch = 'A-Za-z0-9_@()' + String.fromCharCode(92, 91, 92, 93) + '~-';\n              const re = new RegExp('(?:[.]/)*(?:[' + ch + ']+/)+[' + ch + '.]+[.](?:tsx|ts|jsx|js|mjs|cjs|css|scss)', 'gi');\n              const leadRe = new RegExp('^(?:[.]|/)+');\n              const matches = norm.match(re) || [];\n              for (const raw of matches) {\n                let c = raw.replace(leadRe, '');\n                const low = c.toLowerCase();\n                if (low.includes('node_modules/') || low.includes('_next/') || low.includes('.next/') || low.includes('webpack-internal:')) continue;\n                const srcIdx = low.lastIndexOf('/src/');\n                if (srcIdx !== -1) c = c.slice(srcIdx + 1);\n                if (c) return c;\n              }\n              return null;\n            } catch (e) { return null; }\n          }\n          function extractNextjsOverlay() {\n            try {\n              const portal = document.querySelector('nextjs-portal');\n              const root = (portal && portal.shadowRoot) ? portal.shadowRoot : document;\n              const dialog = root.querySelector('[data-nextjs-dialog], [role=\"dialog\"], #nextjs__container_errors_label');\n              let rawText = dialog ? (dialog.innerText || dialog.textContent || '').trim() : '';\n              if (!rawText && root !== document) {\n                rawText = Array.from(root.children || []).filter(el => el.tagName !== 'STYLE' && el.tagName !== 'SCRIPT').map(el => el.innerText || el.textContent || '').join(String.fromCharCode(10)).trim();\n              }\n              if (!rawText || (!rawText.includes('Error') && !rawText.includes('Failed to compile') && !rawText.includes('Module not found'))) return null;\n              const normText = rawText.split(String.fromCharCode(92)).join('/');\n              const sourceFile = extractProjectFileFromStack(normText);\n              const lines = normText.split(String.fromCharCode(10)).map(l => l.trim()).filter(l => l && !l.startsWith(':host') && !l.startsWith('/*!'));\n              const errLine = lines.find(l => l.includes('Module not found:') || l.includes('Error:') || l.includes('Failed to compile')) || lines[0] || '';\n              const message = errLine.substring(0, 220);\n              return { hasError: true, message, sourceFile, rawText: rawText.substring(0, 1200) };\n            } catch (e) { return null; }\n          }\n          function collectAxiomUiSnapshot() {\n            try {\n              const isVis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };\n              const headings = Array.from(document.querySelectorAll('h1, h2, h3')).slice(0, 20).map(h => ({ tag: h.tagName.toLowerCase(), text: (h.innerText || '').trim().substring(0, 120) })).filter(h => h.text);\n              const buttons = Array.from(document.querySelectorAll('button, [role=\"button\"]')).slice(0, 35).map(b => ({ text: (b.innerText || '').trim().substring(0, 80), ariaLabel: b.getAttribute('aria-label') || '', disabled: !!b.disabled, visible: isVis(b) }));\n              const links = Array.from(document.querySelectorAll('a')).slice(0, 35).map(a => ({ text: (a.innerText || '').trim().substring(0, 80), href: a.getAttribute('href') || '', visible: isVis(a) }));\n              const inputs = Array.from(document.querySelectorAll('input, select, textarea')).slice(0, 25).map(i => ({ tag: i.tagName.toLowerCase(), type: i.getAttribute('type') || '', name: i.getAttribute('name') || '', placeholder: i.getAttribute('placeholder') || '', value: (i.value || '').substring(0, 80) }));\n              const overlay = extractNextjsOverlay();\n              const bodyText = (document.body ? document.body.innerText : '').trim();\n              return {\n                url: window.location.href,\n                pathname: window.location.pathname,\n                title: document.title || '',\n                nextjsOverlay: overlay,\n                headings,\n                buttons,\n                links,\n                inputs,\n                layout: {\n                  viewportWidth: window.innerWidth,\n                  viewportHeight: window.innerHeight,\n                  scrollWidth: document.documentElement ? document.documentElement.scrollWidth : 0,\n                  scrollHeight: document.documentElement ? document.documentElement.scrollHeight : 0,\n                  hasHorizontalOverflow: (document.documentElement ? document.documentElement.scrollWidth : 0) > window.innerWidth + 4,\n                  hasNavbar: !!document.querySelector('nav, header'),\n                  hasFooter: !!document.querySelector('footer'),\n                  visibleTextPreview: bodyText.substring(0, 600)\n                }\n              };\n            } catch (e) { return { error: String(e) }; }\n          }\n          function reportAxiomRoute() {\n            try {\n              const overlay = extractNextjsOverlay();\n              if (overlay && overlay.hasError) {\n                const sig = window.location.pathname + '::' + (overlay.sourceFile || '') + '::' + overlay.message;\n                if (sig !== lastReportedOverlaySig) {\n                  lastReportedOverlaySig = sig;\n                  window.parent.postMessage({ channel: 'axiom-preview-error', message: overlay.message, sourceFile: overlay.sourceFile, details: overlay.rawText, path: window.location.pathname }, '*');\n                }\n              } else {\n                lastReportedOverlaySig = '';\n              }\n              window.parent.postMessage({ channel: 'axiom-preview-route', pathname: window.location.pathname, url: window.location.href, snapshot: collectAxiomUiSnapshot() }, '*');\n            } catch(e) {}\n          }\n          setTimeout(reportAxiomRoute, 400);\n          window.addEventListener('popstate', reportAxiomRoute);\n          setInterval(reportAxiomRoute, 2000);\n          window.addEventListener('error', function(e) { try { const srcFromStack = extractProjectFileFromStack(e.error && e.error.stack); const det = e.error && e.error.stack ? String(e.error.stack).substring(0, 1200) : (e.message || ''); window.parent.postMessage({ channel: 'axiom-preview-error', message: e.message || 'Unknown runtime error', sourceFile: srcFromStack || e.filename || null, details: det, path: window.location.pathname }, '*'); } catch(err) {} });\n          window.addEventListener('unhandledrejection', function(e) { try { const srcFromStack = extractProjectFileFromStack(e.reason && e.reason.stack); const det = e.reason && e.reason.stack ? String(e.reason.stack).substring(0, 1200) : ''; window.parent.postMessage({ channel: 'axiom-preview-error', message: e.reason?.message || String(e.reason || 'Unhandled promise rejection'), sourceFile: srcFromStack, details: det, path: window.location.pathname }, '*'); } catch(err) {} });\n          window.addEventListener('message', (e) => {\n            if (e.data && e.data.channel === 'axiom-toggle-inspect') {\n              isInspectActive = !!e.data.enabled;\n              if (!isInspectActive && highlightedElement) {\n                highlightedElement.classList.remove('axiom-inspect-highlight');\n                highlightedElement = null;\n              }\n            }\n            if (e.data && e.data.channel === 'axiom-agent-dom-cmd') {\n              const cmd = e.data;\n              try {\n                if (cmd.action === 'snapshot') {\n                  window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'ok', snapshot: collectAxiomUiSnapshot() }, '*');\n                } else if (cmd.action === 'click') {\n                  let el = cmd.selector ? document.querySelector(cmd.selector) : null;\n                  if (!el && cmd.text) {\n                    const needle = cmd.text.toLowerCase();\n                    const candidates = Array.from(document.querySelectorAll('button, a, [role=\"button\"], li, span'));\n                    el = candidates.find(c => ((c.innerText || '').trim().toLowerCase().includes(needle)) || ((c.getAttribute('aria-label') || '').toLowerCase().includes(needle)));\n                  }\n                  if (el) {\n                    el.click();\n                    setTimeout(() => {\n                      window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'clicked: ' + (el.innerText || el.tagName).trim().substring(0, 50), snapshot: collectAxiomUiSnapshot() }, '*');\n                    }, 600);\n                  } else {\n                    window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'element_not_found', snapshot: collectAxiomUiSnapshot() }, '*');\n                  }\n                } else if (cmd.action === 'type') {\n                  let el = cmd.selector ? document.querySelector(cmd.selector) : null;\n                  if (!el && cmd.placeholder) {\n                    const needle = cmd.placeholder.toLowerCase();\n                    el = Array.from(document.querySelectorAll('input, textarea')).find(i => (i.getAttribute('placeholder') || '').toLowerCase().includes(needle) || (i.getAttribute('name') || '').toLowerCase().includes(needle));\n                  }\n                  if (el) {\n                    const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;\n                    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;\n                    if (setter) setter.call(el, cmd.value || ''); else el.value = cmd.value || '';\n                    el.dispatchEvent(new Event('input', { bubbles: true }));\n                    el.dispatchEvent(new Event('change', { bubbles: true }));\n                    setTimeout(() => {\n                      window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'typed', snapshot: collectAxiomUiSnapshot() }, '*');\n                    }, 300);\n                  } else {\n                    window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'input_not_found', snapshot: collectAxiomUiSnapshot() }, '*');\n                  }\n                } else if (cmd.action === 'navigate' && cmd.route) {\n                  window.location.href = cmd.route;\n                }\n              } catch (err) {\n                window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'error: ' + String(err), snapshot: collectAxiomUiSnapshot() }, '*');\n              }\n            }\n          });\n          const styleEl = document.createElement('style');\n          styleEl.textContent = '.axiom-inspect-highlight { outline: 2px solid #6366f1 !important; outline-offset: -2px !important; cursor: crosshair !important; background-color: rgba(99, 102, 241, 0.12) !important; transition: all 0.1s ease; }';\n          document.head.appendChild(styleEl);\n          let highlightedElement = null;\n          function findAxiomTarget(el) {\n            if (!el || el === document.body || el === document.documentElement) return null;\n            let cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              if (cur.dataset && (cur.dataset.axiomFile || cur.dataset.axiomComponent)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            const validTags = ['h1','h2','h3','h4','h5','h6','p','button','a','input','textarea','select','header','footer','nav','section','article','aside','li'];\n            cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              const tag = cur.tagName.toLowerCase();\n              if (validTags.includes(tag) || (cur.innerText && cur.innerText.trim().length > 0 && cur.children.length === 0)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            return el !== document.body && el !== document.documentElement ? el : null;\n          }\n          document.addEventListener('mouseover', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (highlightedElement && highlightedElement !== target) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n            }\n            if (target) {\n              target.classList.add('axiom-inspect-highlight');\n              highlightedElement = target;\n            }\n          }, true);\n          document.addEventListener('mouseout', (e) => {\n            if (highlightedElement) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n              highlightedElement = null;\n            }\n          }, true);\n          document.addEventListener('click', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (target) {\n              e.preventDefault();\n              e.stopPropagation();\n              const payload = {\n                file: target.dataset?.axiomFile || null,\n                component: target.dataset?.axiomComponent || null,\n                tagName: target.tagName.toLowerCase(),\n                text: (target.innerText || target.value || '').trim().substring(0, 80),\n                path: window.location.pathname\n              };\n              window.parent.postMessage({ channel: 'axiom-inspect-click', payload }, '*');\n            }\n          }, true);\n        }\n      ` }} />"
 }
 
 pub fn strip_axiom_inspector_script(content: &str) -> String {
@@ -484,6 +484,7 @@ pub fn ensure_axiom_inspector_injected(proj_dir: &std::path::Path) {
             if let Ok(content) = std::fs::read_to_string(&full_path) {
                 let needs_upgrade = !content.contains("axiom-agent-dom-cmd")
                     || !content.contains("extractProjectFileFromStack")
+                    || content.contains("(?:src/(?:app|pages|components|hooks|lib|utils|services|models)/")
                     || content.contains("rawText.match(/(?:")
                     || content.contains("styleEl.textContent = \\`")
                     || content.contains("const rawText = (root !== document && root.textContent)");
@@ -1906,6 +1907,342 @@ pub fn sanitize_tailwind_css(css: &str) -> String {
         out.push_str(line);
     }
     sanitize_tailwind_circular_apply(&out)
+}
+
+fn split_tailwind_utility_parts(tok: &str) -> (&str, bool, &str, &str) {
+    // Split variants (up to last `:` outside `[...]`)
+    let bytes = tok.as_bytes();
+    let mut bracket_depth = 0i32;
+    let mut last_colon: Option<usize> = None;
+    let mut last_slash: Option<usize> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'[' => bracket_depth += 1,
+            b']' => bracket_depth = (bracket_depth - 1).max(0),
+            b':' if bracket_depth == 0 => {
+                last_colon = Some(i);
+                last_slash = None;
+            }
+            b'/' if bracket_depth == 0 => last_slash = Some(i),
+            _ => {}
+        }
+    }
+    let var_end = last_colon.map(|c| c + 1).unwrap_or(0);
+    let variants = &tok[..var_end];
+    let after_var = &tok[var_end..];
+    let (has_imp, after_imp) = if let Some(s) = after_var.strip_prefix('!') {
+        (true, s)
+    } else {
+        (false, after_var)
+    };
+    let imp_offset = var_end + if has_imp { 1 } else { 0 };
+    if let Some(slash_abs) = last_slash.filter(|&s| s > imp_offset) {
+        let rel_slash = slash_abs - imp_offset;
+        (variants, has_imp, &after_imp[..rel_slash], &after_imp[rel_slash..])
+    } else {
+        (variants, has_imp, after_imp, "")
+    }
+}
+
+/// Compiler-driven Tailwind CSS helper: strips the exact failing utility class reported by
+/// PostCSS/Tailwind (`The '<missing_class>' class does not exist`) from `@apply` lines.
+pub fn strip_tailwind_apply_class(css: &str, missing_class: &str) -> String {
+    let target = missing_class.trim().trim_start_matches('.');
+    if target.is_empty() {
+        return css.to_string();
+    }
+    let target_core = split_tailwind_utility_parts(target).2;
+    let mut out = String::with_capacity(css.len());
+    for line in css.split_inclusive('\n') {
+        let line_no_nl = line.trim_end_matches(&['\r', '\n'][..]);
+        let nl_suffix = &line[line_no_nl.len()..];
+        let trimmed = line_no_nl.trim();
+        if trimmed.starts_with("@apply ") && trimmed.ends_with(';') && !trimmed.contains('{') && !trimmed.contains('}') {
+            let indent_len = line_no_nl.len() - line_no_nl.trim_start().len();
+            let indent = &line_no_nl[..indent_len];
+            let inner = trimmed["@apply ".len()..trimmed.len() - 1].trim();
+            let tokens = split_tailwind_apply_tokens(inner);
+            let mut kept = Vec::new();
+            let mut removed_any = false;
+            for tok in tokens {
+                let (_, _, core, _) = split_tailwind_utility_parts(&tok);
+                if tok == target || core == target || (!target_core.is_empty() && core == target_core) {
+                    removed_any = true;
+                } else {
+                    kept.push(tok);
+                }
+            }
+            if removed_any {
+                if !kept.is_empty() && kept.iter().any(|t| t != "!important") {
+                    out.push_str(&format!("{}@apply {};{}", indent, kept.join(" "), nl_suffix));
+                }
+                continue;
+            }
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+fn parse_tailwind_config_colors(
+    proj_dir: &std::path::Path,
+) -> (std::collections::HashSet<String>, std::collections::HashSet<String>) {
+    let mut scale_colors = std::collections::HashSet::new();
+    let mut flat_colors = std::collections::HashSet::new();
+    let Ok(colors_kw_re) = regex::Regex::new(r"\bcolors\s*:\s*\{") else {
+        return (scale_colors, flat_colors);
+    };
+
+    for fname in ["tailwind.config.js", "tailwind.config.ts", "tailwind.config.mjs"] {
+        let p = proj_dir.join(fname);
+        let Ok(src) = std::fs::read_to_string(&p) else { continue };
+        for m in colors_kw_re.find_iter(&src) {
+            let open_brace = m.end() - 1;
+            let Some(close_brace) = find_balanced_delimiter_bytes(&src, open_brace, b'{', b'}') else {
+                continue;
+            };
+            let body = &src[open_brace + 1..close_brace];
+            let bytes = body.as_bytes();
+            let mut i = 0usize;
+            let mut depth = 0i32;
+
+            while i < bytes.len() {
+                // Skip whitespace & comments
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    i += 2;
+                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i = (i + 2).min(bytes.len());
+                    continue;
+                }
+                if i >= bytes.len() {
+                    break;
+                }
+                if depth == 0 {
+                    // Attempt to parse `key: value`
+                    let key_opt = if matches!(bytes[i], b'\'' | b'"') {
+                        let q = bytes[i];
+                        let k_start = i + 1;
+                        i += 1;
+                        while i < bytes.len() && bytes[i] != q {
+                            if bytes[i] == b'\\' {
+                                i += 2;
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        let k = &body[k_start..i.min(body.len())];
+                        if i < bytes.len() {
+                            i += 1;
+                        }
+                        Some(k.to_string())
+                    } else if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' || bytes[i] == b'$' {
+                        let k_start = i;
+                        while i < bytes.len()
+                            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'-' || bytes[i] == b'$')
+                        {
+                            i += 1;
+                        }
+                        Some(body[k_start..i].to_string())
+                    } else {
+                        None
+                    };
+
+                    if let Some(key) = key_opt {
+                        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                            i += 1;
+                        }
+                        if i < bytes.len() && bytes[i] == b':' {
+                            i += 1;
+                            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                                i += 1;
+                            }
+                            if i < bytes.len() {
+                                if matches!(bytes[i], b'\'' | b'"' | b'`') {
+                                    flat_colors.insert(key);
+                                } else {
+                                    scale_colors.insert(key);
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                // Advance token/string/brace tracking
+                match bytes[i] {
+                    b'\'' | b'"' | b'`' => {
+                        let q = bytes[i];
+                        i += 1;
+                        while i < bytes.len() && bytes[i] != q {
+                            if bytes[i] == b'\\' {
+                                i += 2;
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        if i < bytes.len() {
+                            i += 1;
+                        }
+                    }
+                    b'{' | b'(' | b'[' => {
+                        depth += 1;
+                        i += 1;
+                    }
+                    b'}' | b')' | b']' => {
+                        depth = (depth - 1).max(0);
+                        i += 1;
+                    }
+                    _ => i += 1,
+                }
+            }
+        }
+    }
+
+    (scale_colors, flat_colors)
+}
+
+/// Validates color-scale utilities inside `@apply` rules strictly against Tailwind built-ins,
+/// custom colors declared in `tailwind.config.*`, and custom classes defined inside CSS `@layer`
+/// blocks — zero hardcoded color mappings.
+pub fn reconcile_tailwind_css_with_config(proj_dir: &std::path::Path) {
+    const BUILTIN_SCALES: &[&str] = &[
+        "slate", "gray", "zinc", "neutral", "stone", "red", "orange", "amber", "yellow", "lime",
+        "green", "emerald", "teal", "cyan", "sky", "blue", "indigo", "violet", "purple",
+        "fuchsia", "pink", "rose",
+    ];
+    if !proj_dir.is_dir() {
+        return;
+    }
+
+    let (config_scale_colors, config_flat_colors) = parse_tailwind_config_colors(proj_dir);
+    let Ok(color_util_re) = regex::Regex::new(
+        r"^(bg|text|border|ring|divide|outline|accent|caret|fill|stroke|from|via|to|placeholder|decoration|shadow)-([a-z][a-z0-9-]*)-(50|100|200|300|400|500|600|700|800|900|950)$",
+    ) else {
+        return;
+    };
+    let Ok(layer_re) = regex::Regex::new(r"@layer\s+[A-Za-z0-9_-]+\s*\{") else {
+        return;
+    };
+    let Ok(cls_sel_re) = regex::Regex::new(r"\.([A-Za-z_-][A-Za-z0-9_-]*)") else {
+        return;
+    };
+
+    // Collect all `.css`/`.scss` files in project
+    let mut css_files: Vec<std::path::PathBuf> = Vec::new();
+    let mut stack = vec![proj_dir.to_path_buf()];
+    while let Some(cur) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&cur) else { continue };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let name = entry.file_name();
+            let ns = name.to_string_lossy();
+            if p.is_dir() {
+                if matches!(
+                    ns.as_ref(),
+                    "node_modules" | ".next" | ".git" | "dist" | "build" | "out" | "target" | ".axiom"
+                ) {
+                    continue;
+                }
+                stack.push(p);
+            } else if p.is_file() {
+                let low = ns.to_ascii_lowercase();
+                if low.ends_with(".css") || low.ends_with(".scss") {
+                    css_files.push(p);
+                }
+            }
+        }
+    }
+
+    if css_files.is_empty() {
+        return;
+    }
+
+    // Pass 1: Extract custom class selectors defined inside `@layer ... { ... }` blocks across all CSS files
+    let mut layer_classes = std::collections::HashSet::new();
+    let mut file_contents: Vec<(std::path::PathBuf, String)> = Vec::new();
+    for p in css_files {
+        let Ok(content) = std::fs::read_to_string(&p) else { continue };
+        for m in layer_re.find_iter(&content) {
+            let open_brace = m.end() - 1;
+            if let Some(close_brace) = find_balanced_delimiter_bytes(&content, open_brace, b'{', b'}') {
+                let block = &content[open_brace + 1..close_brace];
+                for cap in cls_sel_re.captures_iter(block) {
+                    if let Some(cname) = cap.get(1) {
+                        layer_classes.insert(cname.as_str().to_string());
+                    }
+                }
+            }
+        }
+        file_contents.push((p, content));
+    }
+
+    // Pass 2: Validate/reconcile `@apply` lines in each CSS file
+    for (p, content) in file_contents {
+        let mut out = String::with_capacity(content.len());
+        let mut file_changed = false;
+
+        for line in content.split_inclusive('\n') {
+            let line_no_nl = line.trim_end_matches(&['\r', '\n'][..]);
+            let nl_suffix = &line[line_no_nl.len()..];
+            let trimmed = line_no_nl.trim();
+            if trimmed.starts_with("@apply ") && trimmed.ends_with(';') && !trimmed.contains('{') && !trimmed.contains('}') {
+                let indent_len = line_no_nl.len() - line_no_nl.trim_start().len();
+                let indent = &line_no_nl[..indent_len];
+                let inner = trimmed["@apply ".len()..trimmed.len() - 1].trim();
+                let tokens = split_tailwind_apply_tokens(inner);
+                let mut next_tokens: Vec<String> = Vec::with_capacity(tokens.len());
+                let mut line_changed = false;
+
+                for tok in tokens {
+                    let (variants, has_imp, core, opacity) = split_tailwind_utility_parts(&tok);
+                    if let Some(cap) = color_util_re.captures(core) {
+                        let prefix = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+                        let color_name = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+                        if matches!(color_name, "opacity" | "offset" | "spacing")
+                            || BUILTIN_SCALES.contains(&color_name)
+                            || config_scale_colors.contains(color_name)
+                            || layer_classes.contains(core)
+                        {
+                            next_tokens.push(tok);
+                        } else if config_flat_colors.contains(color_name) {
+                            let imp = if has_imp { "!" } else { "" };
+                            next_tokens.push(format!("{}{}{}-{}{}", variants, imp, prefix, color_name, opacity));
+                            line_changed = true;
+                        } else {
+                            // Undefined custom color scale in Tailwind config/built-ins/@layer -> omit invalid token
+                            line_changed = true;
+                        }
+                    } else {
+                        next_tokens.push(tok);
+                    }
+                }
+
+                if line_changed {
+                    file_changed = true;
+                    if next_tokens.iter().any(|t| t != "!important") {
+                        out.push_str(&format!("{}@apply {};{}", indent, next_tokens.join(" "), nl_suffix));
+                    }
+                    continue;
+                }
+            }
+            out.push_str(line);
+        }
+
+        if file_changed && out != content {
+            let _ = std::fs::write(&p, out);
+        }
+    }
 }
 
 fn is_valid_top_level_css_at_statement(stmt_no_comments: &str) -> bool {
@@ -5088,8 +5425,6 @@ pub fn is_banned_external_ui_package(pkg: &str) -> bool {
                 | "react-bootstrap"
                 | "semantic-ui-react"
                 | "mantine"
-                | "formik"
-                | "yup"
         )
         || p.starts_with("@mantine/")
 }
@@ -5125,7 +5460,6 @@ fn rewrite_banned_external_ui_imports(src: &str, rel_path: &str, is_tsx_like: bo
         let spec = cap.get(2).map(|m| m.as_str()).unwrap_or("").trim();
         let root_pkg = root_pkg_name_from_specifier(spec);
         let is_ui_kit = is_banned_external_ui_package(&root_pkg)
-            && !matches!(root_pkg.as_str(), "formik" | "yup")
             && spec != "@radix-ui/react-button";
         if !is_ui_kit {
             continue;
@@ -5601,6 +5935,7 @@ pub fn sanitize_nextjs_and_zod_hallucinations(content: &str, rel_path: &str) -> 
                     })
                     .unwrap_or_default();
 
+                let ast_type_refs = crate::ast_engine::collect_type_reference_names(rel_path, &out);
                 let mut to_inject: Vec<String> = Vec::new();
                 for name in candidates {
                     if imported_names.contains(&name) {
@@ -5617,26 +5952,7 @@ pub fn sanitize_nextjs_and_zod_hallucinations(content: &str, rel_path: &str) -> 
                         continue;
                     }
 
-                    let used_as_generic_arg = regex::Regex::new(&format!(
-                        r"\b(?:useState|useRef|useMemo|useCallback|useReducer|Promise|Array|Set|Map|Partial|Required|Readonly|Record)\s*<\s*{}\b",
-                        esc
-                    ))
-                    .map(|re| re.is_match(&out))
-                    .unwrap_or(false);
-                    let used_as_var_type = regex::Regex::new(&format!(
-                        r"(?:const|let|var)\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s*:\s*{}(?:\[\]|\s*\|\s*(?:null|undefined))?\s*=",
-                        esc
-                    ))
-                    .map(|re| re.is_match(&out))
-                    .unwrap_or(false);
-                    let used_as_cast = regex::Regex::new(&format!(
-                        r"\bas\s+{}(?:\[\])?\s*[;,\)\]\}}]",
-                        esc
-                    ))
-                    .map(|re| re.is_match(&out))
-                    .unwrap_or(false);
-
-                    if used_as_generic_arg || used_as_var_type || used_as_cast {
+                    if ast_type_refs.contains(&name) {
                         to_inject.push(format!("type {} = Record<string, any>;", name));
                     }
                 }
@@ -5991,6 +6307,13 @@ pub fn sanitize_nextjs_and_zod_hallucinations(content: &str, rel_path: &str) -> 
                     }
                 }
             }
+        }
+    }
+
+    // 24. Infer safe AST defaults (`= []`, `= () => {}`, `= {} as any`) for unguarded destructured component props
+    if low.ends_with(".tsx") || low.ends_with(".jsx") {
+        if let Some(with_defaults) = crate::ast_engine::ensure_component_destructured_prop_defaults_in_source(rel_path, &out) {
+            out = with_defaults;
         }
     }
 
@@ -10880,6 +11203,7 @@ pub fn sanitize_tailwind_config_in_project(proj_dir: &std::path::Path) {
             let _ = std::fs::write(&p, next);
         }
     }
+    reconcile_tailwind_css_with_config(proj_dir);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

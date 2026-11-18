@@ -37,6 +37,15 @@ const displayError = (msg, err) => {
     <pre style="white-space: pre-wrap; font-size: 0.85rem; line-height: 1.5;">${msg}\n\n${err}</pre>
   `;
   document.body.appendChild(div);
+
+  // Automatically record host crashes in Katastar
+  try {
+    if (window.electronAPI?.katastar?.recordError) {
+      window.electronAPI.katastar.recordError(null, 'main.jsx', `${msg}: ${err}`, 'host_crash');
+    }
+  } catch (katastarErr) {
+    console.warn('Could not record crash in Katastar:', katastarErr);
+  }
   document.getElementById('close-crash-log')?.addEventListener('click', () => {
     div.remove();
     // If root was unmounted by React, reload cleanly to Dashboard to prevent infinite spinner

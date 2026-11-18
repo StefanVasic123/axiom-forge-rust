@@ -2581,6 +2581,26 @@ pub fn is_complete_top_level_decl(src: &str) -> bool {
 }
 
 #[tauri::command]
+pub fn project_locate_error_file(
+    project_id: String,
+    file_path: Option<String>,
+    error_msg: String,
+) -> Result<Option<String>, String> {
+    let proj_dir = get_project_path(&project_id);
+    if !proj_dir.exists() {
+        return Err("Direktorijum projekta ne postoji.".to_string());
+    }
+    Ok(
+        crate::server::locate_error_source_file(
+            &proj_dir,
+            file_path.as_deref().unwrap_or(""),
+            &error_msg,
+        )
+        .map(|loc| loc.rel_path),
+    )
+}
+
+#[tauri::command]
 pub async fn project_heal_compile_error(
     project_id: String,
     file_path: String,
@@ -2591,7 +2611,7 @@ pub async fn project_heal_compile_error(
         "status": "Inicijalizacija popravke..."
     }));
     let _ = window.emit("server:log", serde_json::json!({
-        "text": format!("> [AI Auto-Healing] Započinjem popravku za fajl: {}\n", file_path),
+        "text": format!("> [AI Auto-Healing] Započinjem analizu greške (hint: {})...\n", file_path),
         "type": "info"
     }));
 
@@ -2603,14 +2623,63 @@ pub async fn project_heal_compile_error(
     crate::sanitizer::ensure_valid_tsconfig(&proj_dir);
     ensure_directory_barrel_files(&proj_dir);
 
-    let file_path = resolve_project_file_candidate(&proj_dir, &file_path)
-        .map(|p| normalize_rel_path_str(&p))
-        .unwrap_or_else(|| normalize_rel_path_str(&file_path));
-    let full_path = proj_dir.join(&file_path);
-    if !full_path.exists() || !full_path.is_file() || !full_path.starts_with(&proj_dir) {
-        let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Greška: Fajl ne postoji" }));
-        return Err(format!("Fajl {} ne postoji.", file_path));
-    }
+    let located_opt = crate::server::locate_error_source_file(&proj_dir, &file_path, &error_msg);
+    let (file_path, full_path) = match located_opt {
+        Some(loc) => {
+            let norm_loc = normalize_rel_path_str(&loc.rel_path);
+            let fp = proj_dir.join(&norm_loc);
+            if fp.exists() && fp.is_file() && fp.starts_with(&proj_dir) {
+                let _ = window.emit("server:log", serde_json::json!({
+                    "text": format!("> [AI Auto-Healing] Lociran fajl greške: {} ({})\n", norm_loc, loc.matched_by),
+                    "type": "info"
+                }));
+                (norm_loc, fp)
+            } else {
+                let sig_info = crate::katastar::normalize_error_signature("", &error_msg, Some(&file_path));
+                let entry_id = crate::katastar::register_repair_attempt(
+                    &sig_info.category,
+                    &error_msg,
+                    &file_path,
+                    "runtime_catcher",
+                    "file_location_unresolved",
+                    None,
+                    "Could not locate source file on disk",
+                    "",
+                );
+                crate::katastar::track_pending_project_repair(
+                    &project_id,
+                    &file_path,
+                    &sig_info.error_signature,
+                    &entry_id,
+                    "runtime_catcher",
+                );
+                let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Greška: Fajl ne postoji" }));
+                return Err(format!("Fajl {} ne postoji.", file_path));
+            }
+        }
+        None => {
+            let sig_info = crate::katastar::normalize_error_signature("", &error_msg, Some(&file_path));
+            let entry_id = crate::katastar::register_repair_attempt(
+                &sig_info.category,
+                &error_msg,
+                &file_path,
+                "runtime_catcher",
+                "file_location_unresolved",
+                None,
+                "Could not locate source file on disk",
+                "",
+            );
+            crate::katastar::track_pending_project_repair(
+                &project_id,
+                &file_path,
+                &sig_info.error_signature,
+                &entry_id,
+                "runtime_catcher",
+            );
+            let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Greška: Fajl ne postoji" }));
+            return Err(format!("Nije moguće locirati fajl za grešku ({}).", file_path));
+        }
+    };
 
     let rel_file_path = if let Ok(stripped) = full_path.strip_prefix(&proj_dir) {
         normalize_rel_path_str(&stripped.to_string_lossy())
@@ -2654,8 +2723,19 @@ pub async fn project_heal_compile_error(
     let mut current_error_context = error_msg.clone();
     let mut cached_baseline_verify: Option<VerifyDetail> = None;
 
-    // Fast deterministic pre-heal pass (rewrites bare `src/...` imports, barrel imports, missing react-icons/.d.ts/local imports, useEffect deps, etc.)
+    // Fast deterministic pre-heal pass (rewrites bare `src/...` imports, barrel imports, missing react-icons/.d.ts/local imports, useEffect deps, AST prop defaults, CSS @apply errors, etc.)
+    let runtime_prop_default_applied = (rel_file_path.ends_with(".tsx") || rel_file_path.ends_with(".jsx"))
+        && crate::ast_engine::ensure_component_destructured_prop_defaults_in_source(&rel_file_path, &raw_file_content).is_some();
     let mut pre_sanitized = post_process_generated_file(&rel_file_path, &raw_file_content, &serde_json::json!({}), has_tailwind);
+    if rel_file_path.ends_with(".css") || rel_file_path.ends_with(".scss") {
+        if let Ok(tw_missing_re) = regex::Regex::new(r#"The\s+['"]([^'"]+)['"]\s+class\s+does\s+not\s+exist"#) {
+            for cap in tw_missing_re.captures_iter(&error_msg) {
+                if let Some(m) = cap.get(1) {
+                    pre_sanitized = crate::sanitizer::strip_tailwind_apply_class(&pre_sanitized, m.as_str());
+                }
+            }
+        }
+    }
     let pre_routes = get_project_routes_from_dir(&proj_dir);
     let pre_routes_list: Vec<String> = pre_routes.into_iter().map(|(r, _)| r).collect();
     if !pre_routes_list.is_empty() {
@@ -2754,6 +2834,32 @@ pub async fn project_heal_compile_error(
                 let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Uspešno popravljeno!" }));
                 let _ = window.emit("server:log", serde_json::json!({
                     "text": format!("> [AI Auto-Healing] Deterministički saniran kod i zavisnosti u: {}\n", rel_file_path),
+                    "type": "info"
+                }));
+                return Ok(true);
+            }
+            SingleFileVerifyOutcome::Passed(_) | SingleFileVerifyOutcome::Inconclusive if runtime_prop_default_applied => {
+                crate::katastar::track_pending_project_repair(
+                    &project_id,
+                    &rel_file_path,
+                    &sig_info.error_signature,
+                    &eid,
+                    "deterministic",
+                );
+                crate::katastar::record_project_heal_round(
+                    &proj_dir,
+                    &rel_file_path,
+                    1,
+                    "deterministic",
+                    "pending_runtime",
+                    &[],
+                    std::slice::from_ref(&error_msg),
+                    "Deterministic AST component prop defaults applied (pending Next.js dev runtime verification)",
+                );
+                ensure_axiom_inspector_injected(&proj_dir);
+                let _ = window.emit("server:heal-status", serde_json::json!({ "status": "Uspešno popravljeno!" }));
+                let _ = window.emit("server:log", serde_json::json!({
+                    "text": format!("> [AI Auto-Healing] Deterministički AST dodao bezbedne default propove u '{}' (čeka runtime verifikaciju)...\n", rel_file_path),
                     "type": "info"
                 }));
                 return Ok(true);

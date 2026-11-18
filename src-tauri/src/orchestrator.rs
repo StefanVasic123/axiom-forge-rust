@@ -54,10 +54,17 @@ pub fn get_checkpoint_path(proj_dir: &std::path::Path) -> std::path::PathBuf {
 
 pub fn load_generation_checkpoint(proj_dir: &std::path::Path) -> Option<Value> {
     let path = get_checkpoint_path(proj_dir);
-    if path.exists() {
-        if let Ok(content) = fs::read_to_string(&path) {
-            if let Ok(val) = serde_json::from_str::<Value>(&content) {
-                return Some(val);
+    let bak_path = proj_dir.join(".axiom").join("generation_state.json.bak");
+
+    for cand in [&path, &bak_path] {
+        if cand.exists() {
+            if let Ok(bytes) = fs::read(cand) {
+                // Reject zero-byte or null-byte NTFS power-outage corrupt files
+                if !bytes.is_empty() && bytes.iter().any(|&b| b != 0) {
+                    if let Ok(val) = serde_json::from_slice::<Value>(&bytes) {
+                        return Some(val);
+                    }
+                }
             }
         }
     }
@@ -66,11 +73,30 @@ pub fn load_generation_checkpoint(proj_dir: &std::path::Path) -> Option<Value> {
 
 pub fn save_generation_checkpoint(proj_dir: &std::path::Path, checkpoint: &Value) {
     let path = get_checkpoint_path(proj_dir);
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(content) = serde_json::to_string_pretty(checkpoint) {
-        let _ = fs::write(&path, content);
+    let parent = match path.parent() {
+        Some(p) => p,
+        None => proj_dir,
+    };
+    let _ = fs::create_dir_all(parent);
+
+    let Ok(content) = serde_json::to_string_pretty(checkpoint) else { return };
+    let tmp_path = parent.join("generation_state.json.tmp");
+    let bak_path = parent.join("generation_state.json.bak");
+
+    // Write atomically: write to tmp file, sync to disk, backup current state, then rename
+    if let Ok(mut f) = fs::File::create(&tmp_path) {
+        use std::io::Write;
+        if f.write_all(content.as_bytes()).is_ok() && f.sync_all().is_ok() {
+            drop(f);
+            if path.exists() {
+                if let Ok(m) = fs::metadata(&path) {
+                    if m.len() > 0 {
+                        let _ = fs::copy(&path, &bak_path);
+                    }
+                }
+            }
+            let _ = fs::rename(&tmp_path, &path);
+        }
     }
 }
 
@@ -172,9 +198,44 @@ pub fn get_generation_phase(file_path: &str, project_type: &str) -> GenerationPh
 }
 
 pub fn get_context_files_for(file_path: &str, proj_dir: &std::path::Path) -> String {
+    get_context_files_for_with_desc(file_path, "", proj_dir)
+}
+
+pub fn get_context_files_for_with_desc(file_path: &str, file_desc: &str, proj_dir: &std::path::Path) -> String {
     let mut context = String::new();
     let path_lower = file_path.to_lowercase().replace('\\', "/");
+    let desc_low = file_desc.to_lowercase();
     let is_app_route = crate::sanitizer::is_app_router_route_file(file_path);
+    let is_tsx_or_jsx = path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx");
+
+    let is_non_ui_ts_js = (path_lower.ends_with(".ts") || path_lower.ends_with(".js"))
+        && !path_lower.ends_with(".d.ts")
+        && !path_lower.contains("/hooks/")
+        && !path_lower.starts_with("hooks/")
+        && !path_lower.contains("/components/")
+        && !path_lower.starts_with("components/")
+        && !path_lower.contains("/types/")
+        && !path_lower.starts_with("types/")
+        && !path_lower.contains("/styles/");
+
+    let desc_mentions_db = desc_low.contains("prisma")
+        || desc_low.contains("database")
+        || desc_low.contains("postgres")
+        || desc_low.contains("sqlite")
+        || desc_low.contains("crud")
+        || desc_low.contains("upsert")
+        || desc_low.contains("repository")
+        || desc_low.contains("db query")
+        || desc_low.contains("database query");
+
+    let is_backend_helper_name = path_lower.ends_with("/api.ts")
+        || path_lower.ends_with("/api.js")
+        || path_lower.ends_with("/db.ts")
+        || path_lower.ends_with("/db.js")
+        || path_lower.ends_with("/queries.ts")
+        || path_lower.ends_with("/queries.js")
+        || path_lower.contains("/services/")
+        || path_lower.starts_with("services/");
 
     let is_backend_or_db = path_lower.contains("/api/")
         || path_lower.ends_with("route.ts")
@@ -182,7 +243,8 @@ pub fn get_context_files_for(file_path: &str, proj_dir: &std::path::Path) -> Str
         || path_lower.contains("prisma")
         || path_lower.contains("server.")
         || (!is_app_route && (path_lower.contains("/models/") || path_lower.starts_with("models/")))
-        || path_lower.contains("seed.");
+        || path_lower.contains("seed.")
+        || (is_non_ui_ts_js && (desc_mentions_db || is_backend_helper_name));
 
     let is_auth_file = path_lower.contains("/login")
         || path_lower.contains("/register")
@@ -258,13 +320,31 @@ pub fn get_context_files_for(file_path: &str, proj_dir: &std::path::Path) -> Str
         }
     }
 
-    // 3. Custom hooks reference: only for feature pages/components, excluding UI primitives and Footer/Navbar
-    let is_feature_ui = (path_lower.contains("components") || (path_lower.contains("app") && path_lower.ends_with("page.tsx")))
-        && !path_lower.contains("components/ui/")
-        && !path_lower.contains("footer")
-        && !path_lower.contains("navbar");
+    // 3. Custom hooks reference: feature screens/components across Web, Mobile (`app/(tabs)/*.tsx`), and Desktop (`src/renderer/...`)
+    // excluding shell Chrome (`components/ui/*`, Footer, Navbar, RootLayout, error/loading boundaries).
+    let file_name_low = path_lower.rsplit('/').next().unwrap_or(&path_lower);
+    let is_shell_or_special = path_lower.contains("components/ui/")
+        || path_lower.contains("footer")
+        || path_lower.contains("navbar")
+        || matches!(
+            file_name_low,
+            "layout.tsx"
+                | "layout.jsx"
+                | "loading.tsx"
+                | "loading.jsx"
+                | "error.tsx"
+                | "error.jsx"
+                | "not-found.tsx"
+                | "not-found.jsx"
+                | "_app.tsx"
+                | "_app.jsx"
+                | "_document.tsx"
+                | "_document.jsx"
+        );
+    let is_feature_ui = is_tsx_or_jsx && !is_shell_or_special;
 
     if is_feature_ui {
+        let mut hook_candidates: Vec<(usize, String, String, String)> = Vec::new();
         for rel_dir in ["src/hooks", "hooks"] {
             let hooks_dir = proj_dir.join(rel_dir);
             if hooks_dir.exists() {
@@ -274,9 +354,24 @@ pub fn get_context_files_for(file_path: &str, proj_dir: &std::path::Path) -> Str
                         if path.is_file() {
                             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                                 if let Ok(content) = std::fs::read_to_string(&path) {
-                                    context.push_str(&format!(
-                                        "\nReference: Hook ({}/{}):\n```typescript\n{}\n```\n",
-                                        rel_dir, name, content
+                                    let stem_low = path
+                                        .file_stem()
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or("")
+                                        .trim_start_matches("use")
+                                        .to_lowercase();
+                                    let relevance = if !stem_low.is_empty()
+                                        && (path_lower.contains(&stem_low) || desc_low.contains(&stem_low))
+                                    {
+                                        1
+                                    } else {
+                                        0
+                                    };
+                                    hook_candidates.push((
+                                        relevance,
+                                        rel_dir.to_string(),
+                                        name.to_string(),
+                                        content,
                                     ));
                                 }
                             }
@@ -284,6 +379,81 @@ pub fn get_context_files_for(file_path: &str, proj_dir: &std::path::Path) -> Str
                     }
                 }
             }
+        }
+        hook_candidates.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        let mut hook_chars = 0usize;
+        for (_, rel_dir, name, content) in hook_candidates {
+            if hook_chars >= 5500 {
+                break;
+            }
+            let capped: String = content.chars().take(1500).collect();
+            let block = format!(
+                "\nReference: Hook ({}/{}):\n```typescript\n{}\n```\n",
+                rel_dir, name, capped
+            );
+            hook_chars += block.len();
+            context.push_str(&block);
+        }
+    }
+
+    // 4. Compact shared `@/types` reference so pages/components/APIs import existing domain contracts
+    // instead of redeclaring duplicate local interfaces.
+    let is_types_or_models_file = path_lower.contains("/types/")
+        || path_lower.starts_with("types/")
+        || path_lower.contains("/models/")
+        || path_lower.starts_with("models/");
+    if (is_feature_ui || is_backend_or_db) && !is_types_or_models_file {
+        let mut type_files: Vec<(String, String, String)> = Vec::new();
+        for rel_dir in ["src/types", "types"] {
+            let tdir = proj_dir.join(rel_dir);
+            if !tdir.is_dir() {
+                continue;
+            }
+            if let Ok(entries) = std::fs::read_dir(&tdir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_file() {
+                        continue;
+                    }
+                    let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+                    let nl = name.to_ascii_lowercase();
+                    if nl.ends_with(".d.ts") || (!nl.ends_with(".ts") && !nl.ends_with(".tsx")) {
+                        continue;
+                    }
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        type_files.push((rel_dir.to_string(), name.to_string(), content));
+                    }
+                }
+            }
+        }
+        type_files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let mut types_chars = 0usize;
+        let mut emitted_types_note = false;
+        for (rel_dir, name, content) in type_files {
+            if types_chars >= 2500 {
+                break;
+            }
+            let remaining = 2500 - types_chars;
+            let capped: String = content.chars().take(remaining).collect();
+            if capped.trim().is_empty() {
+                continue;
+            }
+            let header = if !emitted_types_note {
+                emitted_types_note = true;
+                " (Import shared domain types from '@/types' instead of redeclaring duplicate local interfaces!)"
+            } else {
+                ""
+            };
+            let block = format!(
+                "\nReference: Shared Types ({}/{}){}:\n```typescript\n{}\n```\n",
+                rel_dir, name, header, capped
+            );
+            types_chars += capped.len();
+            context.push_str(&block);
         }
     }
 
@@ -2459,11 +2629,31 @@ pub fn extract_prisma_schema_contract(content: &str) -> Value {
                 let mut scalar_fields = Vec::new();
                 let mut typed_fields = Vec::new();
                 let mut required_fields = Vec::new();
+                let mut unique_fields = Vec::new();
                 let mut relation_fields = Vec::new();
 
                 for line in body_match.as_str().lines() {
                     let trimmed = line.trim();
-                    if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("@@") {
+                    if trimmed.is_empty() || trimmed.starts_with("//") {
+                        continue;
+                    }
+                    if trimmed.starts_with("@@") {
+                        if let Some(rest) = trimmed
+                            .strip_prefix("@@unique")
+                            .or_else(|| trimmed.strip_prefix("@@id"))
+                        {
+                            let rest_trim = rest.trim_start();
+                            if rest_trim.starts_with('(') {
+                                if let (Some(lb), Some(rb)) = (rest_trim.find('['), rest_trim.find(']')) {
+                                    if lb < rb {
+                                        let compound = format!("[{}]", rest_trim[lb + 1..rb].trim());
+                                        if !unique_fields.contains(&compound) {
+                                            unique_fields.push(compound);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         continue;
                     }
                     let parts: Vec<&str> = trimmed.split_whitespace().collect();
@@ -2477,6 +2667,12 @@ pub fn extract_prisma_schema_contract(content: &str) -> Value {
                         } else {
                             scalar_fields.push(field_name.to_string());
                             typed_fields.push(format!("{}: {}", field_name, field_type));
+                            let is_unique = parts[2..]
+                                .iter()
+                                .any(|&t| t == "@id" || t == "@unique" || t.starts_with("@id(") || t.starts_with("@unique("));
+                            if is_unique && !unique_fields.iter().any(|u| u == field_name) {
+                                unique_fields.push(field_name.to_string());
+                            }
                             let is_optional_or_list = field_type.ends_with('?') || field_type.ends_with("[]");
                             let has_auto_default = trimmed.contains("@default(") || trimmed.contains("@updatedAt");
                             if !is_optional_or_list && !has_auto_default {
@@ -2492,6 +2688,7 @@ pub fn extract_prisma_schema_contract(content: &str) -> Value {
                     "fields": scalar_fields,
                     "typedFields": typed_fields,
                     "requiredFields": required_fields,
+                    "uniqueFields": unique_fields,
                     "relations": relation_fields
                 }));
             }
@@ -4383,6 +4580,7 @@ pub fn get_expert_system_prompt(
                  - STRICT TYPE DEFINITIONS & IMPORTS: Declare TypeScript interfaces cleanly inside the file. Import icons ONLY from valid subpaths (`'react-icons/hi'`, `'react-icons/fa'`, `'react-icons/fi'`, `'react-icons/io5'`, or `'lucide-react'`), NEVER from bare `'react-icons'`.\n\
                  - NEXT.JS LINK RULE: Do NOT place `<a>` tags inside `<Link>`. Put `className` and `prefetch={{false}}` directly on `<Link>`.\n\
                  - NO DEAD IMPORTS: Do not import external local modules unless they exist in the project; prefer clean self-contained components or verified `@/components/ui/*` primitives.\n\
+                 - NATIVE FORMS & MINIMAL DEPS: Build forms with native React useState + HTML <form>/<input> and validate with zod; avoid redundant external form/UI packages.\n\
                  {}\n\
                  - NO MANUAL AXIOM ATTRS: Never declare or use 'data-axiom-component' or 'data-axiom-file' props.\n\n",
                 export_compat_rule
@@ -5118,19 +5316,49 @@ pub async fn run_orchestrator(
         let api_base = host.as_deref().unwrap_or("https://idea-analyzer-ten.vercel.app");
         let url = format!("{}/api/axiom/manifest/{}", api_base, manifest_id);
         
-        let res = client.get(&url)
+        let mut manifest_opt: Option<Value> = None;
+        if let Ok(res) = client.get(&url)
             .header("Authorization", format!("Bearer {}", token))
             .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
-            .map_err(|e| e.to_string())?;
-
-        if !res.status().is_success() {
-            return Err(format!("Server response: {}", res.status()));
+        {
+            if res.status().is_success() {
+                if let Ok(json) = res.json::<Value>().await {
+                    manifest_opt = json.get("data").cloned();
+                }
+            } else {
+                debug_log_to_file(format!("[Orchestrator] Manifest fetch returned HTTP {}. Attempting fallback.", res.status()));
+            }
         }
 
-        let json: Value = res.json().await.map_err(|e| e.to_string())?;
-        manifest = json.get("data").cloned().ok_or("No data in manifest response")?;
+        if let Some(m) = manifest_opt {
+            manifest = m;
+        } else {
+            // Self-healing fallback: reconstruct manifest metadata from projects.json
+            let all_projs = project_get_all().unwrap_or_default();
+            if let Some(p) = all_projs.into_iter().find(|pr| pr.get("id").and_then(|i| i.as_str()) == Some(&project_id)) {
+                let p_name = p.get("name").and_then(|n| n.as_str()).unwrap_or("SafetyGuardian Compliance OS");
+                let p_desc = p.get("description").and_then(|d| d.as_str()).unwrap_or("");
+                let p_type = p.get("projectType").and_then(|t| t.as_str()).unwrap_or("nextjs");
+                debug_log_to_file(format!("[Orchestrator] Reconstructing manifest locally from projects.json for '{}'", p_name));
+                manifest = serde_json::json!({
+                    "manifestId": manifest_id,
+                    "platform": "web",
+                    "projectType": p_type,
+                    "resolvedStack": if p_type == "nextjs" { "Next.js" } else { p_type },
+                    "name": p_name,
+                    "description": p_desc,
+                    "metadata": {
+                        "name": p_name,
+                        "description": p_desc
+                    },
+                    "files": []
+                });
+            } else {
+                return Err("Failed to obtain manifest from remote server or local project storage".to_string());
+            }
+        }
     }
     let files = manifest.get("files").and_then(|f| f.as_array()).ok_or("No files in manifest")?;
     let desc_val = manifest.get("description")
@@ -6543,9 +6771,25 @@ export default function RootLayout({
 
         // 3. Check if ALREADY GENERATED (Resume / Recovery from checkpoint on disk)
         let full_disk_path = proj_dir.join(file_path);
-        let already_on_disk = completed_files.contains(&file_path.to_string())
+        let mut already_on_disk = completed_files.contains(&file_path.to_string())
             && full_disk_path.exists()
             && fs::metadata(&full_disk_path).map(|m| m.len() > 0).unwrap_or(false);
+
+        if already_on_disk {
+            // Check if file was corrupted with null bytes due to sudden power loss
+            if let Ok(bytes) = fs::read(&full_disk_path) {
+                if bytes.is_empty() || bytes.iter().all(|&b| b == 0) {
+                    debug_log_to_file(format!(
+                        "[Orchestrator] Detected zero-byte NTFS corrupt file on disk: {}. Deleting and regenerating.",
+                        file_path
+                    ));
+                    let _ = fs::remove_file(&full_disk_path);
+                    already_on_disk = false;
+                }
+            } else {
+                already_on_disk = false;
+            }
+        }
 
         if already_on_disk {
             if let Ok(c) = fs::read_to_string(&full_disk_path) {
@@ -6576,7 +6820,7 @@ export default function RootLayout({
         };
 
         let pkg_db_summary = get_packages_db_summary();
-        let context_ref = get_context_files_for(file_path, &proj_dir);
+        let context_ref = get_context_files_for_with_desc(file_path, desc, &proj_dir);
         let routes_ref = get_project_routes_prompt(&files_to_generate);
 
         let mut system_prompt = get_expert_system_prompt(
@@ -7425,13 +7669,31 @@ pub async fn task_resume_project_generation(
     }
 
     let proj_dir = get_project_path(&project_id);
-    let cp = load_generation_checkpoint(&proj_dir)
-        .ok_or_else(|| format!("No checkpoint found for project {}", project_id))?;
+    let cp_opt = load_generation_checkpoint(&proj_dir);
 
-    let manifest_id = cp.get("manifestId").and_then(|v| v.as_str()).unwrap_or("TEST_LOCAL").to_string();
-    let token = cp.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let model_id = cp.get("modelId").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let host = cp.get("host").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let (manifest_id, token, model_id, host) = if let Some(cp) = cp_opt {
+        let manifest_id = cp.get("manifestId").and_then(|v| v.as_str()).unwrap_or(&project_id).to_string();
+        let token = cp.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let model_id = cp.get("modelId").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let host = cp.get("host").and_then(|v| v.as_str()).map(|s| s.to_string());
+        (manifest_id, token, model_id, host)
+    } else {
+        // Power-loss / missing checkpoint recovery: reconstruct metadata from projects.json instead of crashing
+        debug_log_to_file(format!(
+            "[Orchestrator] No valid generation_state.json on disk for {}. Reconstructing recovery state from projects.json.",
+            project_id
+        ));
+        let all_projs = project_get_all().unwrap_or_default();
+        let proj = all_projs.into_iter().find(|p| p.get("id").and_then(|i| i.as_str()) == Some(&project_id));
+        let model_id = proj.as_ref()
+            .and_then(|p| p.get("metadata"))
+            .and_then(|m| m.get("modelId"))
+            .and_then(|m| m.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| Some("qwen2.5-coder:7b".to_string()));
+        let manifest_id = project_id.clone();
+        (manifest_id, String::new(), model_id, None)
+    };
 
     task_start_generation(window, manifest_id, Some(project_id), token, model_id, host).await
 }

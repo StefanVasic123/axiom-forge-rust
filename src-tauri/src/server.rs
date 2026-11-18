@@ -298,6 +298,46 @@ pub fn extract_package_name_from_error(line: &str) -> Option<String> {
     None
 }
 
+pub fn collect_project_source_files(proj_dir: &Path) -> Vec<String> {
+    let mut files = Vec::new();
+    if !proj_dir.is_dir() {
+        return files;
+    }
+    let mut stack = vec![proj_dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name_os = entry.file_name();
+            let name = name_os.to_string_lossy();
+            if path.is_dir() {
+                if matches!(
+                    name.as_ref(),
+                    "node_modules" | ".next" | ".git" | "dist" | "build" | "out" | "target" | ".axiom" | ".turbo" | ".vercel"
+                ) {
+                    continue;
+                }
+                stack.push(path);
+            } else if path.is_file() {
+                if let Ok(rel) = path.strip_prefix(proj_dir) {
+                    files.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+fn strip_source_extension(path: &str) -> &str {
+    let last_slash = path.rfind('/');
+    let dot_idx = path.rfind('.').filter(|&d| last_slash.map_or(true, |sl| d > sl));
+    match dot_idx {
+        Some(d) => &path[..d],
+        None => path,
+    }
+}
+
 pub fn resolve_project_file_candidate(proj_dir: &Path, rel_path: &str) -> Option<String> {
     if let Some(mapped_chunk) = map_next_chunk_url_to_source(rel_path) {
         if mapped_chunk != rel_path {
@@ -317,12 +357,14 @@ pub fn resolve_project_file_candidate(proj_dir: &Path, rel_path: &str) -> Option
     let proj_dir_norm = proj_dir.to_string_lossy().replace('\\', "/");
     if let Some(stripped) = norm_rel.strip_prefix(&format!("{}/", proj_dir_norm)) {
         norm_rel = stripped.to_string();
+    } else if norm_rel.to_lowercase().starts_with(&format!("{}/", proj_dir_norm.to_lowercase())) {
+        norm_rel = norm_rel[proj_dir_norm.len() + 1..].to_string();
     } else if let Some(src_idx) = norm_rel.rfind("/src/") {
         norm_rel = norm_rel[src_idx + 1..].to_string();
     } else if let Some(prisma_idx) = norm_rel.rfind("/prisma/") {
         norm_rel = norm_rel[prisma_idx + 1..].to_string();
     }
-    let rel_path = norm_rel.as_str();
+    let rel_path = norm_rel.trim_start_matches("./");
 
     if proj_dir.join(rel_path).is_file() {
         return Some(rel_path.to_string());
@@ -423,7 +465,439 @@ pub fn resolve_project_file_candidate(proj_dir: &Path, rel_path: &str) -> Option
         }
     }
 
+    // Universal tree matching against all actual project files (no hardcoded directory allowlists):
+    // 1. Exact suffix match, 2. Extension-tolerant suffix match, 3. Exact basename match.
+    let all_files = collect_project_source_files(proj_dir);
+    if !all_files.is_empty() && !rel_path.is_empty() {
+        let suffix = format!("/{}", rel_path);
+        let mut suffix_matches: Vec<&String> = all_files
+            .iter()
+            .filter(|f| f.as_str() == rel_path || f.ends_with(&suffix))
+            .collect();
+        if !suffix_matches.is_empty() {
+            suffix_matches.sort_by_key(|f| (f.len(), f.as_str()));
+            return Some(suffix_matches[0].clone());
+        }
+
+        if !base_no_ext.is_empty() {
+            let stem_suffix = format!("/{}", base_no_ext);
+            let mut ext_tolerant_matches: Vec<&String> = all_files
+                .iter()
+                .filter(|f| {
+                    let f_stem = strip_source_extension(f);
+                    f_stem == base_no_ext || f_stem.ends_with(&stem_suffix)
+                })
+                .collect();
+            if !ext_tolerant_matches.is_empty() {
+                ext_tolerant_matches.sort_by_key(|f| (f.len(), f.as_str()));
+                return Some(ext_tolerant_matches[0].clone());
+            }
+        }
+
+        let base_name = rel_path.rsplit('/').next().unwrap_or(rel_path);
+        if !base_name.is_empty() && base_name.contains('.') {
+            let mut base_matches: Vec<&String> = all_files
+                .iter()
+                .filter(|f| f.rsplit('/').next() == Some(base_name))
+                .collect();
+            if !base_matches.is_empty() {
+                base_matches.sort_by_key(|f| (f.len(), f.as_str()));
+                return Some(base_matches[0].clone());
+            }
+        }
+    }
+
     None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocatedErrorSource {
+    pub rel_path: String,
+    pub line: Option<usize>,
+    pub matched_by: String,
+}
+
+fn normalize_ws_for_frame(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn extract_msg_path_candidates(proj_dir: &Path, clean_err: &str) -> Vec<(String, Option<usize>)> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let norm_err = clean_err.replace('\\', "/");
+    let proj_dir_norm = proj_dir.to_string_lossy().replace('\\', "/");
+    let proj_dir_low = proj_dir_norm.to_lowercase();
+
+    // Also inspect chunk URLs like `/_next/static/chunks/app/layout.js`
+    if let Ok(chunk_re) = regex::Regex::new(r"/_next/static/chunks/(?:app|pages)/[^\s\)\]'`<>]+?\.(?:m?js)(?:[?#][^\s\)\]'`<>]*)?") {
+        for m in chunk_re.find_iter(&norm_err) {
+            if let Some(mapped) = map_next_chunk_url_to_source(m.as_str()) {
+                if seen.insert((mapped.clone(), None)) {
+                    out.push((mapped, None));
+                }
+            }
+        }
+    }
+
+    let Ok(path_re) = regex::Regex::new(
+        r#"(?i)((?:webpack-internal:///[^\s\)\]'`<>:]*|file:///[^\s\)\]'`<>:]*|[a-zA-Z]:/[^\s\)\]'`<>:]*|[A-Za-z0-9_.@\[\]()~/-]+/)?[A-Za-z0-9_.\[\]()~-]+\.(?:tsx|ts|jsx|js|mjs|cjs|css|scss|prisma))(?:\s*:\s*(\d+)(?::\d+)?|\s*\(\s*(\d+)\s*[,:]\s*\d+\s*\))?"#,
+    ) else {
+        return out;
+    };
+
+    for cap in path_re.captures_iter(&norm_err) {
+        let raw_path = cap.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+        if raw_path.is_empty() {
+            continue;
+        }
+        let line_num = cap
+            .get(2)
+            .or_else(|| cap.get(3))
+            .and_then(|m| m.as_str().parse::<usize>().ok());
+
+        let mut cleaned = raw_path
+            .trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '(' | '[' | '<'))
+            .to_string();
+
+        let low_pre = cleaned.to_lowercase();
+        if low_pre.starts_with("http://") || low_pre.starts_with("https://") {
+            continue;
+        }
+
+        if let Some(wi_idx) = cleaned.find("webpack-internal:///") {
+            let after = &cleaned[wi_idx + "webpack-internal:///".len()..];
+            // Strip optional `(rsc)/` or `(app-pages-browser)/` wrapper group
+            let stripped = if after.starts_with('(') {
+                if let Some(close) = after.find(")/") {
+                    &after[close + 2..]
+                } else {
+                    after
+                }
+            } else {
+                after
+            };
+            cleaned = stripped.to_string();
+        } else if let Some(stripped_file) = cleaned.strip_prefix("file://") {
+            // On Windows file:///C:/... -> strip extra leading '/' if drive follows
+            let s = if stripped_file.starts_with('/')
+                && stripped_file.as_bytes().get(2) == Some(&b':')
+            {
+                &stripped_file[1..]
+            } else {
+                stripped_file
+            };
+            cleaned = s.to_string();
+        }
+
+        // Strip proj_dir prefix (case-insensitive for Windows drive/casing parity)
+        if !proj_dir_norm.is_empty() {
+            let prefix_with_slash = format!("{}/", proj_dir_norm);
+            let prefix_low_slash = format!("{}/", proj_dir_low);
+            if cleaned.starts_with(&prefix_with_slash) {
+                cleaned = cleaned[prefix_with_slash.len()..].to_string();
+            } else if cleaned.to_lowercase().starts_with(&prefix_low_slash) {
+                cleaned = cleaned[prefix_low_slash.len()..].to_string();
+            }
+        }
+
+        while cleaned.starts_with("./") {
+            cleaned = cleaned[2..].to_string();
+        }
+        let cleaned_low = cleaned.to_lowercase();
+        if cleaned.is_empty()
+            || cleaned_low.contains("node_modules/")
+            || cleaned_low.ends_with("/node_modules")
+            || cleaned_low.contains("/.next/")
+            || cleaned_low.starts_with(".next/")
+            || cleaned_low.contains("/_next/")
+            || cleaned_low.starts_with("_next/")
+            || cleaned_low.contains("/.git/")
+            || cleaned_low.starts_with(".git/")
+            || cleaned_low.starts_with("http://")
+            || cleaned_low.starts_with("https://")
+        {
+            continue;
+        }
+
+        // If an external absolute path didn't match proj_dir directly (e.g. symlink / casing / `/src/` inside path),
+        // also trim to `src/` if it starts with a drive letter or `/`
+        if cleaned.starts_with('/') || cleaned.as_bytes().get(1) == Some(&b':') {
+            if let Some(idx) = cleaned_low.rfind("/src/") {
+                cleaned = cleaned[idx + 1..].to_string();
+            } else if let Some(idx) = cleaned_low.rfind("/prisma/") {
+                cleaned = cleaned[idx + 1..].to_string();
+            }
+        }
+
+        if seen.insert((cleaned.clone(), line_num)) {
+            out.push((cleaned, line_num));
+        }
+    }
+
+    out
+}
+
+pub fn locate_error_source_file(
+    proj_dir: &Path,
+    hinted_path: &str,
+    error_msg: &str,
+) -> Option<LocatedErrorSource> {
+    let all_files = collect_project_source_files(proj_dir);
+    if all_files.is_empty() {
+        return None;
+    }
+
+    let clean_err = strip_ansi_codes(error_msg);
+    let msg_candidates = extract_msg_path_candidates(proj_dir, &clean_err);
+
+    // Normalize hinted_path
+    let proj_dir_norm = proj_dir.to_string_lossy().replace('\\', "/");
+    let proj_dir_low = proj_dir_norm.to_lowercase();
+    let mut norm_hint = hinted_path.trim().replace('\\', "/");
+    if !proj_dir_norm.is_empty() {
+        let p_slash = format!("{}/", proj_dir_norm);
+        let p_low = format!("{}/", proj_dir_low);
+        if norm_hint.starts_with(&p_slash) {
+            norm_hint = norm_hint[p_slash.len()..].to_string();
+        } else if norm_hint.to_lowercase().starts_with(&p_low) {
+            norm_hint = norm_hint[p_low.len()..].to_string();
+        }
+    }
+    while norm_hint.starts_with("./") {
+        norm_hint = norm_hint[2..].to_string();
+    }
+    let norm_hint_low = norm_hint.to_lowercase();
+    let hint_valid = !norm_hint.is_empty()
+        && !norm_hint_low.starts_with("http://")
+        && !norm_hint_low.starts_with("https://")
+        && !norm_hint_low.starts_with("webpack-internal:")
+        && !norm_hint_low.contains("node_modules/");
+
+    // Extract code-frame lines
+    let mut primary_frames: Vec<(usize, String)> = Vec::new();
+    let mut primary_line_nums = std::collections::HashSet::new();
+    if let Ok(re_prim) = regex::Regex::new(r"(?m)^\s*>\s*(\d+)\s*\|\s*(.+)$") {
+        for cap in re_prim.captures_iter(&clean_err) {
+            let Some(ln) = cap.get(1).and_then(|m| m.as_str().parse::<usize>().ok()) else { continue };
+            let snippet = normalize_ws_for_frame(cap.get(2).map(|m| m.as_str()).unwrap_or(""));
+            if snippet.len() >= 4 {
+                primary_line_nums.insert(ln);
+                primary_frames.push((ln, snippet));
+            }
+        }
+    }
+    let mut context_frames: Vec<(usize, String)> = Vec::new();
+    if let Ok(re_ctx) = regex::Regex::new(r"(?m)^\s*(\d+)\s*\|\s*(.+)$") {
+        for cap in re_ctx.captures_iter(&clean_err) {
+            let Some(ln) = cap.get(1).and_then(|m| m.as_str().parse::<usize>().ok()) else { continue };
+            if primary_line_nums.contains(&ln) {
+                continue;
+            }
+            let snippet = normalize_ws_for_frame(cap.get(2).map(|m| m.as_str()).unwrap_or(""));
+            if snippet.len() >= 6 {
+                context_frames.push((ln, snippet));
+            }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct FileScore {
+        score: i32,
+        line: Option<usize>,
+        matched_code_frame: bool,
+        reasons: Vec<&'static str>,
+    }
+
+    let mut scores: Vec<FileScore> = vec![FileScore::default(); all_files.len()];
+
+    for (idx, f) in all_files.iter().enumerate() {
+        let f_stem = strip_source_extension(f);
+        let f_base = f.rsplit('/').next().unwrap_or(f);
+
+        // Score best match from error_msg path candidates
+        let mut best_msg_pts = 0i32;
+        let mut best_msg_line: Option<usize> = None;
+        let mut best_msg_reason: Option<&'static str> = None;
+        for (cand, cand_line) in &msg_candidates {
+            let cand_stem = strip_source_extension(cand);
+            let cand_base = cand.rsplit('/').next().unwrap_or(cand);
+            let cand_has_ext = cand_base.contains('.');
+
+            let (pts, reason) = if f == cand {
+                (100, "error-msg exact path")
+            } else if f.ends_with(&format!("/{}", cand))
+                || (f_stem != f && f_stem.ends_with(&format!("/{}", cand_stem)))
+                || (cand_has_ext && f_stem == cand_stem)
+            {
+                (70, "error-msg suffix path")
+            } else if cand_has_ext && f_base == cand_base {
+                (30, "error-msg basename")
+            } else {
+                (0, "")
+            };
+            if pts > best_msg_pts || (pts == best_msg_pts && pts > 0 && best_msg_line.is_none() && cand_line.is_some()) {
+                best_msg_pts = pts;
+                best_msg_line = *cand_line;
+                best_msg_reason = Some(reason);
+            }
+        }
+        if best_msg_pts > 0 {
+            scores[idx].score += best_msg_pts;
+            if best_msg_line.is_some() {
+                scores[idx].line = best_msg_line;
+            }
+            if let Some(r) = best_msg_reason {
+                scores[idx].reasons.push(r);
+            }
+        }
+
+        // Score hinted_path
+        if hint_valid {
+            let hint_stem = strip_source_extension(&norm_hint);
+            let hint_base = norm_hint.rsplit('/').next().unwrap_or(&norm_hint);
+            let hint_has_ext = hint_base.contains('.');
+            let (h_pts, h_reason) = if f == &norm_hint {
+                (60, "hint exact path")
+            } else if f.ends_with(&format!("/{}", norm_hint))
+                || (f_stem != f && f_stem.ends_with(&format!("/{}", hint_stem)))
+            {
+                (45, "hint suffix path")
+            } else if hint_has_ext && f_base == hint_base {
+                (20, "hint basename")
+            } else {
+                (0, "")
+            };
+            if h_pts > 0 {
+                scores[idx].score += h_pts;
+                scores[idx].reasons.push(h_reason);
+            }
+        }
+    }
+
+    let check_code_frame = |idx: usize, scores: &mut [FileScore]| {
+        if primary_frames.is_empty() && context_frames.is_empty() {
+            return;
+        }
+        let rel = &all_files[idx];
+        let full = proj_dir.join(rel);
+        let Ok(meta) = std::fs::metadata(&full) else { return };
+        if meta.len() > 256 * 1024 {
+            return;
+        }
+        let Ok(content) = std::fs::read_to_string(&full) else { return };
+        let file_lines: Vec<String> = content.lines().map(normalize_ws_for_frame).collect();
+        if file_lines.is_empty() {
+            return;
+        }
+
+        let mut prim_bonus = 0i32;
+        for (ln, snippet) in &primary_frames {
+            let target_idx = ln.saturating_sub(1);
+            let start = target_idx.saturating_sub(2);
+            let end = (target_idx + 2).min(file_lines.len().saturating_sub(1));
+            let near_match = start <= end && (start..=end).any(|li| file_lines[li].contains(snippet));
+            if near_match {
+                if prim_bonus < 120 {
+                    prim_bonus = 120;
+                }
+                scores[idx].line = Some(*ln);
+                scores[idx].matched_code_frame = true;
+                if !scores[idx].reasons.contains(&"code-frame line match") {
+                    scores[idx].reasons.push("code-frame line match");
+                }
+            } else if file_lines.iter().any(|l| l.contains(snippet)) {
+                if prim_bonus < 80 {
+                    prim_bonus = 80;
+                }
+                scores[idx].matched_code_frame = true;
+                if !scores[idx].reasons.contains(&"code-frame snippet match") {
+                    scores[idx].reasons.push("code-frame snippet match");
+                }
+            }
+        }
+        scores[idx].score += prim_bonus;
+
+        let mut ctx_bonus = 0i32;
+        for (ln, snippet) in &context_frames {
+            if ctx_bonus >= 75 {
+                break;
+            }
+            let target_idx = ln.saturating_sub(1);
+            let start = target_idx.saturating_sub(2);
+            let end = (target_idx + 2).min(file_lines.len().saturating_sub(1));
+            if start <= end && (start..=end).any(|li| file_lines[li].contains(snippet)) {
+                ctx_bonus = (ctx_bonus + 25).min(75);
+                scores[idx].matched_code_frame = true;
+                if !scores[idx].reasons.contains(&"code-frame context match") {
+                    scores[idx].reasons.push("code-frame context match");
+                }
+            }
+        }
+        scores[idx].score += ctx_bonus;
+    };
+
+    let has_frames = !primary_frames.is_empty() || !context_frames.is_empty();
+    let candidate_indices: Vec<usize> = scores
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.score > 0)
+        .map(|(i, _)| i)
+        .collect();
+
+    if has_frames {
+        for &idx in &candidate_indices {
+            check_code_frame(idx, &mut scores);
+        }
+        let any_candidate_matched_frame = candidate_indices
+            .iter()
+            .any(|&idx| scores[idx].matched_code_frame);
+        if candidate_indices.is_empty() || !any_candidate_matched_frame {
+            let cand_set: std::collections::HashSet<usize> = candidate_indices.into_iter().collect();
+            for idx in 0..all_files.len() {
+                if cand_set.contains(&idx) {
+                    continue;
+                }
+                let low = all_files[idx].to_ascii_lowercase();
+                if low.ends_with(".tsx")
+                    || low.ends_with(".ts")
+                    || low.ends_with(".jsx")
+                    || low.ends_with(".js")
+                    || low.ends_with(".css")
+                    || low.ends_with(".scss")
+                {
+                    check_code_frame(idx, &mut scores);
+                }
+            }
+        }
+    }
+
+    let best_idx = scores
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.score > 0)
+        .max_by(|(i_a, s_a), (i_b, s_b)| {
+            let a_src = all_files[*i_a].starts_with("src/");
+            let b_src = all_files[*i_b].starts_with("src/");
+            s_a.score
+                .cmp(&s_b.score)
+                .then_with(|| a_src.cmp(&b_src))
+                .then_with(|| all_files[*i_b].len().cmp(&all_files[*i_a].len()))
+                .then_with(|| all_files[*i_b].cmp(&all_files[*i_a]))
+        })
+        .map(|(i, _)| i)?;
+
+    let best_score = &scores[best_idx];
+    let matched_by = if best_score.reasons.is_empty() {
+        "path score".to_string()
+    } else {
+        best_score.reasons.join(" + ")
+    };
+
+    Some(LocatedErrorSource {
+        rel_path: all_files[best_idx].clone(),
+        line: best_score.line,
+        matched_by,
+    })
 }
 
 pub struct CompileErrorDetector {

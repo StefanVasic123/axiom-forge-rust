@@ -2411,3 +2411,32 @@ pub fn export_mini_llm_training_dataset(
         .unwrap_or_else(|| "qwen2.5-coder:3b".to_string());
     export_mini_llm_training_dataset_at(&get_projects_dir(), &get_katastar_path(), &dir, &base_model)
 }
+
+#[tauri::command]
+pub fn record_katastar_runtime_error(
+    project_id: Option<String>,
+    file_path: Option<String>,
+    error_msg: String,
+    category: Option<String>,
+) -> Result<String, String> {
+    let cat = category.as_deref().unwrap_or("runtime");
+    let fp = file_path.as_deref().unwrap_or("preview");
+    let entry_id = register_repair_attempt(
+        cat,
+        &error_msg,
+        fp,
+        "runtime_catcher",
+        "observe",
+        None,
+        &format!("Runtime error caught: {}", error_msg),
+        "",
+    );
+    if let Some(pid) = &project_id {
+        if !pid.is_empty() {
+            let sig_info = normalize_error_signature(cat, &error_msg, Some(fp));
+            track_pending_project_repair(pid, fp, &sig_info.error_signature, &entry_id, "runtime_catcher");
+        }
+    }
+    debug_log_to_file(format!("[Katastar] Recorded runtime error for project {:?} in '{}': {}", project_id, fp, error_msg));
+    Ok(entry_id)
+}

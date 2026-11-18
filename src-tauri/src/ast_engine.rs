@@ -2630,3 +2630,931 @@ pub fn detect_truncated_or_degenerate_ts_js(file_path: &str, content: &str) -> O
 
     None
 }
+
+// ---------------------------------------------------------------------------
+// 7. TS2749 type-reference AST collection & Component destructured prop defaults
+// ---------------------------------------------------------------------------
+
+/// Collects all `type_identifier` names appearing in TypeScript type-reference positions
+/// (excluding declaration names and qualified `nested_type_identifier` segments).
+pub fn collect_type_reference_names(path: &str, src: &str) -> std::collections::HashSet<String> {
+    let mut refs = std::collections::HashSet::new();
+    if !is_typed_path(path) {
+        return refs;
+    }
+    let Some(tree) = parse_source(path, src) else {
+        return refs;
+    };
+
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "type_identifier" {
+            let is_decl_or_qualified = node.parent().map_or(false, |parent| {
+                let pk = parent.kind();
+                if pk == "nested_type_identifier" || pk == "type_parameter" {
+                    return true;
+                }
+                if matches!(
+                    pk,
+                    "interface_declaration"
+                        | "type_alias_declaration"
+                        | "enum_declaration"
+                        | "class_declaration"
+                        | "abstract_class_declaration"
+                ) {
+                    if let Some(name_node) = parent.child_by_field_name("name") {
+                        return name_node.id() == node.id();
+                    }
+                }
+                false
+            });
+            if !is_decl_or_qualified {
+                let txt = node_text(node, src).trim();
+                if !txt.is_empty() {
+                    refs.insert(txt.to_string());
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for ch in node.named_children(&mut cursor) {
+            stack.push(ch);
+        }
+    }
+    refs
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PropTypeKind {
+    Array,
+    Function,
+    Object,
+    Primitive,
+    Unknown,
+}
+
+fn unwrap_ts_type_node<'t>(mut node: Node<'t>) -> Node<'t> {
+    loop {
+        match node.kind() {
+            "type_annotation" | "parenthesized_type" => {
+                if let Some(inner) = named_children_vec(node).into_iter().next() {
+                    node = inner;
+                    continue;
+                }
+                return node;
+            }
+            _ => return node,
+        }
+    }
+}
+
+fn classify_ts_type_node(node: Node, src: &str) -> PropTypeKind {
+    let n = unwrap_ts_type_node(node);
+    match n.kind() {
+        "array_type" | "tuple_type" => PropTypeKind::Array,
+        "generic_type" => {
+            let base = n
+                .child_by_field_name("name")
+                .map(|c| node_text(c, src).trim())
+                .unwrap_or("");
+            if matches!(base, "Array" | "ReadonlyArray") {
+                PropTypeKind::Array
+            } else if base == "Record" {
+                PropTypeKind::Object
+            } else {
+                PropTypeKind::Unknown
+            }
+        }
+        "union_type" => {
+            let mut non_nullish = Vec::new();
+            for ch in named_children_vec(n) {
+                let inner = unwrap_ts_type_node(ch);
+                let txt = node_text(inner, src).trim();
+                if txt == "undefined" || txt == "null" {
+                    continue;
+                }
+                non_nullish.push(classify_ts_type_node(inner, src));
+            }
+            if non_nullish.is_empty() {
+                PropTypeKind::Unknown
+            } else if non_nullish.iter().any(|k| *k == PropTypeKind::Array) {
+                PropTypeKind::Array
+            } else if non_nullish.iter().any(|k| *k == PropTypeKind::Function) {
+                PropTypeKind::Function
+            } else if non_nullish.iter().all(|k| *k == PropTypeKind::Primitive) {
+                PropTypeKind::Primitive
+            } else if non_nullish.iter().any(|k| *k == PropTypeKind::Object) {
+                PropTypeKind::Object
+            } else {
+                PropTypeKind::Unknown
+            }
+        }
+        "function_type" => PropTypeKind::Function,
+        "object_type" => PropTypeKind::Object,
+        "predefined_type" | "literal_type" | "null" | "undefined" => PropTypeKind::Primitive,
+        _ => PropTypeKind::Unknown,
+    }
+}
+
+fn extract_object_type_prop_kinds(obj_node: Node, src: &str) -> std::collections::HashMap<String, PropTypeKind> {
+    let mut map = std::collections::HashMap::new();
+    for member in named_children_vec(obj_node) {
+        if member.kind() != "property_signature" {
+            continue;
+        }
+        let Some(name_node) = member.child_by_field_name("name") else { continue };
+        let Some(prop_name) = property_key_name(name_node, src) else { continue };
+        let kind = member
+            .child_by_field_name("type")
+            .map(|t| classify_ts_type_node(t, src))
+            .unwrap_or(PropTypeKind::Unknown);
+        map.insert(prop_name, kind);
+    }
+    map
+}
+
+fn ast_has_jsx(node: Node) -> bool {
+    let mut stack = vec![node];
+    while let Some(cur) = stack.pop() {
+        if matches!(cur.kind(), "jsx_element" | "jsx_self_closing_element" | "jsx_fragment") {
+            return true;
+        }
+        let mut cursor = cur.walk();
+        for ch in cur.named_children(&mut cursor) {
+            stack.push(ch);
+        }
+    }
+    false
+}
+
+fn function_redeclares_param(fn_node: Node, target_name: &str, src: &str) -> bool {
+    if let Some(fp) = fn_node.child_by_field_name("parameters") {
+        let mut stack = vec![fp];
+        while let Some(n) = stack.pop() {
+            if matches!(
+                n.kind(),
+                "identifier" | "shorthand_property_identifier_pattern"
+            ) && node_text(n, src).trim() == target_name
+            {
+                // Ensure we don't match key side of `pair_pattern` if renamed `{ target: other }`
+                let is_renamed_key = n.parent().map_or(false, |p| {
+                    p.kind() == "pair_pattern"
+                        && p.child_by_field_name("key").map_or(false, |k| k.id() == n.id())
+                });
+                if !is_renamed_key {
+                    return true;
+                }
+            }
+            let mut cursor = n.walk();
+            for ch in n.named_children(&mut cursor) {
+                if ch.kind() == "type_annotation" {
+                    continue;
+                }
+                stack.push(ch);
+            }
+        }
+    } else if let Some(single) = fn_node.child_by_field_name("parameter") {
+        if node_text(single, src).trim() == target_name {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_optional_chain_child(node: Node, src: &str) -> bool {
+    all_children_vec(node)
+        .into_iter()
+        .any(|c| c.kind() == "optional_chain" || (!c.is_named() && node_text(c, src).trim() == "?."))
+}
+
+fn unwrapped_ident_name<'a>(node: Node, src: &'a str) -> Option<&'a str> {
+    let u = unwrap_expression(node);
+    if u.kind() == "identifier" {
+        Some(node_text(u, src).trim())
+    } else {
+        None
+    }
+}
+
+#[derive(Default)]
+struct DestructuredPropUsage {
+    has_falsy_guard: bool,
+    used_array_method: bool,
+    used_length: bool,
+    used_string_or_primitive_method: bool,
+    used_object_prop: bool,
+    used_direct_call: bool,
+}
+
+fn analyze_destructured_prop_usage(body: Node, local_name: &str, src: &str) -> DestructuredPropUsage {
+    const ARRAY_METHODS: &[&str] = &[
+        "map", "filter", "reduce", "reduceRight", "forEach", "slice", "flatMap", "some", "every",
+        "find", "findIndex", "concat", "join", "sort", "reverse", "push", "pop",
+    ];
+    const PRIMITIVE_METHODS: &[&str] = &[
+        "trim", "toLowerCase", "toUpperCase", "split", "startsWith", "endsWith", "replace",
+        "replaceAll", "substring", "substr", "charAt", "match", "padStart", "padEnd",
+        "toFixed", "toPrecision", "toExponential", "toISOString", "toLocaleDateString",
+        "toLocaleTimeString", "toLocaleString", "getTime", "getFullYear",
+    ];
+
+    let mut usage = DestructuredPropUsage::default();
+    let mut stack = vec![body];
+
+    while let Some(node) = stack.pop() {
+        if node.id() != body.id()
+            && is_function_like(node.kind())
+            && function_redeclares_param(node, local_name, src)
+        {
+            continue;
+        }
+
+        match node.kind() {
+            "unary_expression" => {
+                let op = node
+                    .child_by_field_name("operator")
+                    .map(|o| node_text(o, src).trim())
+                    .unwrap_or("");
+                if op == "!" {
+                    if let Some(arg) = node.child_by_field_name("argument") {
+                        if unwrapped_ident_name(arg, src) == Some(local_name) {
+                            usage.has_falsy_guard = true;
+                        }
+                    }
+                }
+            }
+            "binary_expression" => {
+                let op = node
+                    .child_by_field_name("operator")
+                    .map(|o| node_text(o, src).trim())
+                    .unwrap_or("");
+                if let (Some(left), Some(right)) = (
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("right"),
+                ) {
+                    if op == "&&" && unwrapped_ident_name(left, src) == Some(local_name) {
+                        usage.has_falsy_guard = true;
+                    } else if matches!(op, "==" | "===" | "!=" | "!==") {
+                        let l_txt = node_text(unwrap_expression(left), src).trim();
+                        let r_txt = node_text(unwrap_expression(right), src).trim();
+                        if (l_txt == local_name && matches!(r_txt, "null" | "undefined"))
+                            || (r_txt == local_name && matches!(l_txt, "null" | "undefined"))
+                        {
+                            usage.has_falsy_guard = true;
+                        }
+                    }
+                }
+            }
+            "if_statement" | "ternary_expression" => {
+                if let Some(cond) = node.child_by_field_name("condition") {
+                    if unwrapped_ident_name(cond, src) == Some(local_name) {
+                        usage.has_falsy_guard = true;
+                    }
+                }
+            }
+            "member_expression" => {
+                if !has_optional_chain_child(node, src) {
+                    if let Some(obj) = node.child_by_field_name("object") {
+                        if unwrapped_ident_name(obj, src) == Some(local_name) {
+                            if let Some(prop) = node.child_by_field_name("property") {
+                                let prop_name = node_text(prop, src).trim();
+                                if ARRAY_METHODS.contains(&prop_name) {
+                                    usage.used_array_method = true;
+                                } else if prop_name == "length" {
+                                    usage.used_length = true;
+                                } else if PRIMITIVE_METHODS.contains(&prop_name) {
+                                    usage.used_string_or_primitive_method = true;
+                                } else if !prop_name.is_empty() {
+                                    usage.used_object_prop = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "call_expression" => {
+                if !has_optional_chain_child(node, src) {
+                    if let Some(func_n) = node.child_by_field_name("function") {
+                        if unwrapped_ident_name(func_n, src) == Some(local_name) {
+                            usage.used_direct_call = true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let mut cursor = node.walk();
+        for ch in node.named_children(&mut cursor) {
+            stack.push(ch);
+        }
+    }
+
+    usage
+}
+
+fn resolve_component_prop_types<'a>(
+    first_param: Node,
+    var_declarator: Option<Node>,
+    local_type_maps: &'a std::collections::HashMap<String, std::collections::HashMap<String, PropTypeKind>>,
+    src: &str,
+) -> std::collections::HashMap<String, PropTypeKind> {
+    let from_type_node = |tn: Node| -> Option<std::collections::HashMap<String, PropTypeKind>> {
+        let u = unwrap_ts_type_node(tn);
+        if u.kind() == "object_type" {
+            return Some(extract_object_type_prop_kinds(u, src));
+        }
+        if u.kind() == "type_identifier" {
+            let name = node_text(u, src).trim();
+            if let Some(found) = local_type_maps.get(name) {
+                return Some(found.clone());
+            }
+        }
+        None
+    };
+
+    if let Some(ta) = first_param.child_by_field_name("type") {
+        if let Some(map) = from_type_node(ta) {
+            return map;
+        }
+    }
+
+    if let Some(vd) = var_declarator {
+        if let Some(ta) = vd.child_by_field_name("type") {
+            let mut stack = vec![ta];
+            while let Some(n) = stack.pop() {
+                if n.kind() == "generic_type" {
+                    if let Some(args) = n.child_by_field_name("type_arguments") {
+                        if let Some(first_arg) = named_children_vec(args).into_iter().next() {
+                            if let Some(map) = from_type_node(first_arg) {
+                                return map;
+                            }
+                        }
+                    }
+                }
+                let mut cursor = n.walk();
+                for ch in n.named_children(&mut cursor) {
+                    stack.push(ch);
+                }
+            }
+        }
+    }
+
+    std::collections::HashMap::new()
+}
+
+/// Automatically infers safe runtime defaults (`= []`, `= () => {}`, `= {} as any`)
+/// for destructured props of React components in `.tsx`/`.jsx` files purely from TypeScript
+/// prop types and unguarded AST usage in the component body — zero hardcoded prop names.
+pub fn ensure_component_destructured_prop_defaults_in_source(rel_path: &str, src: &str) -> Option<String> {
+    let low = rel_path.replace('\\', "/").to_ascii_lowercase();
+    if !(low.ends_with(".tsx") || low.ends_with(".jsx")) {
+        return None;
+    }
+    let tree = parse_source(rel_path, src)?;
+
+    // Step A: Collect top-level interface/type object shapes
+    let mut local_type_maps: std::collections::HashMap<String, std::collections::HashMap<String, PropTypeKind>> =
+        std::collections::HashMap::new();
+
+    for stmt in named_children_vec(tree.root_node()) {
+        let decl = if stmt.kind() == "export_statement" {
+            match stmt.child_by_field_name("declaration") {
+                Some(d) => d,
+                None => continue,
+            }
+        } else {
+            stmt
+        };
+        match decl.kind() {
+            "interface_declaration" => {
+                if let (Some(name_n), Some(body_n)) = (
+                    decl.child_by_field_name("name"),
+                    decl.child_by_field_name("body"),
+                ) {
+                    let name = node_text(name_n, src).trim().to_string();
+                    local_type_maps.insert(name, extract_object_type_prop_kinds(body_n, src));
+                }
+            }
+            "type_alias_declaration" => {
+                if let (Some(name_n), Some(val_n)) = (
+                    decl.child_by_field_name("name"),
+                    decl.child_by_field_name("value"),
+                ) {
+                    let u = unwrap_ts_type_node(val_n);
+                    if u.kind() == "object_type" {
+                        let name = node_text(name_n, src).trim().to_string();
+                        local_type_maps.insert(name, extract_object_type_prop_kinds(u, src));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Step B: Collect top-level React component functions `(func_node, var_declarator_opt)`
+    let mut components: Vec<(Node, Option<Node>)> = Vec::new();
+    for stmt in named_children_vec(tree.root_node()) {
+        let decl = if stmt.kind() == "export_statement" {
+            match stmt.child_by_field_name("declaration") {
+                Some(d) => d,
+                None => continue,
+            }
+        } else {
+            stmt
+        };
+        match decl.kind() {
+            "function_declaration" => {
+                if let Some(name_n) = decl.child_by_field_name("name") {
+                    let name = node_text(name_n, src).trim();
+                    if name.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
+                        components.push((decl, None));
+                    }
+                }
+            }
+            "lexical_declaration" | "variable_declaration" => {
+                for vd in named_children_vec(decl) {
+                    if vd.kind() != "variable_declarator" {
+                        continue;
+                    }
+                    let (Some(name_n), Some(val_n)) = (
+                        vd.child_by_field_name("name"),
+                        vd.child_by_field_name("value"),
+                    ) else {
+                        continue;
+                    };
+                    let name = node_text(name_n, src).trim();
+                    if !name.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
+                        continue;
+                    }
+                    let func = unwrap_expression(val_n);
+                    if matches!(func.kind(), "arrow_function" | "function_expression" | "function") {
+                        components.push((func, Some(vd)));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let typed = is_typed_path(rel_path);
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+
+    for (func_node, vd_opt) in components {
+        let Some(body_node) = func_node.child_by_field_name("body") else { continue };
+        if !ast_has_jsx(body_node) {
+            continue;
+        }
+        let Some(fp_node) = func_node.child_by_field_name("parameters") else { continue };
+        let Some(first_param) = named_children_vec(fp_node)
+            .into_iter()
+            .find(|p| matches!(p.kind(), "required_parameter" | "optional_parameter" | "object_pattern"))
+        else {
+            continue;
+        };
+
+        let obj_pattern = if first_param.kind() == "object_pattern" {
+            first_param
+        } else {
+            let pat = first_param
+                .child_by_field_name("pattern")
+                .or_else(|| named_children_vec(first_param).into_iter().next());
+            let Some(p) = pat.filter(|n| n.kind() == "object_pattern") else {
+                continue;
+            };
+            p
+        };
+
+        let prop_types = resolve_component_prop_types(first_param, vd_opt, &local_type_maps, src);
+
+        // Step C & D: Inspect every destructured member in `object_pattern`
+        for member in named_children_vec(obj_pattern) {
+            let (prop_key, local_name, insert_byte) = match member.kind() {
+                "shorthand_property_identifier_pattern" => {
+                    let sym = node_text(member, src).trim().to_string();
+                    (sym.clone(), sym, member.end_byte())
+                }
+                "pair_pattern" => {
+                    let (Some(k_n), Some(v_n)) = (
+                        member.child_by_field_name("key"),
+                        member.child_by_field_name("value"),
+                    ) else {
+                        continue;
+                    };
+                    if v_n.kind() != "identifier" {
+                        // Already defaulted (`assignment_pattern`) or nested destructure
+                        continue;
+                    }
+                    let Some(k_str) = property_key_name(k_n, src) else { continue };
+                    let l_str = node_text(v_n, src).trim().to_string();
+                    (k_str, l_str, v_n.end_byte())
+                }
+                // `object_assignment_pattern` (already defaulted), `assignment_pattern`, `rest_pattern`
+                _ => continue,
+            };
+
+            if local_name.is_empty() || local_name == "children" {
+                continue;
+            }
+
+            let usage = analyze_destructured_prop_usage(body_node, &local_name, src);
+            if usage.has_falsy_guard {
+                continue;
+            }
+
+            let decl_kind = prop_types.get(&prop_key).copied().unwrap_or(PropTypeKind::Unknown);
+            let default_str = if decl_kind == PropTypeKind::Array
+                || usage.used_array_method
+                || (usage.used_length
+                    && decl_kind != PropTypeKind::Primitive
+                    && !usage.used_string_or_primitive_method)
+            {
+                Some(" = []")
+            } else if usage.used_direct_call && decl_kind != PropTypeKind::Primitive {
+                Some(" = () => {}")
+            } else if usage.used_object_prop
+                && decl_kind != PropTypeKind::Primitive
+                && !usage.used_string_or_primitive_method
+                && !usage.used_length
+            {
+                Some(if typed { " = {} as any" } else { " = {}" })
+            } else {
+                None
+            };
+
+            if let Some(def) = default_str {
+                edits.push((insert_byte, insert_byte, def.to_string()));
+            }
+        }
+    }
+
+    if edits.is_empty() {
+        return None;
+    }
+
+    let candidate = apply_byte_edits(src, edits);
+    verified_rewrite(rel_path, src, candidate)
+}
+
+/// Applies `ensure_component_destructured_prop_defaults_in_source` across all `.tsx`/`.jsx` files
+/// in `proj_dir`, returning the number of updated files.
+pub fn ensure_component_destructured_prop_defaults_in_project(proj_dir: &std::path::Path) -> usize {
+    if !proj_dir.is_dir() {
+        return 0;
+    }
+    let mut updated = 0usize;
+    let mut stack = vec![proj_dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if path.is_dir() {
+                if matches!(
+                    name_str.as_ref(),
+                    "node_modules" | ".next" | ".git" | "dist" | "build" | ".axiom" | "target"
+                ) {
+                    continue;
+                }
+                stack.push(path);
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            let low = name_str.to_ascii_lowercase();
+            if !(low.ends_with(".tsx") || low.ends_with(".jsx")) {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(proj_dir)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| name_str.to_string());
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Some(fixed) = ensure_component_destructured_prop_defaults_in_source(&rel, &content) {
+                    if std::fs::write(&path, fixed).is_ok() {
+                        updated += 1;
+                    }
+                }
+            }
+        }
+    }
+    updated
+}
+
+/// Replaces non-exported local duplicate `interface X` declarations in project `.ts`/`.tsx` files
+/// with `import type { X } from '@/types...'` when `@/types` already exports `X` with `[key: string]: any;`.
+pub fn deduplicate_local_domain_interfaces_against_types_in_project(proj_dir: &std::path::Path) -> usize {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+
+    if !proj_dir.is_dir() {
+        return 0;
+    }
+
+    let (types_dir, types_alias_prefix) = if proj_dir.join("src/types").is_dir() {
+        (proj_dir.join("src/types"), "@/types")
+    } else if proj_dir.join("types").is_dir() && !proj_dir.join("src").is_dir() {
+        (proj_dir.join("types"), "@/types")
+    } else {
+        return 0;
+    };
+
+    // Step A: Scan `@/types` modules and record safe exported domain types (`[key: string]: any;`)
+    let mut module_safe_types: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut index_tree_and_src: Option<(String, Tree)> = None;
+
+    let mut type_stack = vec![types_dir.clone()];
+    while let Some(cur) = type_stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&cur) else { continue };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                type_stack.push(p);
+                continue;
+            }
+            if !p.is_file() {
+                continue;
+            }
+            let Ok(sub_rel) = p.strip_prefix(&types_dir) else { continue };
+            let sub_str = sub_rel.to_string_lossy().replace('\\', "/");
+            let sub_low = sub_str.to_ascii_lowercase();
+            if sub_low.ends_with(".d.ts") || (!sub_low.ends_with(".ts") && !sub_low.ends_with(".tsx")) {
+                continue;
+            }
+            let Ok(src) = std::fs::read_to_string(&p) else { continue };
+            let rel_for_parse = p
+                .strip_prefix(proj_dir)
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| sub_str.clone());
+            let Some(tree) = parse_source(&rel_for_parse, &src) else { continue };
+
+            let contracts = extract_local_type_contracts(&tree, &src);
+            let exports = extract_exports(&tree, &src);
+
+            let mut directly_exported_names: HashSet<String> = exports.named.iter().cloned().collect();
+            for stmt in named_children_vec(tree.root_node()) {
+                if stmt.kind() == "export_statement" && !has_token_child(stmt, "default") {
+                    if let Some(decl) = stmt.child_by_field_name("declaration") {
+                        for n in declaration_names(decl, &src) {
+                            directly_exported_names.insert(n);
+                        }
+                    }
+                }
+            }
+
+            let mut safe_names = HashSet::new();
+            for c in contracts {
+                if c.has_index_sig && directly_exported_names.contains(&c.name) {
+                    safe_names.insert(c.name);
+                }
+            }
+
+            let stem = sub_str
+                .trim_end_matches(".tsx")
+                .trim_end_matches(".ts")
+                .to_string();
+            module_safe_types.insert(stem.clone(), safe_names);
+            if stem == "index" {
+                index_tree_and_src = Some((src, tree));
+            }
+        }
+    }
+
+    let mut exported_types: HashMap<String, String> = HashMap::new();
+    // 1. Direct index types & index re-exports map to `@/types`
+    if let Some(index_safe) = module_safe_types.get("index") {
+        for name in index_safe {
+            exported_types.insert(name.clone(), types_alias_prefix.to_string());
+        }
+    }
+    if let Some((ref idx_src, ref idx_tree)) = index_tree_and_src {
+        let idx_exports = extract_exports(idx_tree, idx_src);
+        for star_spec in &idx_exports.star_reexports {
+            let clean_spec = star_spec.trim_start_matches("./").trim_end_matches(".ts").trim_end_matches(".tsx");
+            if let Some(mod_safe) = module_safe_types.get(clean_spec) {
+                for name in mod_safe {
+                    exported_types.insert(name.clone(), types_alias_prefix.to_string());
+                }
+            }
+        }
+        for stmt in named_children_vec(idx_tree.root_node()) {
+            if stmt.kind() != "export_statement" {
+                continue;
+            }
+            let Some(source_node) = stmt.child_by_field_name("source") else { continue };
+            let src_spec = strip_string_quotes(node_text(source_node, idx_src));
+            let clean_spec = src_spec.trim_start_matches("./").trim_end_matches(".ts").trim_end_matches(".tsx");
+            let Some(mod_safe) = module_safe_types.get(clean_spec) else { continue };
+            if let Some(clause) = first_named_of_kind(stmt, &["export_clause"]) {
+                for spec in named_children_vec(clause) {
+                    if spec.kind() != "export_specifier" {
+                        continue;
+                    }
+                    let orig = spec
+                        .child_by_field_name("name")
+                        .map(|n| strip_string_quotes(node_text(n, idx_src)))
+                        .unwrap_or_default();
+                    let alias = spec
+                        .child_by_field_name("alias")
+                        .map(|n| strip_string_quotes(node_text(n, idx_src)))
+                        .unwrap_or_else(|| orig.clone());
+                    if mod_safe.contains(&orig) && !alias.is_empty() {
+                        exported_types.insert(alias, types_alias_prefix.to_string());
+                    }
+                }
+            }
+        }
+    }
+    // 2. Any safe exported type in submodules not re-exported by `index.ts` maps to `@/types/<stem>`
+    let mut sorted_stems: Vec<String> = module_safe_types.keys().cloned().collect();
+    sorted_stems.sort();
+    for stem in sorted_stems {
+        if stem == "index" {
+            continue;
+        }
+        if let Some(names) = module_safe_types.get(&stem) {
+            let mut sorted_names: Vec<String> = names.iter().cloned().collect();
+            sorted_names.sort();
+            for name in sorted_names {
+                exported_types
+                    .entry(name)
+                    .or_insert_with(|| format!("{}/{}", types_alias_prefix, stem));
+            }
+        }
+    }
+
+    if exported_types.is_empty() {
+        return 0;
+    }
+
+    // Step B: Walk project `.ts`/`.tsx` files outside types/models and replace local duplicate interfaces
+    let mut updated = 0usize;
+    let mut file_stack = vec![proj_dir.to_path_buf()];
+    while let Some(current) = file_stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name_os = entry.file_name();
+            let name_str = name_os.to_string_lossy();
+            if path.is_dir() {
+                if matches!(
+                    name_str.as_ref(),
+                    "node_modules" | ".next" | ".git" | "dist" | "build" | "out" | "target" | ".axiom"
+                ) {
+                    continue;
+                }
+                file_stack.push(path);
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            let Ok(rel_pb) = path.strip_prefix(proj_dir) else { continue };
+            let rel_path = rel_pb.to_string_lossy().replace('\\', "/");
+            let rel_low = rel_path.to_ascii_lowercase();
+            if rel_low.ends_with(".d.ts") || (!rel_low.ends_with(".ts") && !rel_low.ends_with(".tsx")) {
+                continue;
+            }
+            if rel_low.starts_with("src/types/")
+                || rel_low.starts_with("types/")
+                || rel_low.starts_with("src/models/")
+                || rel_low.starts_with("models/")
+            {
+                continue;
+            }
+
+            let Ok(content) = std::fs::read_to_string(&path) else { continue };
+            let Some(tree) = parse_source(&rel_path, &content) else { continue };
+
+            let mut imported_locals = HashSet::new();
+            for imp in extract_imports(&tree, &content) {
+                if let Some(d) = imp.default_local {
+                    imported_locals.insert(d);
+                }
+                if let Some(ns) = imp.namespace_local {
+                    imported_locals.insert(ns);
+                }
+                for b in imp.named {
+                    imported_locals.insert(b.local);
+                }
+            }
+
+            let mut local_value_names = HashSet::new();
+            for stmt in named_children_vec(tree.root_node()) {
+                let inner = if stmt.kind() == "export_statement" {
+                    match stmt.child_by_field_name("declaration") {
+                        Some(d) => d,
+                        None => continue,
+                    }
+                } else {
+                    stmt
+                };
+                if matches!(
+                    inner.kind(),
+                    "lexical_declaration"
+                        | "variable_declaration"
+                        | "function_declaration"
+                        | "generator_function_declaration"
+                        | "class_declaration"
+                        | "abstract_class_declaration"
+                        | "enum_declaration"
+                ) {
+                    for n in declaration_names(inner, &content) {
+                        local_value_names.insert(n);
+                    }
+                }
+            }
+
+            let mut edits: Vec<(usize, usize, String)> = Vec::new();
+            let mut to_import: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+            for stmt in named_children_vec(tree.root_node()) {
+                // Only inspect NON-exported top-level `interface_declaration`
+                if stmt.kind() != "interface_declaration" {
+                    continue;
+                }
+                let Some(iface_name_node) = stmt.child_by_field_name("name") else { continue };
+                let iface_name = node_text(iface_name_node, &content).trim().to_string();
+                if iface_name.is_empty()
+                    || iface_name.ends_with("Props")
+                    || iface_name.ends_with("State")
+                    || iface_name.ends_with("Options")
+                    || iface_name.ends_with("Params")
+                    || iface_name.ends_with("Config")
+                    || iface_name.ends_with("Context")
+                {
+                    continue;
+                }
+                if imported_locals.contains(&iface_name) || local_value_names.contains(&iface_name) {
+                    continue;
+                }
+                let Some(spec) = exported_types.get(&iface_name) else {
+                    continue;
+                };
+
+                let mut del_end = stmt.end_byte();
+                while del_end < content.len() && matches!(content.as_bytes()[del_end], b' ' | b'\t') {
+                    del_end += 1;
+                }
+                if content[del_end..].starts_with("\r\n") {
+                    del_end += 2;
+                } else if content[del_end..].starts_with('\n') {
+                    del_end += 1;
+                }
+                edits.push((stmt.start_byte(), del_end, String::new()));
+
+                let sym_list = to_import.entry(spec.clone()).or_default();
+                if !sym_list.contains(&iface_name) {
+                    sym_list.push(iface_name);
+                }
+            }
+
+            if edits.is_empty() {
+                continue;
+            }
+
+            // Compute safe insertion byte after `'use client'` / `'use server'` and all top-level imports
+            let mut insert_byte = 0usize;
+            for child in named_children_vec(tree.root_node()) {
+                let kind = child.kind();
+                if kind == "import_statement" {
+                    insert_byte = child.end_byte();
+                } else if kind == "expression_statement" {
+                    let txt = node_text(child, &content).trim();
+                    if txt.contains("use client") || txt.contains("use server") {
+                        insert_byte = child.end_byte();
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if insert_byte > 0 && content[insert_byte..].starts_with("\r\n") {
+                insert_byte += 2;
+            } else if insert_byte > 0 && content[insert_byte..].starts_with('\n') {
+                insert_byte += 1;
+            }
+
+            let mut import_block = String::new();
+            for (spec, syms) in to_import {
+                import_block.push_str(&format!("import type {{ {} }} from '{}';\n", syms.join(", "), spec));
+            }
+            let formatted_block = if insert_byte > 0 && !content[..insert_byte].ends_with('\n') {
+                format!("\n{}", import_block)
+            } else {
+                import_block
+            };
+            edits.push((insert_byte, insert_byte, formatted_block));
+
+            let candidate = apply_byte_edits(&content, edits);
+            if let Some(verified) = verified_rewrite(&rel_path, &content, candidate) {
+                if std::fs::write(&path, verified).is_ok() {
+                    updated += 1;
+                }
+            }
+        }
+    }
+
+    updated
+}

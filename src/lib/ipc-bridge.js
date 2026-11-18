@@ -581,6 +581,18 @@ window.electronAPI = {
     onMissingPackage: (callback) => {
       return registerGlobalListener('server:missing-package', callback);
     },
+    locateErrorFile: async (projectId, filePath, errorMsg) => {
+      try {
+        return await invoke('project_locate_error_file', {
+          projectId,
+          filePath: filePath || null,
+          errorMsg: String(errorMsg || '')
+        });
+      } catch (e) {
+        console.warn('locateErrorFile failed:', e);
+        return null;
+      }
+    },
     healCompileError: async (projectId, filePath, errorMsg) => {
       return await invoke('project_heal_compile_error', { projectId, filePath, errorMsg });
     },
@@ -878,6 +890,29 @@ window.electronAPI = {
       try {
         await invoke('agent_write_command_result', { resultJson });
       } catch {}
+    }
+  },
+  katastar: {
+    getKatastar: async () => {
+      try {
+        return await invoke('get_error_katastar');
+      } catch (e) {
+        console.error('Failed to load Katastar:', e);
+        return { schemaVersion: 1, entries: [] };
+      }
+    },
+    recordError: async (projectId, filePath, errorMsg, category) => {
+      try {
+        return await invoke('record_katastar_runtime_error', {
+          projectId: projectId || null,
+          filePath: filePath || null,
+          errorMsg: String(errorMsg || ''),
+          category: category || 'runtime'
+        });
+      } catch (e) {
+        console.error('Failed to record error in Katastar:', e);
+        return null;
+      }
     }
   }
 };

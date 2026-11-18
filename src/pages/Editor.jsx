@@ -586,6 +586,43 @@ export default function EditorPage() {
   const [installingPackage, setInstallingPackage] = useState(false);
   const [installStatus, setInstallStatus] = useState('');
   
+  // Resizable Dev Server Logs Terminal
+  const [terminalHeight, setTerminalHeight] = useState(() => {
+    try {
+      const saved = localStorage.getItem('axiom_terminal_height');
+      return saved ? Math.max(120, Math.min(800, parseInt(saved, 10))) : 260;
+    } catch {
+      return 260;
+    }
+  });
+  const isDraggingTerminalRef = useRef(false);
+
+  const handleTerminalResizeStart = useCallback((e) => {
+    e.preventDefault();
+    isDraggingTerminalRef.current = true;
+    const startY = e.clientY;
+    const startH = terminalHeight;
+
+    const handleMouseMove = (ev) => {
+      if (!isDraggingTerminalRef.current) return;
+      const delta = startY - ev.clientY; // dragging up increases height
+      const newH = Math.max(120, Math.min(window.innerHeight * 0.8, startH + delta));
+      setTerminalHeight(newH);
+    };
+
+    const handleMouseUp = () => {
+      isDraggingTerminalRef.current = false;
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+      try {
+        localStorage.setItem('axiom_terminal_height', String(terminalHeight));
+      } catch {}
+    };
+
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+  }, [terminalHeight]);
+  
   // Status & Inspector States
   const [statusMsg, setStatusMsg] = useState('');
   const [selectedElement, setSelectedElement] = useState(null);
@@ -903,6 +940,45 @@ export default function EditorPage() {
     setTimeout(() => setIframeLoading(false), 2500);
   }, [previewUrl]);
 
+  const resolveLocalFileBySuffixOrBasename = useCallback((rawPath) => {
+    if (!rawPath || !Array.isArray(files) || files.length === 0) return null;
+    let cleaned = String(rawPath).replace(/\\/g, '/').trim().replace(/^\.\//, '');
+    if (!cleaned) return null;
+    const exact = files.find(f => (f.path || '').replace(/\\/g, '/') === cleaned);
+    if (exact) return exact.path;
+    const suffixMatches = files
+      .filter(f => (f.path || '').replace(/\\/g, '/').endsWith('/' + cleaned))
+      .sort((a, b) => a.path.length - b.path.length);
+    if (suffixMatches.length > 0) return suffixMatches[0].path;
+    const baseName = cleaned.split('/').pop();
+    if (baseName) {
+      const baseMatches = files
+        .filter(f => (f.path || '').replace(/\\/g, '/').endsWith('/' + baseName))
+        .sort((a, b) => a.path.length - b.path.length);
+      if (baseMatches.length > 0) return baseMatches[0].path;
+    }
+    return null;
+  }, [files]);
+
+  const extractErrorSourceCandidate = useCallback((errText) => {
+    if (!errText) return null;
+    const norm = String(errText).replace(/\\/g, '/');
+    const matches = norm.match(/(?:[./]*)(?:[A-Za-z0-9_.@[\]()~-]+\/)+[A-Za-z0-9_.[\]()~-]+\.(?:tsx|ts|jsx|js|mjs|cjs|css|scss)/gi) || [];
+    for (const raw of matches) {
+      let cand = raw.replace(/^(?:\.\/|\/)+/, '');
+      const low = cand.toLowerCase();
+      if (low.includes('node_modules/') || low.includes('_next/') || low.includes('.next/') || low.includes('webpack-internal:')) {
+        continue;
+      }
+      const resolved = resolveLocalFileBySuffixOrBasename(cand);
+      if (resolved) return resolved;
+      const srcIdx = low.lastIndexOf('/src/');
+      if (srcIdx !== -1) cand = cand.slice(srcIdx + 1);
+      return cand;
+    }
+    return null;
+  }, [resolveLocalFileBySuffixOrBasename]);
+
   const handleHealError = useCallback(async (errorOverride) => {
     const errObj = (errorOverride && typeof errorOverride === 'object' && errorOverride.filePath && errorOverride.errorMessage)
       ? errorOverride
@@ -911,13 +987,22 @@ export default function EditorPage() {
     setHealingInProgress(true);
     setHealStatus('Započinjem popravku...');
     try {
-      const res = await window.electronAPI.server.healCompileError(
+      const locatedPath = await window.electronAPI?.server?.locateErrorFile?.(
         projectId,
         errObj.filePath,
         errObj.errorMessage
       );
+      const effectiveFilePath = (locatedPath && typeof locatedPath === 'string' && locatedPath.trim())
+        ? locatedPath.trim()
+        : (resolveLocalFileBySuffixOrBasename(errObj.filePath) || errObj.filePath);
+
+      const res = await window.electronAPI.server.healCompileError(
+        projectId,
+        effectiveFilePath,
+        errObj.errorMessage
+      );
       if (res) {
-        const healedFilePath = errObj.filePath;
+        const healedFilePath = effectiveFilePath;
         setCompileError(null);
         setPreviewRuntimeError(null);
         // Reload healed file from disk into Monaco openTabs so editor state is not stale!
@@ -949,7 +1034,7 @@ export default function EditorPage() {
     } finally {
       setHealingInProgress(false);
     }
-  }, [compileError, handleReloadPreview, projectId, showPreview]);
+  }, [compileError, handleReloadPreview, projectId, resolveLocalFileBySuffixOrBasename, showPreview]);
 
   // One-click AI fix for current preview page / compile / runtime error
   const handleAIFixCurrentPage = useCallback(async (customPrompt) => {
@@ -971,15 +1056,15 @@ export default function EditorPage() {
       const rawCandidate = preferRuntime
         ? (previewRuntimeError?.sourceFile || compileError?.filePath || '')
         : (compileError?.filePath || previewRuntimeError?.sourceFile || '');
-      const stackFromMsg = String(errMessage).replace(/\\/g, '/').match(/(?:src\/(?:app|pages|components|hooks|lib|utils|services|models)\/)[A-Za-z0-9_/.[\]-]+\.(?:tsx|ts|jsx|js)/i);
+      const stackFromMsg = extractErrorSourceCandidate(errMessage);
       const chunkFromMsg = String(errMessage).match(/\/_next\/static\/chunks\/(app|pages)\/(.+?)(?:-[0-9a-f]{8,})?\.(?:m?js)/i);
       const isNonProjectPath = !rawCandidate
         || rawCandidate.includes('node_modules/')
         || rawCandidate.startsWith('webpack-internal:')
         || /^https?:\/\//i.test(rawCandidate);
       let errFilePath = rawCandidate;
-      if (stackFromMsg && (isNonProjectPath || !rawCandidate.startsWith('src/'))) {
-        errFilePath = stackFromMsg[0];
+      if (stackFromMsg && (isNonProjectPath || !resolveLocalFileBySuffixOrBasename(rawCandidate))) {
+        errFilePath = stackFromMsg;
       } else if (chunkFromMsg && !['_app', '_document', '_error', '_not-found', 'webpack', 'main', 'framework', 'polyfills'].includes(chunkFromMsg[2])) {
         errFilePath = `src/${chunkFromMsg[1]}/${chunkFromMsg[2]}.tsx`;
       } else if (isNonProjectPath) {
@@ -990,7 +1075,23 @@ export default function EditorPage() {
       }
       errFilePath = errFilePath.replace(/\\/g, '/').replace(/^\.\//, '');
 
-      const errNode = files?.find(f => f.path.replace(/\\/g, '/') === errFilePath)
+      // Query objective Rust locator using error_msg (code frame + stack) & actual project file tree
+      const locatedPath = await window.electronAPI?.server?.locateErrorFile?.(
+        projectId,
+        errFilePath,
+        errMessage
+      );
+      if (locatedPath && typeof locatedPath === 'string' && locatedPath.trim()) {
+        errFilePath = locatedPath.trim().replace(/\\/g, '/');
+      } else {
+        const localMatch = resolveLocalFileBySuffixOrBasename(errFilePath);
+        if (localMatch) {
+          errFilePath = localMatch.replace(/\\/g, '/');
+        }
+      }
+
+      const matchedFile = files?.find(f => (f.path || '').replace(/\\/g, '/') === errFilePath);
+      const errNode = matchedFile
         || { path: errFilePath, name: errFilePath.split('/').pop() };
       await openFile(errNode);
 
@@ -1003,9 +1104,11 @@ export default function EditorPage() {
         return;
       }
 
+      setHealStatus('AI priprema ispravku u asistentu...');
       setAiExternalPrompt(
         `Popravi tačnu compile/runtime grešku u fajlu \`${errFilePath}\` bez promene UI dizajna ili funkcionalnosti:\n\n${errMessage}\n\nPronađi uzrok greške (npr. nedostajući import, pogrešan tip ili eksport) i ispravi isključivo ono što uzrokuje grešku.`
       );
+      setTimeout(() => setHealStatus(''), 2500);
       return;
     }
 
@@ -1030,7 +1133,7 @@ export default function EditorPage() {
       : `Unapredi prikaz i funkcionalnost ovog fajla (${targetFile?.path || 'trenutna stranica'}): 1) Ukloni sve early-return blokade za sesiju (if (!session) return Loading ili if (status === 'unauthenticated') return Log in) kako bi se stranica odmah prikazala u preview modu; 2) Inicijalizuj useState sa 4 do 6 realističnih domenskih mock stavki (ili kompletnim podacima za grafikone) tako da interfejs nikada ne bude prazan; 3) Primeni moderan, responzivan Tailwind dizajn (max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8, kartice sa rounded-xl border shadow-sm, dugmad sa inline-flex items-center gap-2).`;
 
     setAiExternalPrompt(promptText);
-  }, [activeTab, activePreviewFile, compileError, currentPreviewRoute, files, handleHealError, openFile, previewRuntimeError, projectId, resolveRouteToFile]);
+  }, [activeTab, activePreviewFile, compileError, currentPreviewRoute, extractErrorSourceCandidate, files, handleHealError, openFile, previewRuntimeError, projectId, resolveLocalFileBySuffixOrBasename, resolveRouteToFile]);
 
   const handleInstallPackage = async () => {
     if (!missingPackage) return;
@@ -1288,7 +1391,9 @@ export default function EditorPage() {
 
       if (data && data.channel === 'axiom-preview-error') {
         console.log('[Editor] Preview runtime error caught:', data);
+        const errDetailsText = data.details || data.message || 'Unknown runtime error';
         window.electronAPI?.debugLog?.(`[Preview RuntimeError] project=${projectId} route=${data.path || currentPreviewRoute} source=${data.sourceFile || 'none'} msg=${data.message}`);
+
         const resolvePreviewSourceFile = (rawSourceFile, routeFallback) => {
           if (!rawSourceFile) return null;
           let cleaned = String(rawSourceFile).replace(/\\/g, '/').trim();
@@ -1321,22 +1426,20 @@ export default function EditorPage() {
             return resolveRouteToFile(routeFallback)?.path || null;
           }
           cleaned = cleaned.replace(/^\.\//, '');
-          const exact = files.find(f => (f.path || '').replace(/\\/g, '/') === cleaned);
-          return exact ? exact.path : cleaned;
+          return resolveLocalFileBySuffixOrBasename(cleaned) || cleaned;
         };
 
         const routeRef = data.path || currentPreviewRoute;
-        const detailsStackFile = String(data.details || '')
-          .replace(/\\/g, '/')
-          .match(/(?:src\/(?:app|pages|components|hooks|lib|utils|services|models)\/)[A-Za-z0-9_/.[\]-]+\.(?:tsx|ts|jsx|js)/i)?.[0] || null;
+        const detailsStackFile = extractErrorSourceCandidate(data.details || '');
         const cleanSourceFile = resolvePreviewSourceFile(data.sourceFile, routeRef)
           || detailsStackFile;
+        const errTime = Date.now();
         setPreviewRuntimeError({
           message: data.message || 'Nepoznata runtime greška',
           details: data.details || data.message || '',
           sourceFile: cleanSourceFile,
           path: routeRef,
-          time: Date.now()
+          time: errTime
         });
         const targetFilePath = cleanSourceFile
           || resolveRouteToFile(routeRef)?.path
@@ -1359,6 +1462,26 @@ export default function EditorPage() {
           });
           setShowTerminal(true);
         }
+
+        // Objectively locate exact project file on backend before updating state & recording in Katastar
+        const locPromise = window.electronAPI?.server?.locateErrorFile
+          ? window.electronAPI.server.locateErrorFile(projectId, data.sourceFile || cleanSourceFile || '', errDetailsText)
+          : Promise.resolve(null);
+        locPromise.then((locatedPath) => {
+          const resolvedForKatastar = locatedPath || cleanSourceFile || targetFilePath || null;
+          if (locatedPath) {
+            setPreviewRuntimeError(prev => prev && prev.time === errTime ? { ...prev, sourceFile: locatedPath } : prev);
+            setCompileError(prev => prev && prev.source === 'preview' && prev.route === routeRef ? { ...prev, filePath: locatedPath } : prev);
+          }
+          if (window.electronAPI?.katastar?.recordError) {
+            window.electronAPI.katastar.recordError(
+              projectId,
+              resolvedForKatastar,
+              errDetailsText,
+              'runtime'
+            );
+          }
+        });
       }
 
       if (data && data.channel === 'axiom-inspect-click') {
@@ -1405,7 +1528,7 @@ export default function EditorPage() {
     return () => {
       window.removeEventListener('message', handleWindowMessage);
     };
-  }, [openFile, files, projectId, currentPreviewRoute]);
+  }, [openFile, files, projectId, currentPreviewRoute, extractErrorSourceCandidate, resolveLocalFileBySuffixOrBasename, resolveRouteToFile]);
 
   // Lightweight Agent Bridge: sync live Editor & Preview state (<20KB JSON, throttle-safe)
   const liveStateRef = useRef(null);
@@ -2238,11 +2361,21 @@ export default function EditorPage() {
 
                     <button
                       onClick={() => handleAIFixCurrentPage()}
-                      className="flex items-center gap-1.5 px-2.5 py-1 text-[10px] font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded shadow-sm transition-all shrink-0 ml-1"
+                      disabled={healingInProgress}
+                      className="flex items-center gap-1.5 px-2.5 py-1 text-[10px] font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded shadow-sm transition-all shrink-0 ml-1 disabled:opacity-50"
                       title="Zatraži od AI-ja da analizira i popravi trenutnu stranicu ako je prazna ili ima problem sa prikazom"
                     >
-                      <Sparkles className="w-3 h-3 text-indigo-200" />
-                      <span>AI Popravi prikaz</span>
+                      {healingInProgress ? (
+                        <>
+                          <Loader2 className="w-3 h-3 animate-spin text-indigo-200" />
+                          <span>{healStatus || 'Analiziram...'}</span>
+                        </>
+                      ) : (
+                        <>
+                          <Sparkles className="w-3 h-3 text-indigo-200" />
+                          <span>AI Popravi prikaz</span>
+                        </>
+                      )}
                     </button>
                   </div>
                   
@@ -2359,10 +2492,20 @@ export default function EditorPage() {
                           <div className="flex items-center gap-2 shrink-0 ml-3">
                             <button
                               onClick={() => handleAIFixCurrentPage()}
-                              className="flex items-center gap-1.5 px-3 py-1 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded text-[11px] shadow transition-colors"
+                              disabled={healingInProgress}
+                              className="flex items-center gap-1.5 px-3 py-1 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded text-[11px] shadow transition-colors disabled:opacity-50"
                             >
-                              <Sparkles className="w-3.5 h-3.5" />
-                              <span>AI Popravi grešku</span>
+                              {healingInProgress ? (
+                                <>
+                                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                  <span>{healStatus || 'Popravljam...'}</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Sparkles className="w-3.5 h-3.5" />
+                                  <span>AI Popravi grešku</span>
+                                </>
+                              )}
                             </button>
                             <button
                               onClick={toggleServer}
@@ -2510,7 +2653,16 @@ export default function EditorPage() {
 
           {/* Terminal Console */}
           {showTerminal && (
-            <div className="h-48 shrink-0 bg-[#1e1e1e] border-t border-slate-700/50 flex flex-col z-20">
+            <div 
+              style={{ height: `${terminalHeight}px` }}
+              className="shrink-0 bg-[#1e1e1e] border-t border-slate-700/50 flex flex-col z-20 relative select-none"
+            >
+              {/* Drag Handle Splitter */}
+              <div
+                onMouseDown={handleTerminalResizeStart}
+                className="absolute -top-1 left-0 right-0 h-2 cursor-row-resize bg-transparent hover:bg-indigo-500/80 active:bg-indigo-500 transition-colors z-30"
+                title="Povuci gore/dole za promenu visine Dev Server Logs panela"
+              />
               <div className="px-3 py-1.5 bg-slate-800/80 border-b border-slate-700/50 flex justify-between items-center shrink-0">
                 <span className="text-[10px] uppercase font-bold text-slate-400 flex items-center gap-2">
                   <Terminal className="w-3.5 h-3.5" /> Dev Server Logs
@@ -2540,12 +2692,15 @@ export default function EditorPage() {
                     </span>
                     <div className="flex gap-2">
                       <button 
-                        onClick={handleHealError} 
+                        onClick={() => handleHealError()} 
                         disabled={healingInProgress}
                         className="bg-emerald-600 hover:bg-emerald-500 text-white font-semibold px-3 py-1 rounded text-[10px] flex items-center gap-1.5 disabled:opacity-50 transition-colors max-w-xs truncate"
                       >
                         {healingInProgress ? (
-                          <>⏳ {healStatus || 'Popravljam...'}</>
+                          <>
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                            <span>{healStatus || 'Popravljam...'}</span>
+                          </>
                         ) : (
                           <>✨ Popravi sa AI</>
                         )}
@@ -2558,7 +2713,7 @@ export default function EditorPage() {
                       </button>
                     </div>
                   </div>
-                  <pre className="text-[10px] bg-black/40 p-2 rounded font-mono overflow-auto max-h-24 whitespace-pre-wrap text-red-200 border border-red-900/30 leading-normal">
+                  <pre className="text-[10px] bg-black/40 p-2 rounded font-mono overflow-auto max-h-40 whitespace-pre-wrap text-red-200 border border-red-900/30 leading-normal">
                     {compileError.errorMessage}
                   </pre>
                 </div>

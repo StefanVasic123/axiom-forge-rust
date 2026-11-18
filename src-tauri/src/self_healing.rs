@@ -1290,6 +1290,7 @@ pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
     }
 
     crate::ast_engine::promote_typed_js_files_to_ts_in_project(proj_dir);
+    crate::ast_engine::ensure_component_destructured_prop_defaults_in_project(proj_dir);
     crate::sanitizer::ensure_valid_tsconfig(proj_dir);
     crate::sanitizer::sanitize_tailwind_config_in_project(proj_dir);
     crate::sanitizer::ensure_multiplatform_entry_routes_bridged(proj_dir);
@@ -1322,6 +1323,7 @@ pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
     crate::apply_ast_sanity_pass_to_project(proj_dir);
     let _ = crate::ast_engine::reconcile_hook_contracts_in_project(proj_dir);
     let _ = crate::ast_engine::reconcile_model_and_type_contracts_in_project(proj_dir);
+    let _ = crate::ast_engine::deduplicate_local_domain_interfaces_against_types_in_project(proj_dir);
     crate::sanitizer::reconcile_hook_error_returns_in_project(proj_dir);
     crate::sanitizer::ensure_ui_primitives_reconciled(proj_dir);
     crate::sanitizer::ensure_directory_barrel_files(proj_dir);
@@ -1361,7 +1363,7 @@ pub fn extract_prisma_schema_summary_for_healing(proj_dir: &std::path::Path) -> 
     }
     if let Some(models_obj) = contract.get("models").and_then(|m| m.as_object()) {
         if !models_obj.is_empty() {
-            out.push_str("Prisma Models (use ONLY declared delegate names and fields below):\n");
+            out.push_str("Prisma Models (use ONLY declared delegate names and fields below; ONLY fields listed in unique(@id/@unique) are valid in WhereUniqueInput for findUnique/upsert/update/delete):\n");
             for (mname, mval) in models_obj {
                 let delegate = mval.get("delegate").and_then(|v| v.as_str()).unwrap_or("");
                 let typed: Vec<&str> = mval
@@ -1374,17 +1376,23 @@ pub fn extract_prisma_schema_summary_for_healing(proj_dir: &std::path::Path) -> 
                     .and_then(|v| v.as_array())
                     .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
                     .unwrap_or_default();
+                let uniq: Vec<&str> = mval
+                    .get("uniqueFields")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                    .unwrap_or_default();
                 let rels: Vec<&str> = mval
                     .get("relations")
                     .and_then(|v| v.as_array())
                     .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
                     .unwrap_or_default();
                 out.push_str(&format!(
-                    "- {} (prisma.{}) | fields: [{}]{}{}\n",
+                    "- {} (prisma.{}) | fields: [{}]{}{}{}\n",
                     mname,
                     delegate,
                     typed.join(", "),
                     if req.is_empty() { String::new() } else { format!(" | required: [{}]", req.join(", ")) },
+                    if uniq.is_empty() { String::new() } else { format!(" | unique(@id/@unique): [{}]", uniq.join(", ")) },
                     if rels.is_empty() { String::new() } else { format!(" | relations: [{}]", rels.join(", ")) },
                 ));
             }
@@ -1407,9 +1415,9 @@ pub const ZOD_PRISMA_TS2322_HEAL_GUIDE: &str = "\nTS2322 / ZOD-VS-PRISMA HEALING
 - For DateTime fields: use `z.coerce.date()` or `new Date(parsed.date)`.\n\
 - Use ONLY exact delegates, field names, and relation names from ACTUAL PRISMA SCHEMA CONTRACT.\n";
 
-fn collect_exporter_context_for_file(proj_dir: &std::path::Path, rel_path: &str, content: &str) -> String {
+fn collect_exporter_context_for_file(proj_dir: &std::path::Path, rel_path: &str, content: &str, diag_text: &str) -> String {
     let mut ctx = String::new();
-    let Ok(imp_re) = regex::Regex::new(r#"(?:import\s+[^;]+\s+from\s+|require\s*\(\s*)['"](@/[^'"]+|\.\.?/[^'"]+)['"]"#) else {
+    let Ok(imp_re) = regex::Regex::new(r#"(?:import\s+([^;]+?)\s+from\s+|require\s*\(\s*)['"](@/[^'"]+|\.\.?/[^'"]+)['"]"#) else {
         return ctx;
     };
     let mut visited = std::collections::HashSet::new();
@@ -1420,12 +1428,40 @@ fn collect_exporter_context_for_file(proj_dir: &std::path::Path, rel_path: &str,
         proj_dir.to_path_buf()
     };
 
-    for cap in imp_re.captures_iter(content) {
-        let spec = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+    let mut ranked_specs: Vec<(u8, usize, String)> = Vec::new();
+    for (idx, cap) in imp_re.captures_iter(content).enumerate() {
+        let clause = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        let spec = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+        if spec.is_empty() {
+            continue;
+        }
+        let stem = spec.rsplit('/').next().unwrap_or(spec);
+        let mentions_stem = !stem.is_empty() && diag_text.contains(stem);
+        let mentions_sym = clause
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '$')
+            .filter(|w| w.len() >= 2 && *w != "as" && *w != "type")
+            .any(|w| diag_text.contains(w));
+        let spec_low = spec.to_ascii_lowercase();
+        let prio = if mentions_stem || mentions_sym {
+            0
+        } else if spec_low.contains("/hooks")
+            || spec_low.starts_with("./hooks")
+            || spec_low.contains("/types")
+            || spec_low.contains("/models")
+        {
+            1
+        } else {
+            2
+        };
+        ranked_specs.push((prio, idx, spec.to_string()));
+    }
+    ranked_specs.sort_by_key(|(prio, idx, _)| (*prio, *idx));
+
+    for (_, _, spec) in ranked_specs {
         let raw = if let Some(sub) = spec.strip_prefix("@/") {
             alias_base.join(sub)
         } else if let Some(ref par) = file_parent {
-            par.join(spec)
+            par.join(&spec)
         } else {
             continue;
         };
@@ -1451,7 +1487,7 @@ fn collect_exporter_context_for_file(proj_dir: &std::path::Path, rel_path: &str,
                 break;
             }
         }
-        if visited.len() >= 3 {
+        if visited.len() >= 5 {
             break;
         }
     }
@@ -4277,7 +4313,7 @@ pub async fn perform_self_healing_loop(
                     || path_low.ends_with("route.js")
                     || orig_content.contains("@prisma/client")
                     || orig_content.contains("@/lib/prisma")
-                    || file_diags.iter().any(|d| matches!(d.code.as_str(), "TS2322" | "TS2353" | "TS2339" | "TS2305" | "TS2551") || d.message.to_lowercase().contains("prisma"))
+                    || file_diags.iter().any(|d| matches!(d.code.as_str(), "TS2322" | "TS2353" | "TS2339" | "TS2305" | "TS2551" | "TS2304") || d.message.to_lowercase().contains("prisma"))
                 {
                     batch_needs_prisma_contract = true;
                 }
@@ -4307,6 +4343,12 @@ pub async fn perform_self_healing_loop(
                 for rd in review_diags {
                     diag_summary.push_str(&format!("  [REVIEW DIRECTIVE] {}\n", rd));
                 }
+                if file_diags.iter().any(|d| d.message.contains("WhereUniqueInput")) {
+                    diag_summary.push_str("  [PRISMA CONTRACT] WhereUniqueInput accepts ONLY fields marked @id or @unique in prisma/schema.prisma (listed under unique(@id/@unique) below). Align the query logic with the actual schema unique key.\n");
+                }
+                if file_diags.iter().any(|d| d.message.contains("Without<") && d.message.contains("is not assignable to type 'never'")) {
+                    diag_summary.push_str("  [PRISMA CONTRACT] Passing a wide @/types view-model (with [key: string]: any) directly to Prisma create/update conflicts with Prisma's exclusive Checked/Unchecked input types. Explicitly construct the Prisma data payload using only the declared scalar/relation fields from schema.prisma.\n");
+                }
                 for (d_idx, d) in file_diags.iter().take(12).enumerate() {
                     diag_summary.push_str(&format!("  Line {}, Col {}: [{}] {}\n", d.line, d.col, d.code, d.message));
                     if d_idx < 5 && d.line > 0 {
@@ -4328,7 +4370,7 @@ pub async fn perform_self_healing_loop(
                     }
                 }
                 if exporter_context.len() < 4500 {
-                    exporter_context.push_str(&collect_exporter_context_for_file(proj_dir, path_str, &orig_content));
+                    exporter_context.push_str(&collect_exporter_context_for_file(proj_dir, path_str, &orig_content, file_diag_text_for_rev));
                 }
                 if exporter_context.len() < 6000 {
                     let file_diag_ref = per_file_diag_blocks.get(&path_str.to_lowercase()).map(|s| s.as_str()).unwrap_or("");
@@ -4858,7 +4900,7 @@ pub async fn perform_self_healing_loop(
                     }
                 }
                 if exporter_context.len() < 4500 {
-                    exporter_context.push_str(&collect_exporter_context_for_file(proj_dir, err_path, c));
+                    exporter_context.push_str(&collect_exporter_context_for_file(proj_dir, err_path, c, &build_output));
                 }
                 if exporter_context.len() < 6000 {
                     exporter_context.push_str(&inspect_dts_exports_for_file(proj_dir, c, &build_output));

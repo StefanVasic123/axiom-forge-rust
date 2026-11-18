@@ -438,7 +438,8 @@ export interface ETA_Prediction {
         assert!(crate::sanitizer::is_banned_external_ui_package("@chakra-ui/react"));
         assert!(crate::sanitizer::is_banned_external_ui_package("@mui/material"));
         assert!(crate::sanitizer::is_banned_external_ui_package("@radix-ui/react-input"));
-        assert!(crate::sanitizer::is_banned_external_ui_package("formik"));
+        assert!(crate::sanitizer::is_banned_external_ui_package("antd"));
+        assert!(!crate::sanitizer::is_banned_external_ui_package("formik"));
         assert!(!crate::sanitizer::is_banned_external_ui_package("lucide-react"));
 
         let page_chakra = "\"use client\";\nimport { Avatar } from '@chakra-ui/react';\nexport default function P() { return <Avatar name=\"A\" />; }\n";
@@ -656,6 +657,247 @@ export interface ETA_Prediction {
 
         let button_out = std::fs::read_to_string(temp_dir.join("src/components/Button.tsx")).unwrap();
         assert!(!button_out.contains("HiOutlineBellAlert"), "Unused unexported icon removed:\n{}", button_out);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_atomic_checkpoint_persistence_and_zero_byte_recovery() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_checkpoint_resilience_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _ = std::fs::create_dir_all(temp_dir.join(".axiom"));
+
+        let cp_data = serde_json::json!({
+            "projectId": "test-resilient-proj",
+            "name": "SafetyGuardian Compliance OS",
+            "status": "stopped",
+            "completedFiles": ["package.json", "src/lib/prisma.ts"]
+        });
+
+        // 1. Initial atomic save
+        crate::orchestrator::save_generation_checkpoint(&temp_dir, &cp_data);
+        let loaded1 = crate::orchestrator::load_generation_checkpoint(&temp_dir);
+        assert!(loaded1.is_some(), "Loaded checkpoint should succeed");
+        assert_eq!(loaded1.unwrap()["name"], "SafetyGuardian Compliance OS");
+
+        // 2. Second atomic save: creates .bak
+        let cp_data_v2 = serde_json::json!({
+            "projectId": "test-resilient-proj",
+            "name": "SafetyGuardian Compliance OS",
+            "status": "stopped",
+            "completedFiles": ["package.json", "src/lib/prisma.ts", "src/types/Incident.ts"]
+        });
+        crate::orchestrator::save_generation_checkpoint(&temp_dir, &cp_data_v2);
+        assert!(temp_dir.join(".axiom/generation_state.json.bak").exists(), "Backup checkpoint must exist");
+
+        // 3. Simulate sudden power outage: primary file zero-filled by NTFS
+        let zero_bytes = vec![0u8; 4096];
+        std::fs::write(temp_dir.join(".axiom/generation_state.json"), &zero_bytes).unwrap();
+
+        // 4. Load must gracefully fallback to .bak instead of failing/crashing
+        let recovered = crate::orchestrator::load_generation_checkpoint(&temp_dir);
+        assert!(recovered.is_some(), "Must fall back to .bak when main file is zero-filled");
+        assert_eq!(recovered.unwrap()["name"], "SafetyGuardian Compliance OS");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn phase8_v60_universal_locator_ast_prop_defaults_and_config_driven_tailwind() {
+        // 1. Objective Error-File Locator (`locate_error_source_file`)
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v60_universal_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(temp_dir.join("packages/fleet-desktop/modules/views")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/components")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/app")).unwrap();
+
+        std::fs::write(
+            temp_dir.join("packages/fleet-desktop/modules/views/TurbineMonitor.tsx"),
+            "\"use client\";\nimport React from 'react';\nexport default function TurbineMonitor({ turbines }: any) {\n  return <div>{turbines.length > 0 ? <span>OK</span> : null}</div>;\n}\n",
+        ).unwrap();
+        std::fs::write(
+            temp_dir.join("src/components/TurbineMonitor.tsx"),
+            "export default function TurbineMonitor() { return <div>Decoy</div>; }\n",
+        ).unwrap();
+        std::fs::write(
+            temp_dir.join("src/app/page.tsx"),
+            "export default function Home() { return <main>Home</main>; }\n",
+        ).unwrap();
+
+        let code_frame_err = "Unhandled Runtime Error\nTypeError: Cannot read properties of undefined (reading 'length')\n\nSource\nviews/TurbineMonitor.tsx (4:16) @ length\n\n  2 | import React from 'react';\n> 4 |   return <div>{turbines.length > 0 ? <span>OK</span> : null}</div>;\n";
+        let loc_trunc = crate::server::locate_error_source_file(&temp_dir, "views/TurbineMonitor.tsx", code_frame_err)
+            .expect("Expected truncated hint + code-frame to locate exact file");
+        assert_eq!(loc_trunc.rel_path, "packages/fleet-desktop/modules/views/TurbineMonitor.tsx");
+
+        let code_frame_no_path = "TypeError: Cannot read properties of undefined (reading 'length')\n  2 | import React from 'react';\n> 4 |   return <div>{turbines.length > 0 ? <span>OK</span> : null}</div>;\n";
+        let loc_wrong_hint = crate::server::locate_error_source_file(&temp_dir, "src/app/page.tsx", code_frame_no_path)
+            .expect("Expected code-frame alone to override completely wrong hint");
+        assert_eq!(loc_wrong_hint.rel_path, "packages/fleet-desktop/modules/views/TurbineMonitor.tsx");
+
+        // 2. Universal AST Component Destructured Prop Defaults & AST TS2749
+        let comp_in = "\"use client\";\nimport React from 'react';\ninterface DispatchProps {\n  turbines?: any[];\n  shipment?: Shipment;\n  onDispatch?: () => void;\n  title?: string;\n  optionalNote?: string;\n  user?: { email: string };\n  checks?: ComplianceCheck[];\n}\ninterface Shipment { status: string; }\nconst ComplianceCheck = () => <div />;\nconst DispatchPanel: React.FC<DispatchProps> = ({ turbines, shipment, onDispatch, title, optionalNote, user, checks }) => {\n  if (!optionalNote) { onDispatch(); }\n  return (\n    <div>\n      <h1>{title.length > 0 ? title : 'Untitled'}</h1>\n      <span>{shipment.status}</span>\n      <span>{user?.email}</span>\n      {turbines.length > 0 ? <span>{checks?.length}</span> : null}\n    </div>\n  );\n};\nexport default DispatchPanel;\n";
+        let comp_sanitized = crate::sanitizer::sanitize_nextjs_and_zod_hallucinations(comp_in, "src/components/DispatchPanel.tsx");
+        assert!(comp_sanitized.contains("type ComplianceCheck = Record<string, any>;"), "AST TS2749 must catch array type ref:\n{}", comp_sanitized);
+        assert!(comp_sanitized.contains("turbines = []"), "Expected turbines array default:\n{}", comp_sanitized);
+        assert!(comp_sanitized.contains("shipment = {} as any"), "Expected shipment object default:\n{}", comp_sanitized);
+        assert!(comp_sanitized.contains("onDispatch = () => {}"), "Expected onDispatch callback default:\n{}", comp_sanitized);
+        assert!(!comp_sanitized.contains("title = []"), "Primitive string .length must NOT get array default:\n{}", comp_sanitized);
+        assert!(!comp_sanitized.contains("optionalNote ="), "Guarded falsy prop must NOT be defaulted:\n{}", comp_sanitized);
+        assert!(!comp_sanitized.contains("user ="), "Optional-chained prop must NOT be defaulted:\n{}", comp_sanitized);
+        assert!(
+            syntax_issues_for("src/components/DispatchPanel.tsx", &comp_sanitized).unwrap().is_empty(),
+            "Rewritten component must remain valid TSX:\n{}",
+            comp_sanitized
+        );
+
+        // 3. Config-driven Tailwind CSS reconciliation & compiler-driven strip helper
+        std::fs::write(
+            temp_dir.join("tailwind.config.js"),
+            "module.exports = {\n  theme: {\n    extend: {\n      colors: {\n        'safety-blue': '#2196F3',\n        brand: {\n          500: '#3b82f6',\n          600: '#2563eb',\n        },\n      },\n    },\n  },\n};\n",
+        ).unwrap();
+        std::fs::write(
+            temp_dir.join("src/app/globals.css"),
+            "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n.card {\n  @apply bg-brand-500 text-arbitrary-500 border-safety-blue-500 font-heading;\n}\n",
+        ).unwrap();
+        crate::sanitizer::reconcile_tailwind_css_with_config(&temp_dir);
+        let css_after = std::fs::read_to_string(temp_dir.join("src/app/globals.css")).unwrap();
+        assert!(css_after.contains("bg-brand-500"), "Configured scale color must be preserved:\n{}", css_after);
+        assert!(css_after.contains("border-safety-blue"), "Flat configured color must be rewritten to flat utility:\n{}", css_after);
+        assert!(!css_after.contains("text-arbitrary-500"), "Undefined arbitrary color scale must be omitted:\n{}", css_after);
+        assert!(css_after.contains("font-heading"), "Non-scale token preserved until compiler reports it:\n{}", css_after);
+
+        let stripped_compiler = crate::sanitizer::strip_tailwind_apply_class(&css_after, "font-heading");
+        assert!(!stripped_compiler.contains("font-heading"), "Compiler-reported class must be stripped:\n{}", stripped_compiler);
+        assert!(stripped_compiler.contains("bg-brand-500"), "Other valid classes remain:\n{}", stripped_compiler);
+
+        // 4. Universal inspector script parses cleanly inside TSX layout
+        let layout_with_inspector = format!(
+            "export default function Layout({{ children }}: any) {{ return <html><body>{{children}}\n{}</body></html>; }}",
+            crate::sanitizer::get_axiom_inspector_script()
+        );
+        assert!(
+            syntax_issues_for("src/app/layout.tsx", &layout_with_inspector).unwrap().is_empty(),
+            "Inspector script must parse cleanly inside layout TSX"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn phase9_v60_clean_contracts_context_and_interface_dedup() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v60_phase9_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(temp_dir.join("prisma")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/lib")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/hooks")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/types")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/components")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/utils")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("app/(tabs)")).unwrap();
+
+        // 1. Prisma `@id`/`@unique`/`@@unique` contract visibility
+        let schema = r#"
+model Creator {
+  id    String @id @default(cuid())
+  email String @unique
+  strategies EngagementStrategy[]
+}
+model EngagementStrategy {
+  id           String @id @default(cuid())
+  creatorId    String
+  strategyName String
+  creator      Creator @relation(fields: [creatorId], references: [id])
+  @@unique([creatorId, strategyName])
+}
+"#;
+        std::fs::write(temp_dir.join("prisma/schema.prisma"), schema).unwrap();
+        std::fs::write(temp_dir.join("src/lib/prisma.ts"), "export const prisma = {} as any;\n").unwrap();
+
+        let contract = crate::orchestrator::extract_prisma_schema_contract(schema);
+        let creator_uniq = contract["models"]["Creator"]["uniqueFields"].as_array().unwrap();
+        let creator_uniq_strs: Vec<&str> = creator_uniq.iter().filter_map(|v| v.as_str()).collect();
+        assert!(creator_uniq_strs.contains(&"id"));
+        assert!(creator_uniq_strs.contains(&"email"));
+
+        let strat_uniq = contract["models"]["EngagementStrategy"]["uniqueFields"].as_array().unwrap();
+        let strat_uniq_strs: Vec<&str> = strat_uniq.iter().filter_map(|v| v.as_str()).collect();
+        assert!(strat_uniq_strs.contains(&"id"));
+        assert!(strat_uniq_strs.contains(&"[creatorId, strategyName]"));
+        assert!(!strat_uniq_strs.contains(&"creatorId"), "Non-unique FK must NOT be listed as unique");
+
+        let summary = crate::self_healing::extract_prisma_schema_summary_for_healing(&temp_dir);
+        assert!(summary.contains("unique(@id/@unique): [id, [creatorId, strategyName]]"), "{}", summary);
+
+        // 2. Scoped Pre-Generation Context (`get_context_files_for_with_desc`)
+        std::fs::write(
+            temp_dir.join("src/hooks/useEngagementMetrics.ts"),
+            "export function useEngagementMetrics() { return { data: [], isLoading: false, error: null as any }; }\n",
+        ).unwrap();
+        std::fs::write(
+            temp_dir.join("src/types/EngagementMetrics.ts"),
+            "export interface EngagementMetrics { id?: string | number; likes?: number; [key: string]: any; }\n",
+        ).unwrap();
+        std::fs::write(
+            temp_dir.join("src/types/fault.ts"),
+            "export interface Fault { id?: string | number; description?: string; [key: string]: any; }\n",
+        ).unwrap();
+        std::fs::write(
+            temp_dir.join("src/types/NarrowStrict.ts"),
+            "export interface NarrowStrict { code: string; }\n",
+        ).unwrap();
+
+        let mobile_ctx = crate::orchestrator::get_context_files_for_with_desc(
+            "app/(tabs)/EngagementTracking.tsx",
+            "Mobile tab screen displaying engagement metrics",
+            &temp_dir,
+        );
+        assert!(mobile_ctx.contains("src/hooks/useEngagementMetrics.ts"), "{}", mobile_ctx);
+        assert!(mobile_ctx.contains("src/types/EngagementMetrics.ts"), "{}", mobile_ctx);
+        assert!(!mobile_ctx.contains("schema.prisma"), "Mobile UI must NEVER get schema.prisma:\n{}", mobile_ctx);
+
+        let backend_util_ctx = crate::orchestrator::get_context_files_for_with_desc(
+            "src/utils/engagement.ts",
+            "Prisma query helpers for creator analytics and upsert operations",
+            &temp_dir,
+        );
+        assert!(backend_util_ctx.contains("schema.prisma"), "DB util must get schema.prisma:\n{}", backend_util_ctx);
+        assert!(backend_util_ctx.contains("src/lib/prisma.ts"), "{}", backend_util_ctx);
+
+        let client_util_ctx = crate::orchestrator::get_context_files_for_with_desc(
+            "src/lib/utils.ts",
+            "Tailwind className merge helper",
+            &temp_dir,
+        );
+        assert!(!client_util_ctx.contains("schema.prisma"), "Pure client util must NOT get Prisma:\n{}", client_util_ctx);
+
+        // 3. AST Deduplication of Local Duplicate Domain Interfaces against `@/types`
+        std::fs::write(
+            temp_dir.join("src/components/FaultAlert.tsx"),
+            "\"use client\";\nimport React, { useState } from 'react';\ninterface Fault {\n  id: string;\n  description: string;\n}\nexport interface FaultProps { label?: string; }\nexport interface KeptExported { code: string; }\ninterface NarrowStrict {\n  code: string;\n}\nexport default function FaultAlert(_p: FaultProps) {\n  const [faults] = useState<Fault[]>([]);\n  const k: NarrowStrict = { code: 'x' };\n  return <div>{faults.length}{k.code}</div>;\n}\n",
+        ).unwrap();
+
+        let dedup_count = crate::ast_engine::deduplicate_local_domain_interfaces_against_types_in_project(&temp_dir);
+        assert_eq!(dedup_count, 1);
+
+        let updated_fault_alert = std::fs::read_to_string(temp_dir.join("src/components/FaultAlert.tsx")).unwrap();
+        assert!(updated_fault_alert.contains("import type { Fault } from '@/types/fault';"), "{}", updated_fault_alert);
+        assert!(!updated_fault_alert.contains("interface Fault {"), "Duplicate local interface should be removed:\n{}", updated_fault_alert);
+        assert!(updated_fault_alert.contains("export interface FaultProps"), "Props interface must remain:\n{}", updated_fault_alert);
+        assert!(updated_fault_alert.contains("interface NarrowStrict"), "Counterpart without [key: string]: any must NOT be deleted:\n{}", updated_fault_alert);
+        assert!(
+            syntax_issues_for("src/components/FaultAlert.tsx", &updated_fault_alert).unwrap().is_empty(),
+            "Updated component must remain valid TSX:\n{}",
+            updated_fault_alert
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

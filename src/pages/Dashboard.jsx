@@ -190,13 +190,17 @@ function ProjectCard({
                     onClick={async (e) => {
                       e.stopPropagation();
                       setShowMenu(false);
-                      const activeInfo = await window.electronAPI.task.getActiveTaskByProject(project.id);
-                      const realStatus = activeInfo?.task?.status || project.status;
-                      if (realStatus === 'stopped' || realStatus === 'paused') {
-                        await window.electronAPI.task.resumeGeneration(project.id);
+                      try {
+                        const activeInfo = await window.electronAPI.task.getActiveTaskByProject(project.id);
+                        const realStatus = activeInfo?.task?.status || project.status;
+                        if (realStatus === 'stopped' || realStatus === 'paused') {
+                          await window.electronAPI.task.resumeGeneration(project.id);
+                        }
+                        await window.electronAPI.window.showFloating({ id: project.id });
+                        if (onRefresh) await onRefresh();
+                      } catch (err) {
+                        console.error('Failed to resume generation:', err);
                       }
-                      await window.electronAPI.window.showFloating({ id: project.id });
-                      if (onRefresh) await onRefresh();
                     }}
                     className="w-full flex items-center gap-2 px-4 py-2 text-sm text-indigo-400 hover:bg-slate-800"
                   >
@@ -248,13 +252,17 @@ function ProjectCard({
             <button
               onClick={async (e) => {
                 e.stopPropagation();
-                const activeInfo = await window.electronAPI.task.getActiveTaskByProject(project.id);
-                const realStatus = activeInfo?.task?.status || project.status;
-                if (realStatus === 'stopped' || realStatus === 'paused') {
-                  await window.electronAPI.task.resumeGeneration(project.id);
+                try {
+                  const activeInfo = await window.electronAPI.task.getActiveTaskByProject(project.id);
+                  const realStatus = activeInfo?.task?.status || project.status;
+                  if (realStatus === 'stopped' || realStatus === 'paused') {
+                    await window.electronAPI.task.resumeGeneration(project.id);
+                  }
+                  await window.electronAPI.window.showFloating({ id: project.id });
+                  if (onRefresh) await onRefresh();
+                } catch (err) {
+                  console.error('Failed to resume generation:', err);
                 }
-                await window.electronAPI.window.showFloating({ id: project.id });
-                if (onRefresh) await onRefresh();
               }}
               className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium bg-indigo-600/20 text-indigo-400 hover:bg-indigo-600/30 border border-indigo-500/30 rounded-lg transition-colors"
               title="Resume Generation"
