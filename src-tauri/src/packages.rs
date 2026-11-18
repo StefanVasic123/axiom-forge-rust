@@ -20,7 +20,7 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
     let mut needs_write = !db_path.exists();
     if db_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&db_path) {
-            if !content.contains("\"dbVersion\": 6") {
+            if !content.contains("\"dbVersion\": 7") {
                 needs_write = true;
             }
         }
@@ -28,7 +28,7 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
     
     if needs_write {
         let default_db = serde_json::json!({
-            "dbVersion": 6,
+            "dbVersion": 7,
             "packages": [
                 {
                     "name": "resend",
@@ -193,9 +193,14 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
                     "name": "react-icons",
                     "version": "^5.2.1",
                     "aliases": [],
-                    "importExamples": ["import { FaMailBulk } from 'react-icons/fa';", "import { IoMdNotifications } from 'react-icons/io';"],
+                    "importExamples": [
+                        "import { FaMailBulk } from 'react-icons/fa';",
+                        "import { IoMdNotifications } from 'react-icons/io';",
+                        "import { HiOutlineBell } from 'react-icons/hi';",
+                        "import { HiOutlineBellAlert } from 'react-icons/hi2';"
+                    ],
                     "compatibility": {},
-                    "bestPractices": "Import icons individually to reduce bundle size."
+                    "bestPractices": "Import icons individually from family subpaths (`react-icons/hi`, `react-icons/hi2`, `react-icons/fa`, `react-icons/fi`) to reduce bundle size."
                 },
                 {
                     "name": "clsx",
@@ -415,6 +420,11 @@ pub fn resolve_and_rewrite_import(imported_path: &str, packages_db: &[PackageMet
         || imported_path_trimmed == "next-auth/jwt"
         || imported_path_trimmed == "next-auth/adapters"
     {
+        return None;
+    }
+
+    // Preserve valid react-icons family subpaths (`react-icons/hi`, `react-icons/hi2`, `react-icons/fa6`, etc.)
+    if imported_path_trimmed.starts_with("react-icons/") {
         return None;
     }
 

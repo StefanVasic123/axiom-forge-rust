@@ -534,4 +534,129 @@ export interface ETA_Prediction {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    #[test]
+    fn phase7_v59_routing_unification_complete_services_and_zero_regression_suite() {
+        // 1. Preserve react-icons/* subpaths in packages.rs + clean dead unexported icons
+        let db = crate::packages::load_packages_db();
+        assert_eq!(crate::packages::resolve_and_rewrite_import("react-icons/hi2", &db), None);
+        assert_eq!(crate::packages::resolve_and_rewrite_import("react-icons/hi", &db), None);
+
+        // 2. Fix `as any as const` (`TS1355`), `.ts`/`.tsx` import extensions (`TS5097`), mock array `any[]`, and Supabase auth cast
+        let ts_in = "\"use client\";\nimport { Alert } from '@/types/index.ts';\nimport Card from '@/components/ui/card.tsx';\nconst INITIAL_MOCK_ITEMS = [{ id: 1, name: 'Node A' }];\nconst r = { role: 'ADMIN' as any as const };\nexport async function doSignUp(c: any) { const { user, error } = await c.auth.signUp({ email: 'a@b.com', password: '123' }); return { user, error }; }\n";
+        let ts_out = crate::sanitizer::sanitize_nextjs_and_zod_hallucinations(ts_in, "app/(tabs)/alerts.tsx");
+        assert!(ts_out.contains("from '@/types';"), "TS5097 extension + /index stripped:\n{}", ts_out);
+        assert!(ts_out.contains("from '@/components/ui/card';"), "TS5097 .tsx stripped:\n{}", ts_out);
+        assert!(ts_out.contains("const INITIAL_MOCK_ITEMS: any[] = ["), "Mock array typed as any[]:\n{}", ts_out);
+        assert!(!ts_out.contains("as any as const"), "TS1355 fixed:\n{}", ts_out);
+        assert!(ts_out.contains("((await c.auth.signUp({ email: 'a@b.com', password: '123' })) as any)"), "Supabase auth wrapped:\n{}", ts_out);
+
+        // 3. Inline `React.FC<{ data: AnalyticsData[] }>` prop widening + index signature
+        let fc_in = "\"use client\";\nimport React from 'react';\ninterface AnalyticsData { id: number; }\nconst AnalyticsChart: React.FC<{ data: AnalyticsData[] }> = ({ data }) => <div>{data.length}</div>;\nexport default AnalyticsChart;\n";
+        let fc_out = crate::sanitizer::sanitize_nextjs_and_zod_hallucinations(fc_in, "src/components/AnalyticsChart.tsx");
+        assert!(fc_out.contains("data?: AnalyticsData[]"), "{}", fc_out);
+        assert!(fc_out.contains("[key: string]: any;"), "{}", fc_out);
+
+        // 4. Temp project test: Mobile `app/` vs `src/app/` unification, Desktop workspace, `AuthState` auto-import, hook rest args, & complete industry pages
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v59_suite_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(temp_dir.join("app/(tabs)")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/app")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/components")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/hooks")).unwrap();
+        std::fs::create_dir_all(temp_dir.join(".axiom")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("node_modules/react-icons/hi2")).unwrap();
+
+        std::fs::write(
+            temp_dir.join("package.json"),
+            r#"{"name":"tunnel-telemetry-mobile","dependencies":{"next":"14.2.5","react":"18.3.1","react-icons":"^5.7.0","expo":"^51.0.0"}}"#,
+        ).unwrap();
+        std::fs::write(
+            temp_dir.join("node_modules/react-icons/package.json"),
+            r#"{"name":"react-icons","exports":{"./hi":{"types":"./hi/index.d.ts"},"./hi2":{"types":"./hi2/index.d.ts"}}}"#,
+        ).unwrap();
+        std::fs::create_dir_all(temp_dir.join("node_modules/react-icons/hi")).unwrap();
+        std::fs::write(temp_dir.join("node_modules/react-icons/hi/index.d.ts"), "export declare const HiOutlineBell: any;\n").unwrap();
+        std::fs::write(temp_dir.join("node_modules/react-icons/hi2/index.d.ts"), "export declare const HiOutlineBellAlert: any;\n").unwrap();
+
+        std::fs::write(
+            temp_dir.join(".axiom/generation_state.json"),
+            r#"{"name":"TunnelSense QA","projectDescription":"Industrial bore sensor telemetry and automated compliance tracking."}"#,
+        ).unwrap();
+        std::fs::write(
+            temp_dir.join("src/hooks/useAuth.ts"),
+            "import { useState, useCallback } from 'react';\nexport interface AuthState { user: any; registerUser?: (email: string, password: string) => Promise<void>; }\nexport const useAuth = (): AuthState => {\n  const [user] = useState(null);\n  const registerUser = useCallback(async (email: string, password: string) => { console.log(email, password); }, []);\n  return { user, registerUser };\n};\nexport default useAuth;\n",
+        ).unwrap();
+        std::fs::write(
+            temp_dir.join("app/(tabs)/alerts.tsx"),
+            "\"use client\";\nimport { HiOutlineBellAlert } from 'react-icons/hi';\nimport { useAuth } from '@/hooks/useAuth';\ninterface P { user?: AuthState['user']; }\nexport default function Alerts({ user }: P) {\n  const { registerUser } = useAuth();\n  return <button onClick={() => registerUser?.('a@b.c', 'p', 'Name', 'ADMIN', 'Bio')}><HiOutlineBellAlert />{user?.email}</button>;\n}\n",
+        ).unwrap();
+        std::fs::write(
+            temp_dir.join("app/(tabs)/index.tsx"),
+            "\"use client\";\nexport default function MobileHome() { return <div>Mobile Home</div>; }\n",
+        ).unwrap();
+        std::fs::write(
+            temp_dir.join("src/app/layout.tsx"),
+            "\"use client\";\nimport Navbar from '@/components/Navbar';\nimport Footer from '@/components/Footer';\nexport default function RootLayout({ children }: { children: React.ReactNode }) { return <html><body><Navbar /><main>{children}</main><Footer /></body></html>; }\n",
+        ).unwrap();
+        std::fs::write(
+            temp_dir.join("src/app/page.tsx"),
+            "import { redirect } from 'next/navigation';\nexport default function Home() {\n  return redirect('/dashboard');\n}\n",
+        ).unwrap();
+        std::fs::write(
+            temp_dir.join("src/components/Navbar.tsx"),
+            "\"use client\";\nimport React from 'react';\nexport const Navbar: React.FC<any> = ({ children }) => <nav>{children}</nav>;\nexport default Navbar;\n",
+        ).unwrap();
+        std::fs::write(
+            temp_dir.join("src/components/Footer.tsx"),
+            "\"use client\";\nimport React from 'react';\nexport const Footer: React.FC<any> = ({ children }) => <footer>{children}</footer>;\nexport default Footer;\n",
+        ).unwrap();
+        std::fs::write(
+            temp_dir.join("src/components/Button.tsx"),
+            "\"use client\";\nimport { HiOutlineBellAlert } from 'react-icons/hi';\nexport const Button = () => <button>Click</button>;\n",
+        ).unwrap();
+
+        crate::self_healing::run_hygiene_pass_on_project(&temp_dir);
+
+        // Check root `app/` mirror (prevents 404 when root `app/` exists!)
+        assert!(temp_dir.join("src/hooks/useUserTier.ts").is_file(), "Shared useUserTier hook must exist");
+        assert!(temp_dir.join("app/page.tsx").is_file(), "Root app/page.tsx must exist");
+        assert!(temp_dir.join("app/layout.tsx").is_file(), "Root app/layout.tsx must exist");
+        assert!(temp_dir.join("app/dashboard/page.tsx").is_file(), "Mobile dashboard bridge must exist");
+        assert!(temp_dir.join("app/alerts/page.tsx").is_file(), "Bridged /alerts route must exist");
+        assert!(temp_dir.join("app/pricing/page.tsx").is_file(), "Pricing route must exist in root app/");
+        assert!(temp_dir.join("app/about/page.tsx").is_file(), "About route must exist in root app/");
+        assert!(temp_dir.join("app/account/page.tsx").is_file(), "Account route must exist in root app/");
+        assert!(temp_dir.join("app/legal/terms/page.tsx").is_file(), "Terms route must exist in root app/");
+        assert!(temp_dir.join("app/legal/privacy/page.tsx").is_file(), "Privacy route must exist in root app/");
+
+        let home_out = std::fs::read_to_string(temp_dir.join("src/app/page.tsx")).unwrap();
+        assert!(!home_out.contains("redirect('/dashboard')"), "Thin redirect must be replaced:\n{}", home_out);
+        assert!(home_out.contains("How It Works") && home_out.contains("Frequently Asked Questions"), "{}", home_out);
+        assert!(home_out.contains("Field Telemetry"), "Industry archetype styling/content must apply:\n{}", home_out);
+
+        let nav_out = std::fs::read_to_string(temp_dir.join("src/components/Navbar.tsx")).unwrap();
+        assert!(nav_out.contains("/pricing") && nav_out.contains("/account"), "Empty Navbar upgraded:\n{}", nav_out);
+
+        let foot_out = std::fs::read_to_string(temp_dir.join("src/components/Footer.tsx")).unwrap();
+        assert!(foot_out.contains("/legal/terms") && foot_out.contains("/legal/privacy"), "Empty Footer upgraded:\n{}", foot_out);
+
+        let terms_out = std::fs::read_to_string(temp_dir.join("src/app/legal/terms/page.tsx")).unwrap();
+        assert!(terms_out.contains("consult a qualified legal team"), "Legal disclaimer required:\n{}", terms_out);
+
+        let use_auth_out = std::fs::read_to_string(temp_dir.join("src/hooks/useAuth.ts")).unwrap();
+        assert!(use_auth_out.contains("..._args: any[]"), "Hook method rest args added:\n{}", use_auth_out);
+
+        let alerts_out = std::fs::read_to_string(temp_dir.join("app/(tabs)/alerts.tsx")).unwrap();
+        assert!(alerts_out.contains("react-icons/hi2"), "HiOutlineBellAlert moved to hi2:\n{}", alerts_out);
+        assert!(alerts_out.contains("AuthState") && alerts_out.contains("@/hooks/useAuth"), "AuthState auto-imported:\n{}", alerts_out);
+
+        let button_out = std::fs::read_to_string(temp_dir.join("src/components/Button.tsx")).unwrap();
+        assert!(!button_out.contains("HiOutlineBellAlert"), "Unused unexported icon removed:\n{}", button_out);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }

@@ -1828,21 +1828,72 @@ pub const UI_ANALYTICS_AND_CHARTS_RULEPACK: &str = r#"SCOPED ANALYTICS, KPI & DA
 pub fn resolve_design_archetype_prompt(project_name: &str, project_description: &str, category: &str) -> String {
     let combined = format!("{} {} {}", project_name, project_description, category).to_lowercase();
 
-    let (archetype_name, bg_surface, card_surface, primary_cta, badge_style, aesthetic_notes) = if combined.contains("crypto")
-        || combined.contains("blockchain")
-        || combined.contains("cyber")
-        || combined.contains("security")
-        || combined.contains("trading")
-        || combined.contains("terminal")
-        || combined.contains("devops")
+    let (archetype_name, bg_surface, card_surface, primary_cta, badge_style, aesthetic_notes) = if combined.contains("tunnel")
+        || combined.contains("bore")
+        || combined.contains("sensor")
+        || combined.contains("iot")
+        || combined.contains("robot")
+        || combined.contains("anode")
+        || combined.contains("stucco")
+        || combined.contains("panel")
+        || combined.contains("electrical")
+        || combined.contains("grid")
+        || combined.contains("aerospace")
+        || combined.contains("fleet")
+        || combined.contains("manufacturing")
+        || combined.contains("construction")
+        || combined.contains("telemetry")
+        || combined.contains("hardware")
     {
         (
-            "FinTech / Cyber / High-Tech Dark Glassmorphism",
+            "Industrial, Field Engineering, IoT & Telemetry Command",
             "bg-slate-950 text-slate-100",
-            "bg-slate-900/80 backdrop-blur-md border border-slate-800 rounded-2xl p-6 shadow-xl hover:border-indigo-500/40 transition-all",
-            "inline-flex items-center justify-center gap-2 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white font-semibold px-4 py-2.5 rounded-xl shadow-lg shadow-indigo-500/20 transition-all",
-            "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-2.5 py-0.5 rounded-full text-xs font-semibold",
-            "Use sleek dark surfaces, subtle glowing borders, high-contrast metric typography, and cyan/indigo/emerald accents."
+            "bg-slate-900/90 border border-amber-500/20 rounded-2xl p-6 shadow-xl hover:border-amber-400/50 transition-all",
+            "inline-flex items-center justify-center gap-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold px-5 py-2.5 rounded-xl shadow-lg shadow-amber-500/20 transition-all",
+            "bg-amber-500/10 text-amber-300 border border-amber-500/30 px-2.5 py-0.5 rounded-full text-xs font-mono font-semibold",
+            "Design with field-command precision: dark slate telemetry surfaces, amber/cyan status indicators, monospace measurement values, tolerance gauges, and a 4-stage Field Ingestion -> Automated Check -> Dispatch -> Compliance workflow."
+        )
+    } else if combined.contains("fintech")
+        || combined.contains("finance")
+        || combined.contains("ledger")
+        || combined.contains("invoice")
+        || combined.contains("payment")
+        || combined.contains("crypto")
+        || combined.contains("blockchain")
+        || combined.contains("trading")
+        || combined.contains("bank")
+        || combined.contains("treasury")
+        || combined.contains("tax")
+        || combined.contains("billing")
+    {
+        (
+            "FinTech, Ledger, Invoicing & Capital Precision",
+            "bg-slate-950 text-slate-100",
+            "bg-slate-900/80 backdrop-blur-md border border-slate-800 rounded-2xl p-6 shadow-xl hover:border-emerald-500/40 transition-all",
+            "inline-flex items-center justify-center gap-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold px-5 py-2.5 rounded-xl shadow-lg shadow-emerald-500/20 transition-all",
+            "bg-emerald-500/10 text-emerald-400 border border-emerald-500/25 px-2.5 py-0.5 rounded-full text-xs font-semibold",
+            "Emphasize institutional ledger clarity: high-contrast currency typography, reconciliation previews, audit-trail security badges (SOC2/ISO), and emerald/indigo accents."
+        )
+    } else if combined.contains("interop")
+        || combined.contains("protocol")
+        || combined.contains("connector")
+        || combined.contains("api")
+        || combined.contains("sdk")
+        || combined.contains("devops")
+        || combined.contains("terminal")
+        || combined.contains("cyber")
+        || combined.contains("security")
+        || combined.contains("cloud")
+        || combined.contains("pipeline")
+        || combined.contains("compiler")
+    {
+        (
+            "Developer Tools, Interop & Security Infrastructure",
+            "bg-zinc-950 text-zinc-100",
+            "bg-zinc-900/90 border border-zinc-800 rounded-2xl p-6 shadow-xl hover:border-violet-500/40 transition-all",
+            "inline-flex items-center justify-center gap-2 bg-gradient-to-r from-violet-600 to-cyan-600 hover:from-violet-500 hover:to-cyan-500 text-white font-semibold px-5 py-2.5 rounded-xl shadow-lg shadow-violet-500/20 transition-all",
+            "bg-cyan-500/10 text-cyan-300 border border-cyan-500/25 px-2.5 py-0.5 rounded-full text-xs font-mono font-semibold",
+            "Use developer-native visual cues: interactive protocol/connector inspectors, latency badges, clean code/schema hierarchy, and violet/cyan accents."
         )
     } else if combined.contains("ecommerce")
         || combined.contains("e-commerce")
@@ -1851,43 +1902,50 @@ pub fn resolve_design_archetype_prompt(project_name: &str, project_description: 
         || combined.contains("store")
         || combined.contains("booking")
         || combined.contains("hotel")
+        || combined.contains("camp")
+        || combined.contains("rental")
+        || combined.contains("travel")
         || combined.contains("real estate")
         || combined.contains("restaurant")
+        || combined.contains("retail")
     {
         (
-            "Conversion Marketplace & Retail (Airbnb / Shopify Aesthetic)",
+            "Conversion Marketplace, Commerce & Hospitality (Airbnb / Shopify Editorial Aesthetic)",
             "bg-stone-50 text-slate-900",
             "bg-white rounded-2xl border border-stone-200/90 shadow-sm hover:shadow-lg transition-all duration-200 overflow-hidden p-6",
-            "inline-flex items-center justify-center gap-2 bg-rose-600 hover:bg-rose-700 text-white font-semibold px-4 py-2.5 rounded-xl shadow-sm transition-all",
+            "inline-flex items-center justify-center gap-2 bg-rose-600 hover:bg-rose-700 text-white font-semibold px-5 py-2.5 rounded-xl shadow-sm transition-all",
             "bg-amber-50 text-amber-800 border border-amber-200 px-2.5 py-0.5 rounded-full text-xs font-semibold",
-            "Emphasize visual product/listing cards, clear pricing badges, category filter pills, and warm inviting accents."
+            "Emphasize warm editorial curation: listing/product cards, verified ratings, transparent pricing pills, category filters, and buyer-protection assurance."
         )
     } else if combined.contains("health")
         || combined.contains("medical")
         || combined.contains("clinic")
         || combined.contains("patient")
+        || combined.contains("care")
+        || combined.contains("biotech")
         || combined.contains("wellness")
         || combined.contains("edtech")
         || combined.contains("education")
         || combined.contains("learning")
+        || combined.contains("course")
         || combined.contains("school")
     {
         (
-            "Calm & Trustworthy HealthTech / EdTech System",
+            "Calm & Trustworthy HealthTech / Clinical / EdTech System",
             "bg-slate-50 text-slate-900",
             "bg-white rounded-2xl border border-teal-100/90 shadow-sm hover:shadow-md transition-all p-6",
-            "inline-flex items-center justify-center gap-2 bg-teal-600 hover:bg-teal-700 text-white font-semibold px-4 py-2.5 rounded-xl shadow-sm transition-all",
+            "inline-flex items-center justify-center gap-2 bg-teal-600 hover:bg-teal-700 text-white font-semibold px-5 py-2.5 rounded-xl shadow-sm transition-all",
             "bg-teal-50 text-teal-700 border border-teal-200 px-2.5 py-0.5 rounded-full text-xs font-semibold",
-            "Use clean, calm teal/sky/emerald palettes, clear progress bars, accessible contrast, and structured schedule/course cards."
+            "Use calm clinical/academic clarity: teal/sky/emerald palettes, accessible typography, progression meters, and HIPAA/GDPR privacy trust assurances."
         )
     } else {
         (
             "Executive B2B SaaS & Collaborative Workspace (Linear / Stripe / Vercel Aesthetic)",
             "bg-slate-50 text-slate-900",
             "bg-white rounded-2xl border border-slate-200/80 shadow-sm hover:shadow-md transition-all duration-200 p-6",
-            "inline-flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold px-4 py-2.5 rounded-xl shadow-sm transition-colors",
+            "inline-flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold px-5 py-2.5 rounded-xl shadow-sm transition-colors",
             "bg-indigo-50 text-indigo-700 border border-indigo-200/60 px-2.5 py-0.5 rounded-full text-xs font-semibold",
-            "Use crisp white cards over a soft slate-50 canvas, subtle borders, status pills (emerald for active/completed, amber for in-progress, indigo for primary tags), and clean typographic hierarchy."
+            "Use crisp Bento surfaces over a slate-50 canvas, subtle borders, team KPI velocity badges, and structured editorial hierarchy."
         )
     };
 
@@ -4305,10 +4363,13 @@ pub fn get_expert_system_prompt(
         } else if path_lower == "src/app/page.tsx" || path_lower == "src/app/page.jsx" || path_lower == "app/page.tsx" || path_lower == "app/page.jsx" {
             prompt.push_str(
                 "ROOT LANDING PAGE DESIGN RULES:\n\
-                 - This is the HOME/LANDING PAGE (`/`). It must NEVER be a blank screen or bare login form.\n\
-                 - HERO SECTION: Include a high-impact Hero banner with a badge pill, bold headline (`text-4xl sm:text-5xl lg:text-6xl font-extrabold tracking-tight`), engaging value proposition, and clear CTA buttons (`inline-flex items-center justify-center gap-2`) linking to `/dashboard` and key features.\n\
-                 - CORE FEATURE SHOWCASE: Display a responsive `grid grid-cols-1 md:grid-cols-3 gap-6` of interactive domain cards, KPI highlights, and workflow previews.\n\
-                 - DATA RESILIENCY: Pre-populate state with 4-6 realistic domain mockup items so the page is rich and interactive out-of-the-box.\n\n"
+                 - This is the HOME/LANDING PAGE (`/`). It must NEVER redirect to `/dashboard`, never be a blank screen, and never be a bare login form.\n\
+                 - INDUSTRY DESIGN STAMP: Tailor layout tone, terminology, imagery/SVG preview card, and metrics specifically to the application's industry archetype above.\n\
+                 - 1. HERO SECTION: 2-column split with badge pill, bold H1 (`text-4xl sm:text-5xl lg:text-6xl font-extrabold tracking-tight`), compelling industry value proposition, CTA buttons linking to `/dashboard` and `/pricing` (or `/about`), and an interactive industry visual preview/SVG panel on the right.\n\
+                 - 2. KPI & TRUST BAR: 3-4 measurable industry outcomes/metrics.\n\
+                 - 3. HOW IT WORKS: Numbered 3-to-4 step operational flow tailored to this domain.\n\
+                 - 4. CORE FEATURE SHOWCASE: Responsive grid (`grid-cols-1 md:grid-cols-3 gap-6`) with 4-6 realistic interactive domain items/cards.\n\
+                 - 5. PRICING PREVIEW + INTERACTIVE FAQ ACCORDION + BOTTOM CTA: Concise tier preview linking to `/pricing`, collapsible FAQ items with state toggle, and final CTA banner.\n\n"
             );
         } else {
             let export_compat_rule = if is_route_file {
@@ -6303,23 +6364,19 @@ export default function RootLayout({
                 proj_desc,
                 &project_id,
             );
-            
-            let (ui_flow, file_desc, default_content) = if has_public || proj_desc.to_lowercase().contains("landing") || proj_desc.to_lowercase().contains("marketing") {
-                ("Landing Page",
-                 format!("Root landing page/homepage for '{}'. Render a premium, beautifully designed start screen introducing the application features, navigation header, and visual links to core screens. Description: {}.", proj_name, proj_desc),
-                 format!("import React from 'react';\nimport Link from 'next/link';\n\nexport default function HomePage() {{\n  return (\n    <div className=\"min-h-screen bg-slate-900 text-white flex flex-col justify-between\" data-axiom-component=\"HomePage\" data-axiom-file=\"src/app/page.tsx\">\n      <header className=\"border-b border-slate-800 py-4 px-6 flex justify-between items-center\">\n        <h1 className=\"text-xl font-bold tracking-tight bg-gradient-to-r from-blue-400 to-indigo-500 bg-clip-text text-transparent\">{}</h1>\n        <div className=\"space-x-4\">\n          <Link href=\"/auth/login\" className=\"text-sm font-medium hover:text-blue-400 transition\">Sign In</Link>\n          <Link href=\"/dashboard\" className=\"text-sm bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-md font-medium transition\">Dashboard</Link>\n        </div>\n      </header>\n      <main className=\"max-w-4xl mx-auto px-6 py-20 flex-grow flex flex-col justify-center text-center\">\n        <h2 className=\"text-5xl font-extrabold tracking-tight mb-6 bg-gradient-to-r from-white via-slate-200 to-slate-400 bg-clip-text text-transparent leading-tight\">\n          Welcome to {}\n        </h2>\n        <p className=\"text-lg text-slate-400 mb-10 max-w-xl mx-auto\">\n          {}\n        </p>\n        <div className=\"flex justify-center gap-4\">\n          <Link href=\"/dashboard\" className=\"bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white px-8 py-3 rounded-lg font-semibold shadow-lg shadow-blue-500/20 transition\">\n            Go to Dashboard\n          </Link>\n          <Link href=\"/auth/login\" className=\"border border-slate-700 hover:border-slate-600 px-8 py-3 rounded-lg font-semibold transition\">\n            Sign In\n          </Link>\n        </div>\n      </main>\n      <footer className=\"border-t border-slate-800 py-6 text-center text-sm text-slate-500\">\n        &copy; 2026 {}. All rights reserved.\n      </footer>\n    </div>\n  );\n}}", proj_name, proj_name, proj_desc, proj_name)
-                )
-            } else if has_auth && !has_dashboard {
-                ("Auth-First Flow",
-                 format!("Root page of the application '{}'. UI Flow: Auth-First. The application requires authentication to access. Verify session or render a beautiful gateway card directing the user to the Sign In page (/auth/login). Description: {}.", proj_name, proj_desc),
-                 format!("import React from 'react';\nimport Link from 'next/link';\n\nexport default function HomePage() {{\n  return (\n    <div className=\"min-h-screen bg-slate-900 text-white flex flex-col justify-center items-center p-6\" data-axiom-component=\"HomePage\" data-axiom-file=\"src/app/page.tsx\">\n      <div className=\"max-w-md w-full bg-slate-800 border border-slate-700 rounded-2xl p-8 text-center shadow-xl\">\n        <h1 className=\"text-2xl font-bold mb-4\">{}</h1>\n        <p className=\"text-slate-400 mb-6\">Authentication is required to access the application features.</p>\n        <Link href=\"/auth/login\" className=\"inline-block w-full bg-blue-600 hover:bg-blue-500 text-white font-semibold py-3 px-6 rounded-lg transition\">\n          Sign In to Account\n        </Link>\n      </div>\n    </div>\n  );\n}}", proj_name)
-                )
-            } else {
-                ("Dashboard-First Flow",
-                 format!("Root page of the application '{}'. UI Flow: Dashboard-First. The app is a workspace/dashboard. The homepage should perform a server-side redirect to the Dashboard (/dashboard) using Next.js 'redirect'. Description: {}.", proj_name, proj_desc),
-                 "import { redirect } from 'next/navigation';\n\nexport default function HomePage() {\n  redirect('/dashboard');\n}".to_string()
-                )
-            };
+            let _ = (has_dashboard, has_auth, has_public);
+
+            let (ui_flow, file_desc, default_content) = (
+                "Industry Landing Page",
+                format!(
+                    "Rich, industry-tailored homepage for '{}'. Never use redirect('/dashboard'). Render a complete 2-column Hero (with CTA buttons to /dashboard and /pricing + domain visual preview card), KPI trust bar, How It Works (3-4 domain steps), Core Features showcase, Pricing preview, and interactive FAQ accordion. Description: {}.",
+                    proj_name, proj_desc
+                ),
+                format!(
+                    "\"use client\";\n\nimport React, {{ useState }} from 'react';\nimport Link from 'next/link';\n\nconst FAQS = [\n  {{ q: 'How quickly can teams deploy {}?', a: 'Connect your workspace data and launch live monitoring in minutes with built-in Starter, Pro, and Enterprise tiers.' }},\n  {{ q: 'Does {} support role-based access and tier controls?', a: 'Yes. Manage permissions, quotas, and active subscriptions directly from Account settings.' }}\n];\n\nexport default function HomePage() {{\n  const [openFaq, setOpenFaq] = useState<number | null>(0);\n  return (\n    <div className=\"min-h-screen bg-slate-50 text-slate-900\" data-axiom-component=\"HomePage\" data-axiom-file=\"src/app/page.tsx\">\n      <section className=\"max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-16 grid grid-cols-1 lg:grid-cols-2 gap-12 items-center\">\n        <div className=\"space-y-6\">\n          <span className=\"inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200\">Live Domain Workspace</span>\n          <h1 className=\"text-4xl sm:text-5xl font-extrabold tracking-tight leading-tight\">{}</h1>\n          <p className=\"text-lg text-slate-600 leading-relaxed\">{}</p>\n          <div className=\"flex flex-wrap gap-3\">\n            <Link href=\"/dashboard\" className=\"inline-flex items-center justify-center bg-indigo-600 hover:bg-indigo-700 text-white font-semibold px-6 py-3 rounded-xl shadow-sm transition\">Open Dashboard</Link>\n            <Link href=\"/pricing\" className=\"inline-flex items-center justify-center bg-white hover:bg-slate-100 text-slate-900 border border-slate-300 font-semibold px-6 py-3 rounded-xl transition\">View Pricing</Link>\n          </div>\n        </div>\n        <div className=\"bg-white rounded-2xl border border-slate-200 shadow-lg p-6 space-y-4\">\n          <div className=\"flex items-center justify-between border-b border-slate-100 pb-3\">\n            <span className=\"font-semibold\">Operational Snapshot</span>\n            <span className=\"text-xs font-semibold text-emerald-700 bg-emerald-50 px-2.5 py-0.5 rounded-full\">99.9% Active</span>\n          </div>\n          <div className=\"grid grid-cols-3 gap-4\">\n            <div className=\"p-3 rounded-xl bg-slate-50\"><p className=\"text-xs text-slate-500\">Readiness</p><p className=\"text-xl font-bold\">98.4%</p></div>\n            <div className=\"p-3 rounded-xl bg-slate-50\"><p className=\"text-xs text-slate-500\">Response</p><p className=\"text-xl font-bold\">24ms</p></div>\n            <div className=\"p-3 rounded-xl bg-slate-50\"><p className=\"text-xs text-slate-500\">Active Tier</p><p className=\"text-xl font-bold\">Pro</p></div>\n          </div>\n        </div>\n      </section>\n      <section className=\"max-w-4xl mx-auto px-4 py-12 space-y-4\">\n        <h2 className=\"text-2xl font-bold\">Frequently Asked Questions</h2>\n        {{FAQS.map((item, idx) => (\n          <div key={{idx}} className=\"bg-white rounded-xl border border-slate-200 p-4\">\n            <button type=\"button\" onClick={{() => setOpenFaq(openFaq === idx ? null : idx)}} className=\"w-full text-left font-semibold flex justify-between items-center\">\n              <span>{{item.q}}</span>\n              <span>{{openFaq === idx ? '−' : '+'}}</span>\n            </button>\n            {{openFaq === idx && <p className=\"mt-2 text-sm text-slate-600\">{{item.a}}</p>}}\n          </div>\n        ))}}\n      </section>\n    </div>\n  );\n}}",
+                    proj_name, proj_name, proj_name, proj_desc
+                ),
+            );
             
             debug_log_to_file(format!("[Orchestrator] Dynamic UI Flow detected: {}. Adding custom page.tsx template.", ui_flow));
             

@@ -2525,6 +2525,9 @@ pub fn reconcile_external_icon_imports_in_content(proj_dir: &std::path::Path, co
     }
 
     let raw_lines: Vec<&str> = content.lines().collect();
+    let non_import_body = regex::Regex::new(r#"(?ms)^[ \t]*import\s+[\s\S]*?\s+from\s+['"][^'"]+['"]\s*;?"#)
+        .map(|re| re.replace_all(content, "").to_string())
+        .unwrap_or_else(|_| content.to_string());
     let mut out_lines: Vec<String> = Vec::with_capacity(raw_lines.len());
     let mut moved_imports: Vec<(String, String)> = Vec::new();
     let mut any_changed = false;
@@ -2632,6 +2635,15 @@ pub fn reconcile_external_icon_imports_in_content(proj_dir: &std::path::Path, co
                 continue;
             }
 
+            let local_name_check = alias_opt.unwrap_or(orig_sym);
+            let is_used_in_body = regex::Regex::new(&format!(r"\b{}\b", regex::escape(local_name_check)))
+                .map(|re| re.is_match(&non_import_body))
+                .unwrap_or(true);
+            if !is_used_in_body {
+                stmt_changed = true;
+                continue;
+            }
+
             let prefix_match = match_react_icons_prefix(orig_sym);
             let mut resolved = false;
 
@@ -2689,6 +2701,37 @@ pub fn reconcile_external_icon_imports_in_content(proj_dir: &std::path::Path, co
                     moved_imports.push(("lucide-react".to_string(), item.to_string()));
                     stmt_changed = true;
                     resolved = true;
+                }
+                if !resolved {
+                    for suffix in ["Alert", "8Tooth", "6Tooth", "Snooze", "Slash"] {
+                        if let Some(trimmed_sym) = orig_sym.strip_suffix(suffix) {
+                            if trimmed_sym.len() > 3 {
+                                let local_name = alias_opt.unwrap_or(orig_sym);
+                                let rewritten = format!("{} as {}", trimmed_sym, local_name);
+                                if dts_package_exports_symbol(proj_dir, &spec, trimmed_sym) {
+                                    if !kept_items.iter().any(|k| k == &rewritten) {
+                                        kept_items.push(rewritten);
+                                    }
+                                    stmt_changed = true;
+                                    resolved = true;
+                                    break;
+                                }
+                                if let Some((base_sub, _)) = prefix_match {
+                                    for cand_sub in candidate_react_icon_subpaths(base_sub) {
+                                        if cand_sub != spec && dts_package_exports_symbol(proj_dir, cand_sub, trimmed_sym) {
+                                            moved_imports.push((cand_sub.to_string(), rewritten.clone()));
+                                            stmt_changed = true;
+                                            resolved = true;
+                                            break;
+                                        }
+                                    }
+                                    if resolved {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -3069,9 +3112,18 @@ pub fn auto_import_missing_symbols_in_content(
     let mut missing_syms = extract_unimported_jsx_components(&content, &known, is_jsx, extra_missing_idents);
 
     let (prisma_models, prisma_enums) = collect_prisma_schema_symbol_names(proj_dir);
-    let type_candidates = extract_missing_type_ident_candidates(&content, &known);
+    let mut type_candidates = extract_missing_type_ident_candidates(&content, &known);
+    for ast_tc in crate::ast_engine::collect_missing_type_identifiers_ast(&content, &known) {
+        if !type_candidates.iter().any(|x| x == &ast_tc) {
+            type_candidates.push(ast_tc);
+        }
+    }
     for tc in type_candidates {
-        if (prisma_models.contains(&tc) || prisma_enums.contains(&tc)) && !missing_syms.iter().any(|m| m == &tc) {
+        if !missing_syms.iter().any(|m| m == &tc)
+            && (prisma_models.contains(&tc)
+                || prisma_enums.contains(&tc)
+                || find_unique_local_module_for_symbol(proj_dir, abs_file, &tc).is_some())
+        {
             missing_syms.push(tc);
         }
     }
@@ -3137,6 +3189,8 @@ pub fn auto_import_missing_symbols_in_content(
             }
         }
     }
+
+    content = reconcile_external_icon_imports_in_content(proj_dir, &content);
 
     if content != orig_content {
         Some(content)

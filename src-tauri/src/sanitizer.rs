@@ -982,6 +982,41 @@ pub fn has_named_export_symbol(content: &str, sym: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Strips explicit `.ts`/`.tsx`/`.js`/`.jsx` extensions from relative or `@/`/`~/` import/export specifiers
+/// so TypeScript without `allowImportingTsExtensions` (`TS5097`) compiles cleanly.
+pub fn strip_local_import_script_extensions(content: &str) -> String {
+    let Ok(re_ext) = regex::Regex::new(
+        r#"(?m)(\b(?:import|export)\b[^\r\n;]*?\bfrom\s*|\bimport\s*|require\s*\(\s*)(['"])((?:\./|\.\./|@/|~/|src/)[^'"]+?)\.(ts|tsx|js|jsx)(['"])"#,
+    ) else {
+        return content.to_string();
+    };
+    if !re_ext.is_match(content) {
+        return content.to_string();
+    }
+    re_ext
+        .replace_all(content, |caps: &regex::Captures| {
+            let prefix = &caps[1];
+            let q1 = &caps[2];
+            let stem = &caps[3];
+            let q2 = &caps[5];
+            if q1 != q2 || stem.ends_with(".d") {
+                return caps[0].to_string();
+            }
+            let mut normalized = if let Some(rest) = stem.strip_prefix("src/") {
+                format!("@/{}", rest)
+            } else if let Some(rest) = stem.strip_prefix("~/") {
+                format!("@/{}", rest)
+            } else {
+                stem.to_string()
+            };
+            if normalized.starts_with("@/") && normalized.ends_with("/index") && normalized.len() > "@/index".len() {
+                normalized.truncate(normalized.len() - "/index".len());
+            }
+            format!("{}{}{}{}", prefix, q1, normalized, q2)
+        })
+        .to_string()
+}
+
 pub fn normalize_bare_local_imports(content: &str) -> String {
     let mut changed = false;
     let mut out_lines: Vec<String> = Vec::with_capacity(content.lines().count() + 1);
@@ -994,6 +1029,8 @@ pub fn normalize_bare_local_imports(content: &str) -> String {
             || trimmed.starts_with("import{")
             || trimmed.starts_with("import type")
             || (trimmed.starts_with("export ") && trimmed.contains(" from "))
+            || trimmed.contains("} from '")
+            || trimmed.contains("} from \"")
             || trimmed.contains("require(")
             || trimmed.contains("require.resolve(");
 
@@ -1024,12 +1061,18 @@ pub fn normalize_bare_local_imports(content: &str) -> String {
         out_lines.push(cur);
     }
 
-    if !changed {
-        return content.to_string();
-    }
-    let mut joined = out_lines.join("\n");
-    if content.ends_with('\n') && !joined.ends_with('\n') {
-        joined.push('\n');
+    let mut joined = if changed {
+        let mut j = out_lines.join("\n");
+        if content.ends_with('\n') && !j.ends_with('\n') {
+            j.push('\n');
+        }
+        j
+    } else {
+        content.to_string()
+    };
+    let stripped = strip_local_import_script_extensions(&joined);
+    if stripped != joined {
+        joined = stripped;
     }
     joined
 }
@@ -1671,7 +1714,7 @@ pub fn reconcile_client_prisma_enum_mocks(
     }
 
     let Ok(re_kv) = regex::Regex::new(
-        r#"(?m)\b(status|role|priority|tier|plan|type|state|category|paymentStatus|bookingStatus)\s*:\s*(['"])([A-Za-z][A-Za-z0-9_-]*)(['"])(\s*as\s+any)?"#,
+        r#"(?m)\b(status|role|priority|tier|plan|type|state|category|paymentStatus|bookingStatus)\s*:\s*(['"])([A-Za-z][A-Za-z0-9_-]*)(['"])(\s*as\s+(?:any|const))?"#,
     ) else {
         return content.to_string();
     };
@@ -1681,11 +1724,11 @@ pub fn reconcile_client_prisma_enum_mocks(
             let key = &caps[1];
             let q = &caps[2];
             let raw_val = &caps[3];
-            let as_any = caps.get(5).map_or("", |m| m.as_str());
+            let as_suffix = caps.get(5).map_or("", |m| m.as_str());
             let norm = normalize_enum_token(raw_val);
             if let Some(canonical) = member_lookup.get(&norm) {
-                if raw_val != canonical || as_any.is_empty() {
-                    return format!("{}: {}{}{}", key, q, canonical, format!("{} as any", q));
+                if raw_val != canonical || as_suffix.is_empty() || as_suffix.contains("const") {
+                    return format!("{}: {}{}{} as any", key, q, canonical, q);
                 }
             }
             caps[0].to_string()
@@ -2637,21 +2680,79 @@ pub fn widen_narrow_ui_props_interfaces(content: &str) -> String {
         }
     }
 
-    if insertions.is_empty() {
-        return content.to_string();
+    let mut out = content.to_string();
+    if !insertions.is_empty() {
+        insertions.sort_by_key(|(pos, _)| *pos);
+        for (pos, snippet) in insertions.into_iter().rev() {
+            let before_has_nl = pos > 0 && out.as_bytes()[pos - 1] == b'\n';
+            let patch = if before_has_nl {
+                snippet
+            } else {
+                format!("\n{}", snippet)
+            };
+            out.insert_str(pos, &patch);
+        }
     }
 
-    let mut out = content.to_string();
-    insertions.sort_by_key(|(pos, _)| *pos);
-    for (pos, snippet) in insertions.into_iter().rev() {
-        let before_has_nl = pos > 0 && out.as_bytes()[pos - 1] == b'\n';
-        let patch = if before_has_nl {
-            snippet
-        } else {
-            format!("\n{}", snippet)
-        };
-        out.insert_str(pos, &patch);
+    // Also widen inline `React.FC<{ ... }>` / `: FC<{ ... }>` prop objects
+    if out.contains("FC<") {
+        if let Ok(fc_re) = regex::Regex::new(r"(?:React\.)?(?:FC|FunctionComponent)\s*<\s*\{") {
+            let mut spans: Vec<(usize, usize)> = Vec::new();
+            for m in fc_re.find_iter(&out) {
+                let open_brace = m.end() - 1;
+                if let Some(close_brace) = find_balanced_delimiter_bytes(&out, open_brace, b'{', b'}') {
+                    spans.push((open_brace + 1, close_brace));
+                }
+            }
+            if let Ok(prop_colon_re) = regex::Regex::new(r"(?m)((?:^|[;,\n\{])\s*(?:readonly\s+)?)([A-Za-z_$][A-Za-z0-9_$]*)\s*:") {
+                for (s, e) in spans.into_iter().rev() {
+                    if s >= e || e > out.len() {
+                        continue;
+                    }
+                    let body = out[s..e].to_string();
+                    let mut next_body = String::with_capacity(body.len() + 48);
+                    let mut last_idx = 0usize;
+                    for cap in prop_colon_re.captures_iter(&body) {
+                        let m0 = cap.get(0).unwrap();
+                        let g2 = cap.get(2).unwrap();
+                        // Only optionalize top-level properties (depth 0 across `{}`/`()`/`[]`)
+                        let mut depth = 0i32;
+                        for b in body[..g2.start()].bytes() {
+                            match b {
+                                b'{' | b'(' | b'[' => depth += 1,
+                                b'}' | b')' | b']' => depth -= 1,
+                                _ => {}
+                            }
+                        }
+                        if depth == 0 {
+                            next_body.push_str(&body[last_idx..m0.start()]);
+                            next_body.push_str(&format!("{}{}?: ", &cap[1], &cap[2]).trim_end_matches(' '));
+                            last_idx = m0.end();
+                        }
+                    }
+                    next_body.push_str(&body[last_idx..]);
+                    let trimmed_body = next_body.trim_end();
+                    let has_children = body.contains("children");
+                    let has_index = body.contains("[key:");
+                    if !has_children || !has_index {
+                        let sep = if trimmed_body.is_empty() || trimmed_body.ends_with(';') { "" } else { ";" };
+                        let mut extra = String::new();
+                        if !has_children {
+                            extra.push_str(" children?: any;");
+                        }
+                        if !has_index {
+                            extra.push_str(" [key: string]: any;");
+                        }
+                        next_body = format!("{}{} {}", trimmed_body, sep, extra.trim_start());
+                    }
+                    if next_body != body {
+                        out.replace_range(s..e, &next_body);
+                    }
+                }
+            }
+        }
     }
+
     out
 }
 
@@ -5761,7 +5862,7 @@ pub fn sanitize_nextjs_and_zod_hallucinations(content: &str, rel_path: &str) -> 
     if is_ts
         && is_tsx_like
         && (low.contains("/components/") || low.starts_with("components/") || low.starts_with("app/"))
-        && out.contains("Props")
+        && (out.contains("Props") || out.contains("FC<") || out.contains("FunctionComponent<"))
     {
         out = widen_narrow_ui_props_interfaces(&out);
         out = optionalize_component_props_fields(&out);
@@ -5818,6 +5919,79 @@ pub fn sanitize_nextjs_and_zod_hallucinations(content: &str, rel_path: &str) -> 
     // 18. AST object literal duplicate key removal (`TS1117`)
     if let Some(deduped) = crate::ast_engine::deduplicate_object_literal_keys(rel_path, &out) {
         out = deduped;
+    }
+
+    // 19. Clean `as any as const` / `as const as any` (`TS1355`)
+    if is_ts && (out.contains("as any as const") || out.contains("as const as any")) {
+        if let Ok(re_dup_as) = regex::Regex::new(r"\bas\s+(?:any\s+as\s+const|const\s+as\s+any)\b") {
+            out = re_dup_as.replace_all(&out, "as any").to_string();
+        }
+    }
+
+    // 20. Strip explicit `.ts`/`.tsx`/`.js`/`.jsx` extensions from relative or alias imports (`TS5097`)
+    out = strip_local_import_script_extensions(&out);
+
+    // 21. Type untyped top-level mock arrays (`INITIAL_MOCK_*`, `MOCK_*`, `mock*`, `sample*`) as `any[]`
+    if is_ts && (out.contains("MOCK") || out.contains("mock") || out.contains("sample")) {
+        if let Ok(re_mock_arr) = regex::Regex::new(
+            r"(?m)^([ \t]*(?:export\s+)?const\s+(?:INITIAL_MOCK_[A-Za-z0-9_]*|MOCK_[A-Za-z0-9_]*|mock[A-Z][A-Za-z0-9_]*|sample[A-Z][A-Za-z0-9_]*))\s*=\s*\[",
+        ) {
+            out = re_mock_arr.replace_all(&out, "$1: any[] = [").to_string();
+        }
+    }
+
+    // 22. Wrap Supabase v1/v2 destructured auth calls (`const { user, error } = await client.auth.signUp(...)`)
+    if is_ts && out.contains(".auth.") {
+        if let Ok(re_supa_auth) = regex::Regex::new(
+            r"(?m)(?:const|let|var)\s+\{[^}]*\b(?:user|session)\b[^}]*\}\s*=\s*(await\s+[A-Za-z_$][A-Za-z0-9_$.]*\.auth\.(?:signUp|signInWithPassword|signInWithOtp|signInWithOAuth|getUser|getSession)\s*\()",
+        ) {
+            let mut wraps: Vec<(usize, usize)> = Vec::new();
+            for cap in re_supa_auth.captures_iter(&out) {
+                if let Some(m) = cap.get(1) {
+                    let await_start = m.start();
+                    let open_paren = m.end() - 1;
+                    if await_start >= 2 && out[..await_start].ends_with("((") {
+                        continue;
+                    }
+                    if let Some(close_paren) = find_balanced_delimiter_bytes(&out, open_paren, b'(', b')') {
+                        wraps.push((await_start, close_paren + 1));
+                    }
+                }
+            }
+            for (s, e) in wraps.into_iter().rev() {
+                if s < e && e <= out.len() {
+                    let inner = &out[s..e];
+                    let wrapped = format!("(({}) as any)", inner);
+                    out.replace_range(s..e, &wrapped);
+                }
+            }
+        }
+    }
+
+    // 23. TypeScript 5.x resolves `Object.entries(anyVal)` to `[string, unknown][]`, causing
+    // `TS2322: Type 'unknown' is not assignable to type 'ReactNode'` in JSX `.map(([k, value]) => ...)`.
+    if is_ts && out.contains("Object.entries") {
+        if let Ok(re_obj_entries) = regex::Regex::new(r"\bObject\.entries\s*\(") {
+            let mut spans: Vec<(usize, usize)> = Vec::new();
+            for m in re_obj_entries.find_iter(&out) {
+                let open_paren = m.end() - 1;
+                if let Some(close_paren) = find_balanced_delimiter_bytes(&out, open_paren, b'(', b')') {
+                    let arg_start = open_paren + 1;
+                    if spans.last().map_or(true, |&(_, prev_e)| arg_start > prev_e) {
+                        spans.push((arg_start, close_paren));
+                    }
+                }
+            }
+            for (s, e) in spans.into_iter().rev() {
+                if s < e && e <= out.len() {
+                    let raw_inner = &out[s..e];
+                    if !raw_inner.trim().is_empty() && !raw_inner.contains(" as ") {
+                        let wrapped = format!("({}) as Record<string, any>", raw_inner);
+                        out.replace_range(s..e, &wrapped);
+                    }
+                }
+            }
+        }
     }
 
     out
@@ -10708,19 +10882,2541 @@ pub fn sanitize_tailwind_config_in_project(proj_dir: &std::path::Path) {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IndustryArchetypeKind {
+    IndustrialEngineering,
+    FinTechLedger,
+    DevToolsInterop,
+    MarketplaceCommerce,
+    HealthEdTech,
+    CollaborativeB2B,
+}
+
+struct IndustryDesignProfile {
+    kind: IndustryArchetypeKind,
+    archetype_tag: &'static str,
+    badge_label: &'static str,
+    is_dark: bool,
+    canvas_cls: &'static str,
+    card_cls: &'static str,
+    subtle_cls: &'static str,
+    border_cls: &'static str,
+    text_primary: &'static str,
+    text_muted: &'static str,
+    cta_cls: &'static str,
+    secondary_btn_cls: &'static str,
+    badge_cls: &'static str,
+    accent_text: &'static str,
+    progress_fill: &'static str,
+    kpis: [(&'static str, &'static str); 3],
+    workflow_steps: [(&'static str, &'static str); 4],
+    privacy_scope: &'static str,
+    blog_topic_label: &'static str,
+}
+
+struct ProjectServiceMeta {
+    proj_name: String,
+    proj_desc: String,
+    slug: String,
+    is_desktop: bool,
+    is_mobile: bool,
+    include_blog: bool,
+    models: Vec<String>,
+    domain_routes: Vec<(String, String)>,
+    has_auth_routes: bool,
+    profile: IndustryDesignProfile,
+}
+
+fn esc_tsx(raw: &str) -> String {
+    raw.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('{', "&#123;")
+        .replace('}', "&#125;")
+}
+
+fn esc_js_single(raw: &str) -> String {
+    raw.replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\r', " ")
+        .replace('\n', " ")
+}
+
+fn humanize_slug_label(slug: &str) -> String {
+    let trimmed = slug.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        return "Overview".to_string();
+    }
+    let last_seg = trimmed.split('/').last().unwrap_or(trimmed);
+    let mut out = Vec::new();
+    for part in last_seg.split(['-', '_']) {
+        if part.is_empty() {
+            continue;
+        }
+        // Split camelCase (`sensorData` -> `sensor Data`)
+        let mut cur = String::new();
+        for (i, ch) in part.chars().enumerate() {
+            if i > 0 && ch.is_ascii_uppercase() && !cur.is_empty() {
+                out.push(cur);
+                cur = String::new();
+            }
+            if cur.is_empty() {
+                for up in ch.to_uppercase() {
+                    cur.push(up);
+                }
+            } else {
+                cur.push(ch);
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+    }
+    if out.is_empty() {
+        "Workspace".to_string()
+    } else {
+        out.join(" ")
+    }
+}
+
+fn resolve_industry_profile(combined_lower: &str) -> IndustryDesignProfile {
+    if combined_lower.contains("tunnel")
+        || combined_lower.contains("bore")
+        || combined_lower.contains("sensor")
+        || combined_lower.contains("iot")
+        || combined_lower.contains("robot")
+        || combined_lower.contains("anode")
+        || combined_lower.contains("stucco")
+        || combined_lower.contains("panel")
+        || combined_lower.contains("electrical")
+        || combined_lower.contains("grid")
+        || combined_lower.contains("aerospace")
+        || combined_lower.contains("fleet")
+        || combined_lower.contains("manufacturing")
+        || combined_lower.contains("construction")
+        || combined_lower.contains("telemetry")
+        || combined_lower.contains("hardware")
+    {
+        IndustryDesignProfile {
+            kind: IndustryArchetypeKind::IndustrialEngineering,
+            archetype_tag: "Industrial & Telemetry Command",
+            badge_label: "Field Telemetry & Automated QA",
+            is_dark: true,
+            canvas_cls: "bg-slate-950 text-slate-100",
+            card_cls: "bg-slate-900/90 border border-amber-500/25 rounded-2xl shadow-xl",
+            subtle_cls: "bg-slate-900/60 border border-slate-800 rounded-xl",
+            border_cls: "border-slate-800",
+            text_primary: "text-slate-100",
+            text_muted: "text-slate-400",
+            cta_cls: "bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold shadow-lg shadow-amber-500/20",
+            secondary_btn_cls: "bg-slate-900 hover:bg-slate-800 text-slate-100 border border-slate-700",
+            badge_cls: "bg-amber-500/10 text-amber-300 border border-amber-500/30 font-mono",
+            accent_text: "text-amber-400",
+            progress_fill: "bg-amber-500",
+            kpis: [
+                ("99.94%", "Field Telemetry Uptime"),
+                ("18ms", "Anomaly Detection Latency"),
+                ("100%", "Compliance Traceability"),
+            ],
+            workflow_steps: [
+                ("01 · Capture", "Ingest live sensor readings, field logs, and equipment tolerances automatically."),
+                ("02 · Validate", "Evaluate thresholds against domain calibration rules with real-time alerts."),
+                ("03 · Dispatch", "Coordinate field engineers, sign-offs, and corrective maintenance tickets."),
+                ("04 · Certify", "Export verifiable inspection packages and compliance reports in one click."),
+            ],
+            privacy_scope: "operational telemetry streams, equipment identifiers, inspection logs, and operator credentials",
+            blog_topic_label: "Field Engineering & Telemetry Briefs",
+        }
+    } else if combined_lower.contains("fintech")
+        || combined_lower.contains("finance")
+        || combined_lower.contains("ledger")
+        || combined_lower.contains("invoice")
+        || combined_lower.contains("payment")
+        || combined_lower.contains("crypto")
+        || combined_lower.contains("blockchain")
+        || combined_lower.contains("trading")
+        || combined_lower.contains("bank")
+        || combined_lower.contains("treasury")
+        || combined_lower.contains("tax")
+        || combined_lower.contains("billing")
+    {
+        IndustryDesignProfile {
+            kind: IndustryArchetypeKind::FinTechLedger,
+            archetype_tag: "FinTech & Capital Operations",
+            badge_label: "Institutional Ledger & Audit Controls",
+            is_dark: true,
+            canvas_cls: "bg-slate-950 text-slate-100",
+            card_cls: "bg-slate-900/85 border border-emerald-500/25 rounded-2xl shadow-xl",
+            subtle_cls: "bg-slate-900/60 border border-slate-800 rounded-xl",
+            border_cls: "border-slate-800",
+            text_primary: "text-slate-100",
+            text_muted: "text-slate-400",
+            cta_cls: "bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold shadow-lg shadow-emerald-500/20",
+            secondary_btn_cls: "bg-slate-900 hover:bg-slate-800 text-slate-100 border border-slate-700",
+            badge_cls: "bg-emerald-500/10 text-emerald-300 border border-emerald-500/25",
+            accent_text: "text-emerald-400",
+            progress_fill: "bg-emerald-500",
+            kpis: [
+                ("0", "Unreconciled Variance"),
+                ("1.2s", "Ledger Settlement Check"),
+                ("SOC2", "Immutable Audit Coverage"),
+            ],
+            workflow_steps: [
+                ("01 · Ingest", "Connect payment accounts, invoices, and multi-currency ledger entries."),
+                ("02 · Reconcile", "Match inflows, fee schedules, and approval policies automatically."),
+                ("03 · Govern", "Enforce role-based spend limits and real-time discrepancy alerts."),
+                ("04 · Close", "Generate board-ready statements and verifiable tax/audit exports."),
+            ],
+            privacy_scope: "encrypted ledger records, billing metadata, tax identifiers, and role-scoped access logs",
+            blog_topic_label: "Treasury & Compliance Dispatches",
+        }
+    } else if combined_lower.contains("interop")
+        || combined_lower.contains("protocol")
+        || combined_lower.contains("connector")
+        || combined_lower.contains("api")
+        || combined_lower.contains("sdk")
+        || combined_lower.contains("devops")
+        || combined_lower.contains("terminal")
+        || combined_lower.contains("cyber")
+        || combined_lower.contains("security")
+        || combined_lower.contains("cloud")
+        || combined_lower.contains("pipeline")
+        || combined_lower.contains("compiler")
+    {
+        IndustryDesignProfile {
+            kind: IndustryArchetypeKind::DevToolsInterop,
+            archetype_tag: "Developer & Interop Infrastructure",
+            badge_label: "Protocol Bridge & Schema Verification",
+            is_dark: true,
+            canvas_cls: "bg-zinc-950 text-zinc-100",
+            card_cls: "bg-zinc-900/90 border border-violet-500/25 rounded-2xl shadow-xl",
+            subtle_cls: "bg-zinc-900/60 border border-zinc-800 rounded-xl",
+            border_cls: "border-zinc-800",
+            text_primary: "text-zinc-100",
+            text_muted: "text-zinc-400",
+            cta_cls: "bg-violet-600 hover:bg-violet-500 text-white font-semibold shadow-lg shadow-violet-500/20",
+            secondary_btn_cls: "bg-zinc-900 hover:bg-zinc-800 text-zinc-100 border border-zinc-700",
+            badge_cls: "bg-cyan-500/10 text-cyan-300 border border-cyan-500/25 font-mono",
+            accent_text: "text-cyan-400",
+            progress_fill: "bg-violet-500",
+            kpis: [
+                ("99.99%", "Connector Delivery Rate"),
+                ("12ms", "Transform Overhead"),
+                ("24/7", "Schema Drift Watch"),
+            ],
+            workflow_steps: [
+                ("01 · Discover", "Register legacy endpoints, schemas, and custom protocol connectors."),
+                ("02 · Transform", "Map payload contracts safely across versions without downtime."),
+                ("03 · Verify", "Run deterministic schema and compliance checks before deployment."),
+                ("04 · Observe", "Monitor throughput, replay failures, and enforce tier SLAs."),
+            ],
+            privacy_scope: "service credentials, connector payloads, API execution traces, and audit histories",
+            blog_topic_label: "Systems & Protocol Engineering Notes",
+        }
+    } else if combined_lower.contains("ecommerce")
+        || combined_lower.contains("e-commerce")
+        || combined_lower.contains("marketplace")
+        || combined_lower.contains("shop")
+        || combined_lower.contains("store")
+        || combined_lower.contains("booking")
+        || combined_lower.contains("hotel")
+        || combined_lower.contains("camp")
+        || combined_lower.contains("rental")
+        || combined_lower.contains("travel")
+        || combined_lower.contains("real estate")
+        || combined_lower.contains("restaurant")
+        || combined_lower.contains("retail")
+    {
+        IndustryDesignProfile {
+            kind: IndustryArchetypeKind::MarketplaceCommerce,
+            archetype_tag: "Commerce & Curated Marketplace",
+            badge_label: "Curated Listings & Protected Booking",
+            is_dark: false,
+            canvas_cls: "bg-stone-50 text-slate-900",
+            card_cls: "bg-white border border-stone-200 rounded-2xl shadow-sm",
+            subtle_cls: "bg-stone-100/70 border border-stone-200 rounded-xl",
+            border_cls: "border-stone-200",
+            text_primary: "text-slate-900",
+            text_muted: "text-slate-600",
+            cta_cls: "bg-rose-600 hover:bg-rose-700 text-white font-semibold shadow-sm",
+            secondary_btn_cls: "bg-white hover:bg-stone-100 text-slate-900 border border-stone-300",
+            badge_cls: "bg-amber-50 text-amber-800 border border-amber-200",
+            accent_text: "text-rose-600",
+            progress_fill: "bg-rose-600",
+            kpis: [
+                ("4.9/5", "Verified Customer Rating"),
+                ("Instant", "Availability & Confirmation"),
+                ("100%", "Escrow & Order Protection"),
+            ],
+            workflow_steps: [
+                ("01 · Discover", "Browse curated inventory with live availability and verified reviews."),
+                ("02 · Configure", "Select tier options, dates, or fulfillment preferences transparently."),
+                ("03 · Checkout", "Complete protected booking or order placement with instant receipt."),
+                ("04 · Track", "Manage active orders, payouts, and repeat customers from one hub."),
+            ],
+            privacy_scope: "order histories, storefront preferences, fulfillment details, and customer contact records",
+            blog_topic_label: "Commerce Guides & Community Stories",
+        }
+    } else if combined_lower.contains("health")
+        || combined_lower.contains("medical")
+        || combined_lower.contains("clinic")
+        || combined_lower.contains("patient")
+        || combined_lower.contains("care")
+        || combined_lower.contains("biotech")
+        || combined_lower.contains("wellness")
+        || combined_lower.contains("edtech")
+        || combined_lower.contains("education")
+        || combined_lower.contains("learning")
+        || combined_lower.contains("course")
+        || combined_lower.contains("school")
+    {
+        IndustryDesignProfile {
+            kind: IndustryArchetypeKind::HealthEdTech,
+            archetype_tag: "HealthTech & Guided Progression",
+            badge_label: "Trusted Care & Structured Outcomes",
+            is_dark: false,
+            canvas_cls: "bg-slate-50 text-slate-900",
+            card_cls: "bg-white border border-teal-200/80 rounded-2xl shadow-sm",
+            subtle_cls: "bg-teal-50/50 border border-teal-100 rounded-xl",
+            border_cls: "border-teal-100",
+            text_primary: "text-slate-900",
+            text_muted: "text-slate-600",
+            cta_cls: "bg-teal-600 hover:bg-teal-700 text-white font-semibold shadow-sm",
+            secondary_btn_cls: "bg-white hover:bg-teal-50 text-slate-900 border border-teal-200",
+            badge_cls: "bg-teal-50 text-teal-700 border border-teal-200",
+            accent_text: "text-teal-600",
+            progress_fill: "bg-teal-600",
+            kpis: [
+                ("96%", "Program Completion Lift"),
+                ("HIPAA", "Privacy-First Architecture"),
+                ("< 5m", "Onboarding Readiness"),
+            ],
+            workflow_steps: [
+                ("01 · Enroll", "Establish baseline profiles, safety checks, and guided milestones."),
+                ("02 · Practice", "Follow structured modules, schedules, and personalized feedback loops."),
+                ("03 · Measure", "Track progress velocity and outcome metrics with clear visual indicators."),
+                ("04 · Certify", "Review milestones, export transcripts, and coordinate care or cohorts."),
+            ],
+            privacy_scope: "participant enrollment records, progression milestones, schedule data, and encrypted account profiles",
+            blog_topic_label: "Research, Care & Learning Journal",
+        }
+    } else {
+        IndustryDesignProfile {
+            kind: IndustryArchetypeKind::CollaborativeB2B,
+            archetype_tag: "Executive B2B SaaS Workspace",
+            badge_label: "Unified Operations & Team Velocity",
+            is_dark: false,
+            canvas_cls: "bg-slate-50 text-slate-900",
+            card_cls: "bg-white border border-slate-200 rounded-2xl shadow-sm",
+            subtle_cls: "bg-slate-100/70 border border-slate-200 rounded-xl",
+            border_cls: "border-slate-200",
+            text_primary: "text-slate-900",
+            text_muted: "text-slate-600",
+            cta_cls: "bg-indigo-600 hover:bg-indigo-700 text-white font-semibold shadow-sm",
+            secondary_btn_cls: "bg-white hover:bg-slate-100 text-slate-900 border border-slate-300",
+            badge_cls: "bg-indigo-50 text-indigo-700 border border-indigo-200",
+            accent_text: "text-indigo-600",
+            progress_fill: "bg-indigo-600",
+            kpis: [
+                ("3.4x", "Operational Throughput"),
+                ("99.9%", "Workspace Availability"),
+                ("RBAC", "Tier & Role Governance"),
+            ],
+            workflow_steps: [
+                ("01 · Centralize", "Bring projects, team roles, and domain data into one cohesive hub."),
+                ("02 · Automate", "Run real-time workflows, validations, and priority notifications."),
+                ("03 · Collaborate", "Share live status views, approvals, and action items across teams."),
+                ("04 · Scale", "Unlock higher workspaces, seats, and retention via tier controls."),
+            ],
+            privacy_scope: "workspace organization data, role memberships, activity streams, and subscription preferences",
+            blog_topic_label: "Product Updates & Operations Playbooks",
+        }
+    }
+}
+
+fn detect_project_meta_and_profile(proj_dir: &std::path::Path) -> ProjectServiceMeta {
+    let mut proj_name = String::new();
+    let mut proj_desc = String::new();
+    let mut category = String::new();
+    let mut is_desktop = proj_dir.join("src/renderer").is_dir() || proj_dir.join("electron-builder.json").is_file();
+    let mut is_mobile = proj_dir.join("app/(tabs)").is_dir() || proj_dir.join("app.json").is_file();
+
+    if let Ok(raw) = std::fs::read_to_string(proj_dir.join(".axiom/generation_state.json")) {
+        if let Ok(val) = serde_json::from_str::<Value>(&raw) {
+            proj_name = val.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            proj_desc = val.get("projectDescription").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let pt = val.get("projectType").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            if pt.contains("electron") || pt.contains("desktop") {
+                is_desktop = true;
+            }
+            if pt.contains("expo") || pt.contains("react_native") || pt.contains("react-native") || pt.contains("mobile") {
+                is_mobile = true;
+            }
+        }
+    }
+    if let Ok(raw) = std::fs::read_to_string(proj_dir.join(".axiom/live_builder_guide.json")) {
+        if let Ok(val) = serde_json::from_str::<Value>(&raw) {
+            if let Some(cat) = val.get("projectSpecification").and_then(|s| s.get("category")).and_then(|c| c.as_str()) {
+                category = cat.trim().to_string();
+            }
+        }
+    }
+    if let Ok(raw) = std::fs::read_to_string(proj_dir.join("package.json")) {
+        if let Ok(val) = serde_json::from_str::<Value>(&raw) {
+            if proj_name.is_empty() {
+                let raw_pkg_name = val.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                if !raw_pkg_name.is_empty() {
+                    proj_name = humanize_slug_label(raw_pkg_name);
+                }
+            }
+            if let Some(deps) = val.get("dependencies").and_then(|d| d.as_object()) {
+                if deps.contains_key("electron") {
+                    is_desktop = true;
+                }
+                if deps.contains_key("expo") || deps.contains_key("react-native") {
+                    is_mobile = true;
+                }
+            }
+        }
+    }
+
+    if proj_name.is_empty() {
+        proj_name = proj_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|s| s.len() < 20)
+            .map(humanize_slug_label)
+            .unwrap_or_else(|| "Axiom Platform".to_string());
+    }
+
+    let mut models = Vec::new();
+    for cand in [proj_dir.join("prisma/schema.prisma"), proj_dir.join("schema.prisma")] {
+        if let Ok(schema) = std::fs::read_to_string(cand) {
+            if let Ok(re_m) = regex::Regex::new(r"(?m)^\s*model\s+([A-Z][A-Za-z0-9_]*)\s*\{") {
+                for cap in re_m.captures_iter(&schema) {
+                    let mname = cap[1].to_string();
+                    if !matches!(mname.as_str(), "User" | "Account" | "Session" | "VerificationToken")
+                        && !models.contains(&mname)
+                    {
+                        models.push(mname);
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    if proj_desc.is_empty() {
+        if models.is_empty() {
+            proj_desc = format!(
+                "{} delivers structured workflows, live operational visibility, and tier-governed team capabilities.",
+                proj_name
+            );
+        } else {
+            proj_desc = format!(
+                "{} streamlines {} management with real-time monitoring, validation workflows, and tier-governed access.",
+                proj_name,
+                models.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+            );
+        }
+    }
+
+    let mut domain_routes = Vec::new();
+    let mut seen_routes = std::collections::HashSet::new();
+    let mut has_auth_routes = proj_dir.join("src/app/login/page.tsx").exists()
+        || proj_dir.join("app/login/page.tsx").exists();
+
+    let scan_app_root = |base: &std::path::Path, out: &mut Vec<(String, String)>, seen: &mut std::collections::HashSet<String>, auth_flag: &mut bool| {
+        if !base.is_dir() {
+            return;
+        }
+        if let Ok(entries) = std::fs::read_dir(base) {
+            for ent in entries.flatten() {
+                let p = ent.path();
+                if !p.is_dir() {
+                    continue;
+                }
+                let seg = ent.file_name().to_string_lossy().to_string();
+                let seg_low = seg.to_lowercase();
+                if seg.starts_with('_') || seg.starts_with('[') || seg.starts_with('(') {
+                    continue;
+                }
+                if seg_low == "login" || seg_low == "register" || seg_low == "signup" {
+                    *auth_flag = true;
+                    continue;
+                }
+                if matches!(seg_low.as_str(), "api" | "about" | "pricing" | "account" | "legal" | "blog" | "dashboard") {
+                    continue;
+                }
+                if p.join("page.tsx").is_file() || p.join("page.jsx").is_file() {
+                    let route = format!("/{}", seg);
+                    if seen.insert(route.clone()) {
+                        out.push((route, humanize_slug_label(&seg)));
+                    }
+                }
+            }
+        }
+    };
+    scan_app_root(&proj_dir.join("src/app"), &mut domain_routes, &mut seen_routes, &mut has_auth_routes);
+    scan_app_root(&proj_dir.join("app"), &mut domain_routes, &mut seen_routes, &mut has_auth_routes);
+    domain_routes.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let combined = format!("{} {} {} {}", proj_name, proj_desc, category, models.join(" ")).to_lowercase();
+    let profile = resolve_industry_profile(&combined);
+
+    let slug: String = proj_name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    let slug = if slug.is_empty() { "axiom_app".to_string() } else { slug };
+
+    let has_blog_ref = combined.contains("blog")
+        || combined.contains("article")
+        || combined.contains("editorial")
+        || combined.contains("content")
+        || combined.contains("community")
+        || combined.contains("news");
+    let include_blog = has_blog_ref
+        || (!is_desktop
+            && !is_mobile
+            && (combined.contains("saas")
+                || combined.contains("compliance")
+                || combined.contains("analytics")
+                || combined.contains("marketplace")
+                || matches!(
+                    profile.kind,
+                    IndustryArchetypeKind::FinTechLedger
+                        | IndustryArchetypeKind::MarketplaceCommerce
+                        | IndustryArchetypeKind::HealthEdTech
+                )));
+
+    ProjectServiceMeta {
+        proj_name,
+        proj_desc,
+        slug,
+        is_desktop,
+        is_mobile,
+        include_blog,
+        models,
+        domain_routes,
+        has_auth_routes,
+        profile,
+    }
+}
+
+fn ensure_user_tier_hook(proj_dir: &std::path::Path, meta: &ProjectServiceMeta) {
+    let hook_dir = if proj_dir.join("src").is_dir() {
+        proj_dir.join("src/hooks")
+    } else {
+        proj_dir.join("hooks")
+    };
+    let hook_path = hook_dir.join("useUserTier.ts");
+    if hook_path.exists() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(&hook_dir);
+    let storage_key = format!("axiom_tier_{}", esc_js_single(&meta.slug));
+    let content = format!(
+r#""use client";
+
+import {{ useState, useEffect, useCallback }} from 'react';
+
+export type UserTierId = 'Starter' | 'Pro' | 'Enterprise';
+export type BillingCycle = 'monthly' | 'annual';
+
+export interface TierLimits {{
+  seats: number;
+  workspaces: number;
+  monthlyOperations: number;
+  retentionDays: number;
+}}
+
+export interface UserTierState {{
+  tier: UserTierId;
+  billingCycle: BillingCycle;
+  setTier: (nextTier: UserTierId) => void;
+  setBillingCycle: (nextCycle: BillingCycle) => void;
+  isProOrAbove: boolean;
+  isEnterprise: boolean;
+  limits: TierLimits;
+  [key: string]: any;
+}}
+
+const TIER_LIMITS: Record<UserTierId, TierLimits> = {{
+  Starter: {{ seats: 3, workspaces: 2, monthlyOperations: 5000, retentionDays: 14 }},
+  Pro: {{ seats: 25, workspaces: 15, monthlyOperations: 100000, retentionDays: 180 }},
+  Enterprise: {{ seats: 250, workspaces: 999, monthlyOperations: 5000000, retentionDays: 365 }},
+}};
+
+const STORAGE_KEY = '{}';
+
+export const useUserTier = (): UserTierState => {{
+  const [tier, setTierState] = useState<UserTierId>('Starter');
+  const [billingCycle, setBillingCycleState] = useState<BillingCycle>('monthly');
+
+  useEffect(() => {{
+    if (typeof window === 'undefined') return;
+    try {{
+      const saved = window.localStorage.getItem(STORAGE_KEY);
+      if (saved) {{
+        const parsed = JSON.parse(saved);
+        if (parsed?.tier === 'Starter' || parsed?.tier === 'Pro' || parsed?.tier === 'Enterprise') {{
+          setTierState(parsed.tier);
+        }}
+        if (parsed?.billingCycle === 'monthly' || parsed?.billingCycle === 'annual') {{
+          setBillingCycleState(parsed.billingCycle);
+        }}
+      }}
+    }} catch {{}}
+
+    const onSync = (ev: Event) => {{
+      const detail = (ev as CustomEvent)?.detail;
+      if (!detail) return;
+      if (detail.tier === 'Starter' || detail.tier === 'Pro' || detail.tier === 'Enterprise') {{
+        setTierState(detail.tier);
+      }}
+      if (detail.billingCycle === 'monthly' || detail.billingCycle === 'annual') {{
+        setBillingCycleState(detail.billingCycle);
+      }}
+    }};
+    window.addEventListener('axiom-tier-change', onSync);
+    return () => window.removeEventListener('axiom-tier-change', onSync);
+  }}, []);
+
+  const persist = useCallback((nextTier: UserTierId, nextCycle: BillingCycle) => {{
+    if (typeof window === 'undefined') return;
+    try {{
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify({{ tier: nextTier, billingCycle: nextCycle }}));
+      window.dispatchEvent(new CustomEvent('axiom-tier-change', {{ detail: {{ tier: nextTier, billingCycle: nextCycle }} }}));
+    }} catch {{}}
+  }}, []);
+
+  const setTier = useCallback((nextTier: UserTierId) => {{
+    setTierState(nextTier);
+    persist(nextTier, billingCycle);
+  }}, [billingCycle, persist]);
+
+  const setBillingCycle = useCallback((nextCycle: BillingCycle) => {{
+    setBillingCycleState(nextCycle);
+    persist(tier, nextCycle);
+  }}, [tier, persist]);
+
+  return {{
+    tier,
+    billingCycle,
+    setTier,
+    setBillingCycle,
+    isProOrAbove: tier === 'Pro' || tier === 'Enterprise',
+    isEnterprise: tier === 'Enterprise',
+    limits: TIER_LIMITS[tier],
+  }};
+}};
+
+export default useUserTier;
+"#,
+        storage_key
+    );
+    let _ = std::fs::write(&hook_path, content);
+}
+
+fn build_industry_homepage_tsx(meta: &ProjectServiceMeta) -> String {
+    let p = &meta.profile;
+    let name_jsx = esc_tsx(&meta.proj_name);
+    let desc_jsx = esc_tsx(&meta.proj_desc);
+    let badge_jsx = esc_tsx(p.badge_label);
+    let tag_jsx = esc_tsx(p.archetype_tag);
+
+    let mut feature_items: Vec<(String, String, String, String)> = Vec::new();
+    for (route, label) in meta.domain_routes.iter().take(4) {
+        feature_items.push((
+            label.clone(),
+            format!("Dedicated {} workflow module tailored for {} operations and live tracking.", label, meta.proj_name),
+            route.clone(),
+            "Active Module".to_string(),
+        ));
+    }
+    if feature_items.is_empty() {
+        for model in meta.models.iter().take(3) {
+            let lbl = humanize_slug_label(model);
+            feature_items.push((
+                format!("{} Hub", lbl),
+                format!("Structured lifecycle management and validation for {} records.", lbl),
+                "/dashboard".to_string(),
+                "Core Engine".to_string(),
+            ));
+        }
+    }
+    while feature_items.len() < 3 {
+        let idx = feature_items.len();
+        let fallback = match idx {
+            0 => ("Interactive Workspace", "Inspect live operational records, filters, and workflows from your main command hub.", "/dashboard", "Workspace"),
+            1 => ("Flexible Tier Controls", "Manage Starter, Pro, and Enterprise capabilities with instant quota visibility.", "/account", "Tier Ready"),
+            _ => ("Transparent Pricing Plans", "Scale seats, operations, and historical retention smoothly as usage grows.", "/pricing", "Plans"),
+        };
+        feature_items.push((fallback.0.to_string(), fallback.1.to_string(), fallback.2.to_string(), fallback.3.to_string()));
+    }
+
+    let features_js: Vec<String> = feature_items
+        .iter()
+        .map(|(t, d, href, tag)| {
+            format!(
+                "  {{ title: '{}', description: '{}', href: '{}', badge: '{}' }}",
+                esc_js_single(t),
+                esc_js_single(d),
+                esc_js_single(href),
+                esc_js_single(tag)
+            )
+        })
+        .collect();
+
+    let steps_js: Vec<String> = p
+        .workflow_steps
+        .iter()
+        .map(|(title, desc)| {
+            format!(
+                "  {{ step: '{}', detail: '{}' }}",
+                esc_js_single(title),
+                esc_js_single(desc)
+            )
+        })
+        .collect();
+
+    let kpis_js: Vec<String> = p
+        .kpis
+        .iter()
+        .map(|(val, lbl)| format!("  {{ value: '{}', label: '{}' }}", esc_js_single(val), esc_js_single(lbl)))
+        .collect();
+
+    let preview_title = match p.kind {
+        IndustryArchetypeKind::IndustrialEngineering => "Live Telemetry & Tolerance Monitor",
+        IndustryArchetypeKind::FinTechLedger => "Live Reconciliation & Audit Monitor",
+        IndustryArchetypeKind::DevToolsInterop => "Protocol Bridge & Schema Inspector",
+        IndustryArchetypeKind::MarketplaceCommerce => "Live Inventory & Booking Pulse",
+        IndustryArchetypeKind::HealthEdTech => "Cohort Outcomes & Compliance Pulse",
+        IndustryArchetypeKind::CollaborativeB2B => "Live Workspace Velocity Snapshot",
+    };
+
+    let model_pills: Vec<String> = if meta.models.is_empty() {
+        vec!["Records".to_string(), "Workflows".to_string(), "Audit".to_string()]
+    } else {
+        meta.models.iter().take(3).cloned().collect()
+    };
+    let pills_js: Vec<String> = model_pills
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            format!(
+                "  {{ label: '{}', value: '{}', status: '{}' }}",
+                esc_js_single(&humanize_slug_label(m)),
+                match i { 0 => "99.4%", 1 => "142", _ => "Verified" },
+                match i { 0 => "Optimal", 1 => "Live", _ => "Synced" }
+            )
+        })
+        .collect();
+
+    format!(
+r#""use client";
+
+import React, {{ useState }} from 'react';
+import Link from 'next/link';
+import {{ useUserTier }} from '@/hooks/useUserTier';
+
+const KPI_METRICS = [
+{}
+];
+
+const WORKFLOW_STEPS = [
+{}
+];
+
+const DOMAIN_FEATURES = [
+{}
+];
+
+const PREVIEW_SIGNALS = [
+{}
+];
+
+const FAQS = [
+  {{
+    q: 'How is {} tailored to this operational workflow?',
+    a: '{} Every workspace screen combines pre-validated domain schemas, interactive status controls, and fast preview readiness.',
+  }},
+  {{
+    q: 'How do Starter, Pro, and Enterprise tiers work in Account and Dashboard?',
+    a: 'Select any plan on Pricing or switch tiers in Account to unlock expanded seat limits, monthly operations quota, and longer audit retention across your workspace.',
+  }},
+  {{
+    q: 'Are Terms of Service and Privacy notices included?',
+    a: 'Yes. Dedicated Legal pages (/legal/terms and /legal/privacy) ship out-of-the-box with a reminder for your legal team to finalize production policy wording.',
+  }},
+];
+
+export default function HomePage() {{
+  const {{ tier }} = useUserTier();
+  const [openFaq, setOpenFaq] = useState<number | null>(0);
+
+  return (
+    <div className="min-h-screen w-full {}">
+      <section className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-14 pb-16">
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-10 items-center">
+          <div className="lg:col-span-7 space-y-6">
+            <div className="flex flex-wrap items-center gap-2.5">
+              <span className="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold {}">{}</span>
+              <span className="text-xs font-medium {}">{} · Plan: {{tier}}</span>
+            </div>
+            <h1 className="text-4xl sm:text-5xl lg:text-6xl font-extrabold tracking-tight leading-tight">
+              {}
+            </h1>
+            <p className="text-lg sm:text-xl {} max-w-2xl leading-relaxed">
+              {}
+            </p>
+            <div className="flex flex-wrap items-center gap-3 pt-2">
+              <Link href="/dashboard" prefetch={{false}} className="inline-flex items-center justify-center gap-2 px-6 py-3 rounded-xl transition-all {}">
+                Launch Workspace
+                <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 12h14m-7-7 7 7-7 7" />
+                </svg>
+              </Link>
+              <Link href="/pricing" prefetch={{false}} className="inline-flex items-center justify-center gap-2 px-6 py-3 rounded-xl font-semibold transition-all {}">
+                Explore Pricing
+              </Link>
+              <Link href="/about" prefetch={{false}} className="inline-flex items-center px-4 py-3 text-sm font-semibold {} hover:underline">
+                About &amp; Architecture
+              </Link>
+            </div>
+          </div>
+
+          <div className="lg:col-span-5">
+            <div className="p-6 space-y-5 {}">
+              <div className="flex items-center justify-between border-b {} pb-4">
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-wider {}">{}</p>
+                  <h2 className="text-lg font-bold mt-0.5">{} Overview</h2>
+                </div>
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold {}">
+                  <span className="w-2 h-2 rounded-full bg-current animate-pulse" />
+                  Live
+                </span>
+              </div>
+
+              <div className="space-y-3">
+                {{PREVIEW_SIGNALS.map((sig, i) => (
+                  <div key={{i}} className="p-3.5 flex items-center justify-between {}">
+                    <div>
+                      <p className="text-sm font-semibold">{{sig.label}}</p>
+                      <p className="text-xs {}">{{sig.status}}</p>
+                    </div>
+                    <span className="text-lg font-extrabold {}">{{sig.value}}</span>
+                  </div>
+                ))}}
+              </div>
+
+              <div className="pt-2 flex items-center justify-between text-xs {}">
+                <span>Active tier: <strong className="{}">{{tier}}</strong></span>
+                <Link href="/account" prefetch={{false}} className="font-semibold {} hover:underline">
+                  Manage Tier &amp; Quotas &rarr;
+                </Link>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section className="border-y {}">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 grid grid-cols-1 sm:grid-cols-3 gap-6">
+          {{KPI_METRICS.map((kpi, idx) => (
+            <div key={{idx}} className="p-5 {}">
+              <p className="text-3xl font-extrabold {}">{{kpi.value}}</p>
+              <p className="text-sm mt-1 {}">{{kpi.label}}</p>
+            </div>
+          ))}}
+        </div>
+      </section>
+
+      <section className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-16 space-y-8">
+        <div className="max-w-2xl">
+          <span className="text-xs font-bold uppercase tracking-wider {}">How It Works</span>
+          <h2 className="text-3xl font-extrabold mt-2">Built for End-to-End Execution</h2>
+          <p className="mt-2 {}">Follow a deterministic operational lifecycle tailored specifically for {}.</p>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+          {{WORKFLOW_STEPS.map((item, idx) => (
+            <div key={{idx}} className="p-6 space-y-2 {}">
+              <span className="inline-block px-2.5 py-0.5 rounded-full text-xs font-semibold {}">{{item.step}}</span>
+              <p className="text-sm leading-relaxed pt-1 {}">{{item.detail}}</p>
+            </div>
+          ))}}
+        </div>
+      </section>
+
+      <section className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12 space-y-8">
+        <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
+          <div>
+            <span className="text-xs font-bold uppercase tracking-wider {}">Capabilities</span>
+            <h2 className="text-3xl font-extrabold mt-2">Core Service Modules</h2>
+          </div>
+          <Link href="/dashboard" prefetch={{false}} className="text-sm font-semibold {} hover:underline">
+            Open Full Workspace &rarr;
+          </Link>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+          {{DOMAIN_FEATURES.map((feat, idx) => (
+            <div key={{idx}} className="p-6 flex flex-col justify-between space-y-4 {}">
+              <div className="space-y-2">
+                <span className="inline-block px-2.5 py-0.5 rounded-full text-xs font-semibold {}">{{feat.badge}}</span>
+                <h3 className="text-xl font-bold">{{feat.title}}</h3>
+                <p className="text-sm leading-relaxed {}">{{feat.description}}</p>
+              </div>
+              <Link href={{feat.href}} prefetch={{false}} className="text-sm font-semibold {} hover:underline">
+                Open Module &rarr;
+              </Link>
+            </div>
+          ))}}
+        </div>
+      </section>
+
+      <section className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
+        <div className="p-8 sm:p-10 flex flex-col lg:flex-row items-start lg:items-center justify-between gap-6 {}">
+          <div className="space-y-2 max-w-2xl">
+            <span className="text-xs font-bold uppercase tracking-wider {}">Plans &amp; Tiers</span>
+            <h2 className="text-2xl sm:text-3xl font-extrabold">Start Free, Scale With Pro &amp; Enterprise</h2>
+            <p className="text-sm sm:text-base {}">
+              Compare Starter, Pro, and Enterprise tiers or inspect your active plan quotas anytime from your Account dashboard.
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-3 shrink-0">
+            <Link href="/pricing" prefetch={{false}} className="px-5 py-2.5 rounded-xl text-sm transition-all {}">
+              Compare Plans
+            </Link>
+            <Link href="/account" prefetch={{false}} className="px-5 py-2.5 rounded-xl text-sm font-semibold transition-all {}">
+              Account &amp; Tier ({{tier}})
+            </Link>
+          </div>
+        </div>
+      </section>
+
+      <section className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-14 space-y-6">
+        <div className="text-center space-y-2">
+          <span className="text-xs font-bold uppercase tracking-wider {}">FAQ</span>
+          <h2 className="text-3xl font-extrabold">Frequently Asked Questions</h2>
+        </div>
+        <div className="space-y-3">
+          {{FAQS.map((item, idx) => (
+            <div key={{idx}} className="p-5 {}">
+              <button
+                type="button"
+                onClick={{() => setOpenFaq(openFaq === idx ? null : idx)}}
+                className="w-full flex items-center justify-between text-left font-semibold text-base gap-4"
+              >
+                <span>{{item.q}}</span>
+                <span className="text-xl font-bold {}">{{openFaq === idx ? '−' : '+'}}</span>
+              </button>
+              {{openFaq === idx && (
+                <p className="mt-3 text-sm leading-relaxed {}">{{item.a}}</p>
+              )}}
+            </div>
+          ))}}
+        </div>
+      </section>
+    </div>
+  );
+}}
+"#,
+        kpis_js.join(",\n"),
+        steps_js.join(",\n"),
+        features_js.join(",\n"),
+        pills_js.join(",\n"),
+        esc_js_single(&meta.proj_name),
+        esc_js_single(&meta.proj_desc),
+        p.canvas_cls,
+        p.badge_cls,
+        badge_jsx,
+        p.text_muted,
+        tag_jsx,
+        name_jsx,
+        p.text_muted,
+        desc_jsx,
+        p.cta_cls,
+        p.secondary_btn_cls,
+        p.accent_text,
+        p.card_cls,
+        p.border_cls,
+        p.accent_text,
+        esc_tsx(preview_title),
+        name_jsx,
+        p.badge_cls,
+        p.subtle_cls,
+        p.text_muted,
+        p.accent_text,
+        p.text_muted,
+        p.text_primary,
+        p.accent_text,
+        p.border_cls,
+        p.card_cls,
+        p.accent_text,
+        p.text_muted,
+        p.accent_text,
+        p.text_muted,
+        name_jsx,
+        p.card_cls,
+        p.badge_cls,
+        p.text_muted,
+        p.accent_text,
+        p.accent_text,
+        p.card_cls,
+        p.badge_cls,
+        p.text_muted,
+        p.accent_text,
+        p.card_cls,
+        p.accent_text,
+        p.text_muted,
+        p.cta_cls,
+        p.secondary_btn_cls,
+        p.accent_text,
+        p.card_cls,
+        p.accent_text,
+        p.text_muted
+    )
+}
+
+fn build_about_page_tsx(meta: &ProjectServiceMeta) -> String {
+    let p = &meta.profile;
+    let name_jsx = esc_tsx(&meta.proj_name);
+    let desc_jsx = esc_tsx(&meta.proj_desc);
+    let arch_jsx = esc_tsx(p.archetype_tag);
+    format!(
+r#""use client";
+
+import React from 'react';
+import Link from 'next/link';
+
+export default function AboutPage() {{
+  return (
+    <div className="min-h-screen w-full {}">
+      <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-14 space-y-12">
+        <section className="space-y-4 border-b {} pb-10">
+          <span className="inline-flex px-3 py-1 rounded-full text-xs font-semibold {}">About {}</span>
+          <h1 className="text-4xl font-extrabold tracking-tight">Purpose-Built for {}</h1>
+          <p className="text-lg {} leading-relaxed">{}</p>
+        </section>
+
+        <section className="grid grid-cols-1 md:grid-cols-3 gap-6">
+          <div className="p-6 space-y-2 {}">
+            <h2 className="text-lg font-bold">Deterministic Reliability</h2>
+            <p className="text-sm {} leading-relaxed">
+              Every module in {} shares unified TypeScript contracts, resilient fallbacks, and validated domain workflows.
+            </p>
+          </div>
+          <div className="p-6 space-y-2 {}">
+            <h2 className="text-lg font-bold">Tier-Aware Governance</h2>
+            <p className="text-sm {} leading-relaxed">
+              Teams scale cleanly across Starter, Pro, and Enterprise tiers with transparent operational quotas in Account settings.
+            </p>
+          </div>
+          <div className="p-6 space-y-2 {}">
+            <h2 className="text-lg font-bold">Privacy &amp; Compliance Ready</h2>
+            <p className="text-sm {} leading-relaxed">
+              Designed around explicit data boundaries and dedicated Terms of Service and Privacy Policy documentation.
+            </p>
+          </div>
+        </section>
+
+        <section className="p-8 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-6 {}">
+          <div className="space-y-1">
+            <h2 className="text-2xl font-bold">Ready to explore {}?</h2>
+            <p className="text-sm {}">Open the live workspace or compare subscription plans for your organization.</p>
+          </div>
+          <div className="flex flex-wrap gap-3">
+            <Link href="/dashboard" prefetch={{false}} className="px-5 py-2.5 rounded-xl text-sm transition {}">
+              Go to Dashboard
+            </Link>
+            <Link href="/pricing" prefetch={{false}} className="px-5 py-2.5 rounded-xl text-sm font-semibold transition {}">
+              View Pricing
+            </Link>
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}}
+"#,
+        p.canvas_cls,
+        p.border_cls,
+        p.badge_cls,
+        name_jsx,
+        arch_jsx,
+        p.text_muted,
+        desc_jsx,
+        p.card_cls,
+        p.text_muted,
+        name_jsx,
+        p.card_cls,
+        p.text_muted,
+        p.card_cls,
+        p.text_muted,
+        p.card_cls,
+        name_jsx,
+        p.text_muted,
+        p.cta_cls,
+        p.secondary_btn_cls
+    )
+}
+
+fn build_pricing_page_tsx(meta: &ProjectServiceMeta) -> String {
+    let p = &meta.profile;
+    let name_jsx = esc_tsx(&meta.proj_name);
+    format!(
+r#""use client";
+
+import React, {{ useState }} from 'react';
+import Link from 'next/link';
+import {{ useUserTier, type UserTierId }} from '@/hooks/useUserTier';
+
+const PLANS: Array<{{
+  id: UserTierId;
+  monthly: number;
+  annual: number;
+  tagline: string;
+  popular?: boolean;
+  features: string[];
+}}> = [
+  {{
+    id: 'Starter',
+    monthly: 0,
+    annual: 0,
+    tagline: 'Core workspace workflows and preview validation for small teams.',
+    features: ['Up to 3 team seats', '2 active workspaces', '5,000 monthly operations', '14-day activity retention'],
+  }},
+  {{
+    id: 'Pro',
+    monthly: 49,
+    annual: 39,
+    popular: true,
+    tagline: 'Full operational automation, analytics, and team priority controls.',
+    features: ['Up to 25 team seats', '15 active workspaces', '100,000 monthly operations', '180-day audit retention', 'Priority automation triggers'],
+  }},
+  {{
+    id: 'Enterprise',
+    monthly: 199,
+    annual: 159,
+    tagline: 'Dedicated governance, unlimited scale, and custom SLA compliance.',
+    features: ['Up to 250 seats + SSO', 'Unlimited workspaces', '5,000,000 monthly operations', '365-day immutable retention', 'Dedicated legal & security review'],
+  }},
+];
+
+export default function PricingPage() {{
+  const {{ tier, billingCycle, setTier, setBillingCycle }} = useUserTier();
+  const [notice, setNotice] = useState<string>('');
+
+  const handleSelectPlan = (planId: UserTierId) => {{
+    setTier(planId);
+    setNotice(`Active plan switched to ${{planId}} (${{billingCycle}} billing). Check Account to test quota updates.`);
+  }};
+
+  return (
+    <div className="min-h-screen w-full {}">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-14 space-y-10">
+        <div className="text-center max-w-2xl mx-auto space-y-4">
+          <span className="inline-flex px-3 py-1 rounded-full text-xs font-semibold {}">{} Pricing</span>
+          <h1 className="text-4xl font-extrabold tracking-tight">Plans Built to Scale With Your Team</h1>
+          <p className="text-base {}">Switch plans immediately in preview mode to test tier-gated features and limits in Account and Dashboard.</p>
+
+          <div className="inline-flex items-center p-1 rounded-xl border {} {}">
+            <button
+              type="button"
+              onClick={{() => setBillingCycle('monthly')}}
+              className={{`px-4 py-2 rounded-lg text-sm font-semibold transition ${{billingCycle === 'monthly' ? '{}' : '{}'}}`}}
+            >
+              Monthly
+            </button>
+            <button
+              type="button"
+              onClick={{() => setBillingCycle('annual')}}
+              className={{`px-4 py-2 rounded-lg text-sm font-semibold transition ${{billingCycle === 'annual' ? '{}' : '{}'}}`}}
+            >
+              Annual (Save 20%)
+            </button>
+          </div>
+        </div>
+
+        {{notice && (
+          <div className="max-w-3xl mx-auto p-4 flex flex-col sm:flex-row items-center justify-between gap-3 {}">
+            <span className="text-sm font-medium">{{notice}}</span>
+            <Link href="/account" prefetch={{false}} className="text-sm font-bold {} hover:underline">
+              Open Account Dashboard &rarr;
+            </Link>
+          </div>
+        )}}
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+          {{PLANS.map((plan) => {{
+            const price = billingCycle === 'monthly' ? plan.monthly : plan.annual;
+            const isCurrent = tier === plan.id;
+            return (
+              <div key={{plan.id}} className={{`p-7 flex flex-col justify-between space-y-6 ${{plan.popular ? 'ring-2 ring-indigo-500' : ''}} {}`}}>
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between">
+                    <h2 className="text-2xl font-bold">{{plan.id}}</h2>
+                    {{plan.popular && (
+                      <span className="px-2.5 py-0.5 rounded-full text-xs font-semibold {}">Most Popular</span>
+                    )}}
+                  </div>
+                  <div className="flex items-baseline gap-1">
+                    <span className="text-4xl font-extrabold">${{price}}</span>
+                    <span className="text-sm {}">/ month</span>
+                  </div>
+                  <p className="text-sm {}">{{plan.tagline}}</p>
+                  <ul className="space-y-2.5 pt-2">
+                    {{plan.features.map((feat, idx) => (
+                      <li key={{idx}} className="flex items-center gap-2 text-sm">
+                        <span className="font-bold {}">&#10003;</span>
+                        <span>{{feat}}</span>
+                      </li>
+                    ))}}
+                  </ul>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={{() => handleSelectPlan(plan.id)}}
+                  className={{`w-full py-2.5 px-4 rounded-xl text-sm transition ${{isCurrent ? '{}' : '{}'}}`}}
+                >
+                  {{isCurrent ? `Current Plan (${{plan.id}})` : `Activate ${{plan.id}}`}}
+                </button>
+              </div>
+            );
+          }})}}
+        </div>
+      </div>
+    </div>
+  );
+}}
+"#,
+        p.canvas_cls,
+        p.badge_cls,
+        name_jsx,
+        p.text_muted,
+        p.border_cls,
+        p.subtle_cls,
+        p.cta_cls,
+        p.text_muted,
+        p.cta_cls,
+        p.text_muted,
+        p.card_cls,
+        p.accent_text,
+        p.card_cls,
+        p.badge_cls,
+        p.text_muted,
+        p.text_muted,
+        p.accent_text,
+        p.secondary_btn_cls,
+        p.cta_cls
+    )
+}
+
+fn build_account_page_tsx(meta: &ProjectServiceMeta) -> String {
+    let p = &meta.profile;
+    let name_jsx = esc_tsx(&meta.proj_name);
+    let primary_entity = meta
+        .models
+        .first()
+        .map(|m| humanize_slug_label(m))
+        .unwrap_or_else(|| "Workspaces".to_string());
+    format!(
+r#""use client";
+
+import React, {{ useState }} from 'react';
+import Link from 'next/link';
+import {{ useUserTier, type UserTierId }} from '@/hooks/useUserTier';
+
+export default function AccountPage() {{
+  const {{ tier, billingCycle, setTier, setBillingCycle, limits, isProOrAbove, isEnterprise }} = useUserTier();
+  const [displayName, setDisplayName] = useState('Operations Lead');
+  const [email, setEmail] = useState('lead@example.com');
+  const [alertsEnabled, setAlertsEnabled] = useState(true);
+  const [savedMsg, setSavedMsg] = useState('');
+
+  const usedSeats = tier === 'Starter' ? 2 : tier === 'Pro' ? 11 : 48;
+  const usedOps = tier === 'Starter' ? 2150 : tier === 'Pro' ? 34800 : 420000;
+  const seatPct = Math.min(100, Math.round((usedSeats / limits.seats) * 100));
+  const opsPct = Math.min(100, Math.round((usedOps / limits.monthlyOperations) * 100));
+
+  const handleSaveProfile = (e: React.FormEvent) => {{
+    e.preventDefault();
+    setSavedMsg('Account preferences updated.');
+  }};
+
+  return (
+    <div className="min-h-screen w-full {}">
+      <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-12 space-y-8">
+        <header className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b {} pb-6">
+          <div>
+            <span className="inline-flex px-2.5 py-0.5 rounded-full text-xs font-semibold {}">User-Tier Account Dashboard</span>
+            <h1 className="text-3xl font-extrabold mt-2">{} Account &amp; Subscription</h1>
+            <p className="text-sm {} mt-1">Manage active plan tier, operational quotas, and profile preferences.</p>
+          </div>
+          <div className="flex flex-wrap gap-3">
+            <Link href="/pricing" prefetch={{false}} className="px-4 py-2 rounded-xl text-sm font-semibold {}">
+              Compare Pricing
+            </Link>
+            <Link href="/dashboard" prefetch={{false}} className="px-4 py-2 rounded-xl text-sm {}">
+              Open Dashboard
+            </Link>
+          </div>
+        </header>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          <div className="lg:col-span-2 p-6 space-y-6 {}">
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-wider {}">Active Subscription Tier</p>
+                <h2 className="text-2xl font-extrabold mt-1">{{tier}} Plan ({{billingCycle}})</h2>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {{(['Starter', 'Pro', 'Enterprise'] as UserTierId[]).map((t) => (
+                  <button
+                    key={{t}}
+                    type="button"
+                    onClick={{() => setTier(t)}}
+                    className={{`px-3.5 py-1.5 rounded-lg text-xs font-bold transition ${{tier === t ? '{}' : '{}'}}`}}
+                  >
+                    {{t}}
+                  </button>
+                ))}}
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div className="p-4 space-y-2 {}">
+                <div className="flex justify-between text-xs font-semibold">
+                  <span>Team Seats</span>
+                  <span>{{usedSeats}} / {{limits.seats}}</span>
+                </div>
+                <div className="w-full h-2 rounded-full bg-slate-700/30 overflow-hidden">
+                  <div className="h-full rounded-full {}" style={{{{ width: `${{seatPct}}%` }}}} />
+                </div>
+              </div>
+              <div className="p-4 space-y-2 {}">
+                <div className="flex justify-between text-xs font-semibold">
+                  <span>Monthly {} Operations</span>
+                  <span>{{usedOps.toLocaleString()}} / {{limits.monthlyOperations.toLocaleString()}}</span>
+                </div>
+                <div className="w-full h-2 rounded-full bg-slate-700/30 overflow-hidden">
+                  <div className="h-full rounded-full {}" style={{{{ width: `${{opsPct}}%` }}}} />
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-2">
+              <div className="p-4 {}">
+                <p className="text-xs {}">Workspaces</p>
+                <p className="text-lg font-bold mt-0.5">{{limits.workspaces}}</p>
+              </div>
+              <div className="p-4 {}">
+                <p className="text-xs {}">Audit Retention</p>
+                <p className="text-lg font-bold mt-0.5">{{limits.retentionDays}} days</p>
+              </div>
+              <div className="p-4 {}">
+                <p className="text-xs {}">Billing Cadence</p>
+                <button
+                  type="button"
+                  onClick={{() => setBillingCycle(billingCycle === 'monthly' ? 'annual' : 'monthly')}}
+                  className="text-sm font-bold {} hover:underline mt-0.5"
+                >
+                  {{billingCycle === 'monthly' ? 'Switch to Annual (-20%)' : 'Annual Active (Switch)'}}
+                </button>
+              </div>
+            </div>
+
+            <div className="p-4 space-y-2 {}">
+              <h3 className="text-sm font-bold">Tier Entitlements</h3>
+              <div className="flex flex-wrap gap-2 text-xs">
+                <span className="px-2.5 py-1 rounded-full font-semibold {}">Core Workspace: Unlocked</span>
+                <span className="px-2.5 py-1 rounded-full font-semibold {}">
+                  Priority Automation: {{isProOrAbove ? 'Unlocked (Pro+)' : 'Requires Pro'}}
+                </span>
+                <span className="px-2.5 py-1 rounded-full font-semibold {}">
+                  Enterprise SSO &amp; Governance: {{isEnterprise ? 'Unlocked' : 'Requires Enterprise'}}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <form onSubmit={{handleSaveProfile}} className="p-6 space-y-4 {}">
+            <h2 className="text-xl font-bold">Profile Settings</h2>
+            <div>
+              <label className="block text-xs font-semibold mb-1 {}">Display Name</label>
+              <input
+                type="text"
+                value={{displayName}}
+                onChange={{(e) => setDisplayName(e.target.value)}}
+                className="w-full rounded-xl px-3 py-2 text-sm border {} bg-transparent"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold mb-1 {}">Work Email</label>
+              <input
+                type="email"
+                value={{email}}
+                onChange={{(e) => setEmail(e.target.value)}}
+                className="w-full rounded-xl px-3 py-2 text-sm border {} bg-transparent"
+              />
+            </div>
+            <label className="flex items-center gap-2 text-sm cursor-pointer">
+              <input
+                type="checkbox"
+                checked={{alertsEnabled}}
+                onChange={{(e) => setAlertsEnabled(e.target.checked)}}
+              />
+              <span>Enable real-time tier &amp; status alerts</span>
+            </label>
+            <button type="submit" className="w-full py-2.5 rounded-xl text-sm {}">
+              Save Preferences
+            </button>
+            {{savedMsg && <p className="text-xs font-semibold {}">{{savedMsg}}</p>}}
+            <div className="pt-3 border-t {} flex flex-wrap gap-4 text-xs {}">
+              <Link href="/legal/terms" prefetch={{false}} className="hover:underline">Terms of Service</Link>
+              <Link href="/legal/privacy" prefetch={{false}} className="hover:underline">Privacy Policy</Link>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+  );
+}}
+"#,
+        p.canvas_cls,
+        p.border_cls,
+        p.badge_cls,
+        name_jsx,
+        p.text_muted,
+        p.secondary_btn_cls,
+        p.cta_cls,
+        p.card_cls,
+        p.accent_text,
+        p.cta_cls,
+        p.secondary_btn_cls,
+        p.subtle_cls,
+        p.progress_fill,
+        p.subtle_cls,
+        esc_tsx(&primary_entity),
+        p.progress_fill,
+        p.subtle_cls,
+        p.text_muted,
+        p.subtle_cls,
+        p.text_muted,
+        p.subtle_cls,
+        p.text_muted,
+        p.accent_text,
+        p.subtle_cls,
+        p.badge_cls,
+        p.badge_cls,
+        p.badge_cls,
+        p.card_cls,
+        p.text_muted,
+        p.border_cls,
+        p.text_muted,
+        p.border_cls,
+        p.cta_cls,
+        p.accent_text,
+        p.border_cls,
+        p.text_muted
+    )
+}
+
+fn build_legal_terms_page_tsx(meta: &ProjectServiceMeta) -> String {
+    let p = &meta.profile;
+    let name_jsx = esc_tsx(&meta.proj_name);
+    format!(
+r#""use client";
+
+import React from 'react';
+import Link from 'next/link';
+
+export default function TermsOfServicePage() {{
+  return (
+    <div className="min-h-screen w-full {}">
+      <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-12 space-y-8">
+        <div className="p-4 rounded-xl border border-amber-500/40 bg-amber-500/10 text-amber-300 text-sm">
+          <strong>Legal Disclaimer:</strong> This Terms of Service template is a baseline prototype document generated for <strong>{}</strong>. Please consult a qualified legal team before launching in production.
+        </div>
+
+        <header className="space-y-2 border-b {} pb-6">
+          <h1 className="text-3xl font-extrabold">Terms of Service</h1>
+          <p className="text-sm {}">Last updated: Baseline Service Draft &middot; {}</p>
+        </header>
+
+        <div className="space-y-6 text-sm leading-relaxed {}">
+          <section className="p-6 space-y-2 {}">
+            <h2 className="text-lg font-bold {}">1. Acceptance of Terms</h2>
+            <p>By accessing or using {}, you agree to operate workspaces, automated workflows, and subscription tier resources responsibly in compliance with applicable laws.</p>
+          </section>
+          <section className="p-6 space-y-2 {}">
+            <h2 className="text-lg font-bold {}">2. Subscription Tiers &amp; Usage Limits</h2>
+            <p>Service access scales across Starter, Pro, and Enterprise plans with defined seat, workspace, and monthly operational quotas managed in the Account dashboard.</p>
+          </section>
+          <section className="p-6 space-y-2 {}">
+            <h2 className="text-lg font-bold {}">3. Operational Responsibility</h2>
+            <p>Customers remain responsible for verifying domain outputs, engineering or financial thresholds, and maintaining authorized credentials within their tenant workspace.</p>
+          </section>
+        </div>
+
+        <div className="flex flex-wrap gap-4 text-sm font-semibold">
+          <Link href="/legal/privacy" prefetch={{false}} className="{} hover:underline">Read Privacy Policy &rarr;</Link>
+          <Link href="/" prefetch={{false}} className="{} hover:underline">Back to Home</Link>
+        </div>
+      </div>
+    </div>
+  );
+}}
+"#,
+        p.canvas_cls,
+        name_jsx,
+        p.border_cls,
+        p.text_muted,
+        name_jsx,
+        p.text_muted,
+        p.card_cls,
+        p.text_primary,
+        name_jsx,
+        p.card_cls,
+        p.text_primary,
+        p.card_cls,
+        p.text_primary,
+        p.accent_text,
+        p.text_muted
+    )
+}
+
+fn build_legal_privacy_page_tsx(meta: &ProjectServiceMeta) -> String {
+    let p = &meta.profile;
+    let name_jsx = esc_tsx(&meta.proj_name);
+    let scope_jsx = esc_tsx(p.privacy_scope);
+    format!(
+r#""use client";
+
+import React from 'react';
+import Link from 'next/link';
+
+export default function PrivacyPolicyPage() {{
+  return (
+    <div className="min-h-screen w-full {}">
+      <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-12 space-y-8">
+        <div className="p-4 rounded-xl border border-amber-500/40 bg-amber-500/10 text-amber-300 text-sm">
+          <strong>Legal Disclaimer:</strong> This Privacy Policy template is a baseline prototype document generated for <strong>{}</strong>. Please consult a qualified legal and privacy compliance team before production deployment.
+        </div>
+
+        <header className="space-y-2 border-b {} pb-6">
+          <h1 className="text-3xl font-extrabold">Privacy Policy</h1>
+          <p className="text-sm {}">Data Governance Overview &middot; {}</p>
+        </header>
+
+        <div className="space-y-6 text-sm leading-relaxed {}">
+          <section className="p-6 space-y-2 {}">
+            <h2 className="text-lg font-bold {}">1. Information Processed</h2>
+            <p>{} processes {}, strictly scoped to delivering workspace functionality and audit visibility.</p>
+          </section>
+          <section className="p-6 space-y-2 {}">
+            <h2 className="text-lg font-bold {}">2. Retention &amp; Access Controls</h2>
+            <p>Audit and operational records follow your active Starter, Pro, or Enterprise retention schedule and are restricted to authenticated organization members.</p>
+          </section>
+          <section className="p-6 space-y-2 {}">
+            <h2 className="text-lg font-bold {}">3. User Rights &amp; Preferences</h2>
+            <p>Account owners can review profile details, adjust notification preferences, or export/delete workspace records through the Account dashboard.</p>
+          </section>
+        </div>
+
+        <div className="flex flex-wrap gap-4 text-sm font-semibold">
+          <Link href="/legal/terms" prefetch={{false}} className="{} hover:underline">Read Terms of Service &rarr;</Link>
+          <Link href="/account" prefetch={{false}} className="{} hover:underline">Manage Account Preferences</Link>
+        </div>
+      </div>
+    </div>
+  );
+}}
+"#,
+        p.canvas_cls,
+        name_jsx,
+        p.border_cls,
+        p.text_muted,
+        name_jsx,
+        p.text_muted,
+        p.card_cls,
+        p.text_primary,
+        name_jsx,
+        scope_jsx,
+        p.card_cls,
+        p.text_primary,
+        p.card_cls,
+        p.text_primary,
+        p.accent_text,
+        p.text_muted
+    )
+}
+
+fn build_blog_page_tsx(meta: &ProjectServiceMeta) -> String {
+    let p = &meta.profile;
+    let name_js = esc_js_single(&meta.proj_name);
+    let name_jsx = esc_tsx(&meta.proj_name);
+    let topic_jsx = esc_tsx(p.blog_topic_label);
+    format!(
+r#""use client";
+
+import React, {{ useState }} from 'react';
+import Link from 'next/link';
+
+const POSTS = [
+  {{
+    id: 'architecture',
+    category: 'Architecture',
+    title: 'Designing High-Trust Operational Workflows in {}',
+    summary: 'How deterministic validation, role-scoped permissions, and live telemetry eliminate silent failures.',
+    body: '{} combines schema-validated API handlers, optimistic preview data, and tier governance so teams ship faster with zero regressions.',
+  }},
+  {{
+    id: 'tiers',
+    category: 'Operations',
+    title: 'Scaling From Starter Prototypes to Enterprise Governance',
+    summary: 'Structuring team seats, audit retention windows, and SLA alerts across growing organizations.',
+    body: 'Use the Pricing and Account views to configure Starter, Pro, or Enterprise tier entitlements and inspect live quota utilization.',
+  }},
+  {{
+    id: 'compliance',
+    category: 'Compliance',
+    title: 'Traceability Checklists and Automated Verification',
+    summary: 'Practical guardrails for continuous status reporting and team handoffs.',
+    body: 'Consistent status tracking ensures every workflow action produces an auditable trail from ingestion through final sign-off.',
+  }},
+];
+
+export default function BlogPage() {{
+  const [filter, setFilter] = useState<string>('All');
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const categories = ['All', 'Architecture', 'Operations', 'Compliance'];
+  const visible = filter === 'All' ? POSTS : POSTS.filter((post) => post.category === filter);
+  const activePost = POSTS.find((post) => post.id === selectedId) || null;
+
+  return (
+    <div className="min-h-screen w-full {}">
+      <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-12 space-y-8">
+        <header className="space-y-3 border-b {} pb-6">
+          <span className="inline-flex px-3 py-1 rounded-full text-xs font-semibold {}">{}</span>
+          <h1 className="text-4xl font-extrabold tracking-tight">{} Insights &amp; Guides</h1>
+          <p className="text-base {}">Field dispatches, architecture notes, and release playbooks.</p>
+          <div className="flex flex-wrap gap-2 pt-2">
+            {{categories.map((cat) => (
+              <button
+                key={{cat}}
+                type="button"
+                onClick={{() => setFilter(cat)}}
+                className={{`px-3.5 py-1.5 rounded-xl text-xs font-semibold transition ${{filter === cat ? '{}' : '{}'}}`}}
+              >
+                {{cat}}
+              </button>
+            ))}}
+          </div>
+        </header>
+
+        {{activePost && (
+          <div className="p-6 space-y-3 {}">
+            <div className="flex items-center justify-between">
+              <span className="px-2.5 py-0.5 rounded-full text-xs font-semibold {}">{{activePost.category}}</span>
+              <button type="button" onClick={{() => setSelectedId(null)}} className="text-xs font-semibold {} hover:underline">Close Reader</button>
+            </div>
+            <h2 className="text-2xl font-bold">{{activePost.title}}</h2>
+            <p className="text-sm leading-relaxed {}">{{activePost.body}}</p>
+          </div>
+        )}}
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+          {{visible.map((post) => (
+            <article key={{post.id}} className="p-6 flex flex-col justify-between space-y-4 {}">
+              <div className="space-y-2">
+                <span className="inline-block px-2.5 py-0.5 rounded-full text-xs font-semibold {}">{{post.category}}</span>
+                <h2 className="text-xl font-bold">{{post.title}}</h2>
+                <p className="text-sm {}">{{post.summary}}</p>
+              </div>
+              <button
+                type="button"
+                onClick={{() => setSelectedId(post.id)}}
+                className="text-left text-sm font-semibold {} hover:underline"
+              >
+                Read Dispatch &rarr;
+              </button>
+            </article>
+          ))}}
+        </div>
+
+        <div className="pt-4">
+          <Link href="/dashboard" prefetch={{false}} className="text-sm font-semibold {} hover:underline">
+            &larr; Return to Workspace Dashboard
+          </Link>
+        </div>
+      </div>
+    </div>
+  );
+}}
+"#,
+        name_js,
+        name_js,
+        p.canvas_cls,
+        p.border_cls,
+        p.badge_cls,
+        topic_jsx,
+        name_jsx,
+        p.text_muted,
+        p.cta_cls,
+        p.secondary_btn_cls,
+        p.card_cls,
+        p.badge_cls,
+        p.accent_text,
+        p.text_muted,
+        p.card_cls,
+        p.badge_cls,
+        p.text_muted,
+        p.accent_text,
+        p.accent_text
+    )
+}
+
+fn build_industry_navbar_tsx(meta: &ProjectServiceMeta, nav_links: &[(String, String)]) -> String {
+    let p = &meta.profile;
+    let name_jsx = esc_tsx(&meta.proj_name);
+    let links_js: Vec<String> = nav_links
+        .iter()
+        .map(|(href, lbl)| format!("  {{ href: '{}', label: '{}' }}", esc_js_single(href), esc_js_single(lbl)))
+        .collect();
+    let header_bg = if p.is_dark {
+        "bg-slate-950/90 border-slate-800 text-slate-100"
+    } else {
+        "bg-white/90 border-slate-200/80 text-slate-900"
+    };
+    let nav_link_cls = if p.is_dark {
+        "text-slate-300 hover:text-white hover:bg-slate-800"
+    } else {
+        "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
+    };
+    let mobile_bg = if p.is_dark { "bg-slate-950 border-slate-800" } else { "bg-white border-slate-200" };
+
+    format!(
+r#""use client";
+
+import React, {{ useState }} from 'react';
+import Link from 'next/link';
+import {{ usePathname }} from 'next/navigation';
+import {{ useUserTier }} from '@/hooks/useUserTier';
+
+interface NavbarProps {{
+  children?: React.ReactNode;
+  [key: string]: any;
+}}
+
+const NAV_ITEMS = [
+{}
+];
+
+const Navbar: React.FC<NavbarProps> = () => {{
+  const pathname = usePathname();
+  const {{ tier }} = useUserTier();
+  const [mobileOpen, setMobileOpen] = useState(false);
+
+  return (
+    <header className="sticky top-0 z-50 w-full backdrop-blur-md border-b shadow-sm {}">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">
+        <Link href="/" prefetch={{false}} className="flex items-center gap-2.5 shrink-0">
+          <div className="w-9 h-9 rounded-xl flex items-center justify-center {}">
+            <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
+            </svg>
+          </div>
+          <span className="text-lg font-extrabold tracking-tight">{}</span>
+        </Link>
+
+        <nav className="hidden md:flex items-center gap-1 overflow-x-auto">
+          {{NAV_ITEMS.map((item) => {{
+            const active = pathname === item.href;
+            return (
+              <Link
+                key={{item.href}}
+                href={{item.href}}
+                prefetch={{false}}
+                className={{`px-3 py-2 rounded-lg text-sm font-medium whitespace-nowrap transition-colors ${{active ? '{}' : '{}'}}`}}
+              >
+                {{item.label}}
+              </Link>
+            );
+          }})}}
+        </nav>
+
+        <div className="hidden md:flex items-center gap-2.5 shrink-0">
+          <Link href="/account" prefetch={{false}} className="px-3 py-1.5 rounded-full text-xs font-semibold {}">
+            Account ({{tier}})
+          </Link>
+          {}
+        </div>
+
+        <button
+          type="button"
+          onClick={{() => setMobileOpen(!mobileOpen)}}
+          className="md:hidden inline-flex items-center justify-center p-2 rounded-lg {}"
+          aria-label="Toggle Menu"
+        >
+          <svg className="w-6 h-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            {{mobileOpen ? (
+              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+            ) : (
+              <path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 12h16M4 18h16" />
+            )}}
+          </svg>
+        </button>
+      </div>
+
+      {{mobileOpen && (
+        <nav className="md:hidden border-t px-4 py-3 space-y-1.5 shadow-lg {}">
+          {{NAV_ITEMS.map((item) => (
+            <Link
+              key={{item.href}}
+              href={{item.href}}
+              prefetch={{false}}
+              onClick={{() => setMobileOpen(false)}}
+              className="block px-3 py-2 rounded-lg text-sm font-medium {}"
+            >
+              {{item.label}}
+            </Link>
+          ))}}
+          <Link
+            href="/account"
+            prefetch={{false}}
+            onClick={{() => setMobileOpen(false)}}
+            className="block px-3 py-2 rounded-lg text-sm font-semibold {}"
+          >
+            Account ({{tier}})
+          </Link>
+        </nav>
+      )}}
+    </header>
+  );
+}};
+
+export {{ Navbar }};
+export default Navbar;
+"#,
+        links_js.join(",\n"),
+        header_bg,
+        p.cta_cls,
+        name_jsx,
+        p.badge_cls,
+        nav_link_cls,
+        p.badge_cls,
+        if meta.has_auth_routes {
+            format!(
+                "<Link href=\"/login\" prefetch={{false}} className=\"px-3.5 py-2 rounded-xl text-sm {}\">Sign In</Link>",
+                p.cta_cls
+            )
+        } else {
+            format!(
+                "<Link href=\"/dashboard\" prefetch={{false}} className=\"px-3.5 py-2 rounded-xl text-sm {}\">Workspace</Link>",
+                p.cta_cls
+            )
+        },
+        nav_link_cls,
+        mobile_bg,
+        nav_link_cls,
+        p.accent_text
+    )
+}
+
+fn build_industry_footer_tsx(meta: &ProjectServiceMeta) -> String {
+    let p = &meta.profile;
+    let name_jsx = esc_tsx(&meta.proj_name);
+    let desc_jsx = esc_tsx(&meta.proj_desc);
+    let mut product_links: Vec<(String, String)> = vec![
+        ("/dashboard".to_string(), "Workspace Dashboard".to_string()),
+        ("/pricing".to_string(), "Pricing & Plans".to_string()),
+        ("/account".to_string(), "Account & Quotas".to_string()),
+    ];
+    for (r, l) in meta.domain_routes.iter().take(3) {
+        product_links.push((r.clone(), l.clone()));
+    }
+    let prod_jsx: Vec<String> = product_links
+        .into_iter()
+        .map(|(h, l)| {
+            format!(
+                "            <li><Link href=\"{}\" prefetch={{false}} className=\"hover:underline\">{}</Link></li>",
+                h,
+                esc_tsx(&l)
+            )
+        })
+        .collect();
+    let blog_li = if meta.include_blog {
+        "\n            <li><Link href=\"/blog\" prefetch={false} className=\"hover:underline\">Insights &amp; Blog</Link></li>"
+    } else {
+        ""
+    };
+
+    format!(
+r#""use client";
+
+import React from 'react';
+import Link from 'next/link';
+
+const Footer: React.FC<any> = () => {{
+  return (
+    <footer className="mt-auto w-full border-t {} {}">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-8">
+        <div className="space-y-3">
+          <Link href="/" prefetch={{false}} className="text-lg font-extrabold tracking-tight">{}</Link>
+          <p className="text-xs leading-relaxed {}">{}</p>
+        </div>
+        <div className="space-y-2.5">
+          <h3 className="text-xs font-bold uppercase tracking-wider {}">Product</h3>
+          <ul className="space-y-1.5 text-sm {}">
+{}
+          </ul>
+        </div>
+        <div className="space-y-2.5">
+          <h3 className="text-xs font-bold uppercase tracking-wider {}">Company</h3>
+          <ul className="space-y-1.5 text-sm {}">
+            <li><Link href="/about" prefetch={{false}} className="hover:underline">About</Link></li>
+            <li><Link href="/pricing" prefetch={{false}} className="hover:underline">Plans &amp; Tiers</Link></li>{}
+          </ul>
+        </div>
+        <div className="space-y-2.5">
+          <h3 className="text-xs font-bold uppercase tracking-wider {}">Legal &amp; Trust</h3>
+          <ul className="space-y-1.5 text-sm {}">
+            <li><Link href="/legal/terms" prefetch={{false}} className="hover:underline">Terms of Service</Link></li>
+            <li><Link href="/legal/privacy" prefetch={{false}} className="hover:underline">Privacy Policy</Link></li>
+          </ul>
+          <p className="text-[11px] {}">Prototype legal templates included — consult your legal team before production.</p>
+        </div>
+      </div>
+      <div className="border-t {} py-4 text-center text-xs {}">
+        &copy; {{new Date().getFullYear()}} {}. All rights reserved.
+      </div>
+    </footer>
+  );
+}};
+
+export {{ Footer }};
+export default Footer;
+"#,
+        p.border_cls,
+        if p.is_dark { "bg-slate-950 text-slate-200" } else { "bg-white text-slate-900" },
+        name_jsx,
+        p.text_muted,
+        desc_jsx,
+        p.accent_text,
+        p.text_muted,
+        prod_jsx.join("\n"),
+        p.accent_text,
+        p.text_muted,
+        blog_li,
+        p.accent_text,
+        p.text_muted,
+        p.text_muted,
+        p.border_cls,
+        p.text_muted,
+        name_jsx
+    )
+}
+
+fn ensure_complete_service_pages_and_shell(proj_dir: &std::path::Path, meta: &ProjectServiceMeta) {
+    let src_app = proj_dir.join("src/app");
+    let _ = std::fs::create_dir_all(&src_app);
+
+    ensure_user_tier_hook(proj_dir, meta);
+
+    // 1. Desktop Workspace Dashboard (`src/renderer/components/*` -> `src/app/dashboard/page.tsx`)
+    let dashboard_page = src_app.join("dashboard/page.tsx");
+    if !dashboard_page.exists() && !src_app.join("dashboard/page.jsx").exists() {
+        if meta.is_desktop && proj_dir.join("src/renderer/components").is_dir() {
+            let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(proj_dir.join("src/renderer/components"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.is_file()
+                        && p.extension().and_then(|e| e.to_str()).map_or(false, |ext| ext == "tsx" || ext == "jsx")
+                })
+                .collect();
+            entries.sort();
+
+            let mut imports = Vec::new();
+            let mut module_defs = Vec::new();
+            for p in entries {
+                let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else { continue };
+                if matches!(stem, "LandingPage" | "Navbar" | "Footer" | "Sidebar" | "Header") {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&p) else { continue };
+                let idx = imports.len();
+                let alias = format!("DesktopMod{}", idx);
+                if src.contains("export default") {
+                    imports.push(format!("import {} from '@/renderer/components/{}';", alias, stem));
+                } else if has_named_export_symbol(&src, stem) {
+                    imports.push(format!("import {{ {} as {} }} from '@/renderer/components/{}';", stem, alias, stem));
+                } else {
+                    continue;
+                }
+                let label = humanize_slug_label(stem);
+                module_defs.push(format!(
+                    "  {{ id: '{}', label: '{}', Component: {} as React.ComponentType<any> }}",
+                    esc_js_single(stem),
+                    esc_js_single(&label),
+                    alias
+                ));
+            }
+
+            if !module_defs.is_empty() {
+                let _ = std::fs::create_dir_all(src_app.join("dashboard"));
+                let code = format!(
+r#""use client";
+
+import React, {{ useState }} from 'react';
+import Link from 'next/link';
+import {{ useUserTier }} from '@/hooks/useUserTier';
+{}
+
+const WORKSPACE_MODULES: Array<{{ id: string; label: string; Component: React.ComponentType<any> }}> = [
+{}
+];
+
+export default function DesktopDashboardPage() {{
+  const [activeIdx, setActiveIdx] = useState(0);
+  const {{ tier }} = useUserTier();
+  const active = WORKSPACE_MODULES[activeIdx] || WORKSPACE_MODULES[0];
+  const ActiveComp = active.Component;
+
+  return (
+    <div className="min-h-screen w-full {}">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-6">
+        <header className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b {} pb-5">
+          <div>
+            <span className="inline-flex px-2.5 py-0.5 rounded-full text-xs font-semibold {}">Desktop Workspace &middot; {{tier}}</span>
+            <h1 className="text-3xl font-extrabold mt-1">{} Command Center</h1>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Link href="/account" prefetch={{false}} className="px-4 py-2 rounded-xl text-xs font-semibold {}">Account ({{tier}})</Link>
+            <Link href="/pricing" prefetch={{false}} className="px-4 py-2 rounded-xl text-xs {}">Upgrade Tier</Link>
+          </div>
+        </header>
+
+        <div className="flex flex-wrap gap-2">
+          {{WORKSPACE_MODULES.map((mod, idx) => (
+            <button
+              key={{mod.id}}
+              type="button"
+              onClick={{() => setActiveIdx(idx)}}
+              className={{`px-4 py-2 rounded-xl text-sm font-semibold transition ${{activeIdx === idx ? '{}' : '{}'}}`}}
+            >
+              {{mod.label}}
+            </button>
+          ))}}
+        </div>
+
+        <div className="p-4 sm:p-6 {}">
+          <ActiveComp {{...({{}} as any)}} />
+        </div>
+      </div>
+    </div>
+  );
+}}
+"#,
+                    imports.join("\n"),
+                    module_defs.join(",\n"),
+                    meta.profile.canvas_cls,
+                    meta.profile.border_cls,
+                    meta.profile.badge_cls,
+                    esc_tsx(&meta.proj_name),
+                    meta.profile.secondary_btn_cls,
+                    meta.profile.cta_cls,
+                    meta.profile.cta_cls,
+                    meta.profile.secondary_btn_cls,
+                    meta.profile.card_cls
+                );
+                let _ = std::fs::write(&dashboard_page, code);
+            }
+        } else if meta.is_mobile && proj_dir.join("app/(tabs)").is_dir() {
+            let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(proj_dir.join("app/(tabs)"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.is_file()
+                        && p.extension().and_then(|e| e.to_str()).map_or(false, |ext| ext == "tsx" || ext == "jsx")
+                })
+                .collect();
+            entries.sort();
+
+            let mut imports = Vec::new();
+            let mut tab_defs = Vec::new();
+            for p in entries {
+                let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else { continue };
+                if stem.starts_with('_') || matches!(stem, "index" | "layout" | "page") {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&p) else { continue };
+                if !src.contains("export default") {
+                    continue;
+                }
+                let alias = format!("MobileTab{}", imports.len());
+                imports.push(format!("import {} from '../../../app/(tabs)/{}';", alias, stem));
+                tab_defs.push(format!(
+                    "  {{ id: '{}', label: '{}', href: '/{}', Component: {} as React.ComponentType<any> }}",
+                    esc_js_single(stem),
+                    esc_js_single(&humanize_slug_label(stem)),
+                    esc_js_single(stem),
+                    alias
+                ));
+            }
+            if !tab_defs.is_empty() {
+                let _ = std::fs::create_dir_all(src_app.join("dashboard"));
+                let code = format!(
+r#""use client";
+
+import React, {{ useState }} from 'react';
+import Link from 'next/link';
+import {{ useUserTier }} from '@/hooks/useUserTier';
+{}
+
+const MOBILE_TABS: Array<{{ id: string; label: string; href: string; Component: React.ComponentType<any> }}> = [
+{}
+];
+
+export default function MobileDashboardPage() {{
+  const [activeIdx, setActiveIdx] = useState(0);
+  const {{ tier }} = useUserTier();
+  const active = MOBILE_TABS[activeIdx] || MOBILE_TABS[0];
+  const ActiveTab = active.Component;
+
+  return (
+    <div className="min-h-screen w-full {}">
+      <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-6">
+        <header className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b {} pb-5">
+          <div>
+            <span className="inline-flex px-2.5 py-0.5 rounded-full text-xs font-semibold {}">Mobile Tabs Hub &middot; {{tier}}</span>
+            <h1 className="text-3xl font-extrabold mt-1">{} Workspace</h1>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Link href={{active.href}} prefetch={{false}} className="px-4 py-2 rounded-xl text-xs font-semibold {}">Open Dedicated Route</Link>
+            <Link href="/account" prefetch={{false}} className="px-4 py-2 rounded-xl text-xs {}">Account ({{tier}})</Link>
+          </div>
+        </header>
+
+        <div className="flex flex-wrap gap-2">
+          {{MOBILE_TABS.map((tab, idx) => (
+            <button
+              key={{tab.id}}
+              type="button"
+              onClick={{() => setActiveIdx(idx)}}
+              className={{`px-4 py-2 rounded-xl text-sm font-semibold transition ${{activeIdx === idx ? '{}' : '{}'}}`}}
+            >
+              {{tab.label}}
+            </button>
+          ))}}
+        </div>
+
+        <div className="p-4 sm:p-6 {}">
+          <ActiveTab {{...({{}} as any)}} />
+        </div>
+      </div>
+    </div>
+  );
+}}
+"#,
+                    imports.join("\n"),
+                    tab_defs.join(",\n"),
+                    meta.profile.canvas_cls,
+                    meta.profile.border_cls,
+                    meta.profile.badge_cls,
+                    esc_tsx(&meta.proj_name),
+                    meta.profile.secondary_btn_cls,
+                    meta.profile.cta_cls,
+                    meta.profile.cta_cls,
+                    meta.profile.secondary_btn_cls,
+                    meta.profile.card_cls
+                );
+                let _ = std::fs::write(&dashboard_page, code);
+            }
+        }
+    }
+
+    // 2. Replace thin `redirect('/dashboard')` homepage with rich industry Homepage
+    let home_page = src_app.join("page.tsx");
+    let has_redirect_stub = if home_page.is_file() {
+        std::fs::read_to_string(&home_page)
+            .map(|c| {
+                c.lines().count() < 15
+                    && (c.contains("redirect('/dashboard')") || c.contains("redirect(\"/dashboard\")"))
+            })
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    let should_write_rich_home = has_redirect_stub
+        || (!home_page.exists()
+            && !src_app.join("page.jsx").exists()
+            && !proj_dir.join("src/renderer/App.tsx").exists()
+            && !proj_dir.join("src/renderer/App.jsx").exists()
+            && !proj_dir.join("app/(tabs)/index.tsx").exists());
+    if should_write_rich_home {
+        let _ = std::fs::write(&home_page, build_industry_homepage_tsx(meta));
+    }
+
+    // 3. Complete Web/SaaS Product Pages (/about, /pricing, /account, /legal/terms, /legal/privacy, conditional /blog)
+    let page_exists = |rel: &str| -> bool {
+        src_app.join(rel).exists()
+            || src_app.join(rel.replace(".tsx", ".jsx")).exists()
+            || proj_dir.join("app").join(rel).exists()
+            || proj_dir.join("app").join(rel.replace(".tsx", ".jsx")).exists()
+    };
+
+    if !page_exists("about/page.tsx") {
+        let _ = std::fs::create_dir_all(src_app.join("about"));
+        let _ = std::fs::write(src_app.join("about/page.tsx"), build_about_page_tsx(meta));
+    }
+    if !page_exists("pricing/page.tsx") {
+        let _ = std::fs::create_dir_all(src_app.join("pricing"));
+        let _ = std::fs::write(src_app.join("pricing/page.tsx"), build_pricing_page_tsx(meta));
+    }
+    if !page_exists("account/page.tsx") {
+        let _ = std::fs::create_dir_all(src_app.join("account"));
+        let _ = std::fs::write(src_app.join("account/page.tsx"), build_account_page_tsx(meta));
+    }
+    if !page_exists("legal/terms/page.tsx") {
+        let _ = std::fs::create_dir_all(src_app.join("legal/terms"));
+        let _ = std::fs::write(src_app.join("legal/terms/page.tsx"), build_legal_terms_page_tsx(meta));
+    }
+    if !page_exists("legal/privacy/page.tsx") {
+        let _ = std::fs::create_dir_all(src_app.join("legal/privacy"));
+        let _ = std::fs::write(src_app.join("legal/privacy/page.tsx"), build_legal_privacy_page_tsx(meta));
+    }
+    if meta.include_blog && !page_exists("blog/page.tsx") {
+        let _ = std::fs::create_dir_all(src_app.join("blog"));
+        let _ = std::fs::write(src_app.join("blog/page.tsx"), build_blog_page_tsx(meta));
+    }
+
+    // 4. Zero-404 Link Route Synthesizer: any internal static `<Link href="/foo">` without a page.tsx gets a real workspace route
+    let mut referenced_routes = std::collections::BTreeSet::new();
+    if let Ok(re_link) = regex::Regex::new(r#"(?:href\s*=\s*|router\.push\s*\(\s*)(['"])(/[^'"?#\s>)]+)['"]"#) {
+        let mut scan_stack = Vec::new();
+        if proj_dir.join("src").is_dir() {
+            scan_stack.push(proj_dir.join("src"));
+        }
+        if proj_dir.join("app").is_dir() {
+            scan_stack.push(proj_dir.join("app"));
+        }
+        if proj_dir.join("components").is_dir() {
+            scan_stack.push(proj_dir.join("components"));
+        }
+        while let Some(d) = scan_stack.pop() {
+            let Ok(ents) = std::fs::read_dir(&d) else { continue };
+            for e in ents.flatten() {
+                let p = e.path();
+                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if p.is_dir() {
+                    if name != "node_modules" && name != ".next" && name != ".git" && name != "api" {
+                        scan_stack.push(p);
+                    }
+                } else if name.ends_with(".tsx") || name.ends_with(".jsx") {
+                    if let Ok(src) = std::fs::read_to_string(&p) {
+                        for cap in re_link.captures_iter(&src) {
+                            let route = cap[2].trim_end_matches('/');
+                            if route.is_empty()
+                                || route.starts_with("/api/")
+                                || route == "/api"
+                                || route.contains('[')
+                                || route.contains('$')
+                                || route.contains('.')
+                            {
+                                continue;
+                            }
+                            referenced_routes.insert(route.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for route in referenced_routes {
+        let segs: Vec<&str> = route.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+        if segs.is_empty() || segs.len() > 3 {
+            continue;
+        }
+        let sub = segs.join("/");
+        let check_src = src_app.join(&sub);
+        let check_root = proj_dir.join("app").join(&sub);
+        let exists = check_src.join("page.tsx").exists()
+            || check_src.join("page.jsx").exists()
+            || check_root.join("page.tsx").exists()
+            || check_root.join("page.jsx").exists();
+        if exists {
+            continue;
+        }
+        let parent_route = if segs.len() > 1 {
+            format!("/{}", segs[..segs.len() - 1].join("/"))
+        } else {
+            "/dashboard".to_string()
+        };
+        let title = humanize_slug_label(segs.last().copied().unwrap_or("module"));
+        let is_create = segs.last().copied() == Some("new") || segs.last().copied() == Some("create");
+        let page_code = format!(
+r#""use client";
+
+import React, {{ useState }} from 'react';
+import Link from 'next/link';
+
+export default function DynamicWorkspaceSubpage() {{
+  const [itemTitle, setItemTitle] = useState('');
+  const [notes, setNotes] = useState('');
+  const [submitted, setSubmitted] = useState(false);
+
+  const handleSubmit = (e: React.FormEvent) => {{
+    e.preventDefault();
+    setSubmitted(true);
+  }};
+
+  return (
+    <div className="min-h-screen w-full {}">
+      <div className="max-w-3xl mx-auto px-4 sm:px-6 lg:px-8 py-12 space-y-6">
+        <header className="flex items-center justify-between border-b {} pb-5">
+          <div>
+            <span className="inline-flex px-2.5 py-0.5 rounded-full text-xs font-semibold {}">{}</span>
+            <h1 className="text-3xl font-extrabold mt-1">{}</h1>
+          </div>
+          <Link href="{}" prefetch={{false}} className="px-4 py-2 rounded-xl text-sm font-semibold {}">
+            &larr; Back
+          </Link>
+        </header>
+
+        <form onSubmit={{handleSubmit}} className="p-6 space-y-4 {}">
+          <div>
+            <label className="block text-xs font-semibold mb-1 {}">{} Title</label>
+            <input
+              type="text"
+              required
+              value={{itemTitle}}
+              onChange={{(e) => setItemTitle(e.target.value)}}
+              placeholder="Enter {} details..."
+              className="w-full rounded-xl px-3 py-2 text-sm border {} bg-transparent"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-semibold mb-1 {}">Configuration / Notes</label>
+            <textarea
+              rows={{4}}
+              value={{notes}}
+              onChange={{(e) => setNotes(e.target.value)}}
+              placeholder="Operational parameters..."
+              className="w-full rounded-xl px-3 py-2 text-sm border {} bg-transparent"
+            />
+          </div>
+          <button type="submit" className="px-5 py-2.5 rounded-xl text-sm {}">
+            {}
+          </button>
+          {{submitted && (
+            <p className="text-sm font-semibold {}">Saved changes for ${{itemTitle || '{}'}} in local workspace state.</p>
+          )}}
+        </form>
+      </div>
+    </div>
+  );
+}}
+"#,
+            meta.profile.canvas_cls,
+            meta.profile.border_cls,
+            meta.profile.badge_cls,
+            esc_tsx(&meta.proj_name),
+            esc_tsx(&title),
+            esc_js_single(&parent_route),
+            meta.profile.secondary_btn_cls,
+            meta.profile.card_cls,
+            meta.profile.text_muted,
+            esc_tsx(&title),
+            esc_tsx(&title),
+            meta.profile.border_cls,
+            meta.profile.text_muted,
+            meta.profile.border_cls,
+            meta.profile.cta_cls,
+            if is_create { "Create Entry" } else { "Save Configuration" },
+            meta.profile.accent_text,
+            esc_tsx(&title)
+        );
+        let _ = std::fs::create_dir_all(&check_src);
+        let _ = std::fs::write(check_src.join("page.tsx"), page_code);
+    }
+
+    // 5. Repair empty Navbar / Footer stubs (or ensure core links are reachable)
+    let mut nav_links: Vec<(String, String)> = vec![("/dashboard".to_string(), "Dashboard".to_string())];
+    for (r, l) in meta.domain_routes.iter().take(2) {
+        nav_links.push((r.clone(), l.clone()));
+    }
+    nav_links.push(("/pricing".to_string(), "Pricing".to_string()));
+    nav_links.push(("/about".to_string(), "About".to_string()));
+    if meta.include_blog {
+        nav_links.push(("/blog".to_string(), "Blog".to_string()));
+    }
+
+    let comp_dir = if proj_dir.join("src/components").is_dir() {
+        proj_dir.join("src/components")
+    } else {
+        proj_dir.join("components")
+    };
+    let navbar_path = comp_dir.join("Navbar.tsx");
+    if navbar_path.is_file() {
+        if let Ok(nav_src) = std::fs::read_to_string(&navbar_path) {
+            if !nav_src.contains("<Link") && !nav_src.contains("href=") {
+                let _ = std::fs::write(&navbar_path, build_industry_navbar_tsx(meta, &nav_links));
+            } else if !nav_src.contains("/pricing") {
+                if let Some(close_nav) = nav_src.find("</nav>") {
+                    let link_cls = if meta.profile.is_dark {
+                        "text-slate-300 hover:text-white px-3 py-2 rounded-lg text-sm font-medium transition-colors"
+                    } else {
+                        "text-slate-600 hover:text-slate-900 hover:bg-slate-100 px-3 py-2 rounded-lg text-sm font-medium transition-colors"
+                    };
+                    let extra_links = format!(
+                        "          <Link href=\"/pricing\" prefetch={{false}} className=\"{}\">Pricing</Link>\n          <Link href=\"/about\" prefetch={{false}} className=\"{}\">About</Link>\n          <Link href=\"/account\" prefetch={{false}} className=\"{}\">Account</Link>\n        ",
+                        link_cls, link_cls, link_cls
+                    );
+                    let mut cand = nav_src.clone();
+                    cand.insert_str(close_nav, &extra_links);
+                    if let Some(verified) = crate::ast_engine::verified_rewrite("Navbar.tsx", &nav_src, cand) {
+                        let _ = std::fs::write(&navbar_path, verified);
+                    }
+                }
+            }
+        }
+    }
+
+    let footer_path = comp_dir.join("Footer.tsx");
+    if footer_path.is_file() {
+        if let Ok(foot_src) = std::fs::read_to_string(&footer_path) {
+            if (!foot_src.contains("<Link") && !foot_src.contains("href="))
+                || (!foot_src.contains("/legal/terms") && !foot_src.contains("/pricing"))
+            {
+                let _ = std::fs::write(&footer_path, build_industry_footer_tsx(meta));
+            }
+        }
+    }
+}
+
+/// Resolves Next.js App Router precedence collision when both root `app/` (Expo Router)
+/// and `src/app/` exist: mirrors `src/app/**/page.{tsx,jsx}` and `layout.tsx` into root `app/`
+/// so every route (`/`, `/dashboard`, `/about`, `/pricing`, `/account`, `/legal/*`) serves 200 OK.
+fn sync_src_app_into_root_app_if_present(proj_dir: &std::path::Path) {
+    let root_app = proj_dir.join("app");
+    let src_app = proj_dir.join("src/app");
+    if !root_app.is_dir() || !src_app.is_dir() {
+        return;
+    }
+
+    let src_css = src_app.join("globals.css");
+    let root_css = root_app.join("globals.css");
+    if src_css.is_file() && !root_css.exists() {
+        let _ = std::fs::copy(&src_css, &root_css);
+    }
+
+    let root_layout_tsx = root_app.join("layout.tsx");
+    if !root_layout_tsx.exists() && !root_app.join("layout.jsx").exists() && src_app.join("layout.tsx").is_file() {
+        let layout_bridge = "\"use client\";\n\nimport React from 'react';\nimport RootLayout from '../src/app/layout';\n\nexport default function BridgedRootLayout({ children }: { children: React.ReactNode }) {\n  return <RootLayout>{children}</RootLayout>;\n}\n";
+        let _ = std::fs::write(&root_layout_tsx, layout_bridge);
+    }
+
+    let mut stack: Vec<(std::path::PathBuf, Vec<String>)> = vec![(src_app.clone(), Vec::new())];
+    while let Some((cur_dir, rel_segs)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&cur_dir) else { continue };
+        for ent in entries.flatten() {
+            let p = ent.path();
+            let Some(name) = p.file_name().and_then(|s| s.to_str()) else { continue };
+            if p.is_dir() {
+                if name == "api" {
+                    continue;
+                }
+                let mut next_segs = rel_segs.clone();
+                next_segs.push(name.to_string());
+                stack.push((p, next_segs));
+            } else if p.is_file() && (name == "page.tsx" || name == "page.jsx") {
+                let target_dir = if rel_segs.is_empty() {
+                    root_app.clone()
+                } else {
+                    root_app.join(rel_segs.join("/"))
+                };
+                let target_page = target_dir.join("page.tsx");
+                if target_page.exists() || target_dir.join("page.jsx").exists() {
+                    continue;
+                }
+                let _ = std::fs::create_dir_all(&target_dir);
+                let ups = "../".repeat(rel_segs.len() + 1);
+                let sub = if rel_segs.is_empty() {
+                    "src/app/page".to_string()
+                } else {
+                    format!("src/app/{}/page", rel_segs.join("/"))
+                };
+                let src_text = std::fs::read_to_string(&p).unwrap_or_default();
+                let is_client = src_text.contains("\"use client\"") || src_text.contains("'use client'");
+                let bridge = if is_client {
+                    format!("\"use client\";\nexport {{ default }} from '{}{}';\n", ups, sub)
+                } else {
+                    format!("export {{ default }} from '{}{}';\n", ups, sub)
+                };
+                let _ = std::fs::write(&target_page, bridge);
+            }
+        }
+    }
+
+    // Mirror any `src/app/api/**/route.{ts,js}` missing under `app/api/`
+    let src_api = src_app.join("api");
+    if src_api.is_dir() {
+        let mut api_stack: Vec<(std::path::PathBuf, Vec<String>)> = vec![(src_api, Vec::new())];
+        while let Some((cur_dir, rel_segs)) = api_stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&cur_dir) else { continue };
+            for ent in entries.flatten() {
+                let p = ent.path();
+                let Some(name) = p.file_name().and_then(|s| s.to_str()) else { continue };
+                if p.is_dir() {
+                    let mut next = rel_segs.clone();
+                    next.push(name.to_string());
+                    api_stack.push((p, next));
+                } else if p.is_file() && (name == "route.ts" || name == "route.js") {
+                    let target_dir = if rel_segs.is_empty() {
+                        root_app.join("api")
+                    } else {
+                        root_app.join("api").join(rel_segs.join("/"))
+                    };
+                    let target_route = target_dir.join(name);
+                    if !target_route.exists() {
+                        let _ = std::fs::create_dir_all(&target_dir);
+                        let _ = std::fs::copy(&p, &target_route);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Bridges Desktop (Electron `src/renderer/App.tsx`) and Mobile (Expo / React Native root `app/` routes)
-/// into Next.js App Router (`src/app/page.tsx`, `src/app/layout.tsx`, `src/app/globals.css`) when
-/// `src/app/` exists without a root `src/app/page.tsx`, eliminating the initial-load `404` page in
-/// Desktop and Mobile projects!
+/// into Next.js App Router (`src/app/page.tsx`, `src/app/layout.tsx`, `src/app/globals.css`),
+/// ensures complete industry-adapted service pages (`/`, `/about`, `/pricing`, `/account`, `/legal/*`),
+/// synthesizes any missing static link routes, and unifies `src/app/` with root `app/` to prevent 404s.
 pub fn ensure_multiplatform_entry_routes_bridged(proj_dir: &std::path::Path) {
     let src_app = proj_dir.join("src/app");
     if !src_app.is_dir() && !proj_dir.join("src/renderer").is_dir() && !proj_dir.join("app").is_dir() {
         return;
     }
 
-    // If `src/app` exists (or `src/renderer` exists in an Electron project), Next.js uses `src/app`
-    // as the App Router root and ignores top-level `app/`.
-    let uses_src_app = src_app.is_dir() || proj_dir.join("src/renderer").is_dir();
+    let is_next_workspace = proj_dir.join("package.json").is_file()
+        || proj_dir.join("next.config.js").exists()
+        || proj_dir.join("next.config.mjs").exists();
+    let uses_src_app = src_app.is_dir()
+        || proj_dir.join("src/renderer").is_dir()
+        || (proj_dir.join("app").is_dir() && is_next_workspace);
     if !uses_src_app {
         return;
     }
@@ -10824,5 +13520,11 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             }
         }
     }
+
+    // Complete industry-adapted SaaS/Web service pages, shell completeness, zero-404 route closure,
+    // and root `app/` precedence unification for Next.js App Router.
+    let meta = detect_project_meta_and_profile(proj_dir);
+    ensure_complete_service_pages_and_shell(proj_dir, &meta);
+    sync_src_app_into_root_app_if_present(proj_dir);
 }
 

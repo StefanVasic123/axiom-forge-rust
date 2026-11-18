@@ -1213,6 +1213,319 @@ fn collect_source_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>
     }
 }
 
+/// Izvlači AST `type_identifier` čvorove (van lokalnih `type_parameter`/`nested_type_identifier`
+/// deklaracija) koji nisu u `known` ili ugrađenim TS/React tipovima.
+pub fn collect_missing_type_identifiers_ast(
+    content: &str,
+    known: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let Some(tree) = parse_source("file.tsx", content) else {
+        return Vec::new();
+    };
+    const BUILTINS: &[&str] = &[
+        "React", "FC", "FunctionComponent", "ReactNode", "ReactElement", "CSSProperties",
+        "ComponentType", "PropsWithChildren", "MouseEvent", "ChangeEvent", "FormEvent",
+        "KeyboardEvent", "FocusEvent", "SyntheticEvent", "RefObject", "MutableRefObject",
+        "Dispatch", "SetStateAction", "Promise", "Record", "Partial", "Required", "Readonly",
+        "Pick", "Omit", "Exclude", "Extract", "NonNullable", "ReturnType", "Parameters",
+        "Awaited", "Array", "ReadonlyArray", "Map", "Set", "WeakMap", "WeakSet", "Date",
+        "Error", "RegExp", "URL", "URLSearchParams", "Headers", "Request", "Response",
+        "HTMLElement", "HTMLInputElement", "HTMLButtonElement", "HTMLDivElement",
+        "HTMLFormElement", "HTMLSelectElement", "HTMLTextAreaElement", "Event", "File",
+        "Blob", "FormData", "NextRequest", "NextResponse", "Metadata", "JSX", "Prisma",
+        "ZodError", "ZodSchema", "ZodType", "IconType", "View", "Text", "StyleProp",
+    ];
+    let mut local_skip = known.clone();
+    for b in BUILTINS {
+        local_skip.insert((*b).to_string());
+    }
+
+    // Collect local generic type parameter names `<T, K>` and declared types/interfaces/enums/classes
+    let mut type_param_names = std::collections::HashSet::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "type_parameter" => {
+                for ch in named_children_vec(node) {
+                    if ch.kind() == "type_identifier" {
+                        type_param_names.insert(node_text(ch, content).trim().to_string());
+                    }
+                }
+            }
+            "interface_declaration" | "type_alias_declaration" | "enum_declaration" | "class_declaration" => {
+                if let Some(n) = node.child_by_field_name("name") {
+                    local_skip.insert(node_text(n, content).trim().to_string());
+                }
+            }
+            _ => {}
+        }
+        stack.extend(named_children_vec(node));
+    }
+
+    let mut out = Vec::new();
+    let mut walk_stack = vec![tree.root_node()];
+    while let Some(node) = walk_stack.pop() {
+        if node.kind() == "type_identifier" {
+            let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
+            if !matches!(
+                parent_kind,
+                "type_parameter"
+                    | "nested_type_identifier"
+                    | "interface_declaration"
+                    | "type_alias_declaration"
+                    | "enum_declaration"
+                    | "class_declaration"
+            ) {
+                let name = node_text(node, content).trim();
+                if is_valid_js_identifier(name)
+                    && name.chars().next().map_or(false, |c| c.is_ascii_uppercase())
+                    && !local_skip.contains(name)
+                    && !type_param_names.contains(name)
+                    && !out.iter().any(|x| x == name)
+                {
+                    out.push(name.to_string());
+                }
+            }
+        }
+        walk_stack.extend(named_children_vec(node));
+    }
+    out
+}
+
+fn add_rest_param_insertion(
+    fp: Node,
+    src: &str,
+    typed: bool,
+    require_non_empty: bool,
+    seen_positions: &mut std::collections::HashSet<usize>,
+    insertions: &mut Vec<(usize, String)>,
+) {
+    if fp.kind() != "formal_parameters" {
+        return;
+    }
+    let param_nodes: Vec<Node> = named_children_vec(fp)
+        .into_iter()
+        .filter(|c| {
+            matches!(
+                c.kind(),
+                "required_parameter"
+                    | "optional_parameter"
+                    | "rest_pattern"
+                    | "identifier"
+                    | "object_pattern"
+                    | "array_pattern"
+            )
+        })
+        .collect();
+    if require_non_empty && param_nodes.is_empty() {
+        return;
+    }
+    let fp_text = node_text(fp, src);
+    if fp_text.contains("...")
+        || param_nodes
+            .iter()
+            .any(|p| p.kind() == "rest_pattern" || node_text(*p, src).trim_start().starts_with("..."))
+    {
+        return;
+    }
+    let tokens = all_children_vec(fp);
+    if let Some(close) = tokens.iter().rev().find(|c| !c.is_named() && c.kind() == ")") {
+        let pos = close.start_byte();
+        if !seen_positions.insert(pos) {
+            return;
+        }
+        let rest_suffix = if typed { "..._args: any[]" } else { "..._args" };
+        let prefix = if param_nodes.is_empty() {
+            ""
+        } else {
+            let last_end = param_nodes.last().map(|p| p.end_byte()).unwrap_or(fp.start_byte());
+            let has_trailing_comma = tokens
+                .iter()
+                .any(|c| !c.is_named() && c.kind() == "," && c.start_byte() >= last_end && c.start_byte() < pos);
+            if has_trailing_comma { " " } else { ", " }
+        };
+        insertions.push((pos, format!("{}{}", prefix, rest_suffix)));
+    }
+}
+
+fn collect_inner_hook_fn_rest_insertions(
+    body: Node,
+    src: &str,
+    typed: bool,
+    seen_positions: &mut std::collections::HashSet<usize>,
+    insertions: &mut Vec<(usize, String)>,
+) {
+    if body.kind() != "statement_block" {
+        return;
+    }
+    for stmt in named_children_vec(body) {
+        match stmt.kind() {
+            "function_declaration" | "generator_function_declaration" => {
+                if let Some(fp) = stmt.child_by_field_name("parameters") {
+                    add_rest_param_insertion(fp, src, typed, true, seen_positions, insertions);
+                }
+            }
+            "lexical_declaration" | "variable_declaration" => {
+                for d in named_children_vec(stmt) {
+                    if d.kind() != "variable_declarator" {
+                        continue;
+                    }
+                    let Some(val) = d.child_by_field_name("value") else {
+                        continue;
+                    };
+                    let unwrapped = unwrap_expression(val);
+                    if matches!(unwrapped.kind(), "arrow_function" | "function_expression" | "function") {
+                        if let Some(fp) = unwrapped.child_by_field_name("parameters") {
+                            add_rest_param_insertion(fp, src, typed, true, seen_positions, insertions);
+                        }
+                    } else if unwrapped.kind() == "call_expression" {
+                        let fn_name = unwrapped
+                            .child_by_field_name("function")
+                            .map(|f| node_text(f, src).trim())
+                            .unwrap_or("");
+                        if fn_name == "useCallback" || fn_name.ends_with(".useCallback") {
+                            if let Some(args_node) = unwrapped.child_by_field_name("arguments") {
+                                if let Some(first_arg) = named_children_vec(args_node).into_iter().next() {
+                                    let cb = unwrap_expression(first_arg);
+                                    if matches!(cb.kind(), "arrow_function" | "function_expression" | "function") {
+                                        if let Some(fp) = cb.child_by_field_name("parameters") {
+                                            add_rest_param_insertion(fp, src, typed, true, seen_positions, insertions);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Dodaje `..._args: any[]` na metode unutar `*State`/`*Return`/`*Context` interfejsa
+/// i lokalne funkcije unutar `use*` hook-ova (sa >= 1 parametrom) kako višak argumenata
+/// u pozivaocima ne bi izazivao `TS2554`.
+pub fn collect_hook_method_rest_insertions(
+    tree: &Tree,
+    src: &str,
+    rel_path: &str,
+    hooks: &[HookSignature],
+) -> Vec<(usize, String)> {
+    let typed = is_typed_path(rel_path);
+    let mut insertions = Vec::new();
+    let mut seen_positions = std::collections::HashSet::new();
+    let hook_ret_types: std::collections::HashSet<&str> = hooks
+        .iter()
+        .filter_map(|h| h.explicit_return_type_name.as_deref())
+        .collect();
+
+    let is_state_contract_name = |name: &str| -> bool {
+        hook_ret_types.contains(name)
+            || name.ends_with("State")
+            || name.ends_with("Return")
+            || name.ends_with("Result")
+            || name.ends_with("Context")
+            || name.ends_with("Actions")
+    };
+
+    for stmt in named_children_vec(tree.root_node()) {
+        let decl = if stmt.kind() == "export_statement" {
+            match stmt.child_by_field_name("declaration") {
+                Some(d) => d,
+                None => continue,
+            }
+        } else {
+            stmt
+        };
+        match decl.kind() {
+            "interface_declaration" if typed => {
+                let cname = decl
+                    .child_by_field_name("name")
+                    .map(|n| node_text(n, src).trim())
+                    .unwrap_or("");
+                if !is_state_contract_name(cname) {
+                    continue;
+                }
+                if let Some(body) = decl.child_by_field_name("body") {
+                    for member in named_children_vec(body) {
+                        if member.kind() == "property_signature" {
+                            if let Some(ty) = member.child_by_field_name("type") {
+                                if let Some(fn_ty) = first_named_of_kind(ty, &["function_type"]) {
+                                    if let Some(fp) = fn_ty.child_by_field_name("parameters") {
+                                        add_rest_param_insertion(fp, src, typed, false, &mut seen_positions, &mut insertions);
+                                    }
+                                }
+                            }
+                        } else if member.kind() == "method_signature" {
+                            if let Some(fp) = member.child_by_field_name("parameters") {
+                                add_rest_param_insertion(fp, src, typed, false, &mut seen_positions, &mut insertions);
+                            }
+                        }
+                    }
+                }
+            }
+            "type_alias_declaration" if typed => {
+                let cname = decl
+                    .child_by_field_name("name")
+                    .map(|n| node_text(n, src).trim())
+                    .unwrap_or("");
+                if !is_state_contract_name(cname) {
+                    continue;
+                }
+                if let Some(val) = decl.child_by_field_name("value") {
+                    if val.kind() == "object_type" {
+                        for member in named_children_vec(val) {
+                            if member.kind() == "property_signature" {
+                                if let Some(ty) = member.child_by_field_name("type") {
+                                    if let Some(fn_ty) = first_named_of_kind(ty, &["function_type"]) {
+                                        if let Some(fp) = fn_ty.child_by_field_name("parameters") {
+                                            add_rest_param_insertion(fp, src, typed, false, &mut seen_positions, &mut insertions);
+                                        }
+                                    }
+                                }
+                            } else if member.kind() == "method_signature" {
+                                if let Some(fp) = member.child_by_field_name("parameters") {
+                                    add_rest_param_insertion(fp, src, typed, false, &mut seen_positions, &mut insertions);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "function_declaration" | "generator_function_declaration" => {
+                if let Some(n) = decl.child_by_field_name("name") {
+                    if is_hook_name(node_text(n, src)) {
+                        if let Some(body) = decl.child_by_field_name("body") {
+                            collect_inner_hook_fn_rest_insertions(body, src, typed, &mut seen_positions, &mut insertions);
+                        }
+                    }
+                }
+            }
+            "lexical_declaration" | "variable_declaration" => {
+                for d in named_children_vec(decl) {
+                    if d.kind() != "variable_declarator" {
+                        continue;
+                    }
+                    let (Some(n), Some(v)) = (d.child_by_field_name("name"), d.child_by_field_name("value")) else {
+                        continue;
+                    };
+                    if is_hook_name(node_text(n, src)) {
+                        let func = unwrap_expression(v);
+                        if matches!(func.kind(), "arrow_function" | "function_expression" | "function") {
+                            if let Some(body) = func.child_by_field_name("body") {
+                                collect_inner_hook_fn_rest_insertions(body, src, typed, &mut seen_positions, &mut insertions);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    insertions
+}
+
 /// Planira AST izmene jednog hook fajla na osnovu svih poziva hook-a u projektu
 /// i lokalne `interface`/`type` deklaracije eksplicitnog povratnog tipa (Faza 4).
 pub fn plan_hook_and_interface_insertions(
@@ -1520,6 +1833,23 @@ pub fn reconcile_hook_contracts_in_project(proj_dir: &std::path::Path) -> HookCo
                 continue;
             }
             per_file_insertions.entry(def_idx).or_default().push((pos, txt));
+        }
+    }
+
+    for (idx, f) in parsed.iter().enumerate() {
+        if f.hooks.is_empty() {
+            continue;
+        }
+        if let Some(tree) = parse_source(&f.rel, &f.content) {
+            let method_rest_ins = collect_hook_method_rest_insertions(&tree, &f.content, &f.rel, &f.hooks);
+            if !method_rest_ins.is_empty() {
+                let entry = per_file_insertions.entry(idx).or_default();
+                for (pos, txt) in method_rest_ins {
+                    if !entry.iter().any(|(ep, _)| *ep == pos) {
+                        entry.push((pos, txt));
+                    }
+                }
+            }
         }
     }
 

@@ -642,21 +642,22 @@ impl LogThrottler {
 
 
 pub fn ensure_react_icons_sanitized(proj_dir: &std::path::Path) {
-    fn walk_and_fix(dir: &std::path::Path) {
+    fn walk_and_fix(dir: &std::path::Path, proj_dir: &std::path::Path) {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                     if name != "node_modules" && name != ".next" && name != "build" && name != "dist" && name != ".git" {
-                        walk_and_fix(&path);
+                        walk_and_fix(&path, proj_dir);
                     }
                 } else if path.is_file() {
                     let path_str = path.to_string_lossy();
                     if path_str.ends_with(".tsx") || path_str.ends_with(".jsx") || path_str.ends_with(".ts") || path_str.ends_with(".js") {
                         if let Ok(content) = std::fs::read_to_string(&path) {
-                            if content.contains("react-icons") || content.contains("-icons-react") {
-                                let fixed = sanitize_react_icons_imports(&content);
+                            if content.contains("react-icons") || content.contains("-icons-react") || content.contains("lucide-react") {
+                                let mut fixed = sanitize_react_icons_imports(&content);
+                                fixed = crate::self_healing::reconcile_external_icon_imports_in_content(proj_dir, &fixed);
                                 if fixed != content {
                                     let _ = std::fs::write(&path, fixed);
                                 }
@@ -668,7 +669,7 @@ pub fn ensure_react_icons_sanitized(proj_dir: &std::path::Path) {
         }
     }
 
-    walk_and_fix(proj_dir);
+    walk_and_fix(proj_dir, proj_dir);
 }
 
 #[derive(Serialize, Deserialize)]
