@@ -568,6 +568,8 @@ pub struct HookParam {
     pub end_byte: usize,
     /// Bajt kraja samog pattern-a (pre `: Type`)
     pub pattern_end_byte: usize,
+    pub type_end_byte: Option<usize>,
+    pub type_already_any: bool,
     pub has_default: bool,
     pub optional: bool,
     pub has_type_annotation: bool,
@@ -604,6 +606,8 @@ pub struct HookSignature {
     pub return_objects: Vec<ReturnObject>,
     pub has_explicit_return_type: bool,
     pub explicit_return_type_name: Option<String>,
+    pub return_type_end_byte: Option<usize>,
+    pub return_type_already_any: bool,
 }
 
 fn analyze_param(param: Node, src: &str) -> HookParam {
@@ -645,11 +649,17 @@ fn analyze_param(param: Node, src: &str) -> HookParam {
             }
         }
     }
+    let type_end_byte = type_ann.map(|ta| ta.end_byte());
+    let type_already_any = type_ann
+        .map(|ta| node_text(ta, src).contains("any"))
+        .unwrap_or(false);
     HookParam {
         kind,
         start_byte: param.start_byte(),
         end_byte: param.end_byte(),
         pattern_end_byte: pattern.end_byte(),
+        type_end_byte,
+        type_already_any,
         has_default,
         optional,
         has_type_annotation: type_ann.is_some(),
@@ -770,16 +780,27 @@ fn is_valid_js_identifier(s: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
 }
 
+fn type_ident_or_generic_name(node: Node, src: &str) -> Option<String> {
+    if node.kind() == "type_identifier" {
+        return Some(node_text(node, src).to_string());
+    }
+    if node.kind() == "generic_type" {
+        if let Some(id) = first_named_of_kind(node, &["type_identifier"]) {
+            return Some(node_text(id, src).to_string());
+        }
+    }
+    None
+}
+
 fn extract_explicit_return_type_name(func: Node, src: &str) -> Option<String> {
     let ret_ann = func.child_by_field_name("return_type")?;
     let named = named_children_vec(ret_ann);
-    if named.len() == 1 && named[0].kind() == "type_identifier" {
-        return Some(node_text(named[0], src).to_string());
+    if named.len() == 1 {
+        if let Some(n) = type_ident_or_generic_name(named[0], src) {
+            return Some(n);
+        }
     }
-    if ret_ann.kind() == "type_identifier" {
-        return Some(node_text(ret_ann, src).to_string());
-    }
-    None
+    type_ident_or_generic_name(ret_ann, src)
 }
 
 fn extract_var_fn_return_type_name(declarator: Node, src: &str) -> Option<String> {
@@ -788,12 +809,14 @@ fn extract_var_fn_return_type_name(declarator: Node, src: &str) -> Option<String
     while let Some(n) = stack.pop() {
         if n.kind() == "function_type" {
             if let Some(rt) = n.child_by_field_name("return_type") {
-                if rt.kind() == "type_identifier" {
-                    return Some(node_text(rt, src).to_string());
+                if let Some(name) = type_ident_or_generic_name(rt, src) {
+                    return Some(name);
                 }
                 let inner = named_children_vec(rt);
-                if inner.len() == 1 && inner[0].kind() == "type_identifier" {
-                    return Some(node_text(inner[0], src).to_string());
+                if inner.len() == 1 {
+                    if let Some(name) = type_ident_or_generic_name(inner[0], src) {
+                        return Some(name);
+                    }
                 }
             }
         }
@@ -903,6 +926,11 @@ fn build_hook_signature(name: &str, decl_node: Node, func: Node, var_ret_type: O
         collect_return_objects(body, src, &mut return_objects);
     }
     let explicit_return_type_name = extract_explicit_return_type_name(func, src).or(var_ret_type);
+    let ret_ann_node = func.child_by_field_name("return_type");
+    let return_type_end_byte = ret_ann_node.map(|r| r.end_byte());
+    let return_type_already_any = ret_ann_node
+        .map(|r| node_text(r, src).contains("any"))
+        .unwrap_or(false);
     HookSignature {
         name: name.to_string(),
         line: decl_node.start_position().row + 1,
@@ -910,8 +938,10 @@ fn build_hook_signature(name: &str, decl_node: Node, func: Node, var_ret_type: O
         params_close_byte,
         params_trailing_comma,
         return_objects,
-        has_explicit_return_type: func.child_by_field_name("return_type").is_some() || explicit_return_type_name.is_some(),
+        has_explicit_return_type: ret_ann_node.is_some() || explicit_return_type_name.is_some(),
         explicit_return_type_name,
+        return_type_end_byte,
+        return_type_already_any,
     }
 }
 
@@ -967,6 +997,8 @@ pub struct HookCallSite {
     pub arg_count: usize,
     /// Ključevi destrukturirani iz rezultata: `const { data, error } = useX()`
     pub destructured_keys: Vec<String>,
+    /// Da li pozivalac destrukturira povratnu vrednost kao niz (`const [a, b] = useX()`)
+    pub destructured_as_array: bool,
     /// Ključevi prvog argumenta ako je objekat-literal: `useX({ userId })`
     pub object_arg_keys: Option<Vec<String>>,
 }
@@ -992,6 +1024,7 @@ pub fn extract_hook_call_sites(tree: &Tree, src: &str) -> Vec<HookCallSite> {
                     });
                     // Penji se kroz `await` / `as` / zagrade do `variable_declarator`
                     let mut destructured_keys = Vec::new();
+                    let mut destructured_as_array = false;
                     let mut cur = node;
                     while let Some(parent) = cur.parent() {
                         match parent.kind() {
@@ -1003,6 +1036,8 @@ pub fn extract_hook_call_sites(tree: &Tree, src: &str) -> Vec<HookCallSite> {
                                 if let Some(name) = parent.child_by_field_name("name") {
                                     if name.kind() == "object_pattern" {
                                         destructured_keys = object_pattern_keys(name, src);
+                                    } else if name.kind() == "array_pattern" {
+                                        destructured_as_array = true;
                                     }
                                 }
                                 break;
@@ -1015,6 +1050,7 @@ pub fn extract_hook_call_sites(tree: &Tree, src: &str) -> Vec<HookCallSite> {
                         line: node.start_position().row + 1,
                         arg_count: args.len(),
                         destructured_keys,
+                        destructured_as_array,
                         object_arg_keys,
                     });
                 }
@@ -1251,8 +1287,35 @@ pub fn plan_hook_and_interface_insertions(
         }
     }
 
+    // (a0-opts) Lokalne `*Options` / `*Params` / `*Config` / `*Props` deklaracije u hook fajlu dobijaju `[key: string]: any;`
+    if typed {
+        for c in local_contracts {
+            if matched_contract.map_or(false, |mc| mc.insert_byte == c.insert_byte) {
+                continue;
+            }
+            let is_options_like = c.name.ends_with("Options")
+                || c.name.ends_with("Params")
+                || c.name.ends_with("Config")
+                || c.name.ends_with("Props");
+            if is_options_like && !c.has_index_sig {
+                insertions.push((c.insert_byte, "\n  [key: string]: any;\n".to_string()));
+                for &req_end in &c.required_prop_name_ends {
+                    insertions.push((req_end, "?".to_string()));
+                }
+            }
+        }
+    }
+
     if calls.is_empty() {
         return insertions;
+    }
+
+    // (a-arr) Ako pozivalac destrukturira povratnu vrednost kao niz (`const [a, b] = useX()`),
+    //         proširi eksplicitni povratni tip sa `| any` kako bi i tuple i objekat destrukturiranje radili.
+    if typed && !hook.return_type_already_any && calls.iter().any(|c| c.destructured_as_array) {
+        if let Some(rt_end) = hook.return_type_end_byte {
+            insertions.push((rt_end, " | any".to_string()));
+        }
     }
 
     // (a) Ključevi koje pozivaoci destrukturiraju a hook ih ne vraća
@@ -1349,12 +1412,18 @@ pub fn plan_hook_and_interface_insertions(
         }
     }
 
-    // (d) Objekat-argument ne prosleđuje obavezna svojstva inline tipa → označi ih opcionim
+    // (d) Objekat-argument ne prosleđuje obavezna svojstva inline tipa → označi ih opcionim;
+    //     ako pozivalac prosleđuje ne-objekat (npr. string/id), proširi tip prvog parametra sa `| any`.
     if typed {
         if let Some(first) = hook.params.first() {
+            let non_literal_with_args = calls.iter().any(|c| c.arg_count > 0 && c.object_arg_keys.is_none());
+            if non_literal_with_args && !first.type_already_any {
+                if let Some(te) = first.type_end_byte {
+                    insertions.push((te, " | any".to_string()));
+                }
+            }
             if first.kind == HookParamKind::ObjectPattern && !first.inline_type_props.is_empty() {
                 let literal_calls: Vec<&Vec<String>> = calls.iter().filter_map(|c| c.object_arg_keys.as_ref()).collect();
-                let non_literal_with_args = calls.iter().any(|c| c.arg_count > 0 && c.object_arg_keys.is_none());
                 if !literal_calls.is_empty() && !non_literal_with_args {
                     for prop in &first.inline_type_props {
                         if prop.optional {
@@ -1496,6 +1565,10 @@ pub fn is_model_or_type_rel_path(rel: &str) -> bool {
         || norm.starts_with("models/")
         || norm.starts_with("src/types/")
         || norm.starts_with("types/")
+        || norm.starts_with("src/shared/models/")
+        || norm.starts_with("shared/models/")
+        || norm.starts_with("src/shared/types/")
+        || norm.starts_with("shared/types/")
 }
 
 fn project_uses_strict_ts(proj_dir: &std::path::Path) -> bool {
@@ -1570,11 +1643,108 @@ fn convert_enum_declaration_node(stmt: Node, decl: Node, is_exported: bool, sour
     Some((start, end, replacement))
 }
 
+fn collect_missing_type_ident_decls_in_model(
+    tree: &Tree,
+    source: &str,
+    sibling_dir: Option<&std::path::Path>,
+    current_stem: Option<&str>,
+    local_known: &std::collections::HashSet<String>,
+) -> String {
+    const BUILTINS: &[&str] = &[
+        "Array", "ReadonlyArray", "Record", "Partial", "Required", "Readonly", "Pick", "Omit",
+        "Exclude", "Extract", "NonNullable", "ReturnType", "Parameters", "ConstructorParameters",
+        "InstanceType", "Promise", "PromiseLike", "Awaited", "Date", "RegExp", "Error", "TypeError",
+        "Map", "Set", "WeakMap", "WeakSet", "React", "ReactNode", "ReactElement", "ComponentType",
+        "CSSProperties", "JSX", "Function", "Object", "Number", "String", "Boolean", "Symbol",
+        "BigInt", "HTMLElement", "HTMLInputElement", "HTMLButtonElement", "HTMLDivElement",
+        "HTMLFormElement", "HTMLSelectElement", "HTMLTextAreaElement", "Event", "File", "Blob",
+        "FormData", "URL", "URLSearchParams", "NextRequest", "NextResponse", "Prisma", "T", "K", "V", "U",
+    ];
+    let mut known = local_known.clone();
+    for b in BUILTINS {
+        known.insert((*b).to_string());
+    }
+    for imp in extract_imports(tree, source) {
+        if let Some(d) = imp.default_local {
+            known.insert(d);
+        }
+        if let Some(ns) = imp.namespace_local {
+            known.insert(ns);
+        }
+        for nb in imp.named {
+            known.insert(nb.local);
+        }
+    }
+
+    let mut referenced = std::collections::BTreeSet::new();
+    for stmt in named_children_vec(tree.root_node()) {
+        let decl = if stmt.kind() == "export_statement" {
+            match stmt.child_by_field_name("declaration") {
+                Some(d) => d,
+                None => continue,
+            }
+        } else {
+            stmt
+        };
+        let target_node = match decl.kind() {
+            "interface_declaration" => decl.child_by_field_name("body"),
+            "type_alias_declaration" => decl.child_by_field_name("value"),
+            _ => None,
+        };
+        let Some(root_n) = target_node else { continue };
+        let mut stack = vec![root_n];
+        while let Some(n) = stack.pop() {
+            if n.kind() == "type_identifier" {
+                let name = node_text(n, source).trim();
+                if is_valid_js_identifier(name) && !known.contains(name) {
+                    referenced.insert(name.to_string());
+                }
+            }
+            stack.extend(named_children_vec(n));
+        }
+    }
+
+    if referenced.is_empty() {
+        return String::new();
+    }
+
+    let mut prefix = String::new();
+    for t_name in referenced {
+        let mut imported_from_sibling = false;
+        if let Some(dir) = sibling_dir {
+            if current_stem != Some(t_name.as_str()) {
+                for ext in ["ts", "tsx"] {
+                    let sib_path = dir.join(format!("{}.{}", t_name, ext));
+                    if sib_path.is_file() {
+                        if let Ok(sib_src) = std::fs::read_to_string(&sib_path) {
+                            if crate::sanitizer::has_named_export_symbol(&sib_src, &t_name) {
+                                prefix.push_str(&format!("import type {{ {} }} from './{}';\n", t_name, t_name));
+                                imported_from_sibling = true;
+                                break;
+                            } else if sib_src.contains(&format!("export default {}", t_name)) {
+                                prefix.push_str(&format!("import type {} from './{}';\n", t_name, t_name));
+                                imported_from_sibling = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !imported_from_sibling {
+            prefix.push_str(&format!("type {} = any;\n", t_name));
+        }
+    }
+    prefix
+}
+
 fn reconcile_model_types_with_ui_hints(
     source: &str,
     is_model_or_type_file: bool,
     ui_string_or_jsx_props: &std::collections::HashSet<String>,
     relax_optional_and_date: bool,
+    sibling_dir: Option<&std::path::Path>,
+    current_stem: Option<&str>,
 ) -> Option<String> {
     if !is_model_or_type_file {
         return None;
@@ -1583,6 +1753,7 @@ fn reconcile_model_types_with_ui_hints(
     let mut local_enums = std::collections::HashSet::new();
     let mut local_object_types = std::collections::HashSet::new();
     let mut local_type_aliases = std::collections::HashSet::new();
+    let mut all_local_decls = std::collections::HashSet::new();
 
     for stmt in named_children_vec(tree.root_node()) {
         let decl = if stmt.kind() == "export_statement" {
@@ -1596,21 +1767,31 @@ fn reconcile_model_types_with_ui_hints(
         match decl.kind() {
             "enum_declaration" => {
                 if let Some(n) = decl.child_by_field_name("name") {
-                    local_enums.insert(node_text(n, source).to_string());
+                    let s = node_text(n, source).to_string();
+                    all_local_decls.insert(s.clone());
+                    local_enums.insert(s);
                 }
             }
             "interface_declaration" => {
                 if let Some(n) = decl.child_by_field_name("name") {
-                    local_object_types.insert(node_text(n, source).to_string());
+                    let s = node_text(n, source).to_string();
+                    all_local_decls.insert(s.clone());
+                    local_object_types.insert(s);
                 }
             }
             "type_alias_declaration" => {
                 if let (Some(n), Some(v)) = (decl.child_by_field_name("name"), decl.child_by_field_name("value")) {
                     let tname = node_text(n, source).to_string();
+                    all_local_decls.insert(tname.clone());
                     local_type_aliases.insert(tname.clone());
                     if v.kind() == "object_type" {
                         local_object_types.insert(tname);
                     }
+                }
+            }
+            "class_declaration" => {
+                if let Some(n) = decl.child_by_field_name("name") {
+                    all_local_decls.insert(node_text(n, source).to_string());
                 }
             }
             _ => {}
@@ -1618,6 +1799,19 @@ fn reconcile_model_types_with_ui_hints(
     }
 
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    if relax_optional_and_date && current_stem != Some("index") {
+        let missing_prefix = collect_missing_type_ident_decls_in_model(
+            &tree,
+            source,
+            sibling_dir,
+            current_stem,
+            &all_local_decls,
+        );
+        if !missing_prefix.is_empty() {
+            edits.push((0, 0, missing_prefix));
+        }
+    }
+
     for stmt in named_children_vec(tree.root_node()) {
         let is_exported = stmt.kind() == "export_statement";
         let decl = if is_exported {
@@ -1661,6 +1855,35 @@ fn reconcile_model_types_with_ui_hints(
             let has_opt = has_token_child(member, "?");
             let Some(type_ann) = member.child_by_field_name("type") else { continue };
             let type_children = named_children_vec(type_ann);
+            let type_ann_text = node_text(type_ann, source);
+
+            // Widen id and *Id fields (`id: string` -> `id?: any`) under strict:false so both string/number mocks and `.toLowerCase()` / `fn(id: string)` callers compile
+            if relax_optional_and_date && (prop_name == "id" || prop_name.ends_with("Id")) {
+                let is_plain_str_or_num = type_children.len() == 1
+                    && type_children[0].kind() == "predefined_type"
+                    && matches!(node_text(type_children[0], source), "string" | "number");
+                if is_plain_str_or_num {
+                    let t_node = type_children[0];
+                    if has_opt {
+                        edits.push((t_node.start_byte(), t_node.end_byte(), "any".to_string()));
+                    } else {
+                        edits.push((name_node.end_byte(), t_node.end_byte(), "?: any".to_string()));
+                    }
+                    continue;
+                }
+            }
+
+            // Widen nested inline object types (`performanceMetrics?: { ... }`) to `any` under strict:false
+            if relax_optional_and_date && type_children.len() == 1 && type_children[0].kind() == "object_type" {
+                let obj_ty = type_children[0];
+                if has_opt {
+                    edits.push((obj_ty.start_byte(), obj_ty.end_byte(), "any".to_string()));
+                } else {
+                    edits.push((name_node.end_byte(), obj_ty.end_byte(), "?: any".to_string()));
+                }
+                continue;
+            }
+
             let single_type_ident = if type_children.len() == 1 && type_children[0].kind() == "type_identifier" {
                 Some(type_children[0])
             } else {
@@ -1705,7 +1928,7 @@ fn reconcile_model_types_with_ui_hints(
                 let is_already_any = type_children.len() == 1
                     && type_children[0].kind() == "predefined_type"
                     && node_text(type_children[0], source) == "any";
-                let is_enum_union = node_text(type_ann, source).contains("| string");
+                let is_enum_union = type_ann_text.contains("| string");
                 if !is_enum_union && !(is_already_any && prop_name == "id") {
                     edits.push((name_node.end_byte(), name_node.end_byte(), "?".to_string()));
                 }
@@ -1724,7 +1947,7 @@ fn reconcile_model_types_with_ui_hints(
 /// - dodaje `[key: string]: any;` za view-model svojstva koja UI čita van Prisma sheme,
 /// - proširuje enum polja (`status: Status` → `status: Status | string`) radi poređenja sa string literalima (`TS2367`).
 pub fn reconcile_model_and_type_contracts_in_source(source: &str, is_model_or_type_file: bool) -> Option<String> {
-    reconcile_model_types_with_ui_hints(source, is_model_or_type_file, &std::collections::HashSet::new(), false)
+    reconcile_model_types_with_ui_hints(source, is_model_or_type_file, &std::collections::HashSet::new(), false, None, None)
 }
 
 fn collect_ui_string_and_jsx_member_props(proj_dir: &std::path::Path, paths: &[std::path::PathBuf]) -> std::collections::HashSet<String> {
@@ -1786,7 +2009,15 @@ pub fn reconcile_model_and_type_contracts_in_project(proj_dir: &std::path::Path)
             continue;
         }
         let Ok(content) = std::fs::read_to_string(&abs) else { continue };
-        if let Some(next) = reconcile_model_types_with_ui_hints(&content, true, &ui_props, relax_optional_and_date) {
+        let stem = abs.file_stem().and_then(|s| s.to_str());
+        if let Some(next) = reconcile_model_types_with_ui_hints(
+            &content,
+            true,
+            &ui_props,
+            relax_optional_and_date,
+            abs.parent(),
+            stem,
+        ) {
             if std::fs::write(&abs, &next).is_ok() {
                 edited += 1;
             }
@@ -1814,4 +2045,258 @@ pub fn format_type_shapes_for_prompt(shapes: &[TypeShape], max_props: usize) -> 
         lines.push(format!("{} {} {{ {} }}", s.kind, s.name, props.join("; ")));
     }
     lines.join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// 7. Phase 6 (v0.1.58): `.js`/`.jsx` → `.ts`/`.tsx` AST promocija,
+//    deduplikacija objektnih ključeva i detekcija EOF truncation/degeneracije
+// ---------------------------------------------------------------------------
+
+/// Koristi `tree-sitter-typescript` (TSX gramatiku) za tačno određivanje da li
+/// `.js`/`.jsx` fajl sadrži TypeScript sintaksu (`interface`, `type`, `: T`, `as`, generike, itd.)
+/// i/ili JSX elemente.
+pub fn detect_typescript_and_jsx_in_js_file(content: &str) -> (bool, bool) {
+    let Some(tree) = parse_source("file.tsx", content) else {
+        return (false, false);
+    };
+    if tree.root_node().has_error() {
+        return (false, false);
+    }
+    let mut has_ts = false;
+    let mut has_jsx = false;
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "interface_declaration"
+            | "type_alias_declaration"
+            | "enum_declaration"
+            | "type_annotation"
+            | "type_arguments"
+            | "type_parameters"
+            | "as_expression"
+            | "satisfies_expression"
+            | "non_null_expression"
+            | "implements_clause"
+            | "accessibility_modifier"
+            | "ambient_declaration"
+            | "type_predicate_annotation" => {
+                has_ts = true;
+            }
+            "import_statement" | "export_statement" => {
+                if has_token_child(node, "type") {
+                    has_ts = true;
+                }
+            }
+            "jsx_element" | "jsx_self_closing_element" | "jsx_fragment" => {
+                has_jsx = true;
+            }
+            _ => {}
+        }
+        if has_ts && has_jsx {
+            break;
+        }
+        let mut cursor = node.walk();
+        for ch in node.named_children(&mut cursor) {
+            stack.push(ch);
+        }
+    }
+    (has_ts, has_jsx)
+}
+
+/// Promoviše sve `.js`/`.jsx` fajlove unutar izvornih direktorijuma projekta koji sadrže
+/// AST-verifikovanu TypeScript sintaksu u `.ts`/`.tsx` (ili briše dupli `.js` ako `.ts` već postoji).
+pub fn promote_typed_js_files_to_ts_in_project(proj_dir: &std::path::Path) -> usize {
+    if !proj_dir.is_dir() {
+        return 0;
+    }
+    let mut promoted = 0usize;
+    let mut stack = Vec::new();
+    for dir_name in [
+        "src",
+        "app",
+        "components",
+        "hooks",
+        "lib",
+        "utils",
+        "models",
+        "types",
+        "services",
+        "shared",
+    ] {
+        let d = proj_dir.join(dir_name);
+        if d.is_dir() {
+            stack.push(d);
+        }
+    }
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if !matches!(
+                    name,
+                    "node_modules" | ".next" | ".git" | ".axiom" | "prisma" | "public" | "dist" | "build"
+                ) {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let fname_low = fname.to_ascii_lowercase();
+            if fname_low.ends_with(".config.js")
+                || fname_low.ends_with(".config.cjs")
+                || fname_low.ends_with(".config.mjs")
+                || fname_low == "middleware.js"
+            {
+                continue;
+            }
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+            if ext != "js" && ext != "jsx" {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else { continue };
+            let (has_ts, has_jsx) = detect_typescript_and_jsx_in_js_file(&content);
+            if !has_ts {
+                continue;
+            }
+            let new_ext = if has_jsx || ext == "jsx" { "tsx" } else { "ts" };
+            let target_path = path.with_extension(new_ext);
+            if target_path.is_file() {
+                if std::fs::remove_file(&path).is_ok() {
+                    promoted += 1;
+                }
+            } else if std::fs::write(&target_path, &content).is_ok() {
+                let _ = std::fs::remove_file(&path);
+                promoted += 1;
+            }
+        }
+    }
+    promoted
+}
+
+/// Uklanja duplirane ključeve unutar istog object literala (`TS1117`).
+pub fn deduplicate_object_literal_keys(path: &str, content: &str) -> Option<String> {
+    let tree = parse_source(path, content)?;
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut stack = vec![tree.root_node()];
+
+    while let Some(node) = stack.pop() {
+        if node.kind() == "object" {
+            let children = all_children_vec(node);
+            let mut seen_keys = std::collections::HashSet::new();
+            let mut deleted_commas = std::collections::HashSet::new();
+
+            for (i, &child) in children.iter().enumerate() {
+                if child.kind() == "comment" || !child.is_named() {
+                    continue;
+                }
+                let key_opt = match child.kind() {
+                    "pair" => child.child_by_field_name("key").and_then(|k| property_key_name(k, content)),
+                    "shorthand_property_identifier" => Some(node_text(child, content).to_string()),
+                    "method_definition" => child.child_by_field_name("name").and_then(|k| property_key_name(k, content)),
+                    _ => None,
+                };
+                let Some(key) = key_opt else { continue };
+                if seen_keys.insert(key) {
+                    continue;
+                }
+
+                // Duplicate key found: prefer deleting `[child.start_byte(), next_comma.end_byte()]`
+                let next_comma = children[i + 1..].iter().find_map(|c| {
+                    if c.kind() == "comment" {
+                        None
+                    } else if !c.is_named() && c.kind() == "," {
+                        Some(*c)
+                    } else if c.is_named() {
+                        None
+                    } else {
+                        None
+                    }
+                });
+                // Check only before next named sibling
+                let next_named_pos = children[i + 1..]
+                    .iter()
+                    .find(|c| c.is_named() && c.kind() != "comment")
+                    .map(|c| c.start_byte())
+                    .unwrap_or(usize::MAX);
+                let trailing_comma = next_comma.filter(|c| c.start_byte() < next_named_pos);
+
+                if let Some(comma) = trailing_comma {
+                    deleted_commas.insert(comma.start_byte());
+                    edits.push((child.start_byte(), comma.end_byte(), String::new()));
+                } else {
+                    let prev_comma = children[..i]
+                        .iter()
+                        .rev()
+                        .take_while(|c| !c.is_named() || c.kind() == "comment")
+                        .find(|c| !c.is_named() && c.kind() == "," && !deleted_commas.contains(&c.start_byte()));
+                    if let Some(pc) = prev_comma {
+                        deleted_commas.insert(pc.start_byte());
+                        edits.push((pc.start_byte(), child.end_byte(), String::new()));
+                    } else {
+                        edits.push((child.start_byte(), child.end_byte(), String::new()));
+                    }
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for ch in node.named_children(&mut cursor) {
+            stack.push(ch);
+        }
+    }
+
+    if edits.is_empty() {
+        return None;
+    }
+    let candidate = apply_byte_edits(content, edits);
+    verified_rewrite(path, content, candidate)
+}
+
+/// Detektuje degenerisan izlaz (beskonačnu petlju ponavljanja tokena/identifikatora)
+/// ili odsečen (truncated) fajl pri kraju TS/JS koda.
+pub fn detect_truncated_or_degenerate_ts_js(file_path: &str, content: &str) -> Option<String> {
+    if crate::self_healing::detect_infinite_loop(content) {
+        return Some("Generated file contains an infinite token/identifier repetition loop.".to_string());
+    }
+
+    let path_low = file_path.replace('\\', "/").to_ascii_lowercase();
+    if !(path_low.ends_with(".ts")
+        || path_low.ends_with(".tsx")
+        || path_low.ends_with(".js")
+        || path_low.ends_with(".jsx"))
+    {
+        return None;
+    }
+
+    let trimmed = content.trim_end();
+    if trimmed.is_empty() {
+        return Some("Generated file is empty.".to_string());
+    }
+
+    if let Some(last_line) = trimmed.lines().rev().find(|l| !l.trim().is_empty()) {
+        let lt = last_line.trim();
+        let incomplete_decl = regex::Regex::new(
+            r"^(?:export\s+(?:default\s+)?)?(?:async\s+)?(?:const|let|var|function\*?|interface|type|enum|class)\s+[A-Za-z_$][A-Za-z0-9_$]*$",
+        )
+        .map(|re| re.is_match(lt))
+        .unwrap_or(false);
+        if incomplete_decl || lt.ends_with('=') || lt.ends_with("=>") {
+            return Some("Generated file is truncated mid-statement at EOF.".to_string());
+        }
+    }
+
+    let total_lines = trimmed.lines().count();
+    if total_lines >= 25 {
+        if let Some(issues) = syntax_issues_for(file_path, trimmed) {
+            if issues.iter().any(|iss| iss.line + 2 >= total_lines) {
+                return Some("Generated file has syntax truncation at EOF.".to_string());
+            }
+        }
+    }
+
+    None
 }

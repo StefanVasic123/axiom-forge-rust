@@ -409,4 +409,129 @@ export interface ETA_Prediction {
         assert!(page_out.contains("const [isFormOpen, setIsFormOpen] = useState(false);"), "{}", page_out);
         assert!(page_out.contains("const handleCancel = () => { setIsEditing(false); };"), "{}", page_out);
     }
+
+    #[test]
+    fn phase6_v58_ui_lock_degeneration_types_and_ast_js_promotion_suite() {
+        // 1. Intra-line CamelCase/phrase repetition & EOF truncation detection
+        let loop_ident = "const queryPanelsByComplianceCheckComplianceCheckComplianceCheckComplianceCheckComplianceCheckSchema = z.object({});\n";
+        assert!(
+            crate::self_healing::detect_infinite_loop(loop_ident),
+            "Must detect repeating CamelCase identifier loop"
+        );
+        let loop_comment = "// query panels by compliance check compliance check compliance check compliance check\nconst x = 1;\n";
+        assert!(
+            crate::self_healing::detect_infinite_loop(loop_comment),
+            "Must detect repeating phrase loop inside line"
+        );
+        let truncated_eof = "import { z } from 'zod';\nconst queryPanelsByStatusSchema";
+        assert!(
+            crate::ast_engine::detect_truncated_or_degenerate_ts_js("src/app/api/route.ts", truncated_eof).is_some(),
+            "Must detect truncated variable declaration at EOF"
+        );
+        let normal_jsx = "export const Row = () => <tr><td>a</td><td>b</td><td>c</td><td>d</td></tr>;\n";
+        assert!(
+            !crate::self_healing::detect_infinite_loop(normal_jsx),
+            "Must NOT false-positive on repeated table cells"
+        );
+
+        // 2. Banned external UI kit filtering & import rewriting
+        assert!(crate::sanitizer::is_banned_external_ui_package("@chakra-ui/react"));
+        assert!(crate::sanitizer::is_banned_external_ui_package("@mui/material"));
+        assert!(crate::sanitizer::is_banned_external_ui_package("@radix-ui/react-input"));
+        assert!(crate::sanitizer::is_banned_external_ui_package("formik"));
+        assert!(!crate::sanitizer::is_banned_external_ui_package("lucide-react"));
+
+        let page_chakra = "\"use client\";\nimport { Avatar } from '@chakra-ui/react';\nexport default function P() { return <Avatar name=\"A\" />; }\n";
+        let page_rewritten = crate::sanitizer::sanitize_nextjs_and_zod_hallucinations(page_chakra, "app/(tabs)/ProcessAuditSharing.tsx");
+        assert!(page_rewritten.contains("import { Avatar } from '@/components/ui';"), "{}", page_rewritten);
+
+        let comp_chakra = "\"use client\";\nimport { Avatar as ChakraAvatar, AvatarBadge } from '@chakra-ui/react';\nconst Avatar = () => <ChakraAvatar><AvatarBadge /></ChakraAvatar>;\n";
+        let comp_rewritten = crate::sanitizer::sanitize_nextjs_and_zod_hallucinations(comp_chakra, "src/components/Avatar.tsx");
+        assert!(!comp_rewritten.contains("@chakra-ui/react"), "{}", comp_rewritten);
+        assert!(comp_rewritten.contains("const ChakraAvatar: any ="), "{}", comp_rewritten);
+        assert!(comp_rewritten.contains("const AvatarBadge: any ="), "{}", comp_rewritten);
+
+        // 3. Pure React component props (no DOM HTMLAttributes collision) & required props optionalized
+        let btn_in = "\"use client\";\nimport React, { ButtonHTMLAttributes } from 'react';\ninterface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {\n  type?: 'primary' | 'secondary';\n  label: string;\n}\nexport const Button: React.FC<ButtonProps> = ({ label, children }) => <button>{label}{children}</button>;\n";
+        let btn_out = crate::sanitizer::sanitize_nextjs_and_zod_hallucinations(btn_in, "src/components/Button.tsx");
+        assert!(!btn_out.contains("extends ButtonHTMLAttributes"), "{}", btn_out);
+        assert!(btn_out.contains("label?: string;"), "{}", btn_out);
+        assert!(btn_out.contains("children?: any;"), "{}", btn_out);
+        assert!(btn_out.contains("[key: string]: any;"), "{}", btn_out);
+
+        // 4. Tuple hook widening & self-recursive useToast cleanup
+        let toast_in = "\"use client\";\nimport { useState, useEffect } from 'react';\nconst useToast = (): [any, (o: any) => void] => {\n  const [s, setS] = useState(null);\n  const { toast } = useToast();\n  return [s, setS];\n};\n";
+        let toast_out = crate::sanitizer::sanitize_nextjs_and_zod_hallucinations(toast_in, "src/hooks/useToast.ts");
+        assert!(!toast_out.contains("const { toast } = useToast()"), "{}", toast_out);
+        assert!(toast_out.contains("): any =>"), "{}", toast_out);
+        assert!(toast_out.contains("Object.assign([s, setS]"), "{}", toast_out);
+
+        // 5. Zod 2-arg .refine & z.nativeEnum undeclared fallback & instanceof on interfaces & duplicate object literal keys
+        let auth_in = "\"use client\";\nimport { ComplianceReport } from '@/types';\nconst s = z.object({ a: z.string().refine((val, { parent }) => val === parent.b, 'match'), status: z.nativeEnum(MissingStatus).default(MissingStatus.ACTIVE) });\nconst arr = [{ id: '5', id: '5', ok: true }];\nconst chk = arr[0] instanceof ComplianceReport;\nconst incompleteTrailingVar";
+        let auth_out = crate::sanitizer::sanitize_nextjs_and_zod_hallucinations(auth_in, "src/app/page.tsx");
+        assert!(auth_out.contains("as any"), "{}", auth_out);
+        assert!(auth_out.contains("z.string().default('ACTIVE')"), "{}", auth_out);
+        assert!(!auth_out.contains("incompleteTrailingVar"), "{}", auth_out);
+        assert!(auth_out.contains("Boolean(arr[0])"), "{}", auth_out);
+        assert_eq!(auth_out.matches("id: '5'").count(), 1, "Duplicate object key must be removed:\n{}", auth_out);
+
+        // 6. AST `.js` -> `.ts` promotion, `@/types` sync, `lib/api.ts` deduplication & `id?: any` widening
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v58_suite_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(temp_dir.join("src/shared/models")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/types")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/lib")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/app/settings")).unwrap();
+        std::fs::write(temp_dir.join("tsconfig.json"), r#"{"compilerOptions":{"strict":false}}"#).unwrap();
+
+        std::fs::write(
+            temp_dir.join("src/shared/models/PredictiveAlert.js"),
+            "export interface PredictiveAlert {\n  id: string;\n  panelId: string;\n  metrics: { efficiency: number };\n}\n",
+        ).unwrap();
+        std::fs::write(
+            temp_dir.join("src/types/TBMPerformance.ts"),
+            "export interface TBMPerformance {\n  id: string;\n  projectId: string;\n  performanceMetrics: { excavationRate: number };\n}\n",
+        ).unwrap();
+        std::fs::write(
+            temp_dir.join("src/lib/api.ts"),
+            "export interface TBMPerformance {\n  id: number;\n  date: string;\n}\nexport async function fetchPerf(): Promise<TBMPerformance[]> { return []; }\n",
+        ).unwrap();
+        std::fs::write(
+            temp_dir.join("src/app/settings/page.tsx"),
+            "import { GeologicalCondition } from '@/types/TBMPerformance';\nexport default function Settings() { return null; }\n",
+        ).unwrap();
+
+        let promoted = crate::ast_engine::promote_typed_js_files_to_ts_in_project(&temp_dir);
+        assert_eq!(promoted, 1);
+        assert!(temp_dir.join("src/shared/models/PredictiveAlert.ts").is_file());
+        assert!(!temp_dir.join("src/shared/models/PredictiveAlert.js").exists());
+
+        crate::sanitizer::synchronize_global_types_and_dedup_api(&temp_dir);
+        crate::ast_engine::reconcile_model_and_type_contracts_in_project(&temp_dir);
+
+        let alert_type = std::fs::read_to_string(temp_dir.join("src/types/PredictiveAlert.ts")).unwrap();
+        assert!(alert_type.contains("id?: any;"), "{}", alert_type);
+        assert!(alert_type.contains("panelId?: any;"), "{}", alert_type);
+        assert!(alert_type.contains("metrics?: any;"), "{}", alert_type);
+
+        let tbm_type = std::fs::read_to_string(temp_dir.join("src/types/TBMPerformance.ts")).unwrap();
+        assert!(tbm_type.contains("performanceMetrics?: any;"), "{}", tbm_type);
+        assert!(tbm_type.contains("projectId?: any;"), "{}", tbm_type);
+
+        let api_out = std::fs::read_to_string(temp_dir.join("src/lib/api.ts")).unwrap();
+        assert!(!api_out.contains("export interface TBMPerformance"), "Duplicate interface must be deduplicated from api.ts:\n{}", api_out);
+        assert!(api_out.contains("import { TBMPerformance } from '@/types';"), "{}", api_out);
+
+        let settings_out = std::fs::read_to_string(temp_dir.join("src/app/settings/page.tsx")).unwrap();
+        assert!(settings_out.contains("from '@/types'"), "Broken subpath import must be repaired:\n{}", settings_out);
+
+        let types_idx = std::fs::read_to_string(temp_dir.join("src/types/index.ts")).unwrap();
+        assert!(types_idx.contains("GeologicalCondition"), "{}", types_idx);
+        assert!(types_idx.contains("PredictiveAlert"), "{}", types_idx);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }

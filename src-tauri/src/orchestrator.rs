@@ -1129,6 +1129,10 @@ pub async fn validate_file_with_abstract_rules(
         return Err(format!("Generated code appears truncated: {} unclosed '{{' block(s).", open_curly - close_curly));
     }
 
+    if let Some(degen_reason) = crate::ast_engine::detect_truncated_or_degenerate_ts_js(file_path, trimmed) {
+        return Err(degen_reason);
+    }
+
     // 8. Pure `.ts` files (not `.tsx`/`.d.ts`) cannot parse JSX tags under TS `jsx: preserve`
     if path_lower.ends_with(".ts") && !path_lower.ends_with(".d.ts") {
         let uncommented = strip_ts_js_comments_preserving_strings(trimmed);
@@ -6586,6 +6590,11 @@ export default function RootLayout({
                 );
             }
 
+            let gen_opts = if attempts > 1 {
+                build_ollama_options_with_penalty(&model_id, 0.38, Some(4096), 1.22)
+            } else {
+                build_ollama_options(&model_id, 0.3, Some(4096))
+            };
             let ollama_req = serde_json::json!({
                 "model": model_id.clone(), 
                 "messages": [
@@ -6593,7 +6602,7 @@ export default function RootLayout({
                     { "role": "user", "content": &current_user_prompt }
                 ],
                 "stream": true,
-                "options": build_ollama_options(&model_id, 0.3, Some(4096))
+                "options": gen_opts
             });
 
             let req_fut = client.post("http://127.0.0.1:11434/api/chat")
@@ -6760,6 +6769,13 @@ export default function RootLayout({
                             user_prompt, validation_error
                         );
                         file_gen_success = false;
+                    } else if crate::ast_engine::detect_truncated_or_degenerate_ts_js(file_path, &processed_content).is_some() {
+                        debug_log_to_file(format!(
+                            "[Validator] Max attempts reached for {} and output remains degenerate/truncated. Falling back to safe stub.",
+                            file_path
+                        ));
+                        processed_content.clear();
+                        file_gen_success = false;
                     } else {
                         // Accept anyway to avoid blockages
                         file_gen_success = true;
@@ -6878,8 +6894,10 @@ export default function RootLayout({
         }
     }
 
-    // Ensure theme file, UI primitives & directory barrels exist BEFORE local import repair scans missing modules
+    // Ensure theme file, typed JS promotion, global @/types sync, UI primitives & directory barrels exist BEFORE local import repair scans missing modules
     ensure_theme_file_exists(&proj_dir);
+    crate::ast_engine::promote_typed_js_files_to_ts_in_project(&proj_dir);
+    crate::sanitizer::synchronize_global_types_and_dedup_api(&proj_dir);
     crate::sanitizer::ensure_ui_primitives_reconciled(&proj_dir);
     ensure_directory_barrel_files(&proj_dir);
 

@@ -530,7 +530,7 @@ pub fn ensure_directory_barrel_files(proj_dir: &std::path::Path) {
     let mut demanded_dirs: std::collections::BTreeMap<std::path::PathBuf, std::collections::BTreeSet<String>> = std::collections::BTreeMap::new();
 
     // Seed standard existing directories if they already have an index.* file so dead re-exports are repaired even if unreferenced
-    for std_dir_name in ["components", "hooks", "types", "utils", "lib", "models", "services", "context", "contexts"] {
+    for std_dir_name in ["components", "hooks", "types", "utils", "lib", "models", "services", "context", "contexts", "shared"] {
         let candidate_dir = alias_root.join(std_dir_name);
         if candidate_dir.is_dir()
             && (candidate_dir.join("index.ts").is_file()
@@ -625,7 +625,7 @@ pub fn ensure_directory_barrel_files(proj_dir: &std::path::Path) {
     if has_src {
         scan_demanded_barrels(&src_dir, &alias_root, proj_dir, &import_re, &mut demanded_dirs);
     }
-    for sub_name in ["app", "components", "hooks", "lib", "utils", "models", "types", "services"] {
+    for sub_name in ["app", "components", "hooks", "lib", "utils", "models", "types", "services", "shared"] {
         let sub_dir = proj_dir.join(sub_name);
         if sub_dir.is_dir() {
             scan_demanded_barrels(&sub_dir, &alias_root, proj_dir, &import_re, &mut demanded_dirs);
@@ -872,7 +872,7 @@ pub fn ensure_directory_barrel_files(proj_dir: &std::path::Path) {
                         let stub = if is_component_dir && sym.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
                             format!("export const {}: any = () => null;", sym)
                         } else if sym.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
-                            format!("export type {} = any;", sym)
+                            format!("export const {}: any = {{}};\nexport type {} = any;", sym, sym)
                         } else {
                             format!("export const {}: any = () => ({{}} as any);", sym)
                         };
@@ -946,7 +946,7 @@ pub fn ensure_directory_barrel_files(proj_dir: &std::path::Path) {
                 if is_component_dir && sym.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
                     lines.push(format!("export const {}: any = () => null;", sym));
                 } else if sym.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
-                    lines.push(format!("export type {} = any;", sym));
+                    lines.push(format!("export const {}: any = {{}};\nexport type {} = any;", sym, sym));
                 } else {
                     lines.push(format!("export const {}: any = () => ({{}} as any);", sym));
                 }
@@ -2538,7 +2538,7 @@ pub fn widen_narrow_ui_props_interfaces(content: &str) -> String {
     };
 
     let bytes = content.as_bytes();
-    let mut insertions: Vec<usize> = Vec::new();
+    let mut insertions: Vec<(usize, String)> = Vec::new();
 
     for m in re.find_iter(content) {
         let open_idx = m.end() - 1;
@@ -2624,8 +2624,15 @@ pub fn widen_narrow_ui_props_interfaces(content: &str) -> String {
 
         if let Some(end_idx) = close_idx {
             let body = &content[open_idx + 1..end_idx];
+            let mut snippet = String::new();
+            if !body.contains("children") {
+                snippet.push_str("  children?: any;\n");
+            }
             if !body.contains("[key:") {
-                insertions.push(end_idx);
+                snippet.push_str("  [key: string]: any;\n");
+            }
+            if !snippet.is_empty() {
+                insertions.push((end_idx, snippet));
             }
         }
     }
@@ -2635,16 +2642,15 @@ pub fn widen_narrow_ui_props_interfaces(content: &str) -> String {
     }
 
     let mut out = content.to_string();
-    insertions.sort_unstable();
-    insertions.dedup();
-    for pos in insertions.into_iter().rev() {
+    insertions.sort_by_key(|(pos, _)| *pos);
+    for (pos, snippet) in insertions.into_iter().rev() {
         let before_has_nl = pos > 0 && out.as_bytes()[pos - 1] == b'\n';
         let patch = if before_has_nl {
-            "  [key: string]: any;\n"
+            snippet
         } else {
-            "\n  [key: string]: any;\n"
+            format!("\n{}", snippet)
         };
-        out.insert_str(pos, patch);
+        out.insert_str(pos, &patch);
     }
     out
 }
@@ -2980,14 +2986,47 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
                 | "DialogHeader"
                 | "DialogTitle"
                 | "DialogDescription"
+                | "Drawer"
+                | "DrawerContent"
+                | "DrawerHeader"
+                | "DrawerTitle"
+                | "DrawerDescription"
+                | "DrawerBody"
+                | "DrawerFooter"
+                | "DrawerOverlay"
+                | "DrawerCloseButton"
+                | "Popover"
+                | "PopoverTrigger"
+                | "PopoverContent"
+                | "Tooltip"
+                | "TooltipTrigger"
+                | "TooltipContent"
+                | "TooltipProvider"
+                | "Radio"
+                | "RadioGroup"
+                | "RangeSlider"
+                | "Slider"
+                | "Stepper"
                 | "Alert"
                 | "AlertTitle"
                 | "AlertDescription"
                 | "Avatar"
+                | "AvatarGroup"
+                | "AvatarBadge"
+                | "Box"
+                | "Stack"
+                | "VStack"
+                | "HStack"
                 | "Spinner"
                 | "LoadingSpinner"
                 | "Skeleton"
                 | "Separator"
+                | "Toast"
+                | "ToastComponent"
+                | "SelectTrigger"
+                | "SelectValue"
+                | "SelectContent"
+                | "SelectItem"
                 | "MetricCard"
                 | "DataTable"
                 | "EmptyState"
@@ -3324,6 +3363,23 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
             content = widen_narrow_ui_props_interfaces(&content);
             content = repair_bare_react_fc_signatures(&content, true);
             content = repair_ui_fc_missing_children_prop(&content);
+            if let Ok(re_val_only_opt) = regex::Regex::new(r"(?m)^\s*export\s+const\s+([A-Z][A-Za-z0-9_]*(?:Options|Props|State|Config))\b") {
+                let mut missing_type_aliases = Vec::new();
+                for cap in re_val_only_opt.captures_iter(&content) {
+                    if let Some(m) = cap.get(1) {
+                        let s = m.as_str();
+                        if !content.contains(&format!("export type {}", s)) && !content.contains(&format!("export interface {}", s)) {
+                            missing_type_aliases.push(format!("export type {} = any;\n", s));
+                        }
+                    }
+                }
+                for alias_line in missing_type_aliases {
+                    if !content.ends_with('\n') {
+                        content.push('\n');
+                    }
+                    content.push_str(&alias_line);
+                }
+            }
 
             // Upgrade legacy catch-all `<div ...>` / non-`asChild` stubs previously emitted by older Axiom versions
             for (sym_up, semantic_def) in [
@@ -3413,7 +3469,26 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
                         "Heading" => "export const Heading = ({ children, className = '', ...props }: any) => <h2 className={`text-xl font-bold text-slate-900 ${className}`} {...props}>{children}</h2>;\n".to_string(),
                         "Text" => "export const Text = ({ children, className = '', ...props }: any) => <p className={`text-sm text-slate-700 ${className}`} {...props}>{children}</p>;\n".to_string(),
                         "Modal" => "export const Modal = ({ isOpen, open, onClose, onOpenChange, title, content, children, className = '', ...props }: any) => { const visible = isOpen ?? open ?? true; if (!visible) return null; const handleDismiss = () => { onClose?.(); onOpenChange?.(false); }; return <div className=\"fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4\"><div className={`w-full max-w-lg rounded-xl bg-white p-6 shadow-xl ${className}`} {...props}>{title ? <div className=\"mb-4 flex items-center justify-between\"><h3 className=\"text-lg font-semibold\">{title}</h3><button type=\"button\" onClick={handleDismiss} className=\"text-slate-400 hover:text-slate-600\">×</button></div> : null}{content || children}</div></div>; };\n".to_string(),
-                        "DialogTitle" | "AlertTitle" => format!("export const {} = ({{ children, className = '', ...props }}: any) => <h4 className={{`text-base font-semibold text-slate-900 ${{className}}`}} {{...props}}>{{children}}</h4>;\n", sym),
+                        "Drawer" => "export const Drawer = ({ isOpen, open, onClose, children, className = '', ...props }: any) => { const visible = isOpen ?? open ?? false; if (!visible) return null; return <div className=\"fixed inset-0 z-50 flex justify-end bg-black/40\"><div className={`h-full w-full max-w-md bg-white p-6 shadow-xl overflow-y-auto ${className}`} {...props}>{children}</div></div>; };\n".to_string(),
+                        "DrawerOverlay" => "export const DrawerOverlay = ({ className = '', ...props }: any) => <div className={`fixed inset-0 bg-black/40 ${className}`} {...props} />;\n".to_string(),
+                        "DrawerContent" | "DrawerBody" => format!("export const {} = ({{ children, className = '', ...props }}: any) => <div className={{`flex flex-col gap-4 ${{className}}`}} {{...props}}>{{children}}</div>;\n", sym),
+                        "DrawerHeader" => "export const DrawerHeader = ({ children, className = '', ...props }: any) => <div className={`border-b border-slate-200 pb-3 text-lg font-semibold text-slate-900 ${className}`} {...props}>{children}</div>;\n".to_string(),
+                        "DrawerFooter" => "export const DrawerFooter = ({ children, className = '', ...props }: any) => <div className={`mt-auto flex items-center justify-end gap-2 border-t border-slate-200 pt-3 ${className}`} {...props}>{children}</div>;\n".to_string(),
+                        "DrawerCloseButton" => "export const DrawerCloseButton = ({ onClick, className = '', ...props }: any) => <button type=\"button\" onClick={onClick} aria-label=\"Close\" className={`rounded-md p-1 text-slate-400 hover:text-slate-600 ${className}`} {...props}>×</button>;\n".to_string(),
+                        "DrawerTitle" | "DialogTitle" | "AlertTitle" => format!("export const {} = ({{ children, className = '', ...props }}: any) => <h4 className={{`text-base font-semibold text-slate-900 ${{className}}`}} {{...props}}>{{children}}</h4>;\n", sym),
+                        "DrawerDescription" => "export const DrawerDescription = ({ children, className = '', ...props }: any) => <p className={`text-sm text-slate-500 ${className}`} {...props}>{children}</p>;\n".to_string(),
+                        "Popover" | "PopoverTrigger" | "Tooltip" | "TooltipTrigger" | "TooltipProvider" | "Box" | "Stack" | "VStack" | "HStack" => format!("export const {} = ({{ children, className = '', ...props }}: any) => <div className={{className}} {{...props}}>{{children}}</div>;\n", sym),
+                        "PopoverContent" | "TooltipContent" => format!("export const {} = ({{ children, className = '', ...props }}: any) => <div className={{`z-50 rounded-lg border border-slate-200 bg-white p-3 text-sm text-slate-800 shadow-lg ${{className}}`}} {{...props}}>{{children}}</div>;\n", sym),
+                        "Radio" => "export const Radio = ({ label, children, className = '', ...props }: any) => <label className={`inline-flex items-center gap-2 text-sm text-slate-700 ${className}`}><input type=\"radio\" className=\"h-4 w-4 border-slate-300 text-indigo-600\" {...props} />{label || children}</label>;\n".to_string(),
+                        "RadioGroup" => "export const RadioGroup = ({ children, className = '', ...props }: any) => <div role=\"radiogroup\" className={`flex flex-col gap-2 ${className}`} {...props}>{children}</div>;\n".to_string(),
+                        "RangeSlider" | "Slider" => format!("export const {} = ({{ min = 0, max = 100, step = 1, value, defaultValue, onChange, className = '', ...props }}: any) => <input type=\"range\" min={{min}} max={{max}} step={{step}} value={{value}} defaultValue={{defaultValue}} onChange={{onChange}} className={{`w-full accent-indigo-600 ${{className}}`}} {{...props}} />;\n", sym),
+                        "Stepper" => "export const Stepper = ({ value = 0, min = 0, max = 100, step = 1, onChange, children, className = '', ...props }: any) => <div className={`inline-flex items-center gap-2 rounded-lg border border-slate-200 px-2 py-1 ${className}`} {...props}>{children || <><span>{value}</span><button type=\"button\" onClick={() => onChange?.(Math.min(max, Number(value) + step))} className=\"px-2 font-semibold\">+</button></>}</div>;\n".to_string(),
+                        "Avatar" => "export const Avatar = ({ children, name = '', src, imageUrl, size = 'md', userId, isGroup, groupAvatars, className = '', ...props }: any) => { const img = src || imageUrl; const initials = String(name || userId || 'U').split(' ').filter(Boolean).map((w: string) => w[0]).join('').slice(0, 2).toUpperCase(); return <div className={`inline-flex h-10 w-10 items-center justify-center rounded-full bg-indigo-100 text-sm font-semibold text-indigo-700 overflow-hidden ${className}`} {...props}>{img ? <img src={img} alt={name || 'Avatar'} className=\"h-full w-full object-cover\" /> : (children || initials)}</div>; };\n".to_string(),
+                        "AvatarGroup" => "export const AvatarGroup = ({ children, className = '', ...props }: any) => <div className={`flex -space-x-2 overflow-hidden ${className}`} {...props}>{children}</div>;\n".to_string(),
+                        "AvatarBadge" => "export const AvatarBadge = ({ children, className = '', ...props }: any) => <span className={`inline-flex h-3 w-3 items-center justify-center rounded-full bg-emerald-500 ring-2 ring-white text-[10px] text-white ${className}`} {...props}>{children}</span>;\n".to_string(),
+                        "SelectTrigger" | "SelectValue" | "SelectContent" => format!("export const {} = ({{ children, placeholder, className = '', ...props }}: any) => <span className={{className}} {{...props}}>{{children ?? placeholder}}</span>;\n", sym),
+                        "SelectItem" => "export const SelectItem = ({ children, value, className = '', ...props }: any) => <option value={value} className={className} {...props}>{children}</option>;\n".to_string(),
+                        "Toast" | "ToastComponent" => format!("export const {} = ({{ children, className = '', ...props }}: any) => <div role=\"status\" className={{`rounded-lg border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 shadow-md ${{className}}`}} {{...props}}>{{children}}</div>;\n", sym),
                         "Alert" => "export const Alert = ({ children, className = '', ...props }: any) => <div role=\"alert\" className={`rounded-lg border border-slate-200 bg-slate-50 p-4 text-sm text-slate-800 ${className}`} {...props}>{children}</div>;\n".to_string(),
                         "AlertDescription" => "export const AlertDescription = ({ children, className = '', ...props }: any) => <p className={`text-sm text-slate-600 ${className}`} {...props}>{children}</p>;\n".to_string(),
                         "Spinner" | "LoadingSpinner" => format!("export const {} = ({{ className = '', ...props }}: any) => <span role=\"status\" aria-label=\"Loading\" className={{`inline-block h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent ${{className}}`}} {{...props}} />;\n", sym),
@@ -3428,12 +3503,11 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
                         "TableHeaderCell" => "export const TableHeaderCell = ({ children, className = '', ...props }: any) => <th className={`px-3 py-2 text-left font-medium text-slate-600 ${className}`} {...props}>{children}</th>;\n".to_string(),
                         "TableCell" => "export const TableCell = ({ children, className = '', ...props }: any) => <td className={`px-3 py-2 align-middle ${className}`} {...props}>{children}</td>;\n".to_string(),
                         "TableCaption" => "export const TableCaption = ({ children, className = '', ...props }: any) => <caption className={`mt-2 text-sm text-slate-500 ${className}`} {...props}>{children}</caption>;\n".to_string(),
-                        "Toast" => "export const Toast = ({ children, className = '', ...props }: any) => <div role=\"status\" className={`rounded-lg border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 shadow-md ${className}`} {...props}>{children}</div>;\n".to_string(),
                         "Toaster" => "export const Toaster = () => null;\n".to_string(),
                         "toast" => "export const toast: ((opts?: any) => any) & { success: (msg?: any, opts?: any) => any; error: (msg?: any, opts?: any) => any; info: (msg?: any, opts?: any) => any; warning: (msg?: any, opts?: any) => any; warn: (msg?: any, opts?: any) => any; loading: (msg?: any, opts?: any) => any; dismiss: (id?: string) => void } = Object.assign((opts?: any) => { if (typeof window !== 'undefined') console.info('[toast]', opts?.title || opts?.description || opts); return { id: 'axiom-toast', dismiss: () => {}, update: () => {} }; }, { success: (msg?: any) => ({ id: 'axiom-toast', message: msg }), error: (msg?: any) => ({ id: 'axiom-toast', message: msg }), info: (msg?: any) => ({ id: 'axiom-toast', message: msg }), warning: (msg?: any) => ({ id: 'axiom-toast', message: msg }), warn: (msg?: any) => ({ id: 'axiom-toast', message: msg }), loading: (msg?: any) => ({ id: 'axiom-toast', message: msg }), dismiss: () => {} });\n".to_string(),
                         "useToast" => "export const useToast = () => { const fn: ((opts?: any) => any) & { success: (msg?: any, opts?: any) => any; error: (msg?: any, opts?: any) => any; info: (msg?: any, opts?: any) => any; warning: (msg?: any, opts?: any) => any; warn: (msg?: any, opts?: any) => any; loading: (msg?: any, opts?: any) => any; dismiss: (id?: string) => void } = Object.assign((opts?: any) => { if (typeof window !== 'undefined') console.info('[toast]', opts?.title || opts?.description || opts); return { id: 'axiom-toast', dismiss: () => {}, update: () => {} }; }, { success: (msg?: any) => ({ id: 'axiom-toast', message: msg }), error: (msg?: any) => ({ id: 'axiom-toast', message: msg }), info: (msg?: any) => ({ id: 'axiom-toast', message: msg }), warning: (msg?: any) => ({ id: 'axiom-toast', message: msg }), warn: (msg?: any) => ({ id: 'axiom-toast', message: msg }), loading: (msg?: any) => ({ id: 'axiom-toast', message: msg }), dismiss: () => {} }); return { toast: fn, toasts: [] as any[], dismiss: (_id?: string) => {} }; };\n".to_string(),
                         "Link" => "export const Link = ({ children, href = '#', prefetch, replace, scroll, shallow, locale, legacyBehavior, className = '', ...props }: any) => <a href={typeof href === 'string' ? href : '#'} className={className} {...props}>{children}</a>;\n".to_string(),
-                        _ => format!("export const {} = ({{ children, className = '', ...props }}: any) => <div className={{className}} {{...props}}>{{children}}</div>;\n", sym),
+                        _ => format!("export const {} = ({{ children, className = '', ...props }}: any) => <div className={{className}} {{...props}}>{{children}}</div>;\nexport type {} = any;\n", sym, sym),
                     };
                     appended.push_str(&fallback);
                     added_syms.push(sym.clone());
@@ -4896,6 +4970,452 @@ pub fn sanitize_app_router_route_exports(content: &str, file_path: &str) -> Stri
     result
 }
 
+/// Returns `true` if `pkg` belongs to an external UI widget/form kit that conflicts with
+/// our pure React + Tailwind `@/components/ui` primitives.
+pub fn is_banned_external_ui_package(pkg: &str) -> bool {
+    let p = pkg.trim();
+    p.starts_with("@chakra-ui/")
+        || p.starts_with("@mui/")
+        || p.starts_with("@material-ui/")
+        || p == "@emotion/react"
+        || p == "@emotion/styled"
+        || p.starts_with("@radix-ui/")
+        || matches!(
+            p,
+            "@headlessui/react"
+                | "antd"
+                | "react-bootstrap"
+                | "semantic-ui-react"
+                | "mantine"
+                | "formik"
+                | "yup"
+        )
+        || p.starts_with("@mantine/")
+}
+
+fn root_pkg_name_from_specifier(spec: &str) -> String {
+    let clean = spec.split(['?', '#']).next().unwrap_or(spec).trim();
+    let parts: Vec<&str> = clean.split('/').collect();
+    if clean.starts_with('@') && parts.len() >= 2 {
+        format!("{}/{}", parts[0], parts[1])
+    } else {
+        parts.first().copied().unwrap_or("").to_string()
+    }
+}
+
+fn rewrite_banned_external_ui_imports(src: &str, rel_path: &str, is_tsx_like: bool) -> String {
+    let low = rel_path.replace('\\', "/").to_ascii_lowercase();
+    let is_in_components = low.contains("/components/")
+        || low.starts_with("components/")
+        || low.contains("/renderer/components/");
+    let Ok(imp_re) = regex::Regex::new(
+        r#"(?ms)^[ \t]*import\s+(?:type\s+)?([\s\S]*?)\s+from\s+['"]([^'"]+)['"];?[ \t]*\r?\n?"#,
+    ) else {
+        return src.to_string();
+    };
+
+    let mut out = String::with_capacity(src.len());
+    let mut last = 0usize;
+    let mut changed = false;
+
+    for cap in imp_re.captures_iter(src) {
+        let Some(full_m) = cap.get(0) else { continue };
+        let clause = cap.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+        let spec = cap.get(2).map(|m| m.as_str()).unwrap_or("").trim();
+        let root_pkg = root_pkg_name_from_specifier(spec);
+        let is_ui_kit = is_banned_external_ui_package(&root_pkg)
+            && !matches!(root_pkg.as_str(), "formik" | "yup")
+            && spec != "@radix-ui/react-button";
+        if !is_ui_kit {
+            continue;
+        }
+
+        changed = true;
+        out.push_str(&src[last..full_m.start()]);
+        last = full_m.end();
+
+        if !is_in_components {
+            out.push_str(&format!("import {} from '@/components/ui';\n", clause));
+            continue;
+        }
+
+        // Inside `components/*`, strip external import and emit lightweight local React/Tailwind shims
+        let mut local_syms: Vec<String> = Vec::new();
+        if let Some(ob) = clause.find('{') {
+            let def_part = clause[..ob].trim().trim_end_matches(',').trim();
+            if !def_part.is_empty() && !def_part.starts_with('*') {
+                local_syms.push(def_part.to_string());
+            }
+            if let Some(cb) = clause.rfind('}') {
+                for raw_item in clause[ob + 1..cb].split(',') {
+                    let t = raw_item.trim().trim_start_matches("type ").trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    let local = if let Some((_, alias)) = t.split_once(" as ") {
+                        alias.trim()
+                    } else {
+                        t.split_whitespace().next().unwrap_or("")
+                    };
+                    if !local.is_empty() && !local_syms.iter().any(|s| s == local) {
+                        local_syms.push(local.to_string());
+                    }
+                }
+            }
+        } else if let Some(star) = clause.find("* as ") {
+            let alias = clause[star + 5..].trim();
+            if !alias.is_empty() {
+                local_syms.push(alias.to_string());
+            }
+        } else if !clause.is_empty() {
+            local_syms.push(clause.to_string());
+        }
+
+        for sym in local_syms {
+            if !sym.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$') {
+                continue;
+            }
+            let esc = regex::escape(&sym);
+            let already_declared = regex::Regex::new(&format!(
+                r"(?m)^[ \t]*(?:export\s+)?(?:const|let|var|function\*?|class|interface|type)\s+{}\b",
+                esc
+            ))
+            .map(|re| re.is_match(src))
+            .unwrap_or(false);
+            if already_declared {
+                continue;
+            }
+            if sym.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
+                if is_tsx_like {
+                    out.push_str(&format!(
+                        "const {}: any = ({{ children, className = '', ...props }}: any) => <div className={{className}} {{...props}}>{{children}}</div>;\n",
+                        sym
+                    ));
+                } else {
+                    out.push_str(&format!("const {}: any = ({{}} as any);\n", sym));
+                }
+            } else {
+                out.push_str(&format!(
+                    "const {}: any = (..._args: any[]) => ({{ isOpen: false, onOpen: () => {{}}, onClose: () => {{}}, toast: () => {{}} }});\n",
+                    sym
+                ));
+            }
+        }
+    }
+
+    if !changed {
+        return src.to_string();
+    }
+    out.push_str(&src[last..]);
+    out
+}
+
+fn optionalize_component_props_fields(src: &str) -> String {
+    let Ok(iface_re) = regex::Regex::new(
+        r#"(?m)^[ \t]*(?:export\s+)?interface\s+[A-Za-z0-9_]*Props\b[^{;\n]*\{"#,
+    ) else {
+        return src.to_string();
+    };
+    let Ok(prop_line_re) = regex::Regex::new(
+        r#"^([ \t]*(?:readonly\s+)?[A-Za-z_$][A-Za-z0-9_$]*)(\s*):(.*)$"#,
+    ) else {
+        return src.to_string();
+    };
+
+    let mut bodies: Vec<(usize, usize)> = Vec::new();
+    for m in iface_re.find_iter(src) {
+        let open_idx = m.end() - 1;
+        if let Some(close_idx) = find_balanced_delimiter_bytes(src, open_idx, b'{', b'}') {
+            bodies.push((open_idx + 1, close_idx));
+        }
+    }
+    if bodies.is_empty() {
+        return src.to_string();
+    }
+
+    let mut out = src.to_string();
+    for (start, end) in bodies.into_iter().rev() {
+        if start >= end || end > out.len() {
+            continue;
+        }
+        let body = &out[start..end];
+        let mut depth = 0isize;
+        let mut new_lines = Vec::new();
+        let mut changed = false;
+        for line in body.split_inclusive('\n') {
+            let trimmed = line.trim();
+            if depth == 0 && !trimmed.starts_with("//") && !trimmed.starts_with("/*") && !trimmed.starts_with('*') && !trimmed.starts_with('[') {
+                let no_nl = line.trim_end_matches(['\r', '\n']);
+                let nl = &line[no_nl.len()..];
+                if let Some(cap) = prop_line_re.captures(no_nl) {
+                    changed = true;
+                    new_lines.push(format!("{}{}?:{}{}", &cap[1], &cap[2], &cap[3], nl));
+                } else {
+                    new_lines.push(line.to_string());
+                }
+            } else {
+                new_lines.push(line.to_string());
+            }
+            for ch in trimmed.chars() {
+                if ch == '{' {
+                    depth += 1;
+                } else if ch == '}' {
+                    depth = (depth - 1).max(0);
+                }
+            }
+        }
+        if changed {
+            out.replace_range(start..end, &new_lines.concat());
+        }
+    }
+    out
+}
+
+fn split_top_level_args(inner: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut start = 0usize;
+    let mut paren = 0isize;
+    let mut brace = 0isize;
+    let mut bracket = 0isize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_tick = false;
+    let mut escaped = false;
+    for (idx, ch) in inner.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if (in_single || in_double || in_tick) && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' && !in_double && !in_tick {
+            in_single = !in_single;
+            continue;
+        }
+        if ch == '"' && !in_single && !in_tick {
+            in_double = !in_double;
+            continue;
+        }
+        if ch == '`' && !in_single && !in_double {
+            in_tick = !in_tick;
+            continue;
+        }
+        if in_single || in_double || in_tick {
+            continue;
+        }
+        match ch {
+            '(' => paren += 1,
+            ')' => paren = (paren - 1).max(0),
+            '{' => brace += 1,
+            '}' => brace = (brace - 1).max(0),
+            '[' => bracket += 1,
+            ']' => bracket = (bracket - 1).max(0),
+            ',' if paren == 0 && brace == 0 && bracket == 0 => {
+                args.push(inner[start..idx].to_string());
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    if start <= inner.len() {
+        args.push(inner[start..].to_string());
+    }
+    args
+}
+
+fn widen_tuple_hooks_and_self_use_toast(src: &str, is_ts: bool) -> String {
+    let mut out = src.to_string();
+
+    // Fix recursive `const { toast } = useToast();` inside `useToast` definition
+    if (out.contains("const useToast") || out.contains("function useToast"))
+        && out.contains("useToast(")
+    {
+        if let Ok(re_self) = regex::Regex::new(r#"(?m)^([ \t]*)const\s+\{\s*toast\s*\}\s*=\s*useToast\s*\(\s*\)\s*;?"#) {
+            out = re_self
+                .replace_all(
+                    &out,
+                    "${1}const toast: any = Object.assign((_opts?: any) => {}, { success: () => {}, error: () => {}, info: () => {}, warning: () => {} });",
+                )
+                .to_string();
+        }
+    }
+
+    if !is_ts {
+        return out;
+    }
+
+    // Widen explicit tuple return annotations on hooks: `const useX = (...): [State, Setter] =>`
+    let mut had_tuple_hook = false;
+    let Ok(hook_ret_re) = regex::Regex::new(
+        r#"(?m)\b(?:(?:const|let|var)\s+use[A-Z][A-Za-z0-9_]*\s*=|function\s+use[A-Z][A-Za-z0-9_]*\s*\()"#,
+    ) else {
+        return out;
+    };
+    if hook_ret_re.is_match(&out) {
+        let mut cursor = 0usize;
+        let mut bracket_spans: Vec<(usize, usize)> = Vec::new();
+        while let Some(pos) = out[cursor..].find("): [") {
+            let open_br = cursor + pos + 3;
+            if let Some(close_br) = find_balanced_delimiter_bytes(&out, open_br, b'[', b']') {
+                let after = out[close_br + 1..].trim_start();
+                if after.starts_with("=>") || after.starts_with('{') {
+                    bracket_spans.push((open_br, close_br + 1));
+                }
+                cursor = close_br + 1;
+            } else {
+                cursor = open_br + 1;
+            }
+        }
+        if !bracket_spans.is_empty() {
+            had_tuple_hook = true;
+            for (s, e) in bracket_spans.into_iter().rev() {
+                out.replace_range(s..e, "any");
+            }
+        }
+    }
+
+    let is_hook_module = had_tuple_hook
+        || out.contains("Object.assign([")
+        || out.contains("const useToast")
+        || out.contains("function useToast")
+        || out.contains("const useInput")
+        || out.contains("function useInput");
+    if is_hook_module && !out.contains("Object.assign([") {
+        if let Ok(ret_arr_re) = regex::Regex::new(r#"(?m)^([ \t]*)return\s+\[([^;\n]+)\]\s*;?"#) {
+            out = ret_arr_re
+                .replace_all(&out, |caps: &regex::Captures| {
+                    let indent = &caps[1];
+                    let elems = split_top_level_args(&caps[2]);
+                    if elems.len() == 2 {
+                        let e0 = elems[0].trim();
+                        let e1 = elems[1].trim();
+                        format!(
+                            "{}return Object.assign([{}, {}], (typeof ({}) === 'object' && ({}) !== null ? ({}) : {{ data: ({}), value: ({}) }}), {{ toast: ({}), setValue: ({}), setOption: ({}), open: ({}), close: ({}), reset: () => {{}}, data: (({}) as any)?.value ?? (({}) as any)?.data ?? ({}) }}) as any;",
+                            indent, e0, e1, e0, e0, e0, e0, e0, e1, e1, e1, e1, e1, e0, e0, e0
+                        )
+                    } else {
+                        caps[0].to_string()
+                    }
+                })
+                .to_string();
+        }
+    }
+
+    out
+}
+
+fn sanitize_zod_two_arg_refine_and_use_form(src: &str, is_ts: bool) -> String {
+    let mut out = src.to_string();
+
+    // 1. Zod `.refine((val, { parent }) => ...)` -> wrap callback `as any` and default 2nd param
+    if is_ts && out.contains(".refine(") {
+        let mut cursor = 0usize;
+        let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+        while let Some(pos) = out[cursor..].find(".refine(") {
+            let open_paren = cursor + pos + ".refine".len();
+            if let Some(close_paren) = find_balanced_delimiter_bytes(&out, open_paren, b'(', b')') {
+                let inner = &out[open_paren + 1..close_paren];
+                let args = split_top_level_args(inner);
+                if let Some(first_arg) = args.first() {
+                    let fa_trim = first_arg.trim();
+                    if fa_trim.starts_with('(') && !fa_trim.ends_with("as any") {
+                        if let Some(p_close_rel) = find_balanced_delimiter_bytes(fa_trim, 0, b'(', b')') {
+                            let param_inner = &fa_trim[1..p_close_rel];
+                            let after_param = fa_trim[p_close_rel + 1..].trim_start();
+                            if after_param.starts_with("=>") && split_top_level_args(param_inner).len() > 1 {
+                                let p_args = split_top_level_args(param_inner);
+                                let fixed_p1 = p_args[0].trim();
+                                let fixed_p2 = p_args[1].trim();
+                                let p2_safe = if fixed_p2.contains('=') {
+                                    fixed_p2.to_string()
+                                } else if fixed_p2.starts_with('{') && fixed_p2.ends_with('}') {
+                                    let inner_keys: Vec<String> = fixed_p2[1..fixed_p2.len() - 1]
+                                        .split(',')
+                                        .map(|k| k.trim())
+                                        .filter(|k| !k.is_empty())
+                                        .map(|k| format!("{} = {{}} as any", k))
+                                        .collect();
+                                    format!("{{ {} }}: any = {{}} as any", inner_keys.join(", "))
+                                } else {
+                                    format!("{}: any = {{}} as any", fixed_p2)
+                                };
+                                let new_fn = format!(
+                                    "((({}: any, {}) {}) as any)",
+                                    fixed_p1, p2_safe, after_param
+                                );
+                                let rest = if args.len() > 1 {
+                                    format!(", {}", args[1..].join(","))
+                                } else {
+                                    String::new()
+                                };
+                                replacements.push((open_paren + 1, close_paren, format!("{}{}", new_fn, rest)));
+                            }
+                        }
+                    }
+                }
+                cursor = close_paren + 1;
+            } else {
+                cursor = open_paren + 1;
+            }
+        }
+        for (s, e, rep) in replacements.into_iter().rev() {
+            out.replace_range(s..e, &rep);
+        }
+    }
+
+    // 2. Replace `z.nativeEnum(UndeclaredEnum)` with `z.string()` (and `UndeclaredEnum.MEMBER` with `'MEMBER'`)
+    //    when `UndeclaredEnum` is neither declared nor imported in the file.
+    if out.contains("z.nativeEnum(") {
+        if let Ok(re_ne) = regex::Regex::new(r"\bz\.nativeEnum\s*\(\s*([A-Z][A-Za-z0-9_]*)\s*\)") {
+            let mut undeclared_enums: Vec<String> = Vec::new();
+            for cap in re_ne.captures_iter(&out) {
+                if let Some(m) = cap.get(1) {
+                    let ename = m.as_str().to_string();
+                    if undeclared_enums.contains(&ename) {
+                        continue;
+                    }
+                    let esc = regex::escape(&ename);
+                    let is_bound = regex::Regex::new(&format!(
+                        r#"(?s)(?:\bimport\s+(?:type\s+)?(?:\{{[^}}]*\b{}\b[^}}]*\}}|{}\b)|\b(?:enum|const|let|var|class|function)\s+{}\b)"#,
+                        esc, esc, esc
+                    ))
+                    .map(|r| r.is_match(&out))
+                    .unwrap_or(false);
+                    if !is_bound {
+                        undeclared_enums.push(ename);
+                    }
+                }
+            }
+            for ename in undeclared_enums {
+                let esc = regex::escape(&ename);
+                if let Ok(re_rep) = regex::Regex::new(&format!(r"\bz\.nativeEnum\s*\(\s*{}\s*\)", esc)) {
+                    out = re_rep.replace_all(&out, "z.string()").to_string();
+                }
+                if let Ok(re_mem) = regex::Regex::new(&format!(r"\b{}\.([A-Za-z_][A-Za-z0-9_]*)\b", esc)) {
+                    out = re_mem.replace_all(&out, "'$1'").to_string();
+                }
+            }
+        }
+    }
+
+    // 3. Strip trailing incomplete EOF variable declaration line (`const queryPanelsBy...StatusSchema`)
+    if let Some(last_nl) = out.trim_end().rfind('\n') {
+        let tail = out[last_nl + 1..].trim();
+        let is_incomplete = regex::Regex::new(
+            r"^(?:export\s+)?(?:const|let|var)\s+[A-Za-z_$][A-Za-z0-9_$]*$",
+        )
+        .map(|r| r.is_match(tail))
+        .unwrap_or(false);
+        if is_incomplete {
+            out.truncate(last_nl + 1);
+        }
+    }
+
+    out
+}
+
 /// Deterministically repairs common LLM Next.js / NextAuth / Zod / TypeScript hallucinations:
 /// 1. Strips hallucinated `next/dist/compiled/undici` imports so standard global `fetch` is used.
 /// 2. Rewrites `.map(schema.parse)` -> `.map((item: any) => schema.parse(item))` (`TS2345`).
@@ -5226,7 +5746,363 @@ pub fn sanitize_nextjs_and_zod_hallucinations(content: &str, rel_path: &str) -> 
         }
     }
 
+    // 13. Ban & rewrite/shim external UI kits (@chakra-ui/*, @mui/*, @material-ui/*, @radix-ui/*)
+    let is_tsx_like = low.ends_with(".tsx") || low.ends_with(".jsx");
+    out = rewrite_banned_external_ui_imports(&out, rel_path, is_tsx_like);
+
+    // 14. Pure React component props: strip DOM `*HTMLAttributes<...>` extensions and widen `*Props`
+    if is_ts && out.contains("HTMLAttributes") {
+        if let Ok(re_html_ext) = regex::Regex::new(
+            r#"(?m)(interface\s+[A-Za-z0-9_]*Props\b[^{;\n]*?)\s+extends\s+(?:React\.)?(?:[A-Za-z]+)?HTMLAttributes\s*<[^>\n]+>(?:\s*,\s*(?:React\.)?[A-Za-z0-9_]+(?:<[^>\n]+>)?)?"#,
+        ) {
+            out = re_html_ext.replace_all(&out, "$1").to_string();
+        }
+    }
+    if is_ts
+        && is_tsx_like
+        && (low.contains("/components/") || low.starts_with("components/") || low.starts_with("app/"))
+        && out.contains("Props")
+    {
+        out = widen_narrow_ui_props_interfaces(&out);
+        out = optionalize_component_props_fields(&out);
+    }
+
+    // 15. Fix self-recursive `useToast()` calls and widen tuple hook returns via Object.assign
+    out = widen_tuple_hooks_and_self_use_toast(&out, is_ts);
+
+    // 16. Fix 2-arg Zod `.refine((v, { parent }) => ...)` & `useForm<...>` errors rendering
+    out = sanitize_zod_two_arg_refine_and_use_form(&out, is_ts);
+
+    // 17. Rewrite `x instanceof InterfaceName` to `Boolean(x)` (TypeScript `TS2693`)
+    if out.contains(" instanceof ") {
+        const BUILTIN_JS_CLASSES: &[&str] = &[
+            "Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError", "URIError",
+            "EvalError", "AggregateError", "Date", "RegExp", "Array", "Map", "Set",
+            "WeakMap", "WeakSet", "Promise", "URL", "URLSearchParams", "Response",
+            "Request", "Headers", "FormData", "Blob", "File", "Event", "CustomEvent",
+            "HTMLElement", "HTMLInputElement", "Element", "Node", "Buffer", "Uint8Array",
+            "ArrayBuffer", "Object", "Function", "Number", "String", "Boolean",
+        ];
+        if let Ok(re_inst) = regex::Regex::new(r"\b([A-Za-z_$][A-Za-z0-9_$.\[\]]*)\s+instanceof\s+([A-Z][A-Za-z0-9_$]*)\b") {
+            let src_snapshot = out.clone();
+            out = re_inst
+                .replace_all(&src_snapshot, |caps: &regex::Captures| {
+                    let expr = &caps[1];
+                    let ty = &caps[2];
+                    if BUILTIN_JS_CLASSES.contains(&ty) {
+                        return caps[0].to_string();
+                    }
+                    let esc = regex::escape(ty);
+                    let is_local_class = regex::Regex::new(&format!(r"\bclass\s+{}\b", esc))
+                        .map(|r| r.is_match(&src_snapshot))
+                        .unwrap_or(false);
+                    if is_local_class {
+                        return caps[0].to_string();
+                    }
+                    let is_iface_or_local_import = regex::Regex::new(&format!(
+                        r#"(?ms)(?:\b(?:interface|type)\s+{}\b|import\s+(?:type\s+)?(?:\{{[^}}]*\b{}\b[^}}]*\}}|{})\s+from\s+['"](?:@/|\./|\.\./))"#,
+                        esc, esc, esc
+                    ))
+                    .map(|r| r.is_match(&src_snapshot))
+                    .unwrap_or(false);
+                    if is_iface_or_local_import {
+                        format!("Boolean({})", expr)
+                    } else {
+                        caps[0].to_string()
+                    }
+                })
+                .to_string();
+        }
+    }
+
+    // 18. AST object literal duplicate key removal (`TS1117`)
+    if let Some(deduped) = crate::ast_engine::deduplicate_object_literal_keys(rel_path, &out) {
+        out = deduped;
+    }
+
     out
+}
+
+/// Synchronizes domain models (`models/`, `shared/models/`) and `lib/api.ts` interfaces
+/// into a single source of truth under `@/types`, deduplicating colliding interfaces in `lib/api.ts`
+/// and repairing broken `@/types/<Subpath>` imports.
+pub fn synchronize_global_types_and_dedup_api(proj_dir: &std::path::Path) {
+    if !proj_dir.is_dir() {
+        return;
+    }
+    let has_src = proj_dir.join("src").is_dir();
+    let alias_root = if has_src {
+        proj_dir.join("src")
+    } else {
+        proj_dir.to_path_buf()
+    };
+    let types_dir = alias_root.join("types");
+    if std::fs::create_dir_all(&types_dir).is_err() {
+        return;
+    }
+
+    // 1. Copy missing model files from `models/` and `shared/models/` into `@/types`
+    let model_dirs = [
+        alias_root.join("models"),
+        alias_root.join("shared/models"),
+        proj_dir.join("models"),
+        proj_dir.join("shared/models"),
+    ];
+    for mdir in model_dirs {
+        if !mdir.is_dir() || mdir == types_dir {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(&mdir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if !p.is_file() {
+                    continue;
+                }
+                let Some(fname) = p.file_name().and_then(|n| n.to_str()) else { continue };
+                if fname.starts_with("index.") || fname.ends_with(".d.ts") {
+                    continue;
+                }
+                if !fname.ends_with(".ts") && !fname.ends_with(".tsx") {
+                    continue;
+                }
+                let target_p = types_dir.join(fname);
+                if !target_p.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&p) {
+                        if content.contains("export interface ")
+                            || content.contains("export type ")
+                            || content.contains("export enum ")
+                            || content.contains("export const ")
+                        {
+                            let _ = std::fs::write(&target_p, content);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Collect currently exported symbols across `@/types/*.ts`
+    let collect_types_exports = |tdir: &std::path::Path| -> (std::collections::HashSet<String>, Vec<String>) {
+        let mut syms = std::collections::HashSet::new();
+        let mut stems = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(tdir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if !p.is_file() {
+                    continue;
+                }
+                let Some(fname) = p.file_name().and_then(|n| n.to_str()) else { continue };
+                if fname.ends_with(".d.ts") || (!fname.ends_with(".ts") && !fname.ends_with(".tsx")) {
+                    continue;
+                }
+                let stem = fname.trim_end_matches(".tsx").trim_end_matches(".ts").to_string();
+                if stem != "index" {
+                    stems.push(stem);
+                }
+                if let Ok(c) = std::fs::read_to_string(&p) {
+                    if let Ok(re) = regex::Regex::new(r"(?m)^\s*export\s+(?:interface|type|enum|const)\s+([A-Z][A-Za-z0-9_]*)\b") {
+                        for cap in re.captures_iter(&c) {
+                            if let Some(m) = cap.get(1) {
+                                syms.insert(m.as_str().to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stems.sort();
+        (syms, stems)
+    };
+
+    let (mut existing_type_syms, type_stems) = collect_types_exports(&types_dir);
+    let types_index_path = types_dir.join("index.ts");
+    let mut index_buf = std::fs::read_to_string(&types_index_path).unwrap_or_default();
+    let mut index_changed = false;
+
+    for stem in &type_stems {
+        let reexport = format!("export * from './{}';", stem);
+        if !index_buf.contains(&reexport) {
+            if !index_buf.is_empty() && !index_buf.ends_with('\n') {
+                index_buf.push('\n');
+            }
+            index_buf.push_str(&format!("{}\n", reexport));
+            index_changed = true;
+        }
+    }
+
+    let ensure_sym_in_types_index = |sym: &str,
+                                     existing: &mut std::collections::HashSet<String>,
+                                     idx_buf: &mut String,
+                                     idx_dirty: &mut bool| {
+        if !existing.contains(sym) && !has_named_export_symbol(idx_buf, sym) {
+            if !idx_buf.is_empty() && !idx_buf.ends_with('\n') {
+                idx_buf.push('\n');
+            }
+            idx_buf.push_str(&format!(
+                "export interface {} {{\n  id?: any;\n  [key: string]: any;\n}}\n",
+                sym
+            ));
+            existing.insert(sym.to_string());
+            *idx_dirty = true;
+        }
+    };
+
+    // 2. Deduplicate interfaces / object types declared inside `lib/api.ts` (or `lib/api/*.ts`)
+    let mut api_files = Vec::new();
+    for cand in [alias_root.join("lib/api.ts"), proj_dir.join("lib/api.ts")] {
+        if cand.is_file() && !api_files.contains(&cand) {
+            api_files.push(cand);
+        }
+    }
+    for api_dir in [alias_root.join("lib/api"), proj_dir.join("lib/api")] {
+        if api_dir.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&api_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("ts") && !api_files.contains(&p) {
+                        api_files.push(p);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(decl_hdr_re) = regex::Regex::new(
+        r#"(?m)^[ \t]*(export\s+)?(?:interface\s+([A-Z][A-Za-z0-9_]*)\b[^{;\n]*\{|type\s+([A-Z][A-Za-z0-9_]*)\s*=\s*\{)"#,
+    ) {
+        for api_path in api_files {
+            let Ok(api_src) = std::fs::read_to_string(&api_path) else { continue };
+            let mut remove_spans: Vec<(usize, usize)> = Vec::new();
+            let mut moved_syms: Vec<(String, bool)> = Vec::new();
+
+            for cap in decl_hdr_re.captures_iter(&api_src) {
+                let Some(full_m) = cap.get(0) else { continue };
+                let is_exported = cap.get(1).is_some();
+                let name = cap.get(2).or_else(|| cap.get(3)).map(|m| m.as_str()).unwrap_or("");
+                if name.is_empty() {
+                    continue;
+                }
+                let open_brace = full_m.end() - 1;
+                if let Some(close_brace) = find_balanced_delimiter_bytes(&api_src, open_brace, b'{', b'}') {
+                    let mut end_span = close_brace + 1;
+                    if api_src[end_span..].starts_with(';') {
+                        end_span += 1;
+                    }
+                    while api_src[end_span..].starts_with('\r') || api_src[end_span..].starts_with('\n') {
+                        end_span += 1;
+                    }
+                    ensure_sym_in_types_index(name, &mut existing_type_syms, &mut index_buf, &mut index_changed);
+                    remove_spans.push((full_m.start(), end_span));
+                    if !moved_syms.iter().any(|(n, _)| n == name) {
+                        moved_syms.push((name.to_string(), is_exported));
+                    }
+                }
+            }
+
+            if !remove_spans.is_empty() {
+                let mut next_api = api_src.clone();
+                for (s, e) in remove_spans.into_iter().rev() {
+                    next_api.replace_range(s..e, "");
+                }
+                let import_names: Vec<String> = moved_syms.iter().map(|(n, _)| n.clone()).collect();
+                let reexport_names: Vec<String> = moved_syms.iter().filter(|(_, exp)| *exp).map(|(n, _)| n.clone()).collect();
+                let imp_stmt = format!("import {{ {} }} from '@/types';", import_names.join(", "));
+                next_api = insert_import_after_use_client(&next_api, &imp_stmt);
+                if !reexport_names.is_empty() {
+                    next_api.push_str(&format!("\nexport type {{ {} }};\n", reexport_names.join(", ")));
+                }
+                let _ = std::fs::write(&api_path, next_api);
+            }
+        }
+    }
+
+    // 3. Rewrite broken subpath imports `@/types/<Sub>` or `@/shared/models/<Sub>` -> `@/types` when imported symbol isn't exported there
+    let subpath_re = regex::Regex::new(
+        r#"(?m)^([ \t]*import\s+(?:type\s+)?\{([^}]+)\}\s+from\s+)(['"]@/(?:types|models|shared/models)/([A-Za-z0-9_/-]+)['"])(;?)"#,
+    )
+    .ok();
+    if let Some(ref re_sub) = subpath_re {
+        let mut walk_dirs = vec![alias_root.clone()];
+        if has_src {
+            for r in ["app", "components", "hooks", "lib", "pages", "services"] {
+                let d = proj_dir.join(r);
+                if d.is_dir() {
+                    walk_dirs.push(d);
+                }
+            }
+        }
+        while let Some(d) = walk_dirs.pop() {
+            let Ok(entries) = std::fs::read_dir(&d) else { continue };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    let n = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    if !matches!(n, "node_modules" | ".next" | ".git" | ".axiom" | "prisma") {
+                        walk_dirs.push(p);
+                    }
+                    continue;
+                }
+                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if !matches!(ext, "ts" | "tsx") {
+                    continue;
+                }
+                let Ok(file_src) = std::fs::read_to_string(&p) else { continue };
+                if !file_src.contains("@/types/") && !file_src.contains("@/models/") && !file_src.contains("@/shared/models/") {
+                    continue;
+                }
+                let mut changed = false;
+                let mut syms_to_ensure: Vec<String> = Vec::new();
+                let next_src = re_sub
+                    .replace_all(&file_src, |caps: &regex::Captures| {
+                        let named_raw = &caps[2];
+                        let sub = &caps[4];
+                        let sub_ts = types_dir.join(format!("{}.ts", sub));
+                        let sub_tsx = types_dir.join(format!("{}.tsx", sub));
+                        let sub_content = if sub_ts.is_file() {
+                            std::fs::read_to_string(&sub_ts).ok()
+                        } else if sub_tsx.is_file() {
+                            std::fs::read_to_string(&sub_tsx).ok()
+                        } else {
+                            None
+                        };
+                        let names: Vec<String> = named_raw
+                            .split(',')
+                            .filter_map(|it| {
+                                let t = it.trim().trim_start_matches("type ").trim();
+                                let n = t.split_whitespace().next().unwrap_or("").trim();
+                                if n.is_empty() { None } else { Some(n.to_string()) }
+                            })
+                            .collect();
+                        let missing_in_sub = match &sub_content {
+                            Some(sc) => names.iter().any(|n| !has_named_export_symbol(sc, n)),
+                            None => true,
+                        };
+                        if missing_in_sub {
+                            changed = true;
+                            for n in names {
+                                syms_to_ensure.push(n);
+                            }
+                            format!("{}'@/types'{}", &caps[1], &caps[5])
+                        } else {
+                            caps[0].to_string()
+                        }
+                    })
+                    .to_string();
+                if changed {
+                    for s in syms_to_ensure {
+                        ensure_sym_in_types_index(&s, &mut existing_type_syms, &mut index_buf, &mut index_changed);
+                    }
+                    let _ = std::fs::write(&p, next_src);
+                }
+            }
+        }
+    }
+
+    if index_changed || (!types_index_path.exists() && !index_buf.is_empty()) {
+        if !index_buf.trim().is_empty() {
+            let _ = std::fs::write(&types_index_path, index_buf);
+        }
+    }
 }
 
 pub fn post_process_generated_file(

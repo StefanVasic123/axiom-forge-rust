@@ -20,7 +20,7 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
     let mut needs_write = !db_path.exists();
     if db_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&db_path) {
-            if !content.contains("\"dbVersion\": 5") {
+            if !content.contains("\"dbVersion\": 6") {
                 needs_write = true;
             }
         }
@@ -28,7 +28,7 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
     
     if needs_write {
         let default_db = serde_json::json!({
-            "dbVersion": 5,
+            "dbVersion": 6,
             "packages": [
                 {
                     "name": "resend",
@@ -244,33 +244,6 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
                     "importExamples": ["import jwt from 'jsonwebtoken';"],
                     "compatibility": {},
                     "bestPractices": "Sign and verify JWT tokens securely."
-                },
-                {
-                    "name": "@mui/material",
-                    "version": "^5.15.0",
-                    "aliases": ["@material-ui/core", "@mui/core"],
-                    "importExamples": [
-                        "import { Button, AppBar, Toolbar, Typography } from '@mui/material';",
-                        "import { styled } from '@mui/material/styles';"
-                    ],
-                    "compatibility": {
-                        "react": "^18.2.0",
-                        "@emotion/react": "^11.11.4",
-                        "@emotion/styled": "^11.11.5"
-                    },
-                    "bestPractices": "Import components from @mui/material. Use custom styles with styled utility."
-                },
-                {
-                    "name": "@mui/icons-material",
-                    "version": "^5.15.0",
-                    "aliases": ["@material-ui/icons"],
-                    "importExamples": ["import { Mail, Settings, Notifications } from '@mui/icons-material';"],
-                    "compatibility": {
-                        "@mui/material": "^5.15.0",
-                        "@emotion/react": "^11.11.4",
-                        "@emotion/styled": "^11.11.5"
-                    },
-                    "bestPractices": "Import icons individually or destructured. Make sure @mui/material is installed."
                 },
                 {
                     "name": "@prisma/client",
@@ -765,7 +738,9 @@ pub fn repair_package_json_dependencies(proj_dir: &std::path::Path) {
                                                                             break;
                                                                         }
                                                                     }
-                                                                    imports_found.insert(mapped_pkg);
+                                                                    if !crate::sanitizer::is_banned_external_ui_package(&mapped_pkg) {
+                                                                        imports_found.insert(mapped_pkg);
+                                                                    }
                                                                 }
                                                             }
                                                         }
@@ -1421,6 +1396,7 @@ pub fn sanitize_package_json_value_for_offline(json_val: &mut Value) -> bool {
                             || k.starts_with("eslint-config-")
                             || k.ends_with("-icons-react")
                             || k.starts_with("react-icons/")
+                            || crate::sanitizer::is_banned_external_ui_package(k)
                     })
                     .cloned()
                     .collect();

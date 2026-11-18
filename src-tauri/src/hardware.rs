@@ -315,7 +315,12 @@ pub fn get_ollama_runtime_config(model_id: &str) -> OllamaRuntimeConfig {
     }
 }
 
-pub fn build_ollama_options(model_id: &str, temperature: f64, num_predict_override: Option<u32>) -> serde_json::Value {
+pub fn build_ollama_options_with_penalty(
+    model_id: &str,
+    temperature: f64,
+    num_predict_override: Option<u32>,
+    repeat_penalty: f64,
+) -> serde_json::Value {
     let cfg = get_ollama_runtime_config(model_id);
     let num_predict = num_predict_override.unwrap_or(cfg.default_num_predict);
     let mut opts = serde_json::json!({
@@ -323,6 +328,7 @@ pub fn build_ollama_options(model_id: &str, temperature: f64, num_predict_overri
         "num_ctx": cfg.num_ctx,
         "num_predict": num_predict,
         "num_batch": cfg.num_batch,
+        "repeat_penalty": repeat_penalty,
     });
     if let Some(threads) = cfg.num_thread {
         if let Some(obj) = opts.as_object_mut() {
@@ -330,6 +336,10 @@ pub fn build_ollama_options(model_id: &str, temperature: f64, num_predict_overri
         }
     }
     opts
+}
+
+pub fn build_ollama_options(model_id: &str, temperature: f64, num_predict_override: Option<u32>) -> serde_json::Value {
+    build_ollama_options_with_penalty(model_id, temperature, num_predict_override, 1.12)
 }
 
 #[derive(Serialize)]
