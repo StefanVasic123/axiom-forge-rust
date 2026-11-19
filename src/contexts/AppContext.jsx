@@ -53,6 +53,7 @@ const ACTIONS = {
   DELETE_PROJECTS: 'DELETE_PROJECTS',
   SET_CURRENT_PROJECT: 'SET_CURRENT_PROJECT',
   SET_TASK_PROGRESS: 'SET_TASK_PROGRESS',
+  REMOVE_TASK_PROGRESS: 'REMOVE_TASK_PROGRESS',
   UPDATE_SETTINGS: 'UPDATE_SETTINGS',
   SET_TOKENS_CONFIGURED: 'SET_TOKENS_CONFIGURED',
   SET_APP_MODE: 'SET_APP_MODE'
@@ -170,6 +171,7 @@ function appReducer(state, action) {
         ...prevTask,
         ...progress,
         taskId,
+        updatedAt: Date.now(),
         offlineWaiting: nextOfflineWaiting,
         pausedReason: nextPausedReason,
         currentFile: progress?.currentFile ?? prevTask?.currentFile ?? '',
@@ -181,6 +183,25 @@ function appReducer(state, action) {
         logs: mergedLogs
       };
 
+      return {
+        ...state,
+        taskProgress: nextTaskProgress
+      };
+    }
+
+    case ACTIONS.REMOVE_TASK_PROGRESS: {
+      const ids = new Set(Array.isArray(action.payload) ? action.payload : [action.payload]);
+      if (ids.size === 0) return state;
+      const nextTaskProgress = {};
+      let removed = false;
+      for (const [k, v] of Object.entries(state.taskProgress)) {
+        if (ids.has(k)) {
+          removed = true;
+          continue;
+        }
+        nextTaskProgress[k] = v;
+      }
+      if (!removed) return state;
       return {
         ...state,
         taskProgress: nextTaskProgress
@@ -258,6 +279,10 @@ export function AppProvider({ children }) {
     dispatch({ type: ACTIONS.SET_TASK_PROGRESS, payload: { taskId, progress } });
   }, []);
 
+  const removeTaskProgress = useCallback((taskIds) => {
+    dispatch({ type: ACTIONS.REMOVE_TASK_PROGRESS, payload: taskIds });
+  }, []);
+
   const updateSettings = useCallback((settings) => {
     dispatch({ type: ACTIONS.UPDATE_SETTINGS, payload: settings });
   }, []);
@@ -281,13 +306,14 @@ export function AppProvider({ children }) {
     deleteProjects,
     setCurrentProject,
     setTaskProgress,
+    removeTaskProgress,
     updateSettings,
     setTokensConfigured,
     setAppMode
   }), [
     setFirstRun, setLoading, setError, setProjects,
     addProject, updateProject, deleteProject, deleteProjects,
-    setCurrentProject, setTaskProgress, updateSettings,
+    setCurrentProject, setTaskProgress, removeTaskProgress, updateSettings,
     setTokensConfigured, setAppMode
   ]);
 

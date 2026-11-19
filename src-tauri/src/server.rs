@@ -149,7 +149,7 @@ pub fn extract_file_path_from_line(line: &str) -> Option<String> {
         if word_low.starts_with("http://") || word_low.starts_with("https://") {
             continue;
         }
-        for ext in &[".tsx", ".ts", ".jsx", ".js", ".css"] {
+        for ext in &[".tsx", ".ts", ".jsx", ".js", ".css", ".scss", ".mjs", ".cjs"] {
             if let Some(idx) = word_clean.find(ext) {
                 let end_pos = idx + ext.len();
                 let mut path = word_clean[..end_pos].to_string();

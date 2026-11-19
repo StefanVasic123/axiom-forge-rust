@@ -305,9 +305,13 @@ function AIPanel({
 
   const handleApply = async () => {
     if (!pendingContent) return;
-    await onApply(pendingContent, `AI: ${messages.filter(m => m.role === 'user').at(-1)?.content?.slice(0, 60)}`);
+    const applied = await onApply(pendingContent, `AI: ${messages.filter(m => m.role === 'user').at(-1)?.content?.slice(0, 60)}`);
+    if (applied === false) {
+      setMessages(m => [...m, { role: 'assistant', content: '❌ Could not save changes to disk (no active target file or write failed).' }]);
+      return;
+    }
     setPendingContent(null);
-    setMessages(m => [...m, { role: 'assistant', content: '✅ Changes applied and saved to disk.' }]);
+    setMessages(m => [...m, { role: 'assistant', content: `✅ Changes applied and saved to disk (${activeFile?.path || 'file'}).` }]);
   };
 
   const handleDiscard = () => {
@@ -662,32 +666,63 @@ export default function EditorPage() {
   const [previewRuntimeError, setPreviewRuntimeError] = useState(null);
   const [aiExternalPrompt, setAiExternalPrompt] = useState(null);
 
-  // Helper to resolve route path to actual project file
+  // Helper to resolve route path to actual project file (strict priority: pages over API routes)
   const resolveRouteToFile = useCallback((routePath) => {
     if (!files || files.length === 0) return null;
-    const cleanRoute = (routePath || '').replace(/^\/(en|sr|es|pt|fr|de|it)/, '').replace(/\/$/, '') || '';
-    const candidateSuffixes = [
-      cleanRoute ? `${cleanRoute}/page.tsx` : 'src/app/page.tsx',
-      cleanRoute ? `${cleanRoute}/page.jsx` : 'src/app/page.jsx',
-      cleanRoute ? `${cleanRoute}/page.tsx` : 'app/page.tsx',
-      cleanRoute ? `${cleanRoute}/page.jsx` : 'app/page.jsx',
-      cleanRoute ? `${cleanRoute}.tsx` : 'src/pages/index.tsx',
-      cleanRoute ? `${cleanRoute}.jsx` : 'src/pages/index.jsx',
-      cleanRoute ? `${cleanRoute}/route.ts` : 'src/app/api/route.ts',
-    ];
-    const candidateMatches = [
-      cleanRoute ? `/${cleanRoute}/page.tsx` : '/page.tsx',
-      cleanRoute ? `/${cleanRoute}/page.jsx` : '/page.jsx',
-      cleanRoute ? `/${cleanRoute}.tsx` : '/index.tsx',
-      cleanRoute ? `/${cleanRoute}.jsx` : '/index.jsx',
-    ];
+    const rawRoute = (routePath || '/').split('?')[0].split('#')[0];
+    const cleanRoute = rawRoute.replace(/^\/(en|sr|es|pt|fr|de|it)(?=\/|$)/, '').replace(/\/+$/, '') || '';
+    const isApiRoute = cleanRoute === '/api' || cleanRoute.startsWith('/api/');
 
-    return files.find(f => {
-      const norm = f.path.replace(/\\/g, '/');
-      if (candidateSuffixes.some(s => norm.endsWith(s))) return true;
-      if (candidateMatches.some(m => norm.includes(m))) return true;
-      return false;
-    }) || null;
+    const exactCandidates = isApiRoute
+      ? [
+          `src/app${cleanRoute}/route.ts`,
+          `src/app${cleanRoute}/route.js`,
+          `app${cleanRoute}/route.ts`,
+          `app${cleanRoute}/route.js`,
+          `src/pages${cleanRoute}.ts`,
+          `src/pages${cleanRoute}.js`,
+        ]
+      : cleanRoute
+      ? [
+          `src/app${cleanRoute}/page.tsx`,
+          `src/app${cleanRoute}/page.jsx`,
+          `app${cleanRoute}/page.tsx`,
+          `app${cleanRoute}/page.jsx`,
+          `src/pages${cleanRoute}.tsx`,
+          `src/pages${cleanRoute}.jsx`,
+          `src/pages${cleanRoute}/index.tsx`,
+          `src/pages${cleanRoute}/index.jsx`,
+        ]
+      : [
+          'src/app/page.tsx',
+          'src/app/page.jsx',
+          'app/page.tsx',
+          'app/page.jsx',
+          'src/pages/index.tsx',
+          'src/pages/index.jsx',
+          'pages/index.tsx',
+          'pages/index.jsx',
+        ];
+
+    for (const cand of exactCandidates) {
+      const hit = files.find(f => {
+        const norm = f.path.replace(/\\/g, '/').replace(/^\.\//, '');
+        return norm === cand || norm.endsWith(`/${cand}`);
+      });
+      if (hit) return hit;
+    }
+
+    if (!isApiRoute && cleanRoute) {
+      const cleanRel = cleanRoute.replace(/^\//, '');
+      const fallbackHit = files.find(f => {
+        const norm = f.path.replace(/\\/g, '/');
+        if (norm.includes('/api/') || /\/route\.(ts|js)x?$/.test(norm)) return false;
+        return norm.endsWith(`/${cleanRel}/page.tsx`) || norm.endsWith(`/${cleanRel}/page.jsx`);
+      });
+      if (fallbackHit) return fallbackHit;
+    }
+
+    return null;
   }, [files]);
 
   const activePreviewFile = useMemo(() => {
@@ -1853,24 +1888,33 @@ export default function EditorPage() {
     return () => window.removeEventListener('keydown', handler);
   }, [saveActiveFile]);
 
-  // Apply AI changes to active tab
+  // Apply AI changes to active tab or currently previewed route file
   const handleAIApply = useCallback(async (newContent, commitMsg) => {
-    if (!activeTab) return;
+    const targetFile = activeTab || (showPreview ? activePreviewFile : null);
+    if (!targetFile?.path) return false;
 
-    // 1. Update the React state with the new content (saved on disk, so isDirty is false)
+    // 1. Write to disk first and check result
+    const writeRes = await window.electronAPI.editor.writeFile(projectId, targetFile.path, newContent);
+    if (writeRes && writeRes.success === false) {
+      setStatusMsg(`Failed to save AI changes to ${targetFile.path}: ${writeRes.error || 'write error'}`);
+      setTimeout(() => setStatusMsg(''), 4000);
+      return false;
+    }
+
+    // 2. Update the React state if target file is open in a tab
     setOpenTabs(tabs => tabs.map(t =>
-      t.path === activeTabPath ? { ...t, content: newContent, isDirty: false } : t
+      t.path === targetFile.path ? { ...t, content: newContent, isDirty: false } : t
     ));
 
-    // 2. Unmount the DiffEditor immediately
+    // 3. Unmount the DiffEditor immediately
     setPendingContent(null);
 
-    // 3. Write to disk & Git commit
-    await window.electronAPI.editor.writeFile(projectId, activeTab.path, newContent);
-    await window.electronAPI.editor.gitCommit(projectId, commitMsg || `AI: edited ${activeTab.path}`);
-    setStatusMsg(`AI changes applied & committed`);
+    // 4. Git commit
+    await window.electronAPI.editor.gitCommit(projectId, commitMsg || `AI: edited ${targetFile.path}`);
+    setStatusMsg(`AI changes applied & committed (${targetFile.path})`);
     setTimeout(() => setStatusMsg(''), 3000);
-  }, [activeTab, activeTabPath, projectId, setOpenTabs]);
+    return true;
+  }, [activeTab, showPreview, activePreviewFile, projectId, setOpenTabs]);
 
   // Apply a single file's changes in project-level AI view
   const handleApplyProjectFile = useCallback(async (filePath, newContent) => {

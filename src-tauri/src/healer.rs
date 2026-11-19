@@ -2728,11 +2728,14 @@ pub async fn project_heal_compile_error(
         && crate::ast_engine::ensure_component_destructured_prop_defaults_in_source(&rel_file_path, &raw_file_content).is_some();
     let mut pre_sanitized = post_process_generated_file(&rel_file_path, &raw_file_content, &serde_json::json!({}), has_tailwind);
     if rel_file_path.ends_with(".css") || rel_file_path.ends_with(".scss") {
-        if let Ok(tw_missing_re) = regex::Regex::new(r#"The\s+['"]([^'"]+)['"]\s+class\s+does\s+not\s+exist"#) {
-            for cap in tw_missing_re.captures_iter(&error_msg) {
-                if let Some(m) = cap.get(1) {
-                    pre_sanitized = crate::sanitizer::strip_tailwind_apply_class(&pre_sanitized, m.as_str());
-                }
+        for missing_cls in crate::sanitizer::extract_missing_tailwind_classes_from_error(&error_msg) {
+            pre_sanitized = crate::sanitizer::strip_tailwind_apply_class(&pre_sanitized, &missing_cls);
+        }
+    } else {
+        let ts2305_targets = crate::self_healing::extract_ts2305_missing_imports(&error_msg);
+        if !ts2305_targets.is_empty() {
+            if let Some(cleaned) = crate::ast_engine::remove_unused_named_import_specifiers(&rel_file_path, &pre_sanitized, &ts2305_targets) {
+                pre_sanitized = cleaned;
             }
         }
     }

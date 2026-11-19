@@ -3542,6 +3542,190 @@ pub fn inspect_dts_exports_for_file(proj_dir: &std::path::Path, file_content: &s
     }
 }
 
+/// Extracts `(Some(module_specifier), missing_member_name)` pairs from TypeScript / Next.js
+/// `TS2305: Module '...' has no exported member '...'` diagnostics.
+pub fn extract_ts2305_missing_imports(diag_text: &str) -> Vec<(Option<String>, String)> {
+    let mut out = Vec::new();
+    let Ok(re) = regex::Regex::new(
+        r#"Module\s+['"]['"]?([^'"]+)['"]?['"]\s+has\s+no\s+exported\s+member\s+['"]([A-Za-z_$][A-Za-z0-9_$]*)['"]"#,
+    ) else {
+        return out;
+    };
+    for cap in re.captures_iter(diag_text) {
+        let mod_spec = cap.get(1).map(|m| m.as_str().trim().to_string()).filter(|s| !s.is_empty());
+        let Some(sym_m) = cap.get(2) else { continue };
+        let sym = sym_m.as_str().trim().to_string();
+        if sym.is_empty() {
+            continue;
+        }
+        let pair = (mod_spec, sym);
+        if !out.contains(&pair) {
+            out.push(pair);
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct SemanticBuildDiagnosis {
+    pub has_error: bool,
+    #[serde(default)]
+    pub error_kind: String,
+    #[serde(default)]
+    pub file_path: Option<String>,
+    #[serde(default)]
+    pub error_summary: Option<String>,
+    #[serde(default)]
+    pub missing_css_class: Option<String>,
+}
+
+/// Parses structured JSON output from the local semantic build error analyzer, stripping
+/// optional markdown fences or surrounding prose, and normalizing blank fields to `None`.
+pub fn parse_semantic_build_diagnosis(raw: &str) -> Option<SemanticBuildDiagnosis> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let cleaned = if let Some(after_fence) = trimmed.strip_prefix("```") {
+        let after_lang = after_fence
+            .split_once('\n')
+            .map(|(_, rest)| rest)
+            .unwrap_or(after_fence);
+        after_lang.rsplit_once("```").map(|(body, _)| body).unwrap_or(after_lang).trim()
+    } else {
+        trimmed
+    };
+
+    let json_slice = if cleaned.starts_with('{') && cleaned.ends_with('}') {
+        cleaned
+    } else if let (Some(s), Some(e)) = (cleaned.find('{'), cleaned.rfind('}')) {
+        if s <= e {
+            &cleaned[s..=e]
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    let mut parsed = serde_json::from_str::<SemanticBuildDiagnosis>(json_slice).ok()?;
+    parsed.error_kind = parsed.error_kind.trim().to_lowercase();
+    parsed.file_path = parsed.file_path.and_then(|s| {
+        let t = s.trim().trim_matches(|c| c == '"' || c == '\'' || c == '`').replace('\\', "/");
+        if t.is_empty() || t.eq_ignore_ascii_case("null") || t.eq_ignore_ascii_case("none") {
+            None
+        } else {
+            Some(t)
+        }
+    });
+    parsed.error_summary = parsed.error_summary.and_then(|s| {
+        let t = s.trim().to_string();
+        if t.is_empty() || t.eq_ignore_ascii_case("null") {
+            None
+        } else {
+            Some(t)
+        }
+    });
+    parsed.missing_css_class = parsed.missing_css_class.and_then(|s| {
+        let t = s.trim().trim_start_matches('.').trim_matches(|c| c == '"' || c == '\'' || c == '`').to_string();
+        if t.is_empty() || t.eq_ignore_ascii_case("null") || t.eq_ignore_ascii_case("none") {
+            None
+        } else {
+            Some(t)
+        }
+    });
+    Some(parsed)
+}
+
+/// Semantic LLM fallback called ONLY when a build fails AND deterministic direct-header
+/// file detection could not locate the root failing file. Any returned file path is
+/// strictly grounded against actual files in `proj_dir`.
+pub async fn semantic_analyze_build_error(
+    client: &reqwest::Client,
+    model: &str,
+    proj_dir: &std::path::Path,
+    build_output: &str,
+    candidate_files: &[String],
+) -> Option<SemanticBuildDiagnosis> {
+    if model.trim().is_empty() || build_output.trim().is_empty() {
+        return None;
+    }
+
+    let tail_chars = 2500usize;
+    let total_chars = build_output.chars().count();
+    let log_excerpt: String = if total_chars > tail_chars {
+        build_output.chars().skip(total_chars - tail_chars).collect()
+    } else {
+        build_output.to_string()
+    };
+
+    let files_list: String = candidate_files
+        .iter()
+        .take(60)
+        .map(|p| p.replace('\\', "/"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let system_prompt = "You are a compiler & build log semantic analyzer.\n\
+        Given a failed build log and a list of project files, determine whether there is a real build error, \
+        classify its kind, pinpoint the single root cause file from the project files list (or null if uncertain), \
+        summarize the exact error concisely, and extract any missing CSS utility class if a Tailwind/PostCSS `@apply` error occurred.\n\
+        Respond ONLY with raw JSON matching:\n\
+        {\"has_error\": true|false, \"error_kind\": \"syntax|css|type|module|config|runtime|other\", \"file_path\": \"exact/relative/path.ext or null\", \"error_summary\": \"concise summary\", \"missing_css_class\": \"class-name or null\"}";
+
+    let user_prompt = format!(
+        "Project files:\n{}\n\nBuild log excerpt:\n{}\n\nReturn strict JSON.",
+        files_list, log_excerpt
+    );
+
+    let req_body = serde_json::json!({
+        "model": model,
+        "format": "json",
+        "messages": [
+            { "role": "system", "content": system_prompt },
+            { "role": "user", "content": user_prompt }
+        ],
+        "stream": false,
+        "options": {
+            "temperature": 0.0,
+            "num_predict": 256
+        }
+    });
+
+    let resp = client
+        .post("http://127.0.0.1:11434/api/chat")
+        .timeout(std::time::Duration::from_secs(25))
+        .json(&req_body)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data = resp.json::<serde_json::Value>().await.ok()?;
+    let raw_content = data
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())?;
+
+    let mut diag = parse_semantic_build_diagnosis(raw_content)?;
+
+    // Grounding guard: verify returned `file_path` exists on disk via project resolvers
+    if let Some(fp) = diag.file_path.take() {
+        if let Some(resolved) = resolve_project_file_candidate(proj_dir, &fp) {
+            diag.file_path = Some(resolved);
+        } else {
+            let probe = format!("{}\n{}", diag.error_summary.as_deref().unwrap_or(""), build_output);
+            if let Some(located) = crate::server::locate_error_source_file(proj_dir, &fp, &probe) {
+                diag.file_path = Some(located.rel_path);
+            }
+        }
+    }
+
+    Some(diag)
+}
+
 fn run_tsc_check(proj_dir: &std::path::Path, local_tsc_js: &std::path::Path, enriched_path: &str) -> Result<(bool, String, Vec<TscDiagnostic>), String> {
     let mut cmd = std::process::Command::new("node");
     cmd.arg(local_tsc_js)
@@ -4179,6 +4363,38 @@ pub async fn perform_self_healing_loop(
                 .any(|(p, _)| attempts_failed_for(p) >= 1);
             sorted_files.truncate(if top_has_prior_stagnation { 1 } else { 2 });
 
+            // Deterministic AST cleanup for unused nonexistent named imports (`TS2305`) before AI/Katastar
+            let mut det_ts2305_applied = false;
+            for (path_str, file_diags) in &sorted_files {
+                let diag_text: String = file_diags
+                    .iter()
+                    .filter(|d| d.code == "TS2305")
+                    .map(|d| format!("{} {}", d.code, d.message))
+                    .collect::<Vec<String>>()
+                    .join("\n");
+                if diag_text.is_empty() {
+                    continue;
+                }
+                let targets = extract_ts2305_missing_imports(&diag_text);
+                if targets.is_empty() {
+                    continue;
+                }
+                let full_path = proj_dir.join(path_str);
+                let Ok(orig_content) = std::fs::read_to_string(&full_path) else { continue };
+                if let Some(cleaned) = crate::ast_engine::remove_unused_named_import_specifiers(path_str, &orig_content, &targets) {
+                    if std::fs::write(&full_path, &cleaned).is_ok() {
+                        det_ts2305_applied = true;
+                        debug_log_to_file(format!(
+                            "[Self-Healing] Tier 1 deterministically removed unused nonexistent import(s) from '{}'.",
+                            path_str
+                        ));
+                    }
+                }
+            }
+            if det_ts2305_applied {
+                continue;
+            }
+
             // Try Katastar verified patches first
             let mut katastar_hints: Vec<String> = Vec::new();
             let mut katastar_applied_any = false;
@@ -4725,7 +4941,7 @@ pub async fn perform_self_healing_loop(
             let err_lines: Vec<String> = build_output
                 .lines()
                 .map(|l| l.trim())
-                .filter(|l| l.contains("Error:") || l.contains("Module not found") || l.contains("Type error:") || l.contains("Failed to compile"))
+                .filter(|l| l.contains("Error:") || l.contains("Syntax error") || l.contains("Module not found") || l.contains("Type error:") || l.contains("Failed to compile"))
                 .take(3)
                 .map(|l| l.chars().take(120).collect())
                 .collect();
@@ -4765,15 +4981,24 @@ pub async fn perform_self_healing_loop(
                             trace_paths.push(resolved);
                         }
                     } else {
-                        let next_line = build_lines.get(idx + 1).map(|s| s.trim()).unwrap_or("");
-                        let is_direct_header = t.contains("Module not found")
-                            || t.contains("Type error:")
-                            || t.contains("SyntaxError")
-                            || next_line.starts_with("Module not found")
-                            || next_line.starts_with("Attempted import error")
-                            || next_line.starts_with("Type error:")
-                            || next_line.starts_with("SyntaxError")
-                            || next_line.contains("Can't resolve");
+                        let t_low = t.to_lowercase();
+                        let next_low = build_lines.get(idx + 1).map(|s| s.trim().to_lowercase()).unwrap_or_default();
+                        let is_direct_header = t_low.contains("module not found")
+                            || t_low.contains("type error:")
+                            || t_low.contains("syntaxerror")
+                            || t_low.contains("syntax error")
+                            || t_low.contains("class does not exist")
+                            || t_low.contains("postcss")
+                            || t_low.contains("failed to parse")
+                            || t_low.contains("unexpected token")
+                            || next_low.starts_with("module not found")
+                            || next_low.starts_with("attempted import error")
+                            || next_low.starts_with("type error:")
+                            || next_low.starts_with("syntaxerror")
+                            || next_low.starts_with("syntax error")
+                            || next_low.contains("can't resolve")
+                            || next_low.contains("class does not exist")
+                            || next_low.contains("postcss");
                         if is_direct_header {
                             if !tier2_priority_paths.contains(&resolved) {
                                 tier2_priority_paths.push(resolved);
@@ -4785,6 +5010,26 @@ pub async fn perform_self_healing_loop(
                 }
             }
         }
+
+        // Semantic LLM fallback ONLY when deterministic direct-header detection found no root cause file
+        let mut semantic_missing_css_class: Option<String> = None;
+        if tier2_priority_paths.is_empty() {
+            if let Some(sem_diag) = semantic_analyze_build_error(&client, model, proj_dir, &build_output, &candidate_paths).await {
+                if sem_diag.has_error {
+                    debug_log_to_file(format!(
+                        "[Self-Healing] Semantic LLM build error analyzer identified kind='{}', file='{:?}', summary='{:?}'",
+                        sem_diag.error_kind, sem_diag.file_path, sem_diag.error_summary
+                    ));
+                    if let Some(fp) = sem_diag.file_path {
+                        if !tier2_priority_paths.contains(&fp) {
+                            tier2_priority_paths.push(fp);
+                        }
+                    }
+                    semantic_missing_css_class = sem_diag.missing_css_class;
+                }
+            }
+        }
+
         for p in secondary_extracted_paths.into_iter().chain(trace_paths.into_iter()) {
             if !tier2_priority_paths.contains(&p) {
                 tier2_priority_paths.push(p);
@@ -4835,6 +5080,72 @@ pub async fn perform_self_healing_loop(
                         }));
                     }
                 }
+            }
+        }
+
+        // Deterministic Tier 2 pre-repairs (PostCSS @apply missing class + unused TS2305 named imports)
+        let mut missing_tw_classes = crate::sanitizer::extract_missing_tailwind_classes_from_error(&build_output);
+        if let Some(sem_cls) = semantic_missing_css_class {
+            if !sem_cls.is_empty() && !missing_tw_classes.contains(&sem_cls) {
+                missing_tw_classes.push(sem_cls);
+            }
+        }
+        if !missing_tw_classes.is_empty() {
+            let mut css_cleaned = false;
+            let mut css_candidates: Vec<String> = files_with_errors
+                .iter()
+                .filter_map(|v| v.get("path").and_then(|p| p.as_str()).map(|s| s.to_string()))
+                .filter(|p| {
+                    let low = p.to_lowercase();
+                    low.ends_with(".css") || low.ends_with(".scss")
+                })
+                .collect();
+            for fallback_css in ["src/app/globals.css", "app/globals.css", "src/styles/globals.css", "styles/globals.css"] {
+                if proj_dir.join(fallback_css).is_file() && !css_candidates.iter().any(|p| p == fallback_css) {
+                    css_candidates.push(fallback_css.to_string());
+                }
+            }
+            for css_rel in css_candidates {
+                let css_abs = proj_dir.join(&css_rel);
+                let Ok(orig_css) = std::fs::read_to_string(&css_abs) else { continue };
+                let mut next_css = orig_css.clone();
+                for cls in &missing_tw_classes {
+                    next_css = crate::sanitizer::strip_tailwind_apply_class(&next_css, cls);
+                }
+                if next_css != orig_css && std::fs::write(&css_abs, &next_css).is_ok() {
+                    css_cleaned = true;
+                    debug_log_to_file(format!(
+                        "[Self-Healing] Tier 2 deterministically stripped invalid @apply class(es) from '{}'.",
+                        css_rel
+                    ));
+                }
+            }
+            if css_cleaned {
+                continue;
+            }
+        }
+
+        let ts2305_targets = extract_ts2305_missing_imports(&build_output);
+        if !ts2305_targets.is_empty() {
+            let mut ts2305_cleaned = false;
+            for err_file in &files_with_errors {
+                if let (Some(path_str), Some(orig_content)) = (
+                    err_file.get("path").and_then(|p| p.as_str()),
+                    err_file.get("content").and_then(|c| c.as_str()),
+                ) {
+                    if let Some(cleaned) = crate::ast_engine::remove_unused_named_import_specifiers(path_str, orig_content, &ts2305_targets) {
+                        if std::fs::write(proj_dir.join(path_str), &cleaned).is_ok() {
+                            ts2305_cleaned = true;
+                            debug_log_to_file(format!(
+                                "[Self-Healing] Tier 2 deterministically removed unused nonexistent import(s) from '{}'.",
+                                path_str
+                            ));
+                        }
+                    }
+                }
+            }
+            if ts2305_cleaned {
+                continue;
             }
         }
 
@@ -5711,7 +6022,48 @@ pub async fn run_generation_auto_test_suite(
             let local_tsc_js = nm_dir.join("typescript").join("bin").join("tsc");
             if local_tsc_js.exists() {
                 let enriched_path = ensure_node_toolchain_ready(None, "auto-test").await;
-                if let Ok((tsc_ok, _, diags)) = run_tsc_check(proj_dir, &local_tsc_js, &enriched_path) {
+                if let Ok((mut tsc_ok, _, mut diags)) = run_tsc_check(proj_dir, &local_tsc_js, &enriched_path) {
+                    if !tsc_ok && !diags.is_empty() {
+                        // Deterministic AST cleanup for any trailing unused `TS2305` named imports
+                        let mut per_file_ts2305: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+                        for d in &diags {
+                            if d.code == "TS2305" {
+                                let resolved = resolve_project_file_candidate(proj_dir, &d.file)
+                                    .unwrap_or_else(|| d.file.clone());
+                                per_file_ts2305
+                                    .entry(resolved)
+                                    .or_default()
+                                    .push(format!("{} {}", d.code, d.message));
+                            }
+                        }
+                        let mut cleaned_any_ts2305 = false;
+                        for (rel_path, msgs) in per_file_ts2305 {
+                            let abs_p = proj_dir.join(&rel_path);
+                            let targets = extract_ts2305_missing_imports(&msgs.join("\n"));
+                            if targets.is_empty() {
+                                continue;
+                            }
+                            if let Ok(orig) = std::fs::read_to_string(&abs_p) {
+                                if let Some(cleaned) = crate::ast_engine::remove_unused_named_import_specifiers(&rel_path, &orig, &targets) {
+                                    if std::fs::write(&abs_p, &cleaned).is_ok() {
+                                        cleaned_any_ts2305 = true;
+                                        auto_healed_count += 1;
+                                        debug_log_to_file(format!(
+                                            "[Auto-Test Suite] Removed unused nonexistent import(s) from '{}'.",
+                                            rel_path
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        if cleaned_any_ts2305 {
+                            if let Ok((recheck_ok, _, recheck_diags)) = run_tsc_check(proj_dir, &local_tsc_js, &enriched_path) {
+                                tsc_ok = recheck_ok;
+                                diags = recheck_diags;
+                            }
+                        }
+                    }
+
                     if !tsc_ok && !diags.is_empty() {
                         let sample: Vec<String> = diags
                             .iter()

@@ -3558,3 +3558,146 @@ pub fn deduplicate_local_domain_interfaces_against_types_in_project(proj_dir: &s
 
     updated
 }
+
+/// Deterministically removes nonexistent named import specifiers (e.g. from `TS2305`)
+/// via AST when the imported local binding is completely unused outside `import` declarations
+/// (for instance when the word only appears in comments or JSX text).
+pub fn remove_unused_named_import_specifiers(
+    path: &str,
+    src: &str,
+    targets: &[(Option<String>, String)],
+) -> Option<String> {
+    if targets.is_empty() {
+        return None;
+    }
+    let tree = parse_source(path, src)?;
+
+    let mut used_idents: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "import_statement" {
+            continue;
+        }
+        if matches!(
+            node.kind(),
+            "identifier"
+                | "type_identifier"
+                | "jsx_identifier"
+                | "shorthand_property_identifier"
+                | "shorthand_property_identifier_pattern"
+        ) {
+            let txt = node_text(node, src).trim();
+            if !txt.is_empty() {
+                used_idents.insert(txt.to_string());
+            }
+        }
+        let mut cursor = node.walk();
+        for ch in node.named_children(&mut cursor) {
+            stack.push(ch);
+        }
+    }
+
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    for stmt in named_children_vec(tree.root_node()) {
+        if stmt.kind() != "import_statement" {
+            continue;
+        }
+        let Some(source) = stmt
+            .child_by_field_name("source")
+            .or_else(|| first_named_of_kind(stmt, &["string"]))
+        else {
+            continue;
+        };
+        let module_spec = strip_string_quotes(node_text(source, src));
+        let Some(clause) = first_named_of_kind(stmt, &["import_clause"]) else {
+            continue;
+        };
+
+        let mut has_default_or_namespace = false;
+        let mut named_imports_node: Option<Node> = None;
+        for part in named_children_vec(clause) {
+            match part.kind() {
+                "identifier" | "namespace_import" => has_default_or_namespace = true,
+                "named_imports" => named_imports_node = Some(part),
+                _ => {}
+            }
+        }
+        let Some(named_imports) = named_imports_node else {
+            continue;
+        };
+
+        let mut kept_raw: Vec<String> = Vec::new();
+        let mut removed_any = false;
+        let mut spec_count = 0usize;
+
+        for spec in named_children_vec(named_imports) {
+            if spec.kind() != "import_specifier" {
+                continue;
+            }
+            spec_count += 1;
+            let name_node = spec
+                .child_by_field_name("name")
+                .or_else(|| named_children_vec(spec).into_iter().next());
+            let alias_node = spec.child_by_field_name("alias");
+            let imported_name = name_node
+                .map(|n| strip_string_quotes(node_text(n, src)))
+                .unwrap_or_default();
+            let local_name = alias_node
+                .map(|a| node_text(a, src).trim().to_string())
+                .unwrap_or_else(|| imported_name.clone());
+
+            let matches_target = !imported_name.is_empty()
+                && targets.iter().any(|(mod_opt, sym)| {
+                    sym == &imported_name && mod_opt.as_ref().map_or(true, |m| m == &module_spec)
+                });
+            let is_unused = !local_name.is_empty() && !used_idents.contains(&local_name);
+
+            if matches_target && is_unused {
+                removed_any = true;
+            } else {
+                kept_raw.push(node_text(spec, src).trim().to_string());
+            }
+        }
+
+        if !removed_any || spec_count == 0 {
+            continue;
+        }
+
+        if kept_raw.is_empty() {
+            if !has_default_or_namespace {
+                let mut del_end = stmt.end_byte();
+                while del_end < src.len() && matches!(src.as_bytes()[del_end], b' ' | b'\t') {
+                    del_end += 1;
+                }
+                if src[del_end..].starts_with("\r\n") {
+                    del_end += 2;
+                } else if src[del_end..].starts_with('\n') {
+                    del_end += 1;
+                }
+                edits.push((stmt.start_byte(), del_end, String::new()));
+            } else {
+                let prefix = &src[clause.start_byte()..named_imports.start_byte()];
+                let trimmed_prefix = prefix.trim_end();
+                let del_start = if let Some(comma_prefix) = trimmed_prefix.strip_suffix(',') {
+                    clause.start_byte() + comma_prefix.len()
+                } else {
+                    named_imports.start_byte()
+                };
+                edits.push((del_start, named_imports.end_byte(), String::new()));
+            }
+        } else {
+            edits.push((
+                named_imports.start_byte(),
+                named_imports.end_byte(),
+                format!("{{ {} }}", kept_raw.join(", ")),
+            ));
+        }
+    }
+
+    if edits.is_empty() {
+        return None;
+    }
+
+    let candidate = apply_byte_edits(src, edits);
+    verified_rewrite(path, src, candidate)
+}

@@ -171,9 +171,9 @@ function Header() {
 }
 
 function Layout() {
-  const { projects, taskProgress, setTaskProgress, loadProjects } = useAppStore();
+  const { projects, taskProgress, setTaskProgress, removeTaskProgress, loadProjects } = useAppStore();
   const { t } = useI18n();
-  const [dismissedTaskId, setDismissedTaskId] = React.useState(null);
+  const [dismissedTaskIds, setDismissedTaskIds] = React.useState(() => new Set());
   const [focusedProjectId, setFocusedProjectId] = React.useState(null);
   const [isTaskActionLoading, setIsTaskActionLoading] = React.useState(false);
   const [isDropdownOpen, setIsDropdownOpen] = React.useState(true);
@@ -181,7 +181,45 @@ function Layout() {
   const logsEndRef = React.useRef(null);
   const liveCodeContainerRef = React.useRef(null);
   const hydratedRef = React.useRef(false);
+  const taskProgressRef = React.useRef(taskProgress);
+  taskProgressRef.current = taskProgress;
   const navigate = useNavigate();
+
+  const isTaskFinished = React.useCallback((tk) => {
+    return Boolean(
+      tk &&
+      (tk.phase === 'complete' ||
+        tk.phase === 'success' ||
+        tk.phase === 'error' ||
+        tk.phase === 'stopped' ||
+        tk.status === 'stopped')
+    );
+  }, []);
+
+  const dismissTaskEntry = React.useCallback((tk) => {
+    if (!tk) return;
+    if (isTaskFinished(tk)) {
+      const finishedIds = Object.values(taskProgressRef.current)
+        .filter(item => item && isTaskFinished(item))
+        .map(item => item.taskId);
+      if (!finishedIds.includes(tk.taskId)) {
+        finishedIds.push(tk.taskId);
+      }
+      setDismissedTaskIds(prev => {
+        const next = new Set(prev);
+        for (const id of finishedIds) next.add(id);
+        return next;
+      });
+      removeTaskProgress(finishedIds);
+      setFocusedProjectId(null);
+    } else {
+      setDismissedTaskIds(prev => {
+        const next = new Set(prev);
+        next.add(tk.taskId);
+        return next;
+      });
+    }
+  }, [isTaskFinished, removeTaskProgress]);
 
   // Auto-hydrate interrupted/paused/generating task into bottom-right widget on startup
   React.useEffect(() => {
@@ -209,25 +247,51 @@ function Layout() {
   React.useEffect(() => {
     const handleShowProgress = async (e) => {
       const projectId = e?.detail?.projectId;
-      setDismissedTaskId(null);
       setIsDropdownOpen(true);
       if (projectId) {
         setFocusedProjectId(projectId);
+        setDismissedTaskIds(prev => {
+          const next = new Set(prev);
+          for (const tk of Object.values(taskProgressRef.current)) {
+            if (tk?.projectId === projectId) next.delete(tk.taskId);
+          }
+          return next;
+        });
         try {
           const res = await window.electronAPI.task.getActiveTaskByProject(projectId);
           if (res?.success && res.task) {
+            setDismissedTaskIds(prev => {
+              if (!prev.has(res.task.taskId)) return prev;
+              const next = new Set(prev);
+              next.delete(res.task.taskId);
+              return next;
+            });
             setTaskProgress(res.task.taskId, res.task);
           }
         } catch (err) {
           console.warn('Failed to sync task progress on show:', err);
         }
+      } else {
+        const tasks = Object.values(taskProgressRef.current)
+          .filter(Boolean)
+          .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+        const target = tasks.find(tk => !isTaskFinished(tk)) || tasks[0];
+        if (target) {
+          setDismissedTaskIds(prev => {
+            if (!prev.has(target.taskId)) return prev;
+            const next = new Set(prev);
+            next.delete(target.taskId);
+            return next;
+          });
+        }
       }
     };
     const handleHideProgress = () => {
-      const tasks = Object.values(taskProgress);
-      const current = tasks.find(tk => tk.projectId === focusedProjectId) || tasks[0];
+      const tasks = Object.values(taskProgressRef.current);
+      const current = tasks.find(tk => tk?.projectId === focusedProjectId && !dismissedTaskIds.has(tk.taskId))
+        || tasks.find(tk => tk && !dismissedTaskIds.has(tk.taskId));
       if (current) {
-        setDismissedTaskId(current.taskId);
+        dismissTaskEntry(current);
       }
     };
     window.addEventListener('axiom:show-progress', handleShowProgress);
@@ -236,17 +300,24 @@ function Layout() {
       window.removeEventListener('axiom:show-progress', handleShowProgress);
       window.removeEventListener('axiom:hide-progress', handleHideProgress);
     };
-  }, [setTaskProgress, taskProgress, focusedProjectId]);
+  }, [setTaskProgress, focusedProjectId, dismissedTaskIds, isTaskFinished, dismissTaskEntry]);
 
-  // Find the task matching focusedProjectId first, or the first non-dismissed task
+  // Find the task matching focusedProjectId first, or the highest-priority visible task
   const activeTask = React.useMemo(() => {
-    const tasks = Object.values(taskProgress);
+    const visible = Object.values(taskProgress).filter(tk => tk && !dismissedTaskIds.has(tk.taskId));
+    if (visible.length === 0) return null;
     if (focusedProjectId) {
-      const focused = tasks.find(tk => tk.projectId === focusedProjectId && tk.taskId !== dismissedTaskId);
+      const focused = visible.find(tk => tk.projectId === focusedProjectId);
       if (focused) return focused;
     }
-    return tasks.find(tk => tk.taskId !== dismissedTaskId);
-  }, [taskProgress, focusedProjectId, dismissedTaskId]);
+    visible.sort((a, b) => {
+      const aFin = isTaskFinished(a) ? 1 : 0;
+      const bFin = isTaskFinished(b) ? 1 : 0;
+      if (aFin !== bFin) return aFin - bFin;
+      return (b.updatedAt || 0) - (a.updatedAt || 0);
+    });
+    return visible[0] || null;
+  }, [taskProgress, focusedProjectId, dismissedTaskIds, isTaskFinished]);
 
   React.useEffect(() => {
     if (showLogs && logsEndRef.current) {
@@ -262,14 +333,15 @@ function Layout() {
 
   const handleDismiss = () => {
     if (activeTask) {
-      setDismissedTaskId(activeTask.taskId);
+      dismissTaskEntry(activeTask);
     }
   };
 
   const handleViewProject = () => {
     if (activeTask && activeTask.projectId) {
-      setDismissedTaskId(activeTask.taskId);
-      navigate(`/projects/${activeTask.projectId}`);
+      const targetProjId = activeTask.projectId;
+      dismissTaskEntry(activeTask);
+      navigate(`/projects/${targetProjId}`);
     }
   };
 

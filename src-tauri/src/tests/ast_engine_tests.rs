@@ -901,4 +901,153 @@ model EngagementStrategy {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    #[test]
+    fn phase10_v61_universal_postcss_semantic_ast_ui_and_middleware_suite() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v61_phase10_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(temp_dir.join("prisma")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/app")).unwrap();
+
+        // 1. PostCSS quote-agnostic extraction & inline/multiline @apply cleanup
+        let postcss_err = "Syntax error: The `whitespace-no-wrap` class does not exist.\nThe 'foo-bar' class does not exist.\nThe \"baz-qux\" class does not exist.";
+        let extracted_cls = crate::sanitizer::extract_missing_tailwind_classes_from_error(postcss_err);
+        assert_eq!(extracted_cls, vec!["whitespace-no-wrap", "foo-bar", "baz-qux"]);
+
+        let css_in = ".table { @apply w-full min-w-max table-auto text-left whitespace-no-wrap; }\n.only-bad {\n  @apply whitespace-no-wrap;\n}\n";
+        let css_out = crate::sanitizer::strip_tailwind_apply_class(css_in, "whitespace-no-wrap");
+        assert!(!css_out.contains("whitespace-no-wrap"), "Must strip inline & standalone failing class:\n{}", css_out);
+        assert!(css_out.contains(".table { @apply w-full min-w-max table-auto text-left; }"), "Must preserve sibling valid utilities inline:\n{}", css_out);
+        assert!(!css_out.contains("@apply ;"), "Emptied standalone @apply line must be dropped cleanly:\n{}", css_out);
+
+        // 2. Semantic build error JSON parser
+        let fenced_json = "```json\n{\"has_error\": true, \"error_kind\": \"css\", \"file_path\": \"src/app/globals.css\", \"error_summary\": \"Unknown class whitespace-no-wrap\", \"missing_css_class\": \".whitespace-no-wrap\"}\n```";
+        let parsed_diag = crate::self_healing::parse_semantic_build_diagnosis(fenced_json).unwrap();
+        assert!(parsed_diag.has_error);
+        assert_eq!(parsed_diag.error_kind, "css");
+        assert_eq!(parsed_diag.file_path.as_deref(), Some("src/app/globals.css"));
+        assert_eq!(parsed_diag.missing_css_class.as_deref(), Some("whitespace-no-wrap"));
+
+        let no_err_diag = crate::self_healing::parse_semantic_build_diagnosis("{\"has_error\": false, \"file_path\": \"null\"}").unwrap();
+        assert!(!no_err_diag.has_error);
+        assert_eq!(no_err_diag.file_path, None);
+        assert!(crate::self_healing::parse_semantic_build_diagnosis("not json at all").is_none());
+
+        // 3. AST unused TS2305 named import cleanup
+        let ts2305_msg = "src/renderer/App.tsx(1,10): error TS2305: Module '\"@stripe/stripe-js\"' has no exported member 'Status'.";
+        let targets = crate::self_healing::extract_ts2305_missing_imports(ts2305_msg);
+        assert_eq!(targets, vec![(Some("@stripe/stripe-js".to_string()), "Status".to_string())]);
+
+        let unused_src = "import { Status } from '@stripe/stripe-js';\nexport default function App() {\n  {/* Filter by Status */}\n  return <div>Filter by Status</div>;\n}\n";
+        let cleaned_unused = crate::ast_engine::remove_unused_named_import_specifiers("src/renderer/App.tsx", unused_src, &targets).unwrap();
+        assert!(!cleaned_unused.contains("Status } from"), "Unused TS2305 import line must be removed:\n{}", cleaned_unused);
+        assert!(cleaned_unused.contains("Filter by Status"), "JSX text must stay intact:\n{}", cleaned_unused);
+
+        let partial_src = "import { Status, loadStripe } from '@stripe/stripe-js';\nexport const p = loadStripe('pk_test');\n";
+        let cleaned_partial = crate::ast_engine::remove_unused_named_import_specifiers("src/lib/stripe.ts", partial_src, &targets).unwrap();
+        assert!(cleaned_partial.contains("import { loadStripe } from '@stripe/stripe-js';"), "Used sibling import must remain:\n{}", cleaned_partial);
+
+        let used_type_src = "import { Status } from '@stripe/stripe-js';\nexport const fn = (x: Status) => x;\n";
+        assert!(
+            crate::ast_engine::remove_unused_named_import_specifiers("src/lib/stripe.ts", used_type_src, &targets).is_none(),
+            "Must NOT remove import identifier when referenced in a type annotation"
+        );
+
+        // 4. AST-safe enum mock normalization (never touches TS interfaces/unions)
+        std::fs::write(
+            temp_dir.join("prisma/schema.prisma"),
+            "enum Priority { HIGH MEDIUM LOW }\n",
+        ).unwrap();
+        let hook_src = "\"use client\";\nexport interface MaintenanceAlert {\n  id: string;\n  priority: 'HIGH' | 'MEDIUM' | 'LOW';\n}\nconst sampleMock = { priority: 'high' };\nexport const demo = sampleMock;\n";
+        let rec_hook = crate::sanitizer::reconcile_client_prisma_enum_mocks(&temp_dir, "src/hooks/useMaintenanceAlerts.ts", hook_src);
+        assert!(rec_hook.contains("priority: 'HIGH' | 'MEDIUM' | 'LOW';"), "Interface union property must remain untouched:\n{}", rec_hook);
+        assert!(rec_hook.contains("priority: 'HIGH' as any"), "Runtime object literal mock must normalize:\n{}", rec_hook);
+        assert!(
+            syntax_issues_for("src/hooks/useMaintenanceAlerts.ts", &rec_hook).unwrap().is_empty(),
+            "Enum-reconciled hook must remain syntactically valid TS:\n{}",
+            rec_hook
+        );
+
+        // 5. Spread-safe try/catch body hoisting
+        let spread_route = "export async function POST(request: Request) {\n  try {\n    const body = await request.json();\n    return Response.json(body);\n  } catch (error) {\n    return Response.json({ id: 'mock', ...body }, { status: 201 });\n  }\n}\n";
+        let hoisted_spread = crate::sanitizer::sanitize_try_catch_body_scope(spread_route);
+        assert!(hoisted_spread.contains("let body: any = {};"), "Spread `...body` in catch must hoist body declaration:\n{}", hoisted_spread);
+
+        let req_body_route = "export async function POST(request: Request) {\n  try {\n    const body = await request.json();\n    return Response.json(body);\n  } catch (error) {\n    return Response.json({ err: req.body }, { status: 500 });\n  }\n}\n";
+        let ignored_prop = crate::sanitizer::sanitize_try_catch_body_scope(req_body_route);
+        assert!(!ignored_prop.contains("let body: any = {};"), "Property access `req.body` must NOT falsely trigger hoist:\n{}", ignored_prop);
+
+        // 6. Interactive & contrast UI primitive stubs
+        std::fs::write(
+            temp_dir.join("src/app/page.tsx"),
+            "\"use client\";\nimport { Checkbox } from '@/components/ui/checkbox';\nimport { Switch } from '@/components/ui/switch';\nimport { Input } from '@/components/ui/input';\nimport { useToast } from '@/components/ui/use-toast';\nexport default function Home() {\n  const toast = useToast();\n  toast({ title: 'Ready' });\n  return <div><Input /><Checkbox checked={true} onCheckedChange={() => {}} /><Switch onCheckedChange={() => {}} /></div>;\n}\n",
+        ).unwrap();
+        crate::sanitizer::ensure_ui_primitives_reconciled(&temp_dir);
+        let cb_src = std::fs::read_to_string(temp_dir.join("src/components/ui/checkbox.tsx")).unwrap();
+        assert!(cb_src.contains("onCheckedChange"), "Checkbox stub must wire onCheckedChange:\n{}", cb_src);
+        let sw_src = std::fs::read_to_string(temp_dir.join("src/components/ui/switch.tsx")).unwrap();
+        assert!(sw_src.contains("onCheckedChange") && sw_src.contains("aria-checked"), "Switch stub must wire toggle & aria-checked:\n{}", sw_src);
+        let in_src = std::fs::read_to_string(temp_dir.join("src/components/ui/input.tsx")).unwrap();
+        assert!(in_src.contains("bg-white") && in_src.contains("text-slate-900") && in_src.contains("placeholder:text-slate-400"), "Input stub must enforce conditional light contrast:\n{}", in_src);
+        let ut_src = std::fs::read_to_string(temp_dir.join("src/components/ui/use-toast.tsx")).unwrap();
+        assert!(ut_src.contains("return Object.assign(fn, { toast: fn"), "useToast must be both callable and destructurable:\n{}", ut_src);
+
+        // 7. Edge middleware public-root protection guard
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let bad_catchall_mw = r#"
+import { NextRequest, NextResponse } from 'next/server';
+import { getToken } from 'next-auth/jwt';
+export async function middleware(request: NextRequest) {
+  const pathname = request.nextUrl.pathname;
+  if (pathname.startsWith('/login') || pathname.startsWith('/register')) return NextResponse.next();
+  const token = await getToken({ req: request });
+  if (!token) return NextResponse.redirect(new URL('/login', request.url));
+  if (token && pathname === '/login') return NextResponse.redirect(new URL('/dashboard', request.url));
+  return NextResponse.next();
+}
+export const config = { matcher: ['/((?!api|_next/static|_next/image|favicon.ico).*)'] };
+"#;
+        assert!(crate::orchestrator::middleware_blocks_public_root(bad_catchall_mw));
+        assert!(
+            rt.block_on(crate::orchestrator::validate_file_with_project_context(&temp_dir, "src/middleware.ts", bad_catchall_mw, "qwen")).is_err(),
+            "Catch-all middleware blocking `/` must be rejected when public root page exists"
+        );
+
+        let good_prefix_mw = r#"
+import { NextRequest, NextResponse } from 'next/server';
+import { getToken } from 'next-auth/jwt';
+export async function middleware(request: NextRequest) {
+  const pathname = request.nextUrl.pathname;
+  if (pathname.startsWith('/dashboard/') || pathname.startsWith('/admin/')) {
+    const token = await getToken({ req: request });
+    if (!token) return NextResponse.redirect(new URL('/login', request.url));
+  }
+  return NextResponse.next();
+}
+export const config = { matcher: ['/((?!api|_next/static|_next/image|favicon.ico).*)'] };
+"#;
+        assert!(!crate::orchestrator::middleware_blocks_public_root(good_prefix_mw));
+        assert!(
+            rt.block_on(crate::orchestrator::validate_file_with_project_context(&temp_dir, "src/middleware.ts", good_prefix_mw, "qwen")).is_ok(),
+            "Prefix-scoped middleware must pass"
+        );
+
+        let good_matcher_mw = r#"
+import { NextRequest, NextResponse } from 'next/server';
+export function middleware(_req: NextRequest) {
+  return NextResponse.redirect(new URL('/login', _req.url));
+}
+export const config = { matcher: ['/dashboard/:path*', '/settings/:path*'] };
+"#;
+        assert!(!crate::orchestrator::middleware_blocks_public_root(good_matcher_mw));
+        assert!(
+            rt.block_on(crate::orchestrator::validate_file_with_project_context(&temp_dir, "src/middleware.ts", good_matcher_mw, "qwen")).is_ok(),
+            "Matcher-scoped middleware must pass"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }

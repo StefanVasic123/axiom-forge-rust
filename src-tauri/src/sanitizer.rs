@@ -1541,9 +1541,10 @@ pub fn sanitize_try_catch_body_scope(content: &str) -> String {
                     .ok()
                     .map_or(false, |re| {
                         re.find_iter(catch_body).any(|rm| {
-                            let prev_ch = catch_body[..rm.start()].trim_end().chars().next_back();
+                            let before_trim = catch_body[..rm.start()].trim_end();
+                            let is_prop_access = before_trim.ends_with('.') && !before_trim.ends_with("...");
                             let next_ch = catch_body[rm.end()..].trim_start().chars().next();
-                            prev_ch != Some('.') && next_ch != Some(':')
+                            !is_prop_access && next_ch != Some(':')
                         })
                     });
                 if !ref_in_catch {
@@ -1714,6 +1715,38 @@ pub fn reconcile_client_prisma_enum_mocks(
         return content.to_string();
     }
 
+    let ast_tree = crate::ast_engine::parse_source(file_path, content);
+    let is_in_type_position = |start: usize, end: usize| -> bool {
+        if let Some(ref tree) = ast_tree {
+            if let Some(mut node) = tree.root_node().descendant_for_byte_range(start, end) {
+                loop {
+                    if matches!(
+                        node.kind(),
+                        "interface_declaration"
+                            | "type_alias_declaration"
+                            | "property_signature"
+                            | "type_annotation"
+                            | "object_type"
+                            | "union_type"
+                            | "intersection_type"
+                            | "literal_type"
+                            | "readonly_type"
+                            | "type_arguments"
+                            | "enum_declaration"
+                    ) {
+                        return true;
+                    }
+                    match node.parent() {
+                        Some(p) => node = p,
+                        None => break,
+                    }
+                }
+            }
+        }
+        let rest_same_line = content[end..].lines().next().unwrap_or("").trim_start();
+        rest_same_line.starts_with('|') || rest_same_line.starts_with('&')
+    };
+
     let Ok(re_kv) = regex::Regex::new(
         r#"(?m)\b(status|role|priority|tier|plan|type|state|category|paymentStatus|bookingStatus)\s*:\s*(['"])([A-Za-z][A-Za-z0-9_-]*)(['"])(\s*as\s+(?:any|const))?"#,
     ) else {
@@ -1722,6 +1755,10 @@ pub fn reconcile_client_prisma_enum_mocks(
 
     re_kv
         .replace_all(content, |caps: &regex::Captures| {
+            let full_m = caps.get(0).unwrap();
+            if is_in_type_position(full_m.start(), full_m.end()) {
+                return full_m.as_str().to_string();
+            }
             let key = &caps[1];
             let q = &caps[2];
             let raw_val = &caps[3];
@@ -1944,42 +1981,77 @@ fn split_tailwind_utility_parts(tok: &str) -> (&str, bool, &str, &str) {
     }
 }
 
+/// Extracts missing Tailwind utility class names reported by PostCSS/Tailwind errors
+/// (e.g. `The \`whitespace-no-wrap\` class does not exist`, `'foo-bar'`, `"baz-qux"`).
+pub fn extract_missing_tailwind_classes_from_error(err_msg: &str) -> Vec<String> {
+    let mut classes = Vec::new();
+    let Ok(tw_missing_re) = regex::Regex::new(r#"(?i)The\s+[`'"]\.?([^`'"\s]+)[`'"]\s+class\s+does\s+not\s+exist"#) else {
+        return classes;
+    };
+    for cap in tw_missing_re.captures_iter(err_msg) {
+        if let Some(m) = cap.get(1) {
+            let cls = m.as_str().trim().to_string();
+            if !cls.is_empty() && !classes.contains(&cls) {
+                classes.push(cls);
+            }
+        }
+    }
+    classes
+}
+
 /// Compiler-driven Tailwind CSS helper: strips the exact failing utility class reported by
-/// PostCSS/Tailwind (`The '<missing_class>' class does not exist`) from `@apply` lines.
+/// PostCSS/Tailwind (`The '<missing_class>' class does not exist`) from `@apply` directives,
+/// supporting both standalone `@apply ...;` lines and inline single-line rule blocks.
 pub fn strip_tailwind_apply_class(css: &str, missing_class: &str) -> String {
     let target = missing_class.trim().trim_start_matches('.');
     if target.is_empty() {
         return css.to_string();
     }
     let target_core = split_tailwind_utility_parts(target).2;
-    let mut out = String::with_capacity(css.len());
-    for line in css.split_inclusive('\n') {
-        let line_no_nl = line.trim_end_matches(&['\r', '\n'][..]);
-        let nl_suffix = &line[line_no_nl.len()..];
-        let trimmed = line_no_nl.trim();
-        if trimmed.starts_with("@apply ") && trimmed.ends_with(';') && !trimmed.contains('{') && !trimmed.contains('}') {
-            let indent_len = line_no_nl.len() - line_no_nl.trim_start().len();
-            let indent = &line_no_nl[..indent_len];
-            let inner = trimmed["@apply ".len()..trimmed.len() - 1].trim();
-            let tokens = split_tailwind_apply_tokens(inner);
-            let mut kept = Vec::new();
-            let mut removed_any = false;
-            for tok in tokens {
-                let (_, _, core, _) = split_tailwind_utility_parts(&tok);
-                if tok == target || core == target || (!target_core.is_empty() && core == target_core) {
-                    removed_any = true;
-                } else {
-                    kept.push(tok);
-                }
-            }
-            if removed_any {
-                if !kept.is_empty() && kept.iter().any(|t| t != "!important") {
-                    out.push_str(&format!("{}@apply {};{}", indent, kept.join(" "), nl_suffix));
-                }
-                continue;
+    let Ok(apply_re) = regex::Regex::new(r"@apply\s+([^;{}]+);") else {
+        return css.to_string();
+    };
+
+    let mut any_emptied = false;
+    let replaced = apply_re.replace_all(css, |caps: &regex::Captures| {
+        let inner = caps.get(1).map_or("", |m| m.as_str()).trim();
+        let tokens = split_tailwind_apply_tokens(inner);
+        let mut kept = Vec::new();
+        let mut removed_any = false;
+        for tok in tokens {
+            let (_, _, core, _) = split_tailwind_utility_parts(&tok);
+            if tok == target || core == target || (!target_core.is_empty() && core == target_core) {
+                removed_any = true;
+            } else {
+                kept.push(tok);
             }
         }
-        out.push_str(line);
+        if !removed_any {
+            return caps[0].to_string();
+        }
+        if !kept.is_empty() && kept.iter().any(|t| t != "!important") {
+            format!("@apply {};", kept.join(" "))
+        } else {
+            any_emptied = true;
+            "__AXIOM_EMPTY_APPLY__".to_string()
+        }
+    });
+
+    if !any_emptied {
+        return replaced.into_owned();
+    }
+
+    let mut out = String::with_capacity(replaced.len());
+    for line in replaced.split_inclusive('\n') {
+        if line.contains("__AXIOM_EMPTY_APPLY__") {
+            let cleaned = line.replace("__AXIOM_EMPTY_APPLY__", "");
+            if cleaned.trim().is_empty() {
+                continue;
+            }
+            out.push_str(&cleaned);
+        } else {
+            out.push_str(line);
+        }
     }
     out
 }
@@ -3888,12 +3960,12 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
                         "CardTitle" => "export const CardTitle = ({ children, className = '', ...props }: any) => <h3 className={`text-base font-semibold text-slate-900 ${className}`} {...props}>{children}</h3>;\n".to_string(),
                         "CardDescription" | "DialogDescription" => format!("export const {} = ({{ children, className = '', ...props }}: any) => <p className={{`text-sm text-slate-500 ${{className}}`}} {{...props}}>{{children}}</p>;\n", sym),
                         "Badge" => "export const Badge = ({ children, variant = 'default', className = '', ...props }: any) => <span className={`inline-flex items-center rounded-full bg-slate-100 px-2.5 py-0.5 text-xs font-medium text-slate-800 ${className}`} {...props}>{children}</span>;\n".to_string(),
-                        "Input" | "TextInput" => format!("export const {} = ({{ label, error, onChangeText, onChange, className = '', ...props }}: any) => <input onChange={{onChange || (onChangeText ? (e: any) => onChangeText(e.target.value) : undefined)}} className={{`w-full rounded-lg border border-slate-300 px-3 py-2 text-sm ${{className}}`}} {{...props}} />;\n", sym),
-                        "Textarea" => "export const Textarea = ({ label, error, className = '', ...props }: any) => <textarea className={`w-full rounded-lg border border-slate-300 px-3 py-2 text-sm ${className}`} {...props} />;\n".to_string(),
-                        "Select" => "export const Select = ({ children, options, label, className = '', ...props }: any) => <select className={`w-full rounded-lg border border-slate-300 px-3 py-2 text-sm ${className}`} {...props}>{Array.isArray(options) ? options.map((opt: any, idx: number) => <option key={idx} value={opt?.value ?? opt}>{opt?.label ?? opt}</option>) : children}</select>;\n".to_string(),
+                        "Input" | "TextInput" => format!("export const {} = ({{ label, error, onChangeText, onChange, className = '', ...props }}: any) => {{ const c = className || ''; const contrast = `${{/\\bbg-/.test(c) ? '' : 'bg-white'}} ${{/\\btext-/.test(c) ? '' : 'text-slate-900'}} ${{/\\bplaceholder:/.test(c) ? '' : 'placeholder:text-slate-400'}}`; return <input onChange={{onChange || (onChangeText ? (e: any) => onChangeText(e.target.value) : undefined)}} className={{`w-full rounded-lg border border-slate-300 px-3 py-2 text-sm ${{contrast}} ${{c}}`}} {{...props}} />; }};\n", sym),
+                        "Textarea" => "export const Textarea = ({ label, error, onChangeText, onChange, className = '', ...props }: any) => { const c = className || ''; const contrast = `${/\\bbg-/.test(c) ? '' : 'bg-white'} ${/\\btext-/.test(c) ? '' : 'text-slate-900'} ${/\\bplaceholder:/.test(c) ? '' : 'placeholder:text-slate-400'}`; return <textarea onChange={onChange || (onChangeText ? (e: any) => onChangeText(e.target.value) : undefined)} className={`w-full rounded-lg border border-slate-300 px-3 py-2 text-sm ${contrast} ${c}`} {...props} />; };\n".to_string(),
+                        "Select" => "export const Select = ({ children, options, label, onValueChange, onChange, className = '', ...props }: any) => { const c = className || ''; const contrast = `${/\\bbg-/.test(c) ? '' : 'bg-white'} ${/\\btext-/.test(c) ? '' : 'text-slate-900'}`; const handleChange = (e: any) => { onChange?.(e); onValueChange?.(e.target.value); }; return <select onChange={handleChange} className={`w-full rounded-lg border border-slate-300 px-3 py-2 text-sm ${contrast} ${c}`} {...props}>{Array.isArray(options) ? options.map((opt: any, idx: number) => <option key={idx} value={opt?.value ?? opt}>{opt?.label ?? opt}</option>) : children}</select>; };\n".to_string(),
                         "Label" => "export const Label = ({ children, className = '', ...props }: any) => <label className={`text-sm font-medium text-slate-700 ${className}`} {...props}>{children}</label>;\n".to_string(),
-                        "Checkbox" => "export const Checkbox = ({ className = '', ...props }: any) => <input type=\"checkbox\" className={`h-4 w-4 rounded border-slate-300 ${className}`} {...props} />;\n".to_string(),
-                        "Switch" => "export const Switch = ({ children, className = '', ...props }: any) => <button type=\"button\" role=\"switch\" className={`inline-flex h-5 w-9 items-center rounded-full bg-slate-200 transition-colors ${className}`} {...props}>{children}</button>;\n".to_string(),
+                        "Checkbox" => "export const Checkbox = ({ checked, defaultChecked, onCheckedChange, onChange, className = '', ...props }: any) => { const handleChange = (e: any) => { onChange?.(e); onCheckedChange?.(Boolean(e.target.checked)); }; return <input type=\"checkbox\" checked={checked} defaultChecked={defaultChecked} onChange={handleChange} className={`h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer ${className}`} {...props} />; };\n".to_string(),
+                        "Switch" => "export const Switch = ({ checked, defaultChecked = false, onCheckedChange, onChange, onClick, children, className = '', ...props }: any) => { const [internal, setInternal] = React.useState(Boolean(defaultChecked)); const isOn = checked !== undefined ? Boolean(checked) : internal; const toggle = (e: any) => { const next = !isOn; if (checked === undefined) setInternal(next); onClick?.(e); onChange?.(e); onCheckedChange?.(next); }; return <button type=\"button\" role=\"switch\" aria-checked={isOn} onClick={toggle} className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full p-0.5 transition-colors ${isOn ? 'bg-indigo-600' : 'bg-slate-200'} ${className}`} {...props}><span className={`inline-block h-4 w-4 rounded-full bg-white shadow transition-transform ${isOn ? 'translate-x-4' : 'translate-x-0'}`} />{children}</button>; };\n".to_string(),
                         "TabsList" => "export const TabsList = ({ children, className = '', ...props }: any) => <div role=\"tablist\" className={`inline-flex items-center gap-1 rounded-lg bg-slate-100 p-1 ${className}`} {...props}>{children}</div>;\n".to_string(),
                         "TabsTrigger" => "export const TabsTrigger = ({ children, value, className = '', ...props }: any) => <button type=\"button\" role=\"tab\" data-value={value} className={`rounded-md px-3 py-1.5 text-sm font-medium transition-colors hover:bg-white ${className}`} {...props}>{children}</button>;\n".to_string(),
                         "TabsContent" => "export const TabsContent = ({ children, value, className = '', ...props }: any) => <div role=\"tabpanel\" data-value={value} className={className} {...props}>{children}</div>;\n".to_string(),
@@ -3943,7 +4015,7 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
                         "TableCaption" => "export const TableCaption = ({ children, className = '', ...props }: any) => <caption className={`mt-2 text-sm text-slate-500 ${className}`} {...props}>{children}</caption>;\n".to_string(),
                         "Toaster" => "export const Toaster = () => null;\n".to_string(),
                         "toast" => "export const toast: ((opts?: any) => any) & { success: (msg?: any, opts?: any) => any; error: (msg?: any, opts?: any) => any; info: (msg?: any, opts?: any) => any; warning: (msg?: any, opts?: any) => any; warn: (msg?: any, opts?: any) => any; loading: (msg?: any, opts?: any) => any; dismiss: (id?: string) => void } = Object.assign((opts?: any) => { if (typeof window !== 'undefined') console.info('[toast]', opts?.title || opts?.description || opts); return { id: 'axiom-toast', dismiss: () => {}, update: () => {} }; }, { success: (msg?: any) => ({ id: 'axiom-toast', message: msg }), error: (msg?: any) => ({ id: 'axiom-toast', message: msg }), info: (msg?: any) => ({ id: 'axiom-toast', message: msg }), warning: (msg?: any) => ({ id: 'axiom-toast', message: msg }), warn: (msg?: any) => ({ id: 'axiom-toast', message: msg }), loading: (msg?: any) => ({ id: 'axiom-toast', message: msg }), dismiss: () => {} });\n".to_string(),
-                        "useToast" => "export const useToast = () => { const fn: ((opts?: any) => any) & { success: (msg?: any, opts?: any) => any; error: (msg?: any, opts?: any) => any; info: (msg?: any, opts?: any) => any; warning: (msg?: any, opts?: any) => any; warn: (msg?: any, opts?: any) => any; loading: (msg?: any, opts?: any) => any; dismiss: (id?: string) => void } = Object.assign((opts?: any) => { if (typeof window !== 'undefined') console.info('[toast]', opts?.title || opts?.description || opts); return { id: 'axiom-toast', dismiss: () => {}, update: () => {} }; }, { success: (msg?: any) => ({ id: 'axiom-toast', message: msg }), error: (msg?: any) => ({ id: 'axiom-toast', message: msg }), info: (msg?: any) => ({ id: 'axiom-toast', message: msg }), warning: (msg?: any) => ({ id: 'axiom-toast', message: msg }), warn: (msg?: any) => ({ id: 'axiom-toast', message: msg }), loading: (msg?: any) => ({ id: 'axiom-toast', message: msg }), dismiss: () => {} }); return { toast: fn, toasts: [] as any[], dismiss: (_id?: string) => {} }; };\n".to_string(),
+                        "useToast" => "export const useToast = () => { const fn: ((opts?: any) => any) & { success: (msg?: any, opts?: any) => any; error: (msg?: any, opts?: any) => any; info: (msg?: any, opts?: any) => any; warning: (msg?: any, opts?: any) => any; warn: (msg?: any, opts?: any) => any; loading: (msg?: any, opts?: any) => any; dismiss: (id?: string) => void } = Object.assign((opts?: any) => { if (typeof window !== 'undefined') console.info('[toast]', opts?.title || opts?.description || opts); return { id: 'axiom-toast', dismiss: () => {}, update: () => {} }; }, { success: (msg?: any) => ({ id: 'axiom-toast', message: msg }), error: (msg?: any) => ({ id: 'axiom-toast', message: msg }), info: (msg?: any) => ({ id: 'axiom-toast', message: msg }), warning: (msg?: any) => ({ id: 'axiom-toast', message: msg }), warn: (msg?: any) => ({ id: 'axiom-toast', message: msg }), loading: (msg?: any) => ({ id: 'axiom-toast', message: msg }), dismiss: () => {} }); return Object.assign(fn, { toast: fn, toasts: [] as any[], dismiss: (_id?: string) => {} }); };\n".to_string(),
                         "Link" => "export const Link = ({ children, href = '#', prefetch, replace, scroll, shallow, locale, legacyBehavior, className = '', ...props }: any) => <a href={typeof href === 'string' ? href : '#'} className={className} {...props}>{children}</a>;\n".to_string(),
                         _ => format!("export const {} = ({{ children, className = '', ...props }}: any) => <div className={{className}} {{...props}}>{{children}}</div>;\nexport type {} = any;\n", sym, sym),
                     };
@@ -3952,7 +4024,10 @@ pub fn ensure_ui_primitives_reconciled(proj_dir: &std::path::Path) {
                 }
             }
             if !appended.is_empty() {
-                if !content.contains("import React") && !content.contains("from 'react'") && !content.contains("from \"react\"") {
+                if !content.contains("import React")
+                    && !content.contains("* as React")
+                    && (appended.contains("React.") || (!content.contains("from 'react'") && !content.contains("from \"react\"")))
+                {
                     content = if content.trim().is_empty() {
                         "import React from 'react';\n".to_string()
                     } else {

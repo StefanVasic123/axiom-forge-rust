@@ -666,6 +666,15 @@ pub async fn editor_ai_edit(
                             }
                         }
                         
+                        if strip_axiom_inspector_script(&final_content).trim() == strip_axiom_inspector_script(&content).trim() {
+                            debug_log_to_file(format!("[AI Edit] No effective changes produced for '{}'.", rel_file_path));
+                            return Ok(AIEditResult {
+                                success: false,
+                                new_content: None,
+                                error: Some(format!("AI produced no effective changes for '{}'. Verify the target file and try describing the exact element or style change.", rel_file_path)),
+                            });
+                        }
+
                         return Ok(AIEditResult {
                             success: true,
                             new_content: Some(final_content),

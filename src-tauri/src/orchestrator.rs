@@ -622,6 +622,83 @@ pub fn extract_planned_api_routes_summary(files: &[Value]) -> String {
     }
 }
 
+/// Returns `true` if a Next.js Edge `middleware.ts`/`middleware.js` uses a catch-all matcher
+/// and redirects unauthenticated requests to `/login`/`/signin` without scoping auth to
+/// protected prefixes or explicitly allowing public landing `'/'`.
+pub fn middleware_blocks_public_root(content: &str) -> bool {
+    let clean = strip_ts_js_comments_preserving_strings(content);
+    let clean_low = clean.to_lowercase();
+
+    let redirects_to_auth = (clean_low.contains("nextresponse.redirect")
+        && (clean_low.contains("/login") || clean_low.contains("/signin") || clean_low.contains("/auth")))
+        || clean_low.contains("withauth");
+    if !redirects_to_auth {
+        return false;
+    }
+
+    // Check if `config.matcher` is strictly scoped to private/protected prefixes (never matching `/`)
+    if let Ok(matcher_re) = regex::Regex::new(r#"(?s)\bmatcher\s*:\s*\[([^\]]+)\]"#) {
+        if let Some(cap) = matcher_re.captures(&clean) {
+            let block = cap.get(1).map_or("", |m| m.as_str());
+            if let Ok(lit_re) = regex::Regex::new(r#"['"]([^'"]+)['"]"#) {
+                let entries: Vec<&str> = lit_re
+                    .captures_iter(block)
+                    .filter_map(|c| c.get(1).map(|m| m.as_str().trim()))
+                    .collect();
+                if !entries.is_empty()
+                    && entries.iter().all(|e| {
+                        let el = e.to_lowercase();
+                        (el.starts_with("/dashboard")
+                            || el.starts_with("/admin")
+                            || el.starts_with("/account")
+                            || el.starts_with("/profile")
+                            || el.starts_with("/settings")
+                            || el.starts_with("/app"))
+                            && !el.contains("((")
+                    })
+                {
+                    return false;
+                }
+            }
+        }
+    }
+
+    // Check if middleware body guards auth redirect strictly inside protected-prefix branches
+    let guards_protected_prefixes = [
+        "startswith('/dashboard",
+        "startswith(\"/dashboard",
+        "startswith('/admin",
+        "startswith(\"/admin",
+        "startswith('/account",
+        "startswith(\"/account",
+        "startswith('/profile",
+        "startswith(\"/profile",
+        "startswith('/settings",
+        "startswith(\"/settings",
+        "protectedpaths",
+        "protectedroutes",
+        "isprotected",
+    ]
+    .iter()
+    .any(|kw| clean_low.contains(kw));
+    if guards_protected_prefixes {
+        return false;
+    }
+
+    // Check if middleware body explicitly bypasses root `/` (direct equality or public route array)
+    let allows_root_eq = regex::Regex::new(r#"pathname\s*===?\s*['"]/['"]"#)
+        .ok()
+        .map_or(false, |re| re.is_match(&clean));
+    let allows_root_array = regex::Regex::new(r#"(?:\[|,)\s*['"]/['"]"#)
+        .ok()
+        .map_or(false, |re| re.is_match(&clean));
+    if allows_root_eq || allows_root_array {
+        return false;
+    }
+
+    true
+}
+
 pub async fn validate_file_with_project_context(
     proj_dir: &std::path::Path,
     file_path: &str,
@@ -637,6 +714,23 @@ pub async fn validate_file_with_project_context(
         || path_lower.ends_with(".jsx");
     if !is_ts_js {
         return Ok(());
+    }
+
+    if path_lower.ends_with("middleware.ts") || path_lower.ends_with("middleware.js") {
+        let has_public_root_page = [
+            "src/app/page.tsx",
+            "src/app/page.jsx",
+            "app/page.tsx",
+            "app/page.jsx",
+        ]
+        .iter()
+        .any(|p| proj_dir.join(p).is_file());
+        if has_public_root_page && middleware_blocks_public_root(content) {
+            return Err(
+                "Next.js middleware must NOT unconditionally redirect the public landing page `/` (or `/pricing`, `/about`, `/legal`) to `/login`. Scope auth checks strictly to protected route prefixes (e.g. `pathname.startsWith('/dashboard') || pathname.startsWith('/admin') || pathname.startsWith('/account') || pathname.startsWith('/settings')`), or explicitly allow `pathname === '/'` and all public marketing routes."
+                    .to_string(),
+            );
+        }
     }
 
     let is_api_route = (path_lower.contains("/api/") || path_lower.starts_with("api/"))
@@ -4608,8 +4702,16 @@ pub fn get_expert_system_prompt(
             prompt.push_str(
                 "SCOPED AUTH UI RULES (ACTIVE ONLY FOR AUTH FILES):\n\
                  - Ensure the Login/Register UI works out-of-the-box locally without any SMTP server configuration.\n\
-                 - Render a polished card (`max-w-md w-full mx-auto bg-white rounded-2xl border border-slate-200 shadow-lg p-8`) with the inline SVG Brand Lockup at the top, email + password inputs (`signIn('credentials', { email, password, redirect: false })`), clear validation feedback, and a link to `/dashboard`.\n\
+                 - Render a polished card (`max-w-md w-full mx-auto bg-white rounded-2xl border border-slate-200 shadow-lg p-8 text-slate-900`) with the inline SVG Brand Lockup at the top, email + password inputs with explicit light-surface contrast (`bg-white text-slate-900 placeholder:text-slate-400`), reliable checkbox/toggle state (`<input type=\"checkbox\" ... />` or `<Checkbox onCheckedChange={...} />`), (`signIn('credentials', { email, password, redirect: false })`), clear validation feedback, and a link to `/dashboard`.\n\
                  - If defining an auth hook or provider (e.g. `useAuth`), export BOTH named (`export { useAuth }`) and default (`export default useAuth`) exports.\n\n"
+            );
+        }
+
+        if path_lower.contains("/api/register") {
+            prompt.push_str(
+                "SCOPED REGISTRATION API RULES (ACTIVE ONLY FOR `/api/register`):\n\
+                 - Always parse JSON & validate with `schema.safeParse(body)` INSIDE `try { ... } catch` — returning HTTP `400` with a descriptive `{ message }` on validation errors, NEVER throwing an uncaught `500`.\n\
+                 - Make `name` OPTIONAL in the Zod schema (`name: z.string().trim().min(1).max(100).optional()`) and derive fallback `const displayName = name || email.split('@')[0];` so both 2-field (`email`, `password`) and 3-field (`name`, `email`, `password`) registration forms succeed cleanly.\n\n"
             );
         }
 
@@ -5670,7 +5772,7 @@ import prisma from "@/lib/prisma";
 import { z } from "zod";
 
 const registerSchema = z.object({
-  name: z.string().min(2).max(50),
+  name: z.string().trim().min(1).max(100).optional(),
   email: z.string().email(),
   password: z.string().min(8)
 });
@@ -5678,7 +5780,15 @@ const registerSchema = z.object({
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const { name, email, password } = registerSchema.parse(body);
+    const parsed = registerSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(
+        { message: parsed.error.issues[0]?.message || "Invalid registration payload" },
+        { status: 400 }
+      );
+    }
+    const { name, email, password } = parsed.data;
+    const displayName = name || email.split("@")[0];
 
     const existingUser = await prisma.user.findUnique({ where: { email } });
     if (existingUser) {
@@ -5689,7 +5799,7 @@ export async function POST(request: Request) {
 
     const newUser = await prisma.user.create({
       data: {
-        name,
+        name: displayName,
         email,
         hashedPassword,
         role: "USER"
