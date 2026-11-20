@@ -1,0 +1,32 @@
+{
+  "manifestId": "mobile_1",
+  "platform": "mobile",
+  "projectType": "react_native",
+  "resolvedStack": "React Native / Expo + Next.js 14 Web Preview + TypeScript + Tailwind CSS + Prisma",
+  "name": "FieldPulse Site Inspector",
+  "description": "FieldPulse Site Inspector is a cross-platform mobile application for construction site engineers to complete safety checklists, log structural defects, and sync inspection reports in real time with NextAuth and Prisma PostgreSQL.",
+  "metadata": {
+    "name": "FieldPulse Site Inspector",
+    "description": "Cross-platform mobile app for construction site inspections, defect logs, and safety alerts."
+  },
+  "files": [
+    { "path": "package.json", "description": "Next.js 14, React 18, React Native / Expo preview compatible deps, TypeScript, Tailwind CSS, Prisma 5, NextAuth v4, Zod, lucide-react, react-icons.", "language": "json" },
+    { "path": "app.json", "description": "Expo app configuration for FieldPulse Site Inspector.", "language": "json" },
+    { "path": "prisma/schema.prisma", "description": "PostgreSQL Prisma schema with Role, InspectionStatus, DefectSeverity enums and User, SiteInspection, DefectLog, SafetyAlert models.", "language": "prisma" },
+    { "path": "src/lib/prisma.ts", "description": "Singleton PrismaClient export.", "language": "typescript" },
+    { "path": "src/types/index.ts", "description": "Shared TypeScript interfaces for SiteInspection, DefectLog, SafetyAlert.", "language": "typescript" },
+    { "path": "src/app/globals.css", "description": "Tailwind CSS base styles for mobile-first UI.", "language": "css" },
+    { "path": "src/app/layout.tsx", "description": "Root layout wrapping SessionProvider, Navbar, main content, and Footer.", "language": "typescript" },
+    { "path": "src/app/page.tsx", "description": "Mobile welcome landing screen for FieldPulse Site Inspector with CTA to /dashboard.", "language": "typescript" },
+    { "path": "src/app/dashboard/page.tsx", "description": "Mobile inspection dashboard showing active sites, open defects, and safety alerts.", "language": "typescript" },
+    { "path": "src/app/inspections/page.tsx", "description": "Site inspections checklist screen with status filters and new inspection form.", "language": "typescript" },
+    { "path": "src/app/defects/page.tsx", "description": "Defect tracking screen with severity badges and log form.", "language": "typescript" },
+    { "path": "src/app/login/page.tsx", "description": "Login screen using NextAuth credentials.", "language": "typescript" },
+    { "path": "src/app/register/page.tsx", "description": "Registration screen calling POST /api/register then signing in.", "language": "typescript" },
+    { "path": "src/hooks/useInspections.ts", "description": "Client hook fetching /api/inspections on mount via useEffect with safe array defaults.", "language": "typescript" },
+    { "path": "src/hooks/useDefects.ts", "description": "Client hook fetching /api/defects on mount via useEffect with safe array defaults.", "language": "typescript" },
+    { "path": "src/app/api/register/route.ts", "description": "Registration endpoint creating user via Prisma.", "language": "typescript" },
+    { "path": "src/app/api/inspections/route.ts", "description": "GET and POST API route for SiteInspection records.", "language": "typescript" },
+    { "path": "src/app/api/defects/route.ts", "description": "GET and POST API route for DefectLog records.", "language": "typescript" }
+  ]
+}

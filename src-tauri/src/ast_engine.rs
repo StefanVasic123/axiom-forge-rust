@@ -2185,7 +2185,7 @@ fn reconcile_model_types_with_ui_hints(
             let has_opt = has_token_child(member, "?");
             let Some(type_ann) = member.child_by_field_name("type") else { continue };
             let type_children = named_children_vec(type_ann);
-            let type_ann_text = node_text(type_ann, source);
+            let _type_ann_text = node_text(type_ann, source);
 
             // Widen id and *Id fields (`id: string` -> `id?: any`) under strict:false so both string/number mocks and `.toLowerCase()` / `fn(id: string)` callers compile
             if relax_optional_and_date && (prop_name == "id" || prop_name.ends_with("Id")) {
@@ -2237,7 +2237,15 @@ fn reconcile_model_types_with_ui_hints(
                         ));
 
                 if is_known_enum {
-                    edits.push((t_node.start_byte(), t_node.end_byte(), format!("{} | string", t_name)));
+                    if relax_optional_and_date && !has_opt && prop_name != "id" {
+                        edits.push((
+                            name_node.end_byte(),
+                            t_node.end_byte(),
+                            format!("?: {} | string", t_name),
+                        ));
+                    } else {
+                        edits.push((t_node.start_byte(), t_node.end_byte(), format!("{} | string", t_name)));
+                    }
                     continue;
                 }
                 if ui_string_or_jsx_props.contains(&prop_name) && local_object_types.contains(t_name) {
@@ -2258,8 +2266,7 @@ fn reconcile_model_types_with_ui_hints(
                 let is_already_any = type_children.len() == 1
                     && type_children[0].kind() == "predefined_type"
                     && node_text(type_children[0], source) == "any";
-                let is_enum_union = type_ann_text.contains("| string");
-                if !is_enum_union && !(is_already_any && prop_name == "id") {
+                if !(is_already_any && prop_name == "id") {
                     edits.push((name_node.end_byte(), name_node.end_byte(), "?".to_string()));
                 }
             }
@@ -2335,7 +2342,12 @@ pub fn reconcile_model_and_type_contracts_in_project(proj_dir: &std::path::Path)
             .strip_prefix(proj_dir)
             .map(|r| r.to_string_lossy().replace('\\', "/"))
             .unwrap_or_default();
-        if !is_model_or_type_rel_path(&rel) {
+        let is_hook_file = {
+            let low = rel.to_ascii_lowercase();
+            (low.starts_with("src/hooks/") || low.starts_with("hooks/"))
+                && (low.ends_with(".ts") || low.ends_with(".tsx"))
+        };
+        if !is_model_or_type_rel_path(&rel) && !is_hook_file {
             continue;
         }
         let Ok(content) = std::fs::read_to_string(&abs) else { continue };
@@ -3170,7 +3182,7 @@ pub fn ensure_component_destructured_prop_defaults_in_source(rel_path: &str, src
             {
                 Some(" = []")
             } else if usage.used_direct_call && decl_kind != PropTypeKind::Primitive {
-                Some(" = () => {}")
+                Some(if typed { " = ((() => {}) as any)" } else { " = () => {}" })
             } else if usage.used_object_prop
                 && decl_kind != PropTypeKind::Primitive
                 && !usage.used_string_or_primitive_method
@@ -3698,6 +3710,781 @@ pub fn remove_unused_named_import_specifiers(
         return None;
     }
 
+    let candidate = apply_byte_edits(src, edits);
+    verified_rewrite(path, src, candidate)
+}
+
+/// Relaxes local non-Props domain view-model interfaces in UI components (e.g. `interface AssemblyNode { id: string; ... }`)
+/// in non-strict TS projects by adding `[key: string]: any;` and making fields optional, preventing TS2322/TS2339 when
+/// spreading widened `@/types` records into local tree/card/table view-models.
+pub fn widen_local_component_view_models_in_source(rel_path: &str, src: &str) -> Option<String> {
+    let low = rel_path.replace('\\', "/").to_ascii_lowercase();
+    if !low.ends_with(".tsx") && !low.ends_with(".ts") {
+        return None;
+    }
+    if low.ends_with(".d.ts") || low.contains("/api/") || low.starts_with("api/") {
+        return None;
+    }
+    let tree = parse_source(rel_path, src)?;
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut touched: Vec<(usize, usize)> = Vec::new();
+
+    for stmt in named_children_vec(tree.root_node()) {
+        let decl = if stmt.kind() == "export_statement" {
+            match stmt.child_by_field_name("declaration") {
+                Some(d) => d,
+                None => continue,
+            }
+        } else {
+            stmt
+        };
+        if decl.kind() != "interface_declaration" {
+            continue;
+        }
+        let Some(name_n) = decl.child_by_field_name("name") else { continue };
+        let iname = node_text(name_n, src).trim();
+        let iname_low = iname.to_ascii_lowercase();
+        if iname_low.ends_with("props")
+            || iname_low.ends_with("options")
+            || iname_low.ends_with("state")
+            || iname_low.ends_with("context")
+            || iname_low.ends_with("config")
+            || iname_low.ends_with("params")
+            || iname_low.ends_with("result")
+        {
+            continue;
+        }
+        let Some(body) = decl.child_by_field_name("body") else { continue };
+        let body_txt = node_text(body, src);
+        if body_txt.contains("[key:") {
+            continue;
+        }
+        // Only treat as a domain entity view-model if it declares an `id` property
+        let mut has_id_prop = false;
+        let mut required_prop_name_ends: Vec<usize> = Vec::new();
+        for member in named_children_vec(body) {
+            if member.kind() == "property_signature" {
+                let Some(pn) = member.child_by_field_name("name") else { continue };
+                let pname = strip_string_quotes(node_text(pn, src));
+                if pname == "id" {
+                    has_id_prop = true;
+                }
+                let member_txt = node_text(member, src);
+                let after_name = &src[pn.end_byte()..member.end_byte()];
+                if !after_name.trim_start().starts_with('?') && !member_txt.contains('?') {
+                    required_prop_name_ends.push(pn.end_byte());
+                }
+            }
+        }
+        if !has_id_prop {
+            continue;
+        }
+        for pos in required_prop_name_ends {
+            if !touched.iter().any(|&(s, e)| pos >= s && pos <= e) {
+                edits.push((pos, pos, "?".to_string()));
+                touched.push((pos, pos));
+            }
+        }
+        let close_brace = body.end_byte().saturating_sub(1);
+        if close_brace > body.start_byte() && src.as_bytes()[close_brace] == b'}' {
+            edits.push((close_brace, close_brace, "  [key: string]: any;\n".to_string()));
+        }
+    }
+
+    if edits.is_empty() {
+        return None;
+    }
+    let candidate = apply_byte_edits(src, edits);
+    verified_rewrite(rel_path, src, candidate)
+}
+
+pub fn widen_local_component_view_models_in_project(proj_dir: &std::path::Path) -> usize {
+    if project_uses_strict_ts(proj_dir) {
+        return 0;
+    }
+    let mut updated = 0usize;
+    let mut files = Vec::new();
+    for root in ["src/components", "src/renderer", "src/app", "components", "app"] {
+        let dir = proj_dir.join(root);
+        if dir.is_dir() {
+            collect_source_files(&dir, &mut files);
+        }
+    }
+    for abs_path in files {
+        let rel_path = abs_path
+            .strip_prefix(proj_dir)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let Ok(orig) = std::fs::read_to_string(&abs_path) else { continue };
+        if let Some(next) = widen_local_component_view_models_in_source(&rel_path, &orig) {
+            if next != orig && std::fs::write(&abs_path, next).is_ok() {
+                updated += 1;
+            }
+        }
+    }
+    updated
+}
+
+/// Universally guards custom hook (`useXxx`) array parameters and `useState<...[]>(param)` calls
+/// against runtime `undefined.map()` / `undefined.length` crashes when callers invoke the hook
+/// with fewer arguments or a mismatched argument type.
+pub fn ensure_hook_array_param_defaults_in_source(rel_path: &str, src: &str) -> Option<String> {
+    let lower = rel_path.replace('\\', "/").to_ascii_lowercase();
+    let is_ts = lower.ends_with(".ts") || lower.ends_with(".tsx");
+    let is_js = lower.ends_with(".js") || lower.ends_with(".jsx");
+    if !is_ts && !is_js {
+        return None;
+    }
+    if lower.contains("/api/") || lower.starts_with("api/") {
+        return None;
+    }
+    let tree = parse_source(rel_path, src)?;
+    let root = tree.root_node();
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut touched_ranges: Vec<(usize, usize)> = Vec::new();
+
+    fn overlaps(ranges: &[(usize, usize)], s: usize, e: usize) -> bool {
+        ranges.iter().any(|&(rs, re)| s < re && rs < e)
+    }
+
+    fn is_array_ts_type(node: Node, src: &str) -> bool {
+        let txt = node_text(node, src).trim();
+        if txt.contains("[]") || txt.starts_with("Array<") || txt.starts_with("ReadonlyArray<") {
+            return true;
+        }
+        false
+    }
+
+    fn find_hook_functions<'a>(node: Node<'a>, src: &str, out: &mut Vec<(Node<'a>, Node<'a>)>) {
+        match node.kind() {
+            "function_declaration" => {
+                if let Some(name_n) = node.child_by_field_name("name") {
+                    let name = node_text(name_n, src).trim();
+                    if name.starts_with("use") && name.chars().nth(3).map_or(false, |c| c.is_ascii_uppercase()) {
+                        if let (Some(fp), Some(body)) = (node.child_by_field_name("parameters"), node.child_by_field_name("body")) {
+                            out.push((fp, body));
+                        }
+                    }
+                }
+            }
+            "variable_declarator" => {
+                if let (Some(name_n), Some(val_n)) = (node.child_by_field_name("name"), node.child_by_field_name("value")) {
+                    let name = node_text(name_n, src).trim();
+                    if name.starts_with("use") && name.chars().nth(3).map_or(false, |c| c.is_ascii_uppercase()) {
+                        if matches!(val_n.kind(), "arrow_function" | "function_expression") {
+                            if let (Some(fp), Some(body)) = (val_n.child_by_field_name("parameters"), val_n.child_by_field_name("body")) {
+                                out.push((fp, body));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for ch in node.named_children(&mut cursor) {
+            find_hook_functions(ch, src, out);
+        }
+    }
+
+    let mut hooks = Vec::new();
+    find_hook_functions(root, src, &mut hooks);
+    if hooks.is_empty() {
+        return None;
+    }
+
+    for (fp, body) in hooks {
+        let mut array_param_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for param in named_children_vec(fp) {
+            match param.kind() {
+                "optional_parameter" | "required_parameter" => {
+                    let has_default = param.child_by_field_name("value").is_some();
+                    let pat = param.child_by_field_name("pattern")
+                        .or_else(|| named_children_vec(param).into_iter().next());
+                    let Some(pat_node) = pat else { continue };
+
+                    if pat_node.kind() == "identifier" {
+                        let pname = node_text(pat_node, src).trim().to_string();
+                        if pname.is_empty() {
+                            continue;
+                        }
+                        let type_ann = param.child_by_field_name("type");
+                        let typed_as_array = type_ann.map_or(false, |t| is_array_ts_type(t, src));
+                        let usage = analyze_destructured_prop_usage(body, &pname, src);
+                        let is_array_param = typed_as_array || usage.used_array_method;
+
+                        if is_array_param {
+                            array_param_names.insert(pname.clone());
+                            // If optional without default (`fallbackData?: T[]`), replace `?` and add ` = [] as any`
+                            if param.kind() == "optional_parameter" && !has_default {
+                                let param_txt = node_text(param, src);
+                                if let Some(q_rel) = param_txt.find('?') {
+                                    let q_abs = param.start_byte() + q_rel;
+                                    let q_end = q_abs + 1;
+                                    if !overlaps(&touched_ranges, param.start_byte(), param.end_byte()) {
+                                        edits.push((q_abs, q_end, String::new()));
+                                        edits.push((
+                                            param.end_byte(),
+                                            param.end_byte(),
+                                            if is_ts { " = [] as any".to_string() } else { " = []".to_string() },
+                                        ));
+                                        touched_ranges.push((param.start_byte(), param.end_byte()));
+                                    }
+                                }
+                            }
+                        }
+                    } else if pat_node.kind() == "object_pattern" {
+                        // Guard destructured array fields inside hook options object (`{ initialSchedules }`)
+                        let type_map = param
+                            .child_by_field_name("type")
+                            .map(|t| extract_object_type_prop_kinds(unwrap_ts_type_node(t), src))
+                            .unwrap_or_default();
+                        for prop in named_children_vec(pat_node) {
+                            match prop.kind() {
+                                "shorthand_property_identifier_pattern" => {
+                                    let local = node_text(prop, src).trim().to_string();
+                                    let typed_arr = matches!(type_map.get(&local), Some(PropTypeKind::Array));
+                                    let usage = analyze_destructured_prop_usage(body, &local, src);
+                                    if typed_arr || usage.used_array_method {
+                                        array_param_names.insert(local);
+                                        if !overlaps(&touched_ranges, prop.start_byte(), prop.end_byte()) {
+                                            edits.push((prop.end_byte(), prop.end_byte(), " = []".to_string()));
+                                            touched_ranges.push((prop.start_byte(), prop.end_byte()));
+                                        }
+                                    }
+                                }
+                                "pair_pattern" => {
+                                    let key_n = prop.child_by_field_name("key");
+                                    let val_n = prop.child_by_field_name("value");
+                                    if let (Some(kn), Some(vn)) = (key_n, val_n) {
+                                        if vn.kind() == "identifier" {
+                                            let key_name = node_text(kn, src).trim().to_string();
+                                            let local = node_text(vn, src).trim().to_string();
+                                            let typed_arr = matches!(type_map.get(&key_name), Some(PropTypeKind::Array));
+                                            let usage = analyze_destructured_prop_usage(body, &local, src);
+                                            if typed_arr || usage.used_array_method {
+                                                array_param_names.insert(local);
+                                                if !overlaps(&touched_ranges, vn.start_byte(), vn.end_byte()) {
+                                                    edits.push((vn.end_byte(), vn.end_byte(), " = []".to_string()));
+                                                    touched_ranges.push((vn.start_byte(), vn.end_byte()));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if array_param_names.is_empty() {
+            continue;
+        }
+
+        // Guard `useState<...>(param)` calls inside the hook body so passing `undefined` or a
+        // mismatched non-array argument never initializes array state as undefined/non-array.
+        let mut stack = vec![body];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "call_expression" {
+                let func_txt = node.child_by_field_name("function").map(|n| node_text(n, src).trim()).unwrap_or("");
+                if func_txt == "useState" || func_txt == "React.useState" {
+                    if let Some(args) = node.child_by_field_name("arguments") {
+                        let arg_nodes = named_children_vec(args);
+                        if arg_nodes.len() == 1 && arg_nodes[0].kind() == "identifier" {
+                            let arg_name = node_text(arg_nodes[0], src).trim();
+                            if array_param_names.contains(arg_name)
+                                && !overlaps(&touched_ranges, arg_nodes[0].start_byte(), arg_nodes[0].end_byte())
+                            {
+                                let replacement = format!("Array.isArray({}) ? {} : []", arg_name, arg_name);
+                                edits.push((arg_nodes[0].start_byte(), arg_nodes[0].end_byte(), replacement));
+                                touched_ranges.push((arg_nodes[0].start_byte(), arg_nodes[0].end_byte()));
+                            }
+                        }
+                    }
+                }
+            }
+            let mut cursor = node.walk();
+            for ch in node.named_children(&mut cursor) {
+                stack.push(ch);
+            }
+        }
+    }
+
+    if edits.is_empty() {
+        return None;
+    }
+
+    let candidate = apply_byte_edits(src, edits);
+    verified_rewrite(rel_path, src, candidate)
+}
+
+pub fn ensure_hook_array_param_defaults_in_project(proj_dir: &std::path::Path) -> usize {
+    let mut updated = 0usize;
+    let mut files = Vec::new();
+    for root in ["src/hooks", "hooks", "src/renderer/hooks"] {
+        let dir = proj_dir.join(root);
+        if dir.is_dir() {
+            collect_source_files(&dir, &mut files);
+        }
+    }
+    for abs_path in files {
+        let rel_path = abs_path
+            .strip_prefix(proj_dir)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let Ok(orig) = std::fs::read_to_string(&abs_path) else { continue };
+        if let Some(next) = ensure_hook_array_param_defaults_in_source(&rel_path, &orig) {
+            if next != orig && std::fs::write(&abs_path, next).is_ok() {
+                updated += 1;
+            }
+        }
+    }
+    updated
+}
+
+/// Extracts `(model_delegate_lowercase -> set of enum field names)` directly from `prisma/schema.prisma`.
+pub fn extract_prisma_model_enum_fields(schema_src: &str) -> std::collections::HashMap<String, std::collections::HashSet<String>> {
+    let mut enum_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Ok(enum_re) = regex::Regex::new(r"(?m)^\s*enum\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{") {
+        for cap in enum_re.captures_iter(schema_src) {
+            if let Some(m) = cap.get(1) {
+                enum_names.insert(m.as_str().to_string());
+            }
+        }
+    }
+    let mut out: std::collections::HashMap<String, std::collections::HashSet<String>> = std::collections::HashMap::new();
+    if enum_names.is_empty() {
+        return out;
+    }
+    if let Ok(model_re) = regex::Regex::new(r"(?ms)^\s*model\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{([^}]*)\}") {
+        for cap in model_re.captures_iter(schema_src) {
+            let Some(m_name) = cap.get(1).map(|m| m.as_str()) else { continue };
+            let Some(body) = cap.get(2).map(|m| m.as_str()) else { continue };
+            let mut fields = std::collections::HashSet::new();
+            for line in body.lines() {
+                let t = line.trim();
+                if t.is_empty() || t.starts_with("//") || t.starts_with("@@") {
+                    continue;
+                }
+                let mut parts = t.split_whitespace();
+                let Some(fname) = parts.next() else { continue };
+                let Some(ftype_raw) = parts.next() else { continue };
+                let ftype = ftype_raw.trim_end_matches(&['?', '[', ']'][..]);
+                if enum_names.contains(ftype) {
+                    fields.insert(fname.to_string());
+                }
+            }
+            if !fields.is_empty() {
+                out.insert(m_name.to_ascii_lowercase(), fields);
+            }
+        }
+    }
+    out
+}
+
+/// Universally relaxes inline Prisma enum fields inside `prisma.<model>.create/update/upsert({ data: { field: expr } })`
+/// when `field` is declared as a Prisma `enum` in `prisma/schema.prisma`, preventing TS2322
+/// (`Type 'string' is not assignable to type 'Status'/'Priority'`) from Zod `z.string()` payloads.
+pub fn relax_prisma_inline_enum_fields_in_source(
+    rel_path: &str,
+    src: &str,
+    model_enum_fields: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) -> Option<String> {
+    if model_enum_fields.is_empty() || !src.contains("prisma.") {
+        return None;
+    }
+    let lower = rel_path.replace('\\', "/").to_ascii_lowercase();
+    if !lower.ends_with(".ts") && !lower.ends_with(".tsx") {
+        return None;
+    }
+    let tree = parse_source(rel_path, src)?;
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut touched_ranges: Vec<(usize, usize)> = Vec::new();
+
+    fn overlaps(ranges: &[(usize, usize)], s: usize, e: usize) -> bool {
+        ranges.iter().any(|&(rs, re)| s < re && rs < e)
+    }
+
+    fn relax_data_object(
+        obj: Node,
+        src: &str,
+        enum_fields: &std::collections::HashSet<String>,
+        edits: &mut Vec<(usize, usize, String)>,
+        touched: &mut Vec<(usize, usize)>,
+    ) {
+        if obj.kind() != "object" {
+            return;
+        }
+        for prop in named_children_vec(obj) {
+            if prop.kind() == "pair" {
+                let Some(key_n) = prop.child_by_field_name("key") else { continue };
+                let Some(val_n) = prop.child_by_field_name("value") else { continue };
+                let key = strip_string_quotes(node_text(key_n, src));
+                if !enum_fields.contains(&key) {
+                    continue;
+                }
+                if matches!(val_n.kind(), "as_expression" | "satisfies_expression" | "null" | "undefined") {
+                    continue;
+                }
+                // Skip explicit `Enum.VALUE` member expressions where the object starts uppercase
+                if val_n.kind() == "member_expression" {
+                    if let Some(obj_n) = val_n.child_by_field_name("object") {
+                        let otxt = node_text(obj_n, src).trim();
+                        if otxt.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
+                            continue;
+                        }
+                    }
+                }
+                let val_txt = node_text(val_n, src).trim();
+                if val_txt.contains(" as ") {
+                    continue;
+                }
+                if !overlaps(touched, val_n.start_byte(), val_n.end_byte()) {
+                    edits.push((val_n.end_byte(), val_n.end_byte(), " as any".to_string()));
+                    touched.push((val_n.start_byte(), val_n.end_byte()));
+                }
+            } else if prop.kind() == "shorthand_property_identifier" {
+                let key = node_text(prop, src).trim();
+                if enum_fields.contains(key) && !overlaps(touched, prop.start_byte(), prop.end_byte()) {
+                    edits.push((prop.start_byte(), prop.end_byte(), format!("{}: {} as any", key, key)));
+                    touched.push((prop.start_byte(), prop.end_byte()));
+                }
+            }
+        }
+    }
+
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "call_expression" {
+            if let (Some(func_n), Some(args_n)) = (node.child_by_field_name("function"), node.child_by_field_name("arguments")) {
+                if func_n.kind() == "member_expression" {
+                    let method = func_n.child_by_field_name("property").map(|n| node_text(n, src).trim()).unwrap_or("");
+                    if matches!(method, "create" | "update" | "upsert" | "createMany" | "updateMany") {
+                        if let Some(target_n) = func_n.child_by_field_name("object") {
+                            if target_n.kind() == "member_expression" {
+                                let root_obj = target_n.child_by_field_name("object").map(|n| node_text(n, src).trim()).unwrap_or("");
+                                let delegate = target_n.child_by_field_name("property").map(|n| node_text(n, src).trim()).unwrap_or("");
+                                if root_obj == "prisma" || root_obj.ends_with(".prisma") {
+                                    if let Some(enum_fields) = model_enum_fields.get(&delegate.to_ascii_lowercase()) {
+                                        if let Some(first_arg) = named_children_vec(args_n).into_iter().next() {
+                                            if first_arg.kind() == "object" {
+                                                for pair in named_children_vec(first_arg) {
+                                                    if pair.kind() == "pair" {
+                                                        let k = pair.child_by_field_name("key").map(|n| strip_string_quotes(node_text(n, src))).unwrap_or_default();
+                                                        if matches!(k.as_str(), "data" | "create" | "update") {
+                                                            if let Some(v) = pair.child_by_field_name("value") {
+                                                                if v.kind() == "object" {
+                                                                    relax_data_object(v, src, enum_fields, &mut edits, &mut touched_ranges);
+                                                                } else if v.kind() == "array" {
+                                                                    for elem in named_children_vec(v) {
+                                                                        if elem.kind() == "object" {
+                                                                            relax_data_object(elem, src, enum_fields, &mut edits, &mut touched_ranges);
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for ch in node.named_children(&mut cursor) {
+            stack.push(ch);
+        }
+    }
+
+    if edits.is_empty() {
+        return None;
+    }
+    let candidate = apply_byte_edits(src, edits);
+    verified_rewrite(rel_path, src, candidate)
+}
+
+pub fn relax_prisma_inline_enum_fields_in_project(proj_dir: &std::path::Path) -> usize {
+    let schema_path = proj_dir.join("prisma").join("schema.prisma");
+    let Ok(schema_src) = std::fs::read_to_string(&schema_path) else {
+        return 0;
+    };
+    let model_enum_fields = extract_prisma_model_enum_fields(&schema_src);
+    if model_enum_fields.is_empty() {
+        return 0;
+    }
+    let mut updated = 0usize;
+    let mut files = Vec::new();
+    for root in ["src/app/api", "app/api", "src/lib", "src/services", "services"] {
+        let dir = proj_dir.join(root);
+        if dir.is_dir() {
+            collect_source_files(&dir, &mut files);
+        }
+    }
+    for abs_path in files {
+        let rel_path = abs_path
+            .strip_prefix(proj_dir)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let Ok(orig) = std::fs::read_to_string(&abs_path) else { continue };
+        if let Some(next) = relax_prisma_inline_enum_fields_in_source(&rel_path, &orig, &model_enum_fields) {
+            if next != orig && std::fs::write(&abs_path, next).is_ok() {
+                updated += 1;
+            }
+        }
+    }
+    updated
+}
+
+/// Extracts `(model_delegate_lowercase -> Vec<declared_field_name>)` from `prisma/schema.prisma`.
+pub fn extract_prisma_model_field_names(schema_src: &str) -> std::collections::HashMap<String, Vec<String>> {
+    let mut out: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    if let Ok(model_re) = regex::Regex::new(r"(?ms)^\s*model\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{([^}]*)\}") {
+        for cap in model_re.captures_iter(schema_src) {
+            let Some(m_name) = cap.get(1).map(|m| m.as_str()) else { continue };
+            let Some(body) = cap.get(2).map(|m| m.as_str()) else { continue };
+            let mut fields = Vec::new();
+            for line in body.lines() {
+                let t = line.trim();
+                if t.is_empty() || t.starts_with("//") || t.starts_with("@@") {
+                    continue;
+                }
+                if let Some(fname) = t.split_whitespace().next() {
+                    if fname.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || c == '_') {
+                        fields.push(fname.to_string());
+                    }
+                }
+            }
+            if !fields.is_empty() {
+                out.insert(m_name.to_ascii_lowercase(), fields);
+            }
+        }
+    }
+    out
+}
+
+/// Universally corrects case-mismatched Prisma `include` / `select` keys (e.g. `include: { doctor: true }`
+/// when `prisma/schema.prisma` declares relation `Doctor`, causing TS2561).
+pub fn reconcile_prisma_relation_case_in_source(
+    rel_path: &str,
+    src: &str,
+    model_fields: &std::collections::HashMap<String, Vec<String>>,
+) -> Option<String> {
+    if model_fields.is_empty() || !src.contains("prisma.") {
+        return None;
+    }
+    let lower = rel_path.replace('\\', "/").to_ascii_lowercase();
+    if !lower.ends_with(".ts") && !lower.ends_with(".tsx") {
+        return None;
+    }
+    let tree = parse_source(rel_path, src)?;
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut touched: Vec<(usize, usize)> = Vec::new();
+
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "call_expression" {
+            if let (Some(func_n), Some(args_n)) = (node.child_by_field_name("function"), node.child_by_field_name("arguments")) {
+                if func_n.kind() == "member_expression" {
+                    if let Some(target_n) = func_n.child_by_field_name("object") {
+                        if target_n.kind() == "member_expression" {
+                            let root_obj = target_n.child_by_field_name("object").map(|n| node_text(n, src).trim()).unwrap_or("");
+                            let delegate = target_n.child_by_field_name("property").map(|n| node_text(n, src).trim()).unwrap_or("");
+                            if root_obj == "prisma" || root_obj.ends_with(".prisma") {
+                                if let Some(fields) = model_fields.get(&delegate.to_ascii_lowercase()) {
+                                    if let Some(first_arg) = named_children_vec(args_n).into_iter().next() {
+                                        if first_arg.kind() == "object" {
+                                            for pair in named_children_vec(first_arg) {
+                                                if pair.kind() == "pair" {
+                                                    let k = pair.child_by_field_name("key").map(|n| strip_string_quotes(node_text(n, src))).unwrap_or_default();
+                                                    if matches!(k.as_str(), "include" | "select") {
+                                                        if let Some(obj_v) = pair.child_by_field_name("value") {
+                                                            if obj_v.kind() == "object" {
+                                                                for inc_pair in named_children_vec(obj_v) {
+                                                                    if inc_pair.kind() == "pair" {
+                                                                        let Some(ik_node) = inc_pair.child_by_field_name("key") else { continue };
+                                                                        let ik_raw = node_text(ik_node, src).trim();
+                                                                        if ik_raw.starts_with('"') || ik_raw.starts_with('\'') || ik_raw.starts_with('_') {
+                                                                            continue;
+                                                                        }
+                                                                        if fields.iter().any(|f| f == ik_raw) {
+                                                                            continue;
+                                                                        }
+                                                                        if let Some(matched) = fields.iter().find(|f| f.eq_ignore_ascii_case(ik_raw)) {
+                                                                            if !touched.iter().any(|&(rs, re)| ik_node.start_byte() < re && rs < ik_node.end_byte()) {
+                                                                                edits.push((ik_node.start_byte(), ik_node.end_byte(), matched.clone()));
+                                                                                touched.push((ik_node.start_byte(), ik_node.end_byte()));
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for ch in node.named_children(&mut cursor) {
+            stack.push(ch);
+        }
+    }
+
+    if edits.is_empty() {
+        return None;
+    }
+    let candidate = apply_byte_edits(src, edits);
+    verified_rewrite(rel_path, src, candidate)
+}
+
+pub fn reconcile_prisma_relation_case_in_project(proj_dir: &std::path::Path) -> usize {
+    let schema_path = proj_dir.join("prisma").join("schema.prisma");
+    let Ok(schema_src) = std::fs::read_to_string(&schema_path) else {
+        return 0;
+    };
+    let model_fields = extract_prisma_model_field_names(&schema_src);
+    if model_fields.is_empty() {
+        return 0;
+    }
+    let mut updated = 0usize;
+    let mut files = Vec::new();
+    for root in ["src/app/api", "app/api", "src/lib", "src/services", "services"] {
+        let dir = proj_dir.join(root);
+        if dir.is_dir() {
+            collect_source_files(&dir, &mut files);
+        }
+    }
+    for abs_path in files {
+        let rel_path = abs_path
+            .strip_prefix(proj_dir)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let Ok(orig) = std::fs::read_to_string(&abs_path) else { continue };
+        if let Some(next) = reconcile_prisma_relation_case_in_source(&rel_path, &orig, &model_fields) {
+            if next != orig && std::fs::write(&abs_path, next).is_ok() {
+                updated += 1;
+            }
+        }
+    }
+    updated
+}
+
+/// Removes dead `import ... from '<missing_module>'` statements (e.g. TS2307) when NONE of the
+/// imported local bindings are referenced anywhere outside import statements in the AST.
+pub fn remove_unused_missing_module_imports(
+    path: &str,
+    src: &str,
+    missing_modules: &[String],
+) -> Option<String> {
+    if missing_modules.is_empty() {
+        return None;
+    }
+    let tree = parse_source(path, src)?;
+
+    let mut used_idents = std::collections::HashSet::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "import_statement" {
+            continue;
+        }
+        if matches!(
+            node.kind(),
+            "identifier"
+                | "type_identifier"
+                | "jsx_identifier"
+                | "shorthand_property_identifier"
+                | "shorthand_property_identifier_pattern"
+        ) {
+            let txt = node_text(node, src).trim();
+            if !txt.is_empty() {
+                used_idents.insert(txt.to_string());
+            }
+        }
+        let mut cursor = node.walk();
+        for ch in node.named_children(&mut cursor) {
+            stack.push(ch);
+        }
+    }
+
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    for stmt in named_children_vec(tree.root_node()) {
+        if stmt.kind() != "import_statement" {
+            continue;
+        }
+        let Some(source) = stmt
+            .child_by_field_name("source")
+            .or_else(|| first_named_of_kind(stmt, &["string"]))
+        else {
+            continue;
+        };
+        let module_spec = strip_string_quotes(node_text(source, src));
+        if !missing_modules.iter().any(|m| m == &module_spec) {
+            continue;
+        }
+        let Some(clause) = first_named_of_kind(stmt, &["import_clause"]) else {
+            continue;
+        };
+        let mut locals = Vec::new();
+        for part in named_children_vec(clause) {
+            match part.kind() {
+                "identifier" => locals.push(node_text(part, src).trim().to_string()),
+                "namespace_import" => {
+                    for ch in named_children_vec(part) {
+                        if ch.kind() == "identifier" {
+                            locals.push(node_text(ch, src).trim().to_string());
+                        }
+                    }
+                }
+                "named_imports" => {
+                    for spec in named_children_vec(part) {
+                        if spec.kind() == "import_specifier" {
+                            let local_n = spec.child_by_field_name("alias")
+                                .or_else(|| spec.child_by_field_name("name"))
+                                .or_else(|| named_children_vec(spec).into_iter().next());
+                            if let Some(ln) = local_n {
+                                locals.push(strip_string_quotes(node_text(ln, src)));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !locals.is_empty() && locals.iter().all(|l| !used_idents.contains(l)) {
+            let mut del_end = stmt.end_byte();
+            while del_end < src.len() && matches!(src.as_bytes()[del_end], b' ' | b'\t') {
+                del_end += 1;
+            }
+            if src[del_end..].starts_with("\r\n") {
+                del_end += 2;
+            } else if src[del_end..].starts_with('\n') {
+                del_end += 1;
+            }
+            edits.push((stmt.start_byte(), del_end, String::new()));
+        }
+    }
+
+    if edits.is_empty() {
+        return None;
+    }
     let candidate = apply_byte_edits(src, edits);
     verified_rewrite(path, src, candidate)
 }

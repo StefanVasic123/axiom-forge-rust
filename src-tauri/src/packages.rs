@@ -1227,6 +1227,34 @@ pub fn analyze_npm_install_failure(err_log: &str) -> Option<NpmFailureAction> {
         }
     }
 
+    // 4b. Check for ENOVERSIONS (`No versions available for <pkg>`, e.g. unpublished/empty stub packages like `prisma-client-js`)
+    if let Some(idx) = err_log.find("No versions available for ") {
+        let after = &err_log[idx + "No versions available for ".len()..];
+        let pkg_token = after
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches(|c: char| matches!(c, '\'' | '"' | '`' | '.' | ',' | ';'));
+        if !pkg_token.is_empty() && !pkg_token.contains(' ') {
+            return Some(NpmFailureAction::Remove(pkg_token.to_string()));
+        }
+    }
+
+    // 4c. Check for EINVALIDPACKAGENAME (`Invalid package name "..."`)
+    for marker in ["Invalid package name \"", "Invalid package name '"] {
+        if let Some(idx) = err_log.find(marker) {
+            let quote = if marker.ends_with('"') { '"' } else { '\'' };
+            let after = &err_log[idx + marker.len()..];
+            if let Some(end_idx) = after.find(quote) {
+                let pkg_name = after[..end_idx].trim();
+                if !pkg_name.is_empty() {
+                    return Some(NpmFailureAction::Remove(pkg_name.to_string()));
+                }
+            }
+        }
+    }
+
     // 5. Check for installation script failures or compile errors for specific packages in node_modules
     for line in err_log.lines() {
         let clean = line.replace("ERR!", "error").replace("warn", "error").replace("WARN", "error");
@@ -1298,6 +1326,31 @@ fn is_legacy_react_lt18_pin(ver: &str) -> bool {
         || v.starts_with("14.")
         || v == "14"
         || v.starts_with("0.")
+}
+
+pub fn is_valid_npm_package_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 214 || name != name.trim() {
+        return false;
+    }
+    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        return false;
+    }
+    let is_valid_part = |part: &str| -> bool {
+        !part.is_empty()
+            && !part.starts_with('.')
+            && !part.starts_with('_')
+            && part
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.' | '~'))
+    };
+    if let Some(rest) = name.strip_prefix('@') {
+        let Some((scope, pkg)) = rest.split_once('/') else {
+            return false;
+        };
+        !pkg.contains('/') && !pkg.contains('@') && is_valid_part(scope) && is_valid_part(pkg)
+    } else {
+        !name.contains('/') && !name.contains('@') && is_valid_part(name)
+    }
 }
 
 pub fn sanitize_package_json_value_for_offline(json_val: &mut Value) -> bool {
@@ -1406,6 +1459,8 @@ pub fn sanitize_package_json_value_for_offline(json_val: &mut Value) -> bool {
                             || k.starts_with("eslint-config-")
                             || k.ends_with("-icons-react")
                             || k.starts_with("react-icons/")
+                            || k.as_str() == "prisma-client-js"
+                            || !is_valid_npm_package_name(k)
                             || crate::sanitizer::is_banned_external_ui_package(k)
                     })
                     .cloned()
@@ -1486,6 +1541,37 @@ pub fn sanitize_package_json_value_for_offline(json_val: &mut Value) -> bool {
                     deps.insert("stripe".to_string(), serde_json::json!("^17.5.0"));
                     changed = true;
                 }
+                // Upgrade legacy OpenAI SDK (<4, e.g. `^3.1.0` -> `^4.67.0`) to match v4 `new OpenAI(...)` API
+                let upgrade_openai = deps
+                    .get("openai")
+                    .and_then(|v| v.as_str())
+                    .map_or(false, |ver| {
+                        let cleaned = ver
+                            .trim()
+                            .trim_start_matches(|c: char| matches!(c, '^' | '~' | '>' | '<' | '=' | 'v' | 'V' | ' '));
+                        let major_str = cleaned.split('.').next().unwrap_or("");
+                        matches!(major_str.parse::<u32>(), Ok(m) if m < 4)
+                    });
+                if upgrade_openai {
+                    deps.insert("openai".to_string(), serde_json::json!("^4.67.0"));
+                    changed = true;
+                }
+                // Clamp hallucinated `@stripe/stripe-js` server-SDK major pins (`>= 10`, e.g. `^17.5.0`)
+                // back to valid `@stripe/stripe-js` client major `^4.10.0`.
+                let fix_stripe_js = deps
+                    .get("@stripe/stripe-js")
+                    .and_then(|v| v.as_str())
+                    .map_or(false, |ver| {
+                        let cleaned = ver
+                            .trim()
+                            .trim_start_matches(|c: char| matches!(c, '^' | '~' | '>' | '<' | '=' | 'v' | 'V' | ' '));
+                        let major_str = cleaned.split('.').next().unwrap_or("");
+                        matches!(major_str.parse::<u32>(), Ok(m) if m >= 10)
+                    });
+                if fix_stripe_js {
+                    deps.insert("@stripe/stripe-js".to_string(), serde_json::json!("^4.10.0"));
+                    changed = true;
+                }
             }
         }
 
@@ -1552,7 +1638,23 @@ pub fn sanitize_package_json_value_for_offline(json_val: &mut Value) -> bool {
 pub fn sanitize_package_json_for_offline(pkg_path: &std::path::Path) -> bool {
     if let Ok(content) = std::fs::read_to_string(pkg_path) {
         if let Ok(mut json_val) = serde_json::from_str::<Value>(&content) {
-            if sanitize_package_json_value_for_offline(&mut json_val) {
+            let mut changed = sanitize_package_json_value_for_offline(&mut json_val);
+            // Reconcile Electron `main` entry field against actual file on disk (`main.js` vs `src/main.js`)
+            if let (Some(proj_dir), Some(obj)) = (pkg_path.parent(), json_val.as_object_mut()) {
+                if let Some(main_val) = obj.get("main").and_then(|v| v.as_str()).map(|s| s.to_string()) {
+                    let trimmed_main = main_val.trim().trim_start_matches("./");
+                    if !trimmed_main.is_empty() && !proj_dir.join(trimmed_main).is_file() {
+                        for candidate in ["main.js", "src/main/index.js", "electron/main.js"] {
+                            if proj_dir.join(candidate).is_file() {
+                                obj.insert("main".to_string(), serde_json::json!(candidate));
+                                changed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if changed {
                 if let Ok(pretty) = serde_json::to_string_pretty(&json_val) {
                     let _ = std::fs::write(pkg_path, pretty);
                     return true;
@@ -2102,12 +2204,21 @@ pub async fn run_npm_install_with_auto_healing(
     log_event: &str,
     task_id_opt: Option<&str>,
 ) -> NpmInstallOutcome {
+    run_npm_install_with_auto_healing_opt(proj_dir, Some(window), log_event, task_id_opt).await
+}
+
+pub async fn run_npm_install_with_auto_healing_opt(
+    proj_dir: &std::path::Path,
+    window: Option<&tauri::Window>,
+    log_event: &str,
+    task_id_opt: Option<&str>,
+) -> NpmInstallOutcome {
     let pkg_path = proj_dir.join("package.json");
     if !pkg_path.exists() {
         return NpmInstallOutcome::Installed;
     }
 
-    let enriched_path = ensure_node_toolchain_ready(Some(window), log_event).await;
+    let enriched_path = ensure_node_toolchain_ready(window, log_event).await;
 
     use tauri::Manager;
     let mut project_id = proj_dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
@@ -2117,6 +2228,7 @@ pub async fn run_npm_install_with_auto_healing(
         }
     }
 
+    if let Some(window) = window {
     if let Some(state) = window.try_state::<ServerState>() {
         let child_opt = {
             let mut servers = state.0.lock().unwrap();
@@ -2144,28 +2256,42 @@ pub async fn run_npm_install_with_auto_healing(
             }));
         }
     }
+    }
 
     let emit_log = |text: &str, is_error: bool| {
-        if !log_event.is_empty() {
-            let _ = window.emit(log_event, serde_json::json!({
-                "text": text.to_string(),
-                "type": if is_error { "error" } else { "info" }
-            }));
+        if let Some(win) = window {
+            if !log_event.is_empty() {
+                let _ = win.emit(log_event, serde_json::json!({
+                    "text": text.to_string(),
+                    "type": if is_error { "error" } else { "info" }
+                }));
+            }
         }
         debug_log_to_file(format!("[Dependency Installer] {}", text.trim()));
     };
 
     let emit_progress = |msg: &str, progress: f64| {
         if let Some(task_id) = task_id_opt {
-            let _ = window.emit("task:progress", serde_json::json!({
-                "taskId": task_id,
-                "projectId": project_id,
-                "phase": "install-deps",
-                "status": "generating",
-                "offlineWaiting": false,
-                "message": msg,
-                "progress": progress
-            }));
+            if let Some(win) = window {
+                let _ = win.emit("task:progress", serde_json::json!({
+                    "taskId": task_id,
+                    "projectId": project_id,
+                    "phase": "install-deps",
+                    "status": "generating",
+                    "offlineWaiting": false,
+                    "message": msg,
+                    "progress": progress
+                }));
+            } else if std::env::var("AXIOM_E2E_HEADLESS").is_ok() {
+                println!("__AXIOM_PROGRESS__:{}", serde_json::json!({
+                    "taskId": task_id,
+                    "projectId": project_id,
+                    "phase": "install-deps",
+                    "status": "generating",
+                    "message": msg,
+                    "progress": progress
+                }));
+            }
         }
     };
 
@@ -2231,7 +2357,7 @@ pub async fn run_npm_install_with_auto_healing(
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
 
-        let window_log = window.clone();
+        let window_log = window.cloned();
         let log_event_str = log_event.to_string();
         let stdout_handle = tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
@@ -2239,17 +2365,19 @@ pub async fn run_npm_install_with_auto_healing(
             let mut collected = Vec::new();
             while let Ok(Some(line)) = reader.next_line().await {
                 if !log_event_str.is_empty() {
-                    let _ = window_log.emit(&log_event_str, serde_json::json!({
-                        "text": format!("> [npm install] {}\n", line),
-                        "type": "info"
-                    }));
+                    if let Some(ref win) = window_log {
+                        let _ = win.emit(&log_event_str, serde_json::json!({
+                            "text": format!("> [npm install] {}\n", line),
+                            "type": "info"
+                        }));
+                    }
                 }
                 collected.push(line);
             }
             collected.join("\n")
         });
 
-        let window_err = window.clone();
+        let window_err = window.cloned();
         let log_event_err_str = log_event.to_string();
         let stderr_handle = tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
@@ -2257,13 +2385,15 @@ pub async fn run_npm_install_with_auto_healing(
             let mut collected = Vec::new();
             while let Ok(Some(line)) = reader.next_line().await {
                 if !log_event_err_str.is_empty() {
-                    let is_warn = line.contains("npm warn") || line.contains("npm WARN") || line.contains("npm depr") || line.contains("npm DEPR") || line.contains("npm notice") || line.contains("npm NOTICE");
-                    let prefix = if is_warn { "> [npm install warn]" } else { "> [npm install err]" };
-                    let log_type = if is_warn { "info" } else { "error" };
-                    let _ = window_err.emit(&log_event_err_str, serde_json::json!({
-                        "text": format!("{} {}\n", prefix, line),
-                        "type": log_type
-                    }));
+                    if let Some(ref win) = window_err {
+                        let is_warn = line.contains("npm warn") || line.contains("npm WARN") || line.contains("npm depr") || line.contains("npm DEPR") || line.contains("npm notice") || line.contains("npm NOTICE");
+                        let prefix = if is_warn { "> [npm install warn]" } else { "> [npm install err]" };
+                        let log_type = if is_warn { "info" } else { "error" };
+                        let _ = win.emit(&log_event_err_str, serde_json::json!({
+                            "text": format!("{} {}\n", prefix, line),
+                            "type": log_type
+                        }));
+                    }
                 }
                 collected.push(line);
             }

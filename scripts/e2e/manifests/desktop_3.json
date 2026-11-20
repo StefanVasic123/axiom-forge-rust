@@ -1,0 +1,30 @@
+{
+  "manifestId": "desktop_3",
+  "platform": "desktop",
+  "projectType": "electron",
+  "resolvedStack": "Electron + Next.js 14 + TypeScript + Tailwind CSS + Prisma",
+  "name": "SoundCraft Studio Console",
+  "description": "SoundCraft Studio Console is an Electron desktop audio mastering and session asset manager for managing multi-track stems, DSP plugin preset chains, and batch export render queues.",
+  "metadata": {
+    "name": "SoundCraft Studio Console",
+    "description": "Electron desktop mastering console for audio sessions, DSP presets, and export queues."
+  },
+  "files": [
+    { "path": "package.json", "description": "Electron, Next.js 14, React 18, TypeScript, Tailwind CSS, Prisma 5, Zod, lucide-react, react-icons.", "language": "json" },
+    { "path": "main.js", "description": "Electron main process window launcher.", "language": "javascript" },
+    { "path": "preload.js", "description": "Electron contextBridge IPC preload.", "language": "javascript" },
+    { "path": "prisma/schema.prisma", "description": "PostgreSQL Prisma schema with Role, ExportStatus, TrackFormat enums and User, AudioSession, DspPreset, ExportJob models.", "language": "prisma" },
+    { "path": "src/lib/prisma.ts", "description": "Singleton PrismaClient export.", "language": "typescript" },
+    { "path": "src/types/index.ts", "description": "Shared TypeScript types for AudioSession, DspPreset, ExportJob.", "language": "typescript" },
+    { "path": "src/app/globals.css", "description": "Tailwind CSS directives for dark audio studio console.", "language": "css" },
+    { "path": "src/app/layout.tsx", "description": "Root layout with SessionProvider, Navbar, and Footer.", "language": "typescript" },
+    { "path": "src/app/page.tsx", "description": "Desktop landing page for SoundCraft Studio Console.", "language": "typescript" },
+    { "path": "src/app/dashboard/page.tsx", "description": "Desktop workspace switching between SessionBrowser, PresetRack, and RenderQueue.", "language": "typescript" },
+    { "path": "src/renderer/components/SessionBrowser.tsx", "description": "Client renderer component listing audio sessions fetched from /api/sessions.", "language": "typescript" },
+    { "path": "src/renderer/components/PresetRack.tsx", "description": "Client renderer component managing DSP plugin presets from /api/presets.", "language": "typescript" },
+    { "path": "src/renderer/components/RenderQueue.tsx", "description": "Client renderer component showing batch export jobs and progress badges.", "language": "typescript" },
+    { "path": "src/hooks/useSessions.ts", "description": "Client hook fetching /api/sessions on mount via useEffect.", "language": "typescript" },
+    { "path": "src/app/api/sessions/route.ts", "description": "GET and POST API route for AudioSession records.", "language": "typescript" },
+    { "path": "src/app/api/presets/route.ts", "description": "GET and POST API route for DspPreset records.", "language": "typescript" }
+  ]
+}

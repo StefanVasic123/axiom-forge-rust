@@ -313,16 +313,61 @@ pub fn normalize_project_structure(files: &mut Vec<Value>, metamanifest: &Value,
 }
 
 pub fn deduplicate_manifest_files(files: &mut Vec<Value>) {
+    let has_src_app = files.iter().any(|f| {
+        f.get("path")
+            .and_then(|p| p.as_str())
+            .map(|s| {
+                s.trim()
+                    .replace('\\', "/")
+                    .trim_start_matches("./")
+                    .to_lowercase()
+                    .starts_with("src/app/")
+            })
+            .unwrap_or(false)
+    });
+    let has_root_app = !has_src_app
+        && files.iter().any(|f| {
+            f.get("path")
+                .and_then(|p| p.as_str())
+                .map(|s| {
+                    s.trim()
+                        .replace('\\', "/")
+                        .trim_start_matches("./")
+                        .to_lowercase()
+                        .starts_with("app/")
+                })
+                .unwrap_or(false)
+        });
+    let _ = has_root_app;
+
     let mut seen_idx: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut out: Vec<Value> = Vec::with_capacity(files.len());
     for mut item in files.drain(..) {
         if let Some(raw_path) = item.get("path").and_then(|p| p.as_str()).map(|s| s.to_string()) {
-            let clean_path = raw_path
+            let mut clean_path = raw_path
                 .trim()
                 .replace('\\', "/")
                 .trim_start_matches("./")
                 .to_string();
-            let norm = clean_path.to_lowercase();
+            let mut norm = clean_path.to_lowercase();
+            let is_app_route_suffix = norm.ends_with("/route.ts")
+                || norm.ends_with("/route.tsx")
+                || norm.ends_with("/route.js")
+                || norm.ends_with("/route.jsx");
+            if is_app_route_suffix {
+                if norm.starts_with("src/pages/api/") {
+                    if let Some(rest) = clean_path.get("src/pages/api/".len()..) {
+                        clean_path = format!("src/app/api/{}", rest);
+                        norm = clean_path.to_lowercase();
+                    }
+                } else if norm.starts_with("pages/api/") {
+                    if let Some(rest) = clean_path.get("pages/api/".len()..) {
+                        let target_prefix = if has_src_app { "src/app/api/" } else { "app/api/" };
+                        clean_path = format!("{}{}", target_prefix, rest);
+                        norm = clean_path.to_lowercase();
+                    }
+                }
+            }
             if !norm.is_empty() {
                 if let Some(obj) = item.as_object_mut() {
                     obj.insert("path".to_string(), serde_json::json!(clean_path));
@@ -977,10 +1022,27 @@ pub fn has_named_export_symbol(content: &str, sym: &str) -> bool {
     {
         return true;
     }
-    let braced_pat = format!(r"(?s)\bexport\s*(?:type\s+)?\{{[^}}]*\b{}\b[^}}]*\}}", esc);
-    regex::Regex::new(&braced_pat)
-        .map(|re| re.is_match(content))
-        .unwrap_or(false)
+    let target = sym.trim();
+    if let Ok(braced_re) = regex::Regex::new(r"(?s)\bexport\s*(?:type\s+)?\{([^}]*)\}") {
+        for cap in braced_re.captures_iter(content) {
+            let inner = cap.get(1).map_or("", |m| m.as_str());
+            for raw_item in inner.split(',') {
+                let item = raw_item.trim().trim_start_matches("type ").trim();
+                if item.is_empty() {
+                    continue;
+                }
+                let exported_name = if let Some((_, alias)) = item.split_once(" as ") {
+                    alias.trim()
+                } else {
+                    item
+                };
+                if exported_name == target {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Strips explicit `.ts`/`.tsx`/`.js`/`.jsx` extensions from relative or `@/`/`~/` import/export specifiers
@@ -4794,15 +4856,23 @@ pub fn sanitize_app_router_links_with_routes(content: &str, valid_routes: &[Stri
 pub fn sanitize_unhandled_session_loading(content: &str) -> String {
     let mut modified = content.to_string();
 
-    // Neutralize client-side preview redirect traps (`if (!user) { router.push('/login'); }` or `if (!session) { router.push('/login'); }`)
-    if modified.contains("router.push") && (modified.contains("'/login'") || modified.contains("\"/login\"")) {
+    // Neutralize client-side preview redirect traps (`if (!user) { router.push('/login'); }`,
+    // `if (!session) { window.location.href = '/login'; }`, `if (status === 'unauthenticated') { window.location.href = '/login'; }`)
+    if (modified.contains("router.push")
+        || modified.contains("router.replace")
+        || modified.contains("window.location"))
+        && (modified.contains("'/login'")
+            || modified.contains("\"/login\"")
+            || modified.contains("'/signin'")
+            || modified.contains("\"/signin\""))
+    {
         if let Ok(re_redirect_block) = regex::Regex::new(
-            r#"(?m)^[ \t]*if\s*\(\s*!(?:user|session)\s*\)\s*\{\s*router\.push\s*\(\s*['"]/login['"]\s*\)\s*;?\s*(?:return\s*;?\s*)?\}[ \t]*\r?\n?"#
+            r#"(?ms)^[ \t]*if\s*\(\s*(?:!(?:user|session)|status\s*===?\s*['"]unauthenticated['"])\s*\)\s*\{\s*(?:router\.(?:push|replace)\s*\(\s*['"]/(?:login|signin)['"]\s*\)|window\.location(?:\.href)?\s*=\s*['"]/(?:login|signin)['"]|window\.location\.replace\s*\(\s*['"]/(?:login|signin)['"]\s*\))\s*;?\s*(?:return\s*;?\s*)?\}[ \t]*\r?\n?"#
         ) {
             modified = re_redirect_block.replace_all(&modified, "").to_string();
         }
         if let Ok(re_redirect_line) = regex::Regex::new(
-            r#"(?m)^[ \t]*if\s*\(\s*!(?:user|session)\s*\)\s*router\.push\s*\(\s*['"]/login['"]\s*\)\s*;?[ \t]*\r?\n?"#
+            r#"(?m)^[ \t]*if\s*\(\s*(?:!(?:user|session)|status\s*===?\s*['"]unauthenticated['"])\s*\)\s*(?:router\.(?:push|replace)\s*\(\s*['"]/(?:login|signin)['"]\s*\)|window\.location(?:\.href)?\s*=\s*['"]/(?:login|signin)['"]|window\.location\.replace\s*\(\s*['"]/(?:login|signin)['"]\s*\))\s*;?[ \t]*\r?\n?"#
         ) {
             modified = re_redirect_line.replace_all(&modified, "").to_string();
         }
@@ -4995,6 +5065,10 @@ pub fn sanitize_root_layout_direct_use_session(content: &str) -> String {
     }
 
     let mut result = format!("{}{}{}", &content[..open_idx], new_body_lines.join("\n"), &content[body_close..]);
+
+    // Neutralize any remaining unauthenticated login redirects inside RootLayout so replacing
+    // `useSession()` with `status = 'unauthenticated'` never creates an infinite `/login` reload loop.
+    result = sanitize_unhandled_session_loading(&result);
 
     // If `useSession` is no longer called anywhere, prune it from `next-auth/react` imports
     let body_still_uses_session = result.contains("useSession(")
@@ -5493,6 +5567,8 @@ pub fn is_banned_external_ui_package(pkg: &str) -> bool {
         || p == "@emotion/react"
         || p == "@emotion/styled"
         || p.starts_with("@radix-ui/")
+        || p.starts_with("@nextui-org/")
+        || p.starts_with("@heroui/")
         || matches!(
             p,
             "@headlessui/react"
@@ -5528,6 +5604,7 @@ fn rewrite_banned_external_ui_imports(src: &str, rel_path: &str, is_tsx_like: bo
     let mut out = String::with_capacity(src.len());
     let mut last = 0usize;
     let mut changed = false;
+    let mut rewrote_link_to_next = false;
 
     for cap in imp_re.captures_iter(src) {
         let Some(full_m) = cap.get(0) else { continue };
@@ -5595,6 +5672,16 @@ fn rewrite_banned_external_ui_imports(src: &str, rel_path: &str, is_tsx_like: bo
             if already_declared {
                 continue;
             }
+            if sym == "Link" {
+                rewrote_link_to_next = true;
+                let has_next_link = src.contains("from 'next/link'")
+                    || src.contains("from \"next/link\"")
+                    || out.contains("from 'next/link'");
+                if !has_next_link {
+                    out.push_str("import Link from 'next/link';\n");
+                }
+                continue;
+            }
             if sym.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
                 if is_tsx_like {
                     out.push_str(&format!(
@@ -5617,6 +5704,24 @@ fn rewrite_banned_external_ui_imports(src: &str, rel_path: &str, is_tsx_like: bo
         return src.to_string();
     }
     out.push_str(&src[last..]);
+    if rewrote_link_to_next && is_tsx_like {
+        // Strip NextUI/HeroUI-only props (`size`, `isExternal`, `showAnchorIcon`, `isBlock`, `isDisabled`, `underline`)
+        // from `<Link ...>` tags now backed by `next/link` so `LinkProps` does not fail with TS2322.
+        if let (Ok(link_tag_re), Ok(bad_prop_re)) = (
+            regex::Regex::new(r"<Link\b([^>]*)>"),
+            regex::Regex::new(
+                r#"\s+\b(?:size|underline|isExternal|showAnchorIcon|isBlock|isDisabled|anchorIcon)(?:=(?:"[^"]*"|'[^']*'|\{[^}]*\}))?"#,
+            ),
+        ) {
+            out = link_tag_re
+                .replace_all(&out, |caps: &regex::Captures| {
+                    let attrs = caps.get(1).map_or("", |m| m.as_str());
+                    let cleaned = bad_prop_re.replace_all(attrs, "");
+                    format!("<Link{}>", cleaned)
+                })
+                .into_owned();
+        }
+    }
     out
 }
 
@@ -5977,6 +6082,188 @@ pub fn sanitize_nextjs_and_zod_hallucinations(content: &str, rel_path: &str) -> 
         if let Ok(re_nextauth) = regex::Regex::new(r"(^|[^A-Za-z0-9_$.])(request|req)\.nextauth\b") {
             out = re_nextauth.replace_all(&out, "${1}(${2} as any).nextauth").to_string();
         }
+    }
+
+    // 3b. Inverted Zod coercion chain: `z.date().coerce()` -> `z.coerce.date()` (also number/string/boolean)
+    if out.contains(".coerce(") {
+        if let Ok(re_zod_coerce) = regex::Regex::new(r"\bz\.(date|number|string|boolean|bigint)\s*\(\s*\)\s*\.coerce\s*\(\s*\)") {
+            out = re_zod_coerce.replace_all(&out, "z.coerce.$1()").to_string();
+        }
+    }
+
+    // 3c. Express/Pages Router hallucination on App Router `NextResponse`:
+    // `NextResponse.status(400).json(payload)` -> `NextResponse.json(payload, { status: 400 })`
+    if out.contains("NextResponse.status(") {
+        if let Ok(re_nr_status) = regex::Regex::new(r"NextResponse\.status\(\s*([^)]+)\s*\)\.json\(") {
+            let mut cursor = 0usize;
+            let mut rebuilt = String::with_capacity(out.len() + 32);
+            let mut changed_nr = false;
+            while let Some(m) = re_nr_status.find_at(&out, cursor) {
+                let Some(caps) = re_nr_status.captures(&out[m.start()..m.end()]) else {
+                    break;
+                };
+                let status_expr = caps.get(1).map_or("400", |c| c.as_str()).trim();
+                let open_paren = m.end() - 1;
+                if let Some(close_paren) = find_balanced_delimiter_bytes(&out, open_paren, b'(', b')') {
+                    let payload = &out[open_paren + 1..close_paren];
+                    rebuilt.push_str(&out[cursor..m.start()]);
+                    rebuilt.push_str(&format!("NextResponse.json({}, {{ status: {} }})", payload, status_expr));
+                    cursor = close_paren + 1;
+                    changed_nr = true;
+                } else {
+                    rebuilt.push_str(&out[cursor..m.end()]);
+                    cursor = m.end();
+                }
+            }
+            if changed_nr {
+                rebuilt.push_str(&out[cursor..]);
+                out = rebuilt;
+            }
+        }
+    }
+
+    // 3d. Empty object literal assigned to an explicit non-any object type annotation (TS2741):
+    // `let body: { logText: string } = {};` -> `let body: { logText: string } = {} as any;`
+    if is_ts && out.contains("= {}") {
+        if let Ok(re_empty_typed_obj) = regex::Regex::new(
+            r"(?m)^([ \t]*(?:let|var|const)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*:\s*\{[^;\r\n=]+\}\s*=\s*\{\s*\})(\s*;?[ \t]*)$",
+        ) {
+            out = re_empty_typed_obj.replace_all(&out, "$1 as any$2").to_string();
+        }
+    }
+
+    // 3e. Hallucinated scoped `@react-icons/<pack>` -> real `react-icons/<pack>` package
+    if out.contains("@react-icons/") {
+        out = out
+            .replace("'@react-icons/", "'react-icons/")
+            .replace("\"@react-icons/", "\"react-icons/");
+    }
+
+    // 3f. Literal NextAuth catch-all filesystem segment `/api/auth/[...nextauth]` used as runtime fetch URL -> `/api/auth/session`
+    if out.contains("/api/auth/[...nextauth]") {
+        out = out
+            .replace("'/api/auth/[...nextauth]'", "'/api/auth/session'")
+            .replace("\"/api/auth/[...nextauth]\"", "\"/api/auth/session\"")
+            .replace("`/api/auth/[...nextauth]`", "`/api/auth/session`");
+    }
+
+    // 3g. Auto-import `NextAuthOptions` from 'next-auth' when referenced as a type annotation without import (TS2304)
+    if is_ts
+        && out.contains("NextAuthOptions")
+        && !out.contains("import type { NextAuthOptions")
+        && !out.contains("NextAuthOptions } from 'next-auth'")
+        && !out.contains("NextAuthOptions } from \"next-auth\"")
+        && !out.contains("NextAuthOptions,")
+        && !out.contains(", NextAuthOptions")
+        && !out.contains("interface NextAuthOptions")
+        && !out.contains("type NextAuthOptions")
+    {
+        out = insert_import_after_use_client(&out, "import type { NextAuthOptions } from 'next-auth';");
+    }
+
+    // 3h. Default import from `lucide-react` (`import LucideLock from 'lucide-react'` -> `import { LucideLock } from 'lucide-react'`)
+    // `lucide-react` has no default export; default imports resolve to the module namespace causing TS2604/TS2786.
+    if out.contains("lucide-react") {
+        if let Ok(re_lucide_def) = regex::Regex::new(
+            r#"(?m)^([ \t]*import\s+)([A-Z][A-Za-z0-9_$]*)(\s+from\s+['"]lucide-react['"]\s*;?[ \t]*)$"#,
+        ) {
+            out = re_lucide_def.replace_all(&out, "${1}{ ${2} }${3}").to_string();
+        }
+    }
+
+    // 3i. Broken NextAuth `jwt: { encode: async (...) => { return { token }; } }` stub (returns object instead of string -> TS2322)
+    if out.contains("NextAuthOptions") && out.contains("encode:") && out.contains("return { token }") {
+        if let Ok(re_jwt_start) = regex::Regex::new(r"(?m)[ \t]*jwt\s*:\s*\{") {
+            if let Some(m) = re_jwt_start.find(&out) {
+                let open_brace = m.end() - 1;
+                if let Some(close_brace) = find_balanced_delimiter_bytes(&out, open_brace, b'{', b'}') {
+                    let block = &out[m.start()..=close_brace];
+                    if block.contains("encode:") && block.contains("return { token }") {
+                        let mut del_end = close_brace + 1;
+                        let bytes = out.as_bytes();
+                        while del_end < bytes.len() && matches!(bytes[del_end], b' ' | b'\t') {
+                            del_end += 1;
+                        }
+                        if del_end < bytes.len() && bytes[del_end] == b',' {
+                            del_end += 1;
+                        }
+                        if out[del_end..].starts_with("\r\n") {
+                            del_end += 2;
+                        } else if out[del_end..].starts_with('\n') {
+                            del_end += 1;
+                        }
+                        out = format!("{}{}", &out[..m.start()], &out[del_end..]);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3j. Auto-import `zodResolver` from '@hookform/resolvers/zod' when invoked without import (TS2304)
+    if is_ts
+        && out.contains("zodResolver(")
+        && !out.contains("from '@hookform/resolvers/zod'")
+        && !out.contains("from \"@hookform/resolvers/zod\"")
+        && !out.contains("function zodResolver")
+        && !out.contains("const zodResolver")
+    {
+        out = insert_import_after_use_client(&out, "import { zodResolver } from '@hookform/resolvers/zod';");
+    }
+
+    // 3k. `import type { ..., useXxx, ... } from '...'` where `useXxx(` is called as a runtime hook (TS1361):
+    // split runtime `use*` hook identifiers out of `import type` into a normal value import.
+    if is_ts && out.contains("import type") {
+        if let Ok(re_imp_type) = regex::Regex::new(
+            r#"(?m)^([ \t]*)import\s+type\s*\{([^}]+)\}\s*from\s*(['"][^'"]+['"])\s*;?[ \t]*$"#,
+        ) {
+            let snapshot = out.clone();
+            out = re_imp_type.replace_all(&snapshot, |caps: &regex::Captures| {
+                let indent = caps.get(1).map_or("", |m| m.as_str());
+                let inner = caps.get(2).map_or("", |m| m.as_str());
+                let mod_spec = caps.get(3).map_or("", |m| m.as_str());
+                let mut type_items: Vec<&str> = Vec::new();
+                let mut value_hooks: Vec<&str> = Vec::new();
+                for raw in inner.split(',') {
+                    let item = raw.trim();
+                    if item.is_empty() {
+                        continue;
+                    }
+                    let local = item.split(" as ").last().unwrap_or(item).trim();
+                    let is_hook_name = local.starts_with("use")
+                        && local.chars().nth(3).map_or(false, |c| c.is_ascii_uppercase());
+                    let called_as_value = is_hook_name && snapshot.contains(&format!("{}(", local));
+                    if called_as_value {
+                        value_hooks.push(item);
+                    } else {
+                        type_items.push(item);
+                    }
+                }
+                if value_hooks.is_empty() {
+                    return caps[0].to_string();
+                }
+                let mut lines = Vec::new();
+                if !type_items.is_empty() {
+                    lines.push(format!("{}import type {{ {} }} from {};", indent, type_items.join(", "), mod_spec));
+                }
+                lines.push(format!("{}import {{ {} }} from {};", indent, value_hooks.join(", "), mod_spec));
+                lines.join("\n")
+            }).into_owned();
+        }
+    }
+
+    // 3l. Shared form `onChange` handler typed strictly as `ChangeEvent<HTMLInputElement>` in a file
+    // that also renders `<select` or `<textarea` (TS2322). Only widen when `.checked`/`.files` are not accessed.
+    if is_ts
+        && low.ends_with(".tsx")
+        && (out.contains("<select") || out.contains("<textarea"))
+        && out.contains("ChangeEvent<HTMLInputElement>")
+        && !out.contains(".checked")
+        && !out.contains(".files")
+    {
+        out = out.replace(
+            "ChangeEvent<HTMLInputElement>",
+            "ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>",
+        );
     }
 
     // 4. TS2749: local value `const Foo =` / `function Foo(` also used in a type position without `type Foo` / `interface Foo`
@@ -7393,7 +7680,36 @@ pub fn post_process_generated_file(
                 if !processed.contains("SessionProvider") {
                     processed = format!("import {{ SessionProvider }} from 'next-auth/react';\n{}", processed);
                 }
-                if processed.contains("{children}") {
+                let wrapped_body = if (processed.contains("<Navbar") || processed.contains("<Footer"))
+                    && processed.contains("<body")
+                    && processed.contains("</body>")
+                {
+                    if let (Some(body_open_start), Some(body_close_start)) =
+                        (processed.find("<body"), processed.rfind("</body>"))
+                    {
+                        if let Some(gt_rel) = processed[body_open_start..].find('>') {
+                            let inner_start = body_open_start + gt_rel + 1;
+                            if inner_start < body_close_start && processed[inner_start..body_close_start].contains("{children}") {
+                                processed = format!(
+                                    "{}<SessionProvider>{}</SessionProvider>{}",
+                                    &processed[..inner_start],
+                                    &processed[inner_start..body_close_start],
+                                    &processed[body_close_start..]
+                                );
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if !wrapped_body && processed.contains("{children}") {
                     processed = processed.replace("{children}", "<SessionProvider>{children}</SessionProvider>");
                 }
                 if !processed.trim_start().starts_with("\"use client\"") && !processed.trim_start().starts_with("'use client'") {
@@ -8894,6 +9210,126 @@ pub fn sanitize_prisma_relations(schema: &str) -> String {
         Err(_) => return schema.to_string(),
     };
 
+    // 0. Repair inverted `@relation(references: [localFk])` clauses missing `fields: [...]` (P1012).
+    // Also strip invalid `@relation(references: [foreignFk])` from opposite relation sides where the FK lives on the target model.
+    if let Ok(ref_only_re) = regex::Regex::new(r"@relation\(\s*references:\s*\[([^\]]+)\]\s*\)") {
+        // Snapshot declared scalar/non-model field names per model
+        let model_name_set: std::collections::HashSet<&str> = model_names.iter().map(|s| s.as_str()).collect();
+        let mut model_scalar_fields: std::collections::HashMap<String, std::collections::HashSet<String>> = std::collections::HashMap::new();
+        for m in &model_names {
+            let mut scalars = std::collections::HashSet::new();
+            if let Some(lines) = model_bodies.get(m) {
+                for line in lines {
+                    let t = line.trim();
+                    if t.is_empty() || t.starts_with("//") || t.starts_with("@@") || t.starts_with('@') {
+                        continue;
+                    }
+                    let parts: Vec<&str> = t.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        let base_ty = parts[1].replace(['?', '[', ']'], "");
+                        if !model_name_set.contains(base_ty.as_str()) {
+                            scalars.insert(parts[0].to_string());
+                        }
+                    }
+                }
+            }
+            model_scalar_fields.insert(m.clone(), scalars);
+        }
+
+        for m in &model_names {
+            let my_scalars = model_scalar_fields.get(m).cloned().unwrap_or_default();
+            if let Some(lines) = model_bodies.get_mut(m) {
+                for line in lines.iter_mut() {
+                    if !line.contains("@relation(") || line.contains("fields:") {
+                        continue;
+                    }
+                    let trimmed = line.trim();
+                    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                    if parts.len() < 2 {
+                        continue;
+                    }
+                    let target_model = parts[1].replace(['?', '[', ']'], "");
+                    if !model_name_set.contains(target_model.as_str()) {
+                        continue;
+                    }
+                    let target_scalars = model_scalar_fields.get(&target_model);
+                    if let Some(cap) = ref_only_re.captures(line) {
+                        let ref_inner = cap.get(1).map_or("", |c| c.as_str()).trim();
+                        let ref_fields: Vec<&str> = ref_inner.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                        let all_on_self = !ref_fields.is_empty() && ref_fields.iter().all(|f| my_scalars.contains(*f));
+                        let all_on_target = !ref_fields.is_empty()
+                            && target_scalars.map_or(false, |ts| ref_fields.iter().all(|f| ts.contains(*f)));
+                        if all_on_self && !all_on_target {
+                            // Local FK was mistakenly placed in `references: [...]` -> rewrite to `fields: [fk], references: [id]`
+                            let replacement = format!("@relation(fields: [{}], references: [id])", ref_inner);
+                            *line = ref_only_re.replace(line, replacement.as_str()).to_string();
+                        } else if !all_on_self {
+                            // Foreign FK placed in `references: [...]` on opposite side (e.g. 1:1 back-relation) -> strip invalid @relation
+                            *line = ref_only_re.replace(line, "").trim_end().to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 0b. Enforce Prisma P1012 rule: if a required relation `rel TargetModel @relation(fields: [fk], ...)`
+    // references an optional scalar FK (`fk String?`), the relation field MUST also be optional (`TargetModel?`).
+    {
+        let model_name_set: std::collections::HashSet<&str> = model_names.iter().map(|s| s.as_str()).collect();
+        for m in &model_names {
+            if let Some(lines) = model_bodies.get_mut(m) {
+                let mut optional_scalars: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for line in lines.iter() {
+                    let t = line.trim();
+                    if t.is_empty() || t.starts_with("//") || t.starts_with("@@") || t.starts_with('@') {
+                        continue;
+                    }
+                    let parts: Vec<&str> = t.split_whitespace().collect();
+                    if parts.len() >= 2 && parts[1].ends_with('?') {
+                        let base_ty = parts[1].trim_end_matches('?');
+                        if !model_name_set.contains(base_ty) {
+                            optional_scalars.insert(parts[0].to_string());
+                        }
+                    }
+                }
+                if optional_scalars.is_empty() {
+                    continue;
+                }
+                for line in lines.iter_mut() {
+                    if !line.contains("@relation(") || !line.contains("fields:") {
+                        continue;
+                    }
+                    let trimmed = line.trim();
+                    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                    if parts.len() < 2 {
+                        continue;
+                    }
+                    let ftype = parts[1];
+                    if ftype.ends_with('?') || ftype.ends_with("[]") || !model_name_set.contains(ftype) {
+                        continue;
+                    }
+                    if let Some(cap) = fields_re.captures(line) {
+                        let fk_list = cap.get(1).map_or("", |c| c.as_str());
+                        let any_fk_optional = fk_list
+                            .split(',')
+                            .map(|s| s.trim())
+                            .any(|fk| optional_scalars.contains(fk));
+                        if any_fk_optional {
+                            if let Ok(rel_ty_re) = regex::Regex::new(&format!(
+                                r"^(\s*{}\s+){}(\s)",
+                                regex::escape(parts[0]),
+                                regex::escape(ftype)
+                            )) {
+                                *line = rel_ty_re.replace(line, format!("${{1}}{}?${{2}}", ftype).as_str()).to_string();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // 1. Prune ghost / duplicate self-relations (preserving valid paired self-relations like parent <-> children
     // and valid symmetric named self-M2M relations, while pruning un-paired or un-annotated self-lists like `projects Club[]`).
     for m in &model_names {
@@ -10372,6 +10808,44 @@ pub fn normalize_prisma_schema_imports(content: &str, is_client_or_hook: bool) -
                     || s_low.ends_with("/prisma/schema")
                     || s_low.ends_with("/prisma/client");
 
+                let is_lib_prisma_path = s_low == "@/lib/prisma"
+                    || s_low == "~/lib/prisma"
+                    || s_low == "src/lib/prisma"
+                    || s_low == "lib/prisma"
+                    || s_low.ends_with("/lib/prisma");
+
+                if is_lib_prisma_path {
+                    let imports_prisma_singleton = regex::Regex::new(r"(?m)(?:import\s+prisma\b|\{[^}]*\bprisma\b)")
+                        .map(|re| re.is_match(flat_trim))
+                        .unwrap_or(false);
+                    if !imports_prisma_singleton {
+                        let target_mod = if is_client_or_hook { "@/types" } else { "@prisma/client" };
+                        let mut rewritten_stmt = stmt
+                            .replace(&format!("'{}'", spec), &format!("'{}'", target_mod))
+                            .replace(&format!("\"{}\"", spec), &format!("\"{}\"", target_mod));
+                        let is_already_top_type = flat_trim.starts_with("import type ") || flat_trim.starts_with("import type{");
+                        if is_client_or_hook && !is_already_top_type {
+                            if let Some(pos) = rewritten_stmt.find("import") {
+                                let after = &rewritten_stmt[pos + 6..];
+                                let new_after = if after.starts_with('{') {
+                                    format!(" type {}", after)
+                                } else {
+                                    format!(" type{}", after)
+                                };
+                                rewritten_stmt = format!("{}{}{}", &rewritten_stmt[..pos], "import", new_after);
+                            }
+                        }
+                        if rewritten_stmt != stmt {
+                            changed = true;
+                            for line_piece in rewritten_stmt.lines() {
+                                out_lines.push(line_piece.to_string());
+                            }
+                            idx = end_idx + 1;
+                            continue;
+                        }
+                    }
+                }
+
                 if is_schema_path {
                     let imports_prisma_singleton = regex::Regex::new(r"(?m)(?:import\s+prisma\b|\{[^}]*\bprisma\b)")
                         .map(|re| re.is_match(flat_trim))
@@ -11225,12 +11699,21 @@ pub fn sanitize_openai_v3_to_v4(content: &str) -> String {
         out = imp_re.replace_all(&out, "import OpenAI from 'openai';").to_string();
     }
     if let Ok(cfg_re) = regex::Regex::new(
-        r"(?s)(?:const|let|var)\s+[A-Za-z0-9_$]+\s*=\s*new\s+Configuration\s*\(\s*(\{[^)]*\})\s*\)\s*;?\s*(?:const|let|var)\s+([A-Za-z0-9_$]+)\s*=\s*new\s+OpenAIApi\s*\(\s*[A-Za-z0-9_$]+\s*\)\s*;?",
+        r"(?s)(?:export\s+)?(?:const|let|var)\s+[A-Za-z0-9_$]+\s*=\s*new\s+Configuration\s*\(\s*(\{[^)]*\})\s*\)\s*;?(?:\s|//[^\n]*|/\*[\s\S]*?\*/)*(export\s+)?(?:const|let|var)\s+([A-Za-z0-9_$]+)\s*=\s*new\s+OpenAIApi\s*\(\s*[A-Za-z0-9_$]+\s*\)\s*;?",
     ) {
-        out = cfg_re.replace_all(&out, "const $2 = new OpenAI($1);").to_string();
+        out = cfg_re.replace_all(&out, "${2}const $3 = new OpenAI($1);").to_string();
     }
     if let Ok(api_re) = regex::Regex::new(r"\bnew\s+OpenAIApi\s*\(\s*new\s+Configuration\s*\(([^)]*)\)\s*\)") {
         out = api_re.replace_all(&out, "new OpenAI($1)").to_string();
+    }
+    // Fallback if `new Configuration(...)` and `new OpenAIApi(...)` are separated by other statements
+    if out.contains("new Configuration(") && out.contains("new OpenAIApi(") {
+        if let Ok(standalone_cfg_re) = regex::Regex::new(r"\bnew\s+Configuration\s*\(\s*(\{[^)]*\})\s*\)") {
+            out = standalone_cfg_re.replace_all(&out, "$1").to_string();
+        }
+        if let Ok(standalone_api_re) = regex::Regex::new(r"\bnew\s+OpenAIApi\s*\(") {
+            out = standalone_api_re.replace_all(&out, "new OpenAI(").to_string();
+        }
     }
     out = out.replace(".createChatCompletion(", ".chat.completions.create(");
     out = out.replace(".createCompletion(", ".completions.create(");

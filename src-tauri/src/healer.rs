@@ -454,6 +454,15 @@ pub async fn heal_prisma_schema_loop(
     model_id: &str,
     log_channel: &str,
 ) -> Result<(), String> {
+    heal_prisma_schema_loop_opt(proj_dir, Some(window), model_id, log_channel).await
+}
+
+pub async fn heal_prisma_schema_loop_opt(
+    proj_dir: &std::path::Path,
+    window: Option<&tauri::Window>,
+    model_id: &str,
+    log_channel: &str,
+) -> Result<(), String> {
     let schema_path = if proj_dir.join("prisma/schema.prisma").exists() {
         proj_dir.join("prisma/schema.prisma")
     } else if proj_dir.join("schema.prisma").exists() {
@@ -462,11 +471,16 @@ pub async fn heal_prisma_schema_loop(
         return Ok(()); // No schema, nothing to heal
     };
 
-    let enriched_path = ensure_node_toolchain_ready(Some(window), log_channel).await;
+    let enriched_path = ensure_node_toolchain_ready(window, log_channel).await;
+    let emit_win = |payload: serde_json::Value| {
+        if let Some(w) = window {
+            let _ = w.emit(log_channel, payload);
+        }
+    };
 
     // (1) Deterministic pre-pass: fix known schema mistakes without the LLM
     if sanitize_prisma_schema_on_disk(&schema_path) {
-        let _ = window.emit(log_channel, serde_json::json!({
+        emit_win(serde_json::json!({
             "text": "> [Prisma Validator] Deterministički popravljač je ispravio poznate greške u schema.prisma (pre AI-ja).\n",
             "type": "info"
         }));
@@ -508,7 +522,7 @@ pub async fn heal_prisma_schema_loop(
     // while bounding total validation passes at MAX_TOTAL_ITERATIONS.
     for _iter in 0..MAX_TOTAL_ITERATIONS {
         let display_check = (ai_attempts_used + 1).min(total_checks);
-        let _ = window.emit(log_channel, serde_json::json!({
+        emit_win(serde_json::json!({
             "text": format!("> [Prisma Validator] Provera i generisanje Prisma klijenta (provera {}/{})...\n", display_check, total_checks),
             "type": "info"
         }));
@@ -600,7 +614,7 @@ pub async fn heal_prisma_schema_loop(
                     &resolved_model,
                 );
             }
-            let _ = window.emit(log_channel, serde_json::json!({
+            emit_win(serde_json::json!({
                 "text": "> [Prisma Validator] Prisma Client uspešno generisan!\n",
                 "type": "info"
             }));
@@ -614,7 +628,7 @@ pub async fn heal_prisma_schema_loop(
             String::from_utf8_lossy(&output.stderr)
         ));
 
-        let _ = window.emit(log_channel, serde_json::json!({
+        emit_win(serde_json::json!({
             "text": format!("> [Prisma Validator] Greška pri generisanju:\n{}\n", error_log),
             "type": "error"
         }));
@@ -663,7 +677,7 @@ pub async fn heal_prisma_schema_loop(
                 if pf.source == "katastar" {
                     let _ = std::fs::write(&schema_path, &pf.before);
                     tried_katastar_ids.push(pf.entry_id.clone());
-                    let _ = window.emit(log_channel, serde_json::json!({
+                    emit_win(serde_json::json!({
                         "text": format!("> [Katastar] Pravilo '{}' nije uklonilo grešku u schema.prisma; vraćam prethodno stanje i nastavljam.\n", pf.entry_id),
                         "type": "warning"
                     }));
@@ -734,7 +748,7 @@ pub async fn heal_prisma_schema_loop(
                         before: schema_content,
                         after: updated,
                     });
-                    let _ = window.emit(log_channel, serde_json::json!({
+                    emit_win(serde_json::json!({
                         "text": "> [Prisma Validator] Deterministički sinhronizujem provider = \"postgresql\" za podršku enum tipova. Ponovo testiram...\n",
                         "type": "info"
                     }));
@@ -790,7 +804,7 @@ pub async fn heal_prisma_schema_loop(
                     before: schema_content,
                     after: deterministically_fixed,
                 });
-                let _ = window.emit(log_channel, serde_json::json!({
+                emit_win(serde_json::json!({
                     "text": "> [Prisma Validator] Deterministički popravljena schema.prisma (relacije / referencijalne akcije). Ponovo testiram...\n",
                     "type": "info"
                 }));
@@ -833,7 +847,7 @@ pub async fn heal_prisma_schema_loop(
                     before: schema_content,
                     after: fixed_after_prune,
                 });
-                let _ = window.emit(log_channel, serde_json::json!({
+                emit_win(serde_json::json!({
                     "text": "> [Prisma Validator] Uklanjam nedeklarisane relacione reference nakon AI pokušaja i ponovo testiram šemu...\n",
                     "type": "info"
                 }));
@@ -867,7 +881,7 @@ pub async fn heal_prisma_schema_loop(
                     before: schema_content,
                     after: sanitized_candidate,
                 });
-                let _ = window.emit(log_channel, serde_json::json!({
+                emit_win(serde_json::json!({
                     "text": format!("> [Katastar] Primenjeno verifikovano pravilo '{}' na schema.prisma pre AI poziva. Ponovo testiram...\n", best.entry_id),
                     "type": "info"
                 }));
@@ -880,7 +894,7 @@ pub async fn heal_prisma_schema_loop(
         }
         ai_attempts_used += 1;
 
-        let _ = window.emit(log_channel, serde_json::json!({
+        emit_win(serde_json::json!({
             "text": format!("> [Prisma Validator] Započinjem AI auto-healing za schema.prisma (pokušaj {}/{})...\n", ai_attempts_used, MAX_AI_HEALS),
             "type": "info"
         }));
@@ -984,7 +998,7 @@ pub async fn heal_prisma_schema_loop(
                 let unchanged = sanitized.replace("\r\n", "\n").trim() == schema_content.replace("\r\n", "\n").trim();
                 if unchanged {
                     previous_ai_unchanged = true;
-                    let _ = window.emit(log_channel, serde_json::json!({
+                    emit_win(serde_json::json!({
                         "text": "> [Prisma Validator] AI je vratio identičnu šemu. Sledeći pokušaj koristi ciljani prompt sa tačnim linijama greške.\n",
                         "type": "warning"
                     }));
@@ -1013,14 +1027,14 @@ pub async fn heal_prisma_schema_loop(
                         before: schema_content,
                         after: sanitized,
                     });
-                    let _ = window.emit(log_channel, serde_json::json!({
+                    emit_win(serde_json::json!({
                         "text": "> [Prisma Validator] schema.prisma ažuriran (AI predlog + deterministički popravljač). Ponovo testiram...\n",
                         "type": "info"
                     }));
                 }
             }
             None => {
-                let _ = window.emit(log_channel, serde_json::json!({
+                emit_win(serde_json::json!({
                     "text": format!("> [Prisma Validator] AI model '{}' nije vratio upotrebljiv odgovor.\n", resolved_model),
                     "type": "warning"
                 }));

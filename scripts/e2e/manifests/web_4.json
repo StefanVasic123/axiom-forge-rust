@@ -1,0 +1,31 @@
+{
+  "manifestId": "web_4",
+  "platform": "web",
+  "projectType": "nextjs",
+  "resolvedStack": "Next.js 14 + TypeScript + Tailwind CSS + Prisma + NextAuth",
+  "name": "FreightGrid Fleet Logistics",
+  "description": "FreightGrid Fleet Logistics is a real-time logistics and fleet maintenance web platform for managing shipments, vehicle telemetry, and preventive maintenance schedules with NextAuth and Prisma PostgreSQL.",
+  "metadata": {
+    "name": "FreightGrid Fleet Logistics",
+    "description": "Fleet dispatch, shipment tracking, and vehicle maintenance web SaaS."
+  },
+  "files": [
+    { "path": "package.json", "description": "Next.js 14, React 18, TypeScript, Tailwind CSS, Prisma 5, NextAuth v4, zod, react-hook-form, lucide-react.", "language": "json" },
+    { "path": "prisma/schema.prisma", "description": "PostgreSQL Prisma schema with Role, ShipmentStatus, VehicleStatus, Priority enums and User, Vehicle, Shipment, MaintenanceTask models.", "language": "prisma" },
+    { "path": "src/lib/prisma.ts", "description": "Singleton PrismaClient export.", "language": "typescript" },
+    { "path": "src/types/index.ts", "description": "Shared domain interfaces for Vehicle, Shipment, MaintenanceTask.", "language": "typescript" },
+    { "path": "src/app/globals.css", "description": "Tailwind CSS directives and layout helpers.", "language": "css" },
+    { "path": "src/app/layout.tsx", "description": "Root layout with SessionProvider, Navbar, and Footer.", "language": "typescript" },
+    { "path": "src/app/page.tsx", "description": "Landing page for FreightGrid Fleet Logistics.", "language": "typescript" },
+    { "path": "src/app/dashboard/page.tsx", "description": "Operations dashboard showing fleet utilization, active shipments, and overdue maintenance.", "language": "typescript" },
+    { "path": "src/app/shipments/page.tsx", "description": "Shipments tracking board with search and creation form.", "language": "typescript" },
+    { "path": "src/app/maintenance/page.tsx", "description": "Fleet maintenance schedule table using useMaintenance hook.", "language": "typescript" },
+    { "path": "src/app/login/page.tsx", "description": "Login page with NextAuth credentials.", "language": "typescript" },
+    { "path": "src/app/register/page.tsx", "description": "Register page calling /api/register.", "language": "typescript" },
+    { "path": "src/hooks/useShipments.ts", "description": "Client hook fetching /api/shipments.", "language": "typescript" },
+    { "path": "src/hooks/useMaintenance.ts", "description": "Client hook fetching /api/maintenance with safe array defaults.", "language": "typescript" },
+    { "path": "src/app/api/register/route.ts", "description": "Registration endpoint.", "language": "typescript" },
+    { "path": "src/app/api/shipments/route.ts", "description": "GET and POST API route for Shipment records.", "language": "typescript" },
+    { "path": "src/app/api/maintenance/route.ts", "description": "GET and POST API route for MaintenanceTask records.", "language": "typescript" }
+  ]
+}

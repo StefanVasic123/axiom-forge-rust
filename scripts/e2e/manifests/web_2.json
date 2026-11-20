@@ -1,0 +1,30 @@
+{
+  "manifestId": "web_2",
+  "platform": "web",
+  "projectType": "nextjs",
+  "resolvedStack": "Next.js 14 + TypeScript + Tailwind CSS + Prisma + NextAuth",
+  "name": "MedFlow Clinic Scheduler",
+  "description": "MedFlow Clinic Scheduler is a web platform for medical clinics to manage patient appointments, doctor shift availability, and clinical intake records with NextAuth authentication and PostgreSQL Prisma backend.",
+  "metadata": {
+    "name": "MedFlow Clinic Scheduler",
+    "description": "Medical clinic appointment scheduling, doctor shifts, and patient intake SaaS."
+  },
+  "files": [
+    { "path": "package.json", "description": "Next.js 14, React 18, TypeScript, Tailwind CSS, Prisma 5, NextAuth v4, Zod, react-hook-form, date-fns, lucide-react.", "language": "json" },
+    { "path": "prisma/schema.prisma", "description": "PostgreSQL Prisma schema with Role, AppointmentStatus, Priority enums and User, Doctor, Patient, Appointment models.", "language": "prisma" },
+    { "path": "src/lib/prisma.ts", "description": "Singleton PrismaClient export.", "language": "typescript" },
+    { "path": "src/types/index.ts", "description": "Shared TypeScript interfaces for Doctor, Patient, Appointment.", "language": "typescript" },
+    { "path": "src/app/globals.css", "description": "Tailwind CSS base styles for clinical clean UI.", "language": "css" },
+    { "path": "src/app/layout.tsx", "description": "Root layout with SessionProvider, Navbar, main, and Footer.", "language": "typescript" },
+    { "path": "src/app/page.tsx", "description": "Public landing page for MedFlow Clinic Scheduler with features and CTAs.", "language": "typescript" },
+    { "path": "src/app/dashboard/page.tsx", "description": "Clinic overview dashboard displaying daily appointments, doctor utilization, and urgent alerts.", "language": "typescript" },
+    { "path": "src/app/appointments/page.tsx", "description": "Appointment schedule list and booking form with status filtering.", "language": "typescript" },
+    { "path": "src/app/doctors/page.tsx", "description": "Doctors directory and shift availability cards.", "language": "typescript" },
+    { "path": "src/app/login/page.tsx", "description": "Login form using NextAuth credentials provider.", "language": "typescript" },
+    { "path": "src/app/register/page.tsx", "description": "Registration page posting to /api/register then signing in.", "language": "typescript" },
+    { "path": "src/hooks/useAppointments.ts", "description": "Client hook managing appointments from /api/appointments with safe array fallback.", "language": "typescript" },
+    { "path": "src/app/api/register/route.ts", "description": "Registration API creating hashed user in Prisma.", "language": "typescript" },
+    { "path": "src/app/api/appointments/route.ts", "description": "GET and POST API route for Appointment records with Zod validation.", "language": "typescript" },
+    { "path": "src/app/api/doctors/route.ts", "description": "GET and POST API route for Doctor availability.", "language": "typescript" }
+  ]
+}

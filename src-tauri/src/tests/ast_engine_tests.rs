@@ -318,7 +318,7 @@ export interface ETA_Prediction {
         assert_eq!(count, 1);
         let model_out = std::fs::read_to_string(temp_dir.join("src/models/index.ts")).unwrap();
         assert!(model_out.contains("kitchen?: any;"), "{}", model_out);
-        assert!(model_out.contains("status: Status | string;"), "{}", model_out);
+        assert!(model_out.contains("status?: Status | string;"), "{}", model_out);
         assert!(model_out.contains("[key: string]: any;"), "{}", model_out);
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -746,7 +746,7 @@ export interface ETA_Prediction {
         assert!(comp_sanitized.contains("type ComplianceCheck = Record<string, any>;"), "AST TS2749 must catch array type ref:\n{}", comp_sanitized);
         assert!(comp_sanitized.contains("turbines = []"), "Expected turbines array default:\n{}", comp_sanitized);
         assert!(comp_sanitized.contains("shipment = {} as any"), "Expected shipment object default:\n{}", comp_sanitized);
-        assert!(comp_sanitized.contains("onDispatch = () => {}"), "Expected onDispatch callback default:\n{}", comp_sanitized);
+        assert!(comp_sanitized.contains("onDispatch = ((() => {}) as any)"), "Expected onDispatch callback default:\n{}", comp_sanitized);
         assert!(!comp_sanitized.contains("title = []"), "Primitive string .length must NOT get array default:\n{}", comp_sanitized);
         assert!(!comp_sanitized.contains("optionalNote ="), "Guarded falsy prop must NOT be defaulted:\n{}", comp_sanitized);
         assert!(!comp_sanitized.contains("user ="), "Optional-chained prop must NOT be defaulted:\n{}", comp_sanitized);
@@ -1047,6 +1047,365 @@ export const config = { matcher: ['/dashboard/:path*', '/settings/:path*'] };
             rt.block_on(crate::orchestrator::validate_file_with_project_context(&temp_dir, "src/middleware.ts", good_matcher_mw, "qwen")).is_ok(),
             "Matcher-scoped middleware must pass"
         );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn phase11_v62_universal_auth_prisma_hooks_openai_and_katastar_suite() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_v62_phase11_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(temp_dir.join("prisma")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/app/api/maintenance")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/app/api/register")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/shared")).unwrap();
+
+        // 1. OpenAI v3 -> v4 with `export const`
+        let oai_v3_export = "import { Configuration, OpenAIApi } from 'openai';\n\nconst openaiConfig = new Configuration({\n  apiKey: process.env.OPENAI_API_KEY,\n});\n\nexport const openaiClient = new OpenAIApi(openaiConfig);\n";
+        let oai_v4 = crate::sanitizer::sanitize_openai_v3_to_v4(oai_v3_export);
+        assert!(oai_v4.contains("import OpenAI from 'openai';"), "{}", oai_v4);
+        assert!(oai_v4.contains("export const openaiClient = new OpenAI("), "{}", oai_v4);
+        assert!(!oai_v4.contains("Configuration") && !oai_v4.contains("OpenAIApi"), "{}", oai_v4);
+
+        // 2. RootLayout useSession neutralization must ALSO strip window.location.href='/login'
+        let root_layout_trap = "\"use client\";\nimport { useEffect } from 'react';\nimport { useSession } from 'next-auth/react';\nexport default function RootLayout({ children }: { children: React.ReactNode }) {\n  const { data: session, status } = useSession();\n  useEffect(() => {\n    if (status === 'unauthenticated') {\n      window.location.href = '/login';\n    }\n  }, [session, status]);\n  return <html><body>{children}</body></html>;\n}\n";
+        let safe_layout = crate::sanitizer::sanitize_root_layout_direct_use_session(root_layout_trap);
+        assert!(!safe_layout.contains("useSession("), "{}", safe_layout);
+        assert!(!safe_layout.contains("window.location.href = '/login'"), "Must neutralize infinite login redirect loop:\n{}", safe_layout);
+
+        // 3. `import type { DefectData } from '@/lib/prisma'` redirected to `@/types` for client/hooks
+        let bad_hook_imp = "\"use client\";\nimport type { DefectData } from '@/lib/prisma';\nexport const x: DefectData[] = [];\n";
+        let fixed_hook_imp = crate::sanitizer::normalize_prisma_schema_imports(bad_hook_imp, true);
+        assert!(fixed_hook_imp.contains("from '@/types'"), "{}", fixed_hook_imp);
+        assert!(!fixed_hook_imp.contains("@/lib/prisma"), "{}", fixed_hook_imp);
+
+        // Server prisma singleton import must NOT be touched
+        let good_srv_imp = "import { prisma } from '@/lib/prisma';\nexport const fn = () => prisma;\n";
+        assert_eq!(crate::sanitizer::normalize_prisma_schema_imports(good_srv_imp, false), good_srv_imp);
+
+        // 4. AST hook array param defaults (`useCostManagement(fallbackData?: T[])`)
+        let raw_hook = "\"use client\";\nimport { useState } from 'react';\nexport interface CostData { id: number; }\nconst useCostManagement = <T extends CostData>(fallbackData?: T[] | any, options?: { [key: string]: any }) => {\n  const [data, setData] = useState<T[]>(fallbackData);\n  return { data };\n};\nexport default useCostManagement;\n";
+        let safe_hook = crate::ast_engine::ensure_hook_array_param_defaults_in_source("hooks/useCostManagement.ts", raw_hook).unwrap();
+        assert!(safe_hook.contains("fallbackData: T[] | any = [] as any"), "{}", safe_hook);
+        assert!(safe_hook.contains("Array.isArray(fallbackData) ? fallbackData : []"), "{}", safe_hook);
+        assert!(syntax_issues_for("hooks/useCostManagement.ts", &safe_hook).unwrap().is_empty(), "{}", safe_hook);
+
+        // 5. AST Prisma inline enum relaxation + `api/` auto-import of Prisma enums
+        let schema = "enum Status { ACTIVE INACTIVE }\nenum Priority { HIGH MEDIUM LOW }\nmodel Workflow {\n  id String @id\n  title String\n  status Status\n  priority Priority\n}\nmodel MaintenanceAlert {\n  id String @id\n  priority Priority\n  status Status\n}\n";
+        std::fs::write(temp_dir.join("prisma/schema.prisma"), schema).unwrap();
+        let enum_map = crate::ast_engine::extract_prisma_model_enum_fields(schema);
+        let wf_route = "import { prisma } from '@/lib/prisma';\nexport async function POST(body: any) {\n  return prisma.workflow.create({\n    data: {\n      title: body.title,\n      status: body.status,\n      priority: body.priority,\n    },\n  });\n}\n";
+        let relaxed_wf = crate::ast_engine::relax_prisma_inline_enum_fields_in_source("src/app/api/workflow/route.ts", wf_route, &enum_map).unwrap();
+        assert!(relaxed_wf.contains("status: body.status as any"), "{}", relaxed_wf);
+        assert!(relaxed_wf.contains("priority: body.priority as any"), "{}", relaxed_wf);
+        assert!(relaxed_wf.contains("title: body.title,"), "Non-enum scalar must stay untouched:\n{}", relaxed_wf);
+
+        let maint_route_path = temp_dir.join("src/app/api/maintenance/route.ts");
+        std::fs::write(
+            &maint_route_path,
+            "import { prisma } from '@/lib/prisma';\nexport async function POST(body: any) {\n  return prisma.maintenanceAlert.create({ data: { priority: body.priority as Priority, status: body.status as Status } });\n}\n",
+        ).unwrap();
+        let auto_cnt = crate::self_healing::auto_import_missing_symbols_in_project(&temp_dir);
+        assert!(auto_cnt >= 1, "api/ route must be scanned for Prisma enum auto-imports");
+        let maint_after = std::fs::read_to_string(&maint_route_path).unwrap();
+        assert!(maint_after.contains("@prisma/client") && maint_after.contains("Priority") && maint_after.contains("Status"), "{}", maint_after);
+
+        // 6. Middleware auth-route loop guard + register contract + 1-hop client->Prisma guard
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mw_blocks_login = "import { NextRequest, NextResponse } from 'next/server';\nimport { getToken } from 'next-auth/jwt';\nexport async function middleware(request: NextRequest) {\n  const pathname = request.nextUrl.pathname;\n  if (pathname === '/' || pathname.startsWith('/pricing')) return NextResponse.next();\n  const token = await getToken({ req: request });\n  if (!token) return NextResponse.redirect(new URL('/login', request.url));\n  return NextResponse.next();\n}\nexport const config = { matcher: ['/((?!api|_next/static|_next/image|favicon.ico).*)'] };\n";
+        assert!(crate::orchestrator::middleware_blocks_auth_routes(mw_blocks_login));
+        assert!(rt.block_on(crate::orchestrator::validate_file_with_project_context(&temp_dir, "src/middleware.ts", mw_blocks_login, "qwen")).is_err());
+
+        let mw_allows_auth = "import { NextRequest, NextResponse } from 'next/server';\nimport { getToken } from 'next-auth/jwt';\nexport async function middleware(request: NextRequest) {\n  const pathname = request.nextUrl.pathname;\n  if (pathname === '/' || pathname.startsWith('/login') || pathname.startsWith('/register')) return NextResponse.next();\n  const token = await getToken({ req: request });\n  if (!token) return NextResponse.redirect(new URL('/login', request.url));\n  return NextResponse.next();\n}\nexport const config = { matcher: ['/((?!api|_next/static|_next/image|favicon.ico).*)'] };\n";
+        assert!(!crate::orchestrator::middleware_blocks_auth_routes(mw_allows_auth));
+
+        std::fs::write(temp_dir.join("src/app/api/register/route.ts"), "export async function POST() {}\n").unwrap();
+        let bad_reg = "\"use client\";\nimport { signIn } from 'next-auth/react';\nexport default function Register() { const go = () => signIn('credentials', {}); return <button onClick={go}>Go</button>; }\n";
+        assert!(rt.block_on(crate::orchestrator::validate_file_with_project_context(&temp_dir, "src/app/register/page.tsx", bad_reg, "qwen")).is_err());
+
+        std::fs::write(temp_dir.join("src/shared/database.js"), "import prisma from '@/lib/prisma';\nexport const getAll = () => prisma.workflow.findMany();\n").unwrap();
+        let bad_client_db = "\"use client\";\nimport * as db from '@/shared/database';\nexport default function W() { return <div>{String(db)}</div>; }\n";
+        assert!(rt.block_on(crate::orchestrator::validate_file_with_project_context(&temp_dir, "src/renderer/components/W.tsx", bad_client_db, "qwen")).is_err());
+
+        // 7. Katastar scrubs CUID project IDs so PostCSS errors group into one signature
+        let scrubbed = crate::katastar::scrub_sensitive_text("Syntax error: C:\\Users\\PC\\AppData\\Local\\axiom-forge\\projects\\cmwnn3uou0003abwe04b7vorp\\src\\app\\globals.css The `ring-primary` class does not exist.");
+        assert!(scrubbed.contains("projects\\<PROJ>\\src\\app\\globals.css"), "{}", scrubbed);
+        assert!(!scrubbed.contains("cmwnn3uou0003abwe04b7vorp"), "{}", scrubbed);
+
+        // 8. Inverted Zod coerce + NextResponse.status().json()
+        let bad_api = "import { NextResponse } from 'next/server';\nimport { z } from 'zod';\nconst s = z.object({ day: z.date().coerce(), n: z.number().coerce() });\nexport async function POST() {\n  return NextResponse.status(400).json({ error: 'Invalid input' });\n}\n";
+        let good_api = crate::sanitizer::sanitize_nextjs_and_zod_hallucinations(bad_api, "src/app/api/test/route.ts");
+        assert!(good_api.contains("z.coerce.date()") && good_api.contains("z.coerce.number()"), "{}", good_api);
+        assert!(good_api.contains("NextResponse.json({ error: 'Invalid input' }, { status: 400 })"), "{}", good_api);
+
+        // 9. Prisma include relation case reconciliation + unused TS2307 import cleanup + misimported Prisma enum reroute
+        let rel_schema = "enum AppointmentStatus { SCHEDULED COMPLETED CANCELLED }\nmodel Doctor { id String @id }\nmodel Appointment {\n  id String @id\n  Doctor Doctor @relation(fields: [doctorId], references: [id])\n  doctorId String\n  status AppointmentStatus\n}\n";
+        let fields_map = crate::ast_engine::extract_prisma_model_field_names(rel_schema);
+        let inc_src = "import { prisma } from '@/lib/prisma';\nexport async function GET() { return prisma.appointment.findMany({ include: { doctor: true } }); }\n";
+        let inc_fixed = crate::ast_engine::reconcile_prisma_relation_case_in_source("src/app/api/appointments/route.ts", inc_src, &fields_map).unwrap();
+        assert!(inc_fixed.contains("include: { Doctor: true }"), "{}", inc_fixed);
+
+        let dead_mod_src = "\"use client\";\nimport { usePatient } from '@/hooks/usePatient';\nexport default function P() { return <div>OK</div>; }\n";
+        let dead_mod_fixed = crate::ast_engine::remove_unused_missing_module_imports("src/app/patients/[id]/page.tsx", dead_mod_src, &["@/hooks/usePatient".to_string()]).unwrap();
+        assert!(!dead_mod_fixed.contains("@/hooks/usePatient"), "{}", dead_mod_fixed);
+
+        std::fs::create_dir_all(temp_dir.join("src/hooks")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/app/appointments")).unwrap();
+        std::fs::write(temp_dir.join("prisma/schema.prisma"), rel_schema).unwrap();
+        std::fs::write(temp_dir.join("src/hooks/useAppointments.ts"), "export const useAppointments = () => ({ data: [] });\n").unwrap();
+        std::fs::write(temp_dir.join("src/app/appointments/page.tsx"), "\"use client\";\nimport { useAppointments, AppointmentStatus } from '@/hooks/useAppointments';\nexport default function P() { return <div>{Object.values(AppointmentStatus).join(',')}</div>; }\n").unwrap();
+        let rerouted = crate::self_healing::reconcile_misimported_prisma_enums_in_project(&temp_dir);
+        assert!(rerouted >= 1);
+        let appt_after = std::fs::read_to_string(temp_dir.join("src/app/appointments/page.tsx")).unwrap();
+        assert!(appt_after.contains("import { useAppointments } from '@/hooks/useAppointments'"), "{}", appt_after);
+        assert!(appt_after.contains("AppointmentStatus") && appt_after.contains("from '@/types'"), "{}", appt_after);
+        let types_after = std::fs::read_to_string(temp_dir.join("src/types/index.ts")).unwrap();
+        assert!(types_after.contains("export const AppointmentStatus:") && types_after.contains("SCHEDULED: 'SCHEDULED'"), "{}", types_after);
+
+        // 10. Callback prop default in TS must satisfy Promise-returning signatures
+        let async_cb_comp = "\"use client\";\ninterface FormProps { onSubmit?: (d: any) => Promise<void>; }\nconst F = ({ onSubmit }: FormProps) => <button onClick={() => onSubmit({})}>Save</button>;\nexport default F;\n";
+        let safe_cb_comp = crate::ast_engine::ensure_component_destructured_prop_defaults_in_source("src/components/F.tsx", async_cb_comp).unwrap();
+        assert!(safe_cb_comp.contains("onSubmit = ((() => {}) as any)"), "{}", safe_cb_comp);
+
+        // 11. Prisma inverted `@relation(references: [localFk])` repair + 1:1 opposite strip
+        let bad_prisma = "model LogStream {\n  id String @id @default(cuid())\n  incidents Incident[]\n}\nmodel Incident {\n  id String @id @default(cuid())\n  logStreamId String\n  logStream LogStream @relation(references: [logStreamId])\n  aiSummary AiSummary? @relation(references: [incidentId])\n}\nmodel AiSummary {\n  id String @id @default(cuid())\n  incidentId String\n  incident Incident @relation(references: [incidentId])\n}\n";
+        let fixed_prisma = crate::sanitizer::sanitize_prisma_relations(bad_prisma);
+        assert!(fixed_prisma.contains("logStream LogStream @relation(fields: [logStreamId], references: [id])"), "{}", fixed_prisma);
+        assert!(fixed_prisma.contains("incident Incident @relation(fields: [incidentId], references: [id])"), "{}", fixed_prisma);
+        assert!(!fixed_prisma.contains("aiSummary AiSummary? @relation(references: [incidentId])"), "{}", fixed_prisma);
+
+        // 12. Legacy openai@3 package.json upgrade + typed empty object literal `as any` + auto-import `toast`
+        let pkg_v3 = temp_dir.join("package.json");
+        std::fs::write(&pkg_v3, "{\"dependencies\":{\"openai\":\"^3.1.0\",\"next\":\"14.2.35\"}}").unwrap();
+        assert!(crate::packages::sanitize_package_json_for_offline(&pkg_v3));
+        let pkg_after = std::fs::read_to_string(&pkg_v3).unwrap();
+        assert!(pkg_after.contains("\"openai\": \"^4.67.0\""), "{}", pkg_after);
+
+        let typed_empty = "export async function POST() {\n  let body: { logText: string } = {};\n  return body;\n}\n";
+        let fixed_empty = crate::sanitizer::sanitize_nextjs_and_zod_hallucinations(typed_empty, "src/app/api/analyze/route.ts");
+        assert!(fixed_empty.contains("let body: { logText: string } = {} as any;"), "{}", fixed_empty);
+
+        std::fs::create_dir_all(temp_dir.join("src/app/regtest")).unwrap();
+        let toast_page = temp_dir.join("src/app/regtest/page.tsx");
+        std::fs::write(&toast_page, "\"use client\";\nexport default function R() { const go = () => { toast.loading('...'); toast.success('ok'); }; return <button onClick={go}>Go</button>; }\n").unwrap();
+        let _ = crate::self_healing::auto_import_missing_symbols_in_project(&temp_dir);
+        let toast_after = std::fs::read_to_string(&toast_page).unwrap();
+        assert!(toast_after.contains("toast") && toast_after.contains("@/components/ui/use-toast"), "{}", toast_after);
+
+        // 13. `@react-icons/hi2` -> `react-icons/hi2` + client `import type { Enum } from '@prisma/client'` -> `@/types` (TS1361)
+        let bad_icon_imp = "\"use client\";\nimport { HiOutlineTruck } from '@react-icons/hi2';\nexport default function C() { return <HiOutlineTruck />; }\n";
+        let fixed_icon_imp = crate::sanitizer::sanitize_nextjs_and_zod_hallucinations(bad_icon_imp, "src/components/C.tsx");
+        assert!(fixed_icon_imp.contains("from 'react-icons/hi2'"), "{}", fixed_icon_imp);
+
+        let ts1361_page = temp_dir.join("src/app/appointments/ship.tsx");
+        std::fs::write(&ts1361_page, "\"use client\";\nimport type { AppointmentStatus } from '@prisma/client';\nexport default function S() { return <div>{AppointmentStatus.SCHEDULED}</div>; }\n").unwrap();
+        let rerouted_prisma_enum = crate::self_healing::reconcile_misimported_prisma_enums_in_project(&temp_dir);
+        assert!(rerouted_prisma_enum >= 1);
+        let ship_after = std::fs::read_to_string(&ts1361_page).unwrap();
+        assert!(ship_after.contains("AppointmentStatus") && ship_after.contains("from '@/types'"), "{}", ship_after);
+        assert!(!ship_after.contains("@prisma/client"), "{}", ship_after);
+
+        // 14. Web-track functional rules: `/api/auth/[...nextauth]` URL normalization, login `redirect: false` contract, hook `useEffect` mount hydration
+        let bad_auth_fetch = "export async function getU() { return fetch('/api/auth/[...nextauth]'); }\n";
+        let good_auth_fetch = crate::sanitizer::sanitize_nextjs_and_zod_hallucinations(bad_auth_fetch, "src/hooks/useUser.ts");
+        assert!(good_auth_fetch.contains("'/api/auth/session'"), "{}", good_auth_fetch);
+
+        let bad_login = "\"use client\";\nimport { signIn } from 'next-auth/react';\nexport default function L() { const go = async () => { await signIn('credentials', { email: 'a', password: 'b', redirect: false }); }; return <button onClick={go}>Login</button>; }\n";
+        assert!(rt.block_on(crate::orchestrator::validate_file_with_project_context(&temp_dir, "src/app/login/page.tsx", bad_login, "qwen")).is_err());
+
+        let good_login = "\"use client\";\nimport { signIn } from 'next-auth/react';\nimport { useRouter } from 'next/navigation';\nexport default function L() { const router = useRouter(); const go = async () => { const res = await signIn('credentials', { email: 'a', password: 'b', redirect: false }); if (!res?.error) router.push('/dashboard'); }; return <button onClick={go}>Login</button>; }\n";
+        assert!(rt.block_on(crate::orchestrator::validate_file_with_project_context(&temp_dir, "src/app/login/page.tsx", good_login, "qwen")).is_ok());
+
+        let lazy_hook = "\"use client\";\nimport { useState, useCallback } from 'react';\nexport function useItems() { const [data, setData] = useState([]); const load = useCallback(async () => { const r = await fetch('/api/items'); setData(await r.json()); }, []); return { data, load }; }\n";
+        assert!(rt.block_on(crate::orchestrator::validate_file_with_project_context(&temp_dir, "src/hooks/useItems.ts", lazy_hook, "qwen")).is_err());
+
+        // 15. Desktop Iteration #1 fixes: npm ENOVERSIONS + prisma-client-js strip + Electron main reconciliation + Prisma optional FK -> optional relation
+        let enover_action = crate::packages::analyze_npm_install_failure("npm error code ENOVERSIONS\nnpm error No versions available for prisma-client-js\n");
+        assert!(matches!(enover_action, Some(crate::packages::NpmFailureAction::Remove(ref p)) if p == "prisma-client-js"));
+
+        std::fs::write(temp_dir.join("main.js"), "// electron main\n").unwrap();
+        let desktop_pkg = temp_dir.join("package.json");
+        std::fs::write(&desktop_pkg, "{\"main\":\"src/main.js\",\"dependencies\":{\"next\":\"14.2.35\"},\"devDependencies\":{\"prisma-client-js\":\"^2.37.0\",\"prisma\":\"5.22.0\"}}").unwrap();
+        assert!(crate::packages::sanitize_package_json_for_offline(&desktop_pkg));
+        let desktop_pkg_after = std::fs::read_to_string(&desktop_pkg).unwrap();
+        assert!(!desktop_pkg_after.contains("prisma-client-js"), "{}", desktop_pkg_after);
+        assert!(desktop_pkg_after.contains("\"main\": \"main.js\""), "{}", desktop_pkg_after);
+
+        let opt_fk_prisma = "model User {\n  id String @id @default(cuid())\n  alerts CalibrationAlert[]\n}\nmodel CalibrationAlert {\n  id String @id @default(cuid())\n  user User @relation(fields: [userId], references: [id])\n  userId String?\n}\n";
+        let fixed_opt_fk = crate::sanitizer::sanitize_prisma_relations(opt_fk_prisma);
+        assert!(fixed_opt_fk.contains("user User? @relation(fields: [userId], references: [id])"), "{}", fixed_opt_fk);
+
+        // 16. Desktop Iteration #2 fixes: auto-import `NextAuthOptions` + widen local component domain view-model interfaces
+        let raw_auth = "import CredentialsProvider from 'next-auth/providers/credentials';\nexport const authOptions: NextAuthOptions = { providers: [] };\n";
+        let fixed_auth = crate::sanitizer::sanitize_nextjs_and_zod_hallucinations(raw_auth, "src/lib/auth.ts");
+        assert!(fixed_auth.contains("import type { NextAuthOptions } from 'next-auth';"), "{}", fixed_auth);
+
+        let raw_tree = "\"use client\";\ninterface AssemblyNode {\n  id: string;\n  name: string;\n  children?: AssemblyNode[];\n}\ninterface TreeProps { id: string; }\nexport default function T(_p: TreeProps) { return null; }\n";
+        let fixed_tree = crate::ast_engine::widen_local_component_view_models_in_source("src/renderer/components/AssemblyTree.tsx", raw_tree).unwrap();
+        assert!(fixed_tree.contains("id?: string;") && fixed_tree.contains("[key: string]: any;"), "{}", fixed_tree);
+        assert!(fixed_tree.contains("interface TreeProps { id: string; }"), "Props interface must stay untouched:\n{}", fixed_tree);
+
+        // 17. Desktop Iteration #3 fixes: ban `@nextui-org/*` + `@heroui/*`, default `lucide-react` import -> named, strip broken NextAuth jwt.encode stub
+        assert!(crate::sanitizer::is_banned_external_ui_package("@nextui-org/link"));
+        assert!(crate::sanitizer::is_banned_external_ui_package("@heroui/react"));
+
+        let bad_lucide = "\"use client\";\nimport LucideLock from 'lucide-react';\nexport default function L() { return <LucideLock />; }\n";
+        let fixed_lucide = crate::sanitizer::sanitize_nextjs_and_zod_hallucinations(bad_lucide, "src/app/login/page.tsx");
+        assert!(fixed_lucide.contains("import { LucideLock } from 'lucide-react';"), "{}", fixed_lucide);
+
+        let bad_jwt_auth = "import type { NextAuthOptions } from 'next-auth';\nexport const authOptions: NextAuthOptions = {\n  providers: [],\n  jwt: {\n    secret: process.env.NEXTAUTH_SECRET,\n    encode: async ({ token, secret }) => {\n      return { token };\n    },\n    decode: async ({ token, secret }) => {\n      return token;\n    }\n  },\n};\n";
+        let fixed_jwt_auth = crate::sanitizer::sanitize_nextjs_and_zod_hallucinations(bad_jwt_auth, "src/lib/auth.ts");
+        assert!(!fixed_jwt_auth.contains("return { token }"), "{}", fixed_jwt_auth);
+
+        // 18. Desktop Iteration #5 fixes: banned UI `Link` -> `next/link` (no TS2440 collision), `import type { useAuth }` split, `zodResolver` auto-import
+        let nav_nextui = "'use client';\nimport React from 'react';\nimport { Link } from '@nextui-org/link';\nexport default function Navbar() { return <nav><Link href=\"/\">Home</Link></nav>; }\n";
+        let fixed_nav = crate::sanitizer::post_process_generated_file("src/components/Navbar.tsx", nav_nextui, &serde_json::json!({}), true);
+        assert!(fixed_nav.contains("import Link from 'next/link';"), "{}", fixed_nav);
+        assert!(!fixed_nav.contains("const Link:"), "Must NOT emit colliding local const Link stub:\n{}", fixed_nav);
+
+        let bad_hook_type_imp = "\"use client\";\nimport type { AuthContextType, useAuth } from '@/hooks/useAuth';\nexport default function P() { const ctx: AuthContextType | null = useAuth(); return <div>{String(ctx)}</div>; }\n";
+        let fixed_hook_type_imp = crate::sanitizer::sanitize_nextjs_and_zod_hallucinations(bad_hook_type_imp, "src/app/login/page.tsx");
+        assert!(fixed_hook_type_imp.contains("import type { AuthContextType } from '@/hooks/useAuth';"), "{}", fixed_hook_type_imp);
+        assert!(fixed_hook_type_imp.contains("import { useAuth } from '@/hooks/useAuth';"), "{}", fixed_hook_type_imp);
+
+        let missing_zod_res = "\"use client\";\nimport { useForm } from 'react-hook-form';\nexport default function F() { useForm({ resolver: zodResolver({} as any) }); return null; }\n";
+        let fixed_zod_res = crate::sanitizer::sanitize_nextjs_and_zod_hallucinations(missing_zod_res, "src/components/LoginForm.tsx");
+        assert!(fixed_zod_res.contains("import { zodResolver } from '@hookform/resolvers/zod';"), "{}", fixed_zod_res);
+
+        // 19. Mobile Iteration #1 fixes: `has_named_export_symbol` respects `as` alias + widen ChangeEvent<HTMLInputElement> with <select>
+        let aliased_hook = "const useDefects = () => ({ data: [] });\nexport default useDefects;\nexport { useDefects as useSiteInspections };\n";
+        assert!(!crate::sanitizer::has_named_export_symbol(aliased_hook, "useDefects"));
+        assert!(crate::sanitizer::has_named_export_symbol(aliased_hook, "useSiteInspections"));
+        let dual_fixed = crate::sanitizer::post_process_generated_file("src/hooks/useDefects.ts", aliased_hook, &serde_json::json!({}), true);
+        assert!(crate::sanitizer::has_named_export_symbol(&dual_fixed, "useDefects"), "Must export unaliased `useDefects`:\n{}", dual_fixed);
+
+        let select_form = "\"use client\";\nconst P = () => { const onC = (e: React.ChangeEvent<HTMLInputElement>) => e.target.value; return <form><input onChange={onC} /><select onChange={onC}><option>A</option></select></form>; };\nexport default P;\n";
+        let fixed_select_form = crate::sanitizer::sanitize_nextjs_and_zod_hallucinations(select_form, "src/app/defects/page.tsx");
+        assert!(fixed_select_form.contains("ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>"), "{}", fixed_select_form);
+
+        // 20. Mobile Iteration #3 fixes: runtime `export const` for type-only Prisma enums in `src/types/index.ts` + optional enum fields under strict:false
+        let m3_dir = temp_dir.join("mobile3_enum_check");
+        std::fs::create_dir_all(m3_dir.join("prisma")).unwrap();
+        std::fs::create_dir_all(m3_dir.join("src/types")).unwrap();
+        std::fs::create_dir_all(m3_dir.join("src/hooks")).unwrap();
+        std::fs::write(
+            m3_dir.join("tsconfig.json"),
+            r#"{"compilerOptions":{"strict":false}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            m3_dir.join("prisma/schema.prisma"),
+            "enum Role {\n  USER\n  COACH\n}\nenum PainLevel {\n  NONE\n  MILD\n  MODERATE\n  SEVERE\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            m3_dir.join("src/types/index.ts"),
+            "type Role = 'USER' | 'COACH';\nexport type PainLevel = 'NONE' | 'MILD' | 'MODERATE' | 'SEVERE';\nexport interface PainEntry {\n  id: string;\n  level: PainLevel;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            m3_dir.join("src/hooks/usePainLogs.ts"),
+            "export interface PainEntry {\n  id?: any;\n  painLevel: PainLevel | string;\n  [key: string]: any;\n}\n",
+        )
+        .unwrap();
+        let enum_updates = crate::self_healing::reconcile_misimported_prisma_enums_in_project(&m3_dir);
+        assert!(enum_updates >= 1);
+        let types_after = std::fs::read_to_string(m3_dir.join("src/types/index.ts")).unwrap();
+        assert!(types_after.contains("export const PainLevel:"), "Must emit runtime const PainLevel:\n{}", types_after);
+        assert!(types_after.contains("export type Role ="), "Must promote unexported type Role:\n{}", types_after);
+        assert!(types_after.contains("export const Role:"), "Must emit runtime const Role:\n{}", types_after);
+        // Must be idempotent on second run
+        assert_eq!(crate::self_healing::reconcile_misimported_prisma_enums_in_project(&m3_dir), 0);
+
+        let _ = crate::ast_engine::reconcile_model_and_type_contracts_in_project(&m3_dir);
+        let hook_after = std::fs::read_to_string(m3_dir.join("src/hooks/usePainLogs.ts")).unwrap();
+        assert!(hook_after.contains("painLevel?: PainLevel | string"), "Enum union field must be optional under strict:false:\n{}", hook_after);
+        let types_after_ast = std::fs::read_to_string(m3_dir.join("src/types/index.ts")).unwrap();
+        assert!(types_after_ast.contains("level?: PainLevel"), "Enum field must be optional under strict:false:\n{}", types_after_ast);
+
+        // 21. Mobile Iteration #4 fixes: App Router route.ts forbids `export default` + register requires `POST`; NextUI `<Link size="lg">` prop strip; `@/types` auto-import for API routes + ambiguous client types
+        let bad_register_route = "import NextAuth from 'next-auth/next';\nexport default NextAuth({ providers: [] });\n";
+        assert!(rt.block_on(crate::orchestrator::validate_file_with_project_context(&temp_dir, "src/app/api/register/route.ts", bad_register_route, "qwen")).is_err());
+        let good_register_route = "import { NextRequest, NextResponse } from 'next/server';\nexport async function POST(req: NextRequest) { return NextResponse.json({ ok: true }, { status: 201 }); }\n";
+        assert!(rt.block_on(crate::orchestrator::validate_file_with_project_context(&temp_dir, "src/app/api/register/route.ts", good_register_route, "qwen")).is_ok());
+
+        let nextui_sized_link = "'use client';\nimport { Link } from '@nextui-org/link';\nexport default function Nav() { return <Link href=\"/\" size=\"lg\" color=\"primary\" isExternal>Home</Link>; }\n";
+        let fixed_sized_link = crate::sanitizer::post_process_generated_file("src/components/Navbar.tsx", nextui_sized_link, &serde_json::json!({}), true);
+        assert!(fixed_sized_link.contains("import Link from 'next/link';"), "{}", fixed_sized_link);
+        assert!(!fixed_sized_link.contains("size=\"lg\"") && !fixed_sized_link.contains("isExternal"), "Must strip NextUI-only Link props:\n{}", fixed_sized_link);
+
+        let m4_dir = temp_dir.join("mobile4_autoimp_check");
+        std::fs::create_dir_all(m4_dir.join("src/types")).unwrap();
+        std::fs::create_dir_all(m4_dir.join("src/hooks")).unwrap();
+        std::fs::create_dir_all(m4_dir.join("src/app/api/earnings")).unwrap();
+        std::fs::write(
+            m4_dir.join("src/types/index.ts"),
+            "export interface ShiftSummaryCreateInput { userId?: string; }\nexport type Stop = any;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            m4_dir.join("src/hooks/useStops.ts"),
+            "export interface Stop { id?: string; }\nexport const useStops = () => ({ stops: [] });\n",
+        )
+        .unwrap();
+        let api_src = "import { NextRequest, NextResponse } from 'next/server';\nexport async function POST(req: NextRequest) { const parsed: ShiftSummaryCreateInput = await req.json(); return NextResponse.json(parsed); }\n";
+        let api_fixed = crate::self_healing::auto_import_missing_symbols_in_content(
+            &m4_dir,
+            &m4_dir.join("src/app/api/earnings/route.ts"),
+            "src/app/api/earnings/route.ts",
+            api_src,
+            &[],
+        )
+        .unwrap();
+        assert!(api_fixed.contains("import type { ShiftSummaryCreateInput } from '@/types';"), "{}", api_fixed);
+
+        let page_src = "\"use client\";\nimport { useState } from 'react';\nexport default function Home() { const [stops] = useState<Stop[]>([]); return <div>{stops.length}</div>; }\n";
+        let page_fixed = crate::self_healing::auto_import_missing_symbols_in_content(
+            &m4_dir,
+            &m4_dir.join("src/app/page.tsx"),
+            "src/app/page.tsx",
+            page_src,
+            &[],
+        )
+        .unwrap();
+        assert!(page_fixed.contains("Stop") && page_fixed.contains("from '@/types'"), "Must disambiguate Stop via @/types:\n{}", page_fixed);
+
+        // 22. Mobile Iteration #5 fixes: invalid npm package names, `EINVALIDPACKAGENAME` healer, `@stripe/stripe-js` clamp, and `src/pages/api/**/route.ts` -> `src/app/api/**/route.ts`
+        assert!(!crate::packages::is_valid_npm_package_name("@eslint-config-next"));
+        assert!(crate::packages::is_valid_npm_package_name("@stripe/stripe-js"));
+        assert!(crate::packages::is_valid_npm_package_name("next-auth"));
+        assert!(!crate::packages::is_valid_npm_package_name("Bad Package"));
+
+        let mut bad_pkg = serde_json::json!({
+            "dependencies": {
+                "@stripe/stripe-js": "^17.5.0",
+                "next": "14.2.35"
+            },
+            "devDependencies": {
+                "@eslint-config-next": "latest",
+                "typescript": "^5.3.3"
+            }
+        });
+        assert!(crate::packages::sanitize_package_json_value_for_offline(&mut bad_pkg));
+        assert!(bad_pkg["devDependencies"].get("@eslint-config-next").is_none(), "{:?}", bad_pkg);
+        assert_eq!(bad_pkg["dependencies"]["@stripe/stripe-js"], "^4.10.0");
+
+        let invalid_name_action = crate::packages::analyze_npm_install_failure(
+            "npm error code EINVALIDPACKAGENAME\nnpm error Invalid package name \"@eslint-config-next\" of package \"@eslint-config-next@latest\"\n",
+        );
+        assert!(matches!(invalid_name_action, Some(crate::packages::NpmFailureAction::Remove(ref p)) if p == "@eslint-config-next"));
+
+        let mut manifest_files = vec![
+            serde_json::json!({"path": "src/app/layout.tsx", "description": "Root layout"}),
+            serde_json::json!({"path": "src/pages/api/batches/[id]/route.ts", "description": "Batches detail API route with full CRUD handler"}),
+            serde_json::json!({"path": "src/app/api/batches/[id]/route.ts", "description": "Short"}),
+        ];
+        crate::sanitizer::deduplicate_manifest_files(&mut manifest_files);
+        assert_eq!(manifest_files.len(), 2, "{:?}", manifest_files);
+        assert!(!manifest_files.iter().any(|f| f["path"].as_str().unwrap_or("").contains("pages/api")), "{:?}", manifest_files);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

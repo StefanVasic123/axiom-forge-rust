@@ -699,6 +699,89 @@ pub fn middleware_blocks_public_root(content: &str) -> bool {
     true
 }
 
+/// Returns `true` if a Next.js Edge `middleware.ts`/`middleware.js` uses a catch-all matcher
+/// and redirects unauthenticated requests to `/login`/`/signin` without exempting `/login` and `/register`
+/// (which causes an infinite `ERR_TOO_MANY_REDIRECTS` loop when visiting `/login` or `/register`).
+pub fn middleware_blocks_auth_routes(content: &str) -> bool {
+    let clean = strip_ts_js_comments_preserving_strings(content);
+    let clean_low = clean.to_lowercase();
+
+    let redirects_to_auth = (clean_low.contains("nextresponse.redirect")
+        && (clean_low.contains("/login") || clean_low.contains("/signin")))
+        || clean_low.contains("withauth");
+    if !redirects_to_auth {
+        return false;
+    }
+
+    // Scoped matchers that only match private prefixes never match `/login` or `/register`
+    if let Ok(matcher_re) = regex::Regex::new(r#"(?s)\bmatcher\s*:\s*\[([^\]]+)\]"#) {
+        if let Some(cap) = matcher_re.captures(&clean) {
+            let block = cap.get(1).map_or("", |m| m.as_str());
+            let block_low = block.to_lowercase();
+            // Negative lookahead explicitly excluding login & register
+            if block_low.contains("login") && block_low.contains("register") {
+                return false;
+            }
+            if let Ok(lit_re) = regex::Regex::new(r#"['"]([^'"]+)['"]"#) {
+                let entries: Vec<&str> = lit_re
+                    .captures_iter(block)
+                    .filter_map(|c| c.get(1).map(|m| m.as_str().trim()))
+                    .collect();
+                if !entries.is_empty()
+                    && entries.iter().all(|e| {
+                        let el = e.to_lowercase();
+                        (el.starts_with("/dashboard")
+                            || el.starts_with("/admin")
+                            || el.starts_with("/account")
+                            || el.starts_with("/profile")
+                            || el.starts_with("/settings")
+                            || el.starts_with("/app"))
+                            && !el.contains("((")
+                    })
+                {
+                    return false;
+                }
+            }
+        }
+    }
+
+    // Protected-prefix-only checks inside handler body never trigger on `/login` or `/register`
+    let guards_protected_prefixes = [
+        "startswith('/dashboard",
+        "startswith(\"/dashboard",
+        "startswith('/admin",
+        "startswith(\"/admin",
+        "startswith('/account",
+        "startswith(\"/account",
+        "startswith('/profile",
+        "startswith(\"/profile",
+        "startswith('/settings",
+        "startswith(\"/settings",
+        "protectedpaths",
+        "protectedroutes",
+        "isprotected",
+    ]
+    .iter()
+    .any(|kw| clean_low.contains(kw));
+    if guards_protected_prefixes {
+        return false;
+    }
+
+    // Explicit pathname bypass for both `/login` and `/register`
+    let bypasses_login = regex::Regex::new(
+        r#"(?i)(?:pathname\s*(?:===?|\.\s*startsWith\s*\()\s*['"]/login|['"]/login['"]\s*(?:,|\]|\)))"#,
+    )
+    .ok()
+    .map_or(false, |re| re.is_match(&clean));
+    let bypasses_register = regex::Regex::new(
+        r#"(?i)(?:pathname\s*(?:===?|\.\s*startsWith\s*\()\s*['"]/register|['"]/register['"]\s*(?:,|\]|\)))"#,
+    )
+    .ok()
+    .map_or(false, |re| re.is_match(&clean));
+
+    !(bypasses_login && bypasses_register)
+}
+
 pub async fn validate_file_with_project_context(
     proj_dir: &std::path::Path,
     file_path: &str,
@@ -727,10 +810,71 @@ pub async fn validate_file_with_project_context(
         .any(|p| proj_dir.join(p).is_file());
         if has_public_root_page && middleware_blocks_public_root(content) {
             return Err(
-                "Next.js middleware must NOT unconditionally redirect the public landing page `/` (or `/pricing`, `/about`, `/legal`) to `/login`. Scope auth checks strictly to protected route prefixes (e.g. `pathname.startsWith('/dashboard') || pathname.startsWith('/admin') || pathname.startsWith('/account') || pathname.startsWith('/settings')`), or explicitly allow `pathname === '/'` and all public marketing routes."
+                "Next.js middleware must NOT unconditionally redirect the public landing page `/` (or `/pricing`, `/about`, `/legal`, `/login`, `/register`) to `/login`. Scope auth checks strictly to protected route prefixes (e.g. `pathname.startsWith('/dashboard') || pathname.startsWith('/admin') || pathname.startsWith('/account') || pathname.startsWith('/settings')`), or explicitly allow `pathname === '/'`, `/login`, `/register`, `/api/auth`, and all public marketing routes."
                     .to_string(),
             );
         }
+        if middleware_blocks_auth_routes(content) {
+            return Err(
+                "Next.js middleware redirects unauthenticated requests to `/login` without exempting `/login` and `/register`, which causes an infinite ERR_TOO_MANY_REDIRECTS loop. Always exempt `/login`, `/register`, and `/api/auth` (in `config.matcher` or `pathname.startsWith('/login') || pathname.startsWith('/register')`) or scope auth checks strictly to protected prefixes like `/dashboard`."
+                    .to_string(),
+            );
+        }
+    }
+
+    // Registration page contract: if `/api/register` exists, `register/page.tsx` must call `/api/register`
+    if path_lower.ends_with("/register/page.tsx") || path_lower.ends_with("/register/page.jsx") {
+        let has_register_api = [
+            "src/app/api/register/route.ts",
+            "src/app/api/register/route.js",
+            "app/api/register/route.ts",
+            "app/api/register/route.js",
+        ]
+        .iter()
+        .any(|p| proj_dir.join(p).is_file());
+        if has_register_api && content.contains("signIn(") && !content.contains("/api/register") {
+            return Err(
+                "Registration page (`register/page.tsx`) calls `signIn(...)` directly without first sending `POST /api/register` to create the user account. Always `await fetch('/api/register', { method: 'POST', ... })`, check `res.ok`, and only then call `signIn('credentials', ...)`."
+                    .to_string(),
+            );
+        }
+    }
+
+    // Login page contract: NextAuth v4 `signIn(..., { redirect: false })` does not throw on invalid credentials;
+    // it returns `{ ok, error }`, so the page must inspect the result and redirect to `/dashboard` on success.
+    if (path_lower.ends_with("/login/page.tsx") || path_lower.ends_with("/login/page.jsx"))
+        && content.contains("signIn(")
+        && content.contains("redirect: false")
+    {
+        let checks_result = content.contains("?.error")
+            || content.contains(".error")
+            || content.contains("?.ok")
+            || content.contains(".ok");
+        let redirects_on_success = content.contains("router.push")
+            || content.contains("router.replace")
+            || content.contains("window.location");
+        if !checks_result || !redirects_on_success {
+            return Err(
+                "Login page (`login/page.tsx`) calls `signIn('credentials', { ..., redirect: false })` without checking `result?.error` / `result?.ok` and redirecting on success (`router.push('/dashboard')`). NextAuth `signIn` with `redirect: false` does NOT throw on wrong password — capture `const result = await signIn(...)`, check `if (result?.error)`, and redirect to `/dashboard` on success."
+                    .to_string(),
+            );
+        }
+    }
+
+    // Data hook mount-hydration contract: if a custom hook defines a GET fetch/axios call inside `useCallback`
+    // without invoking it in `useEffect`, pages stay permanently stuck on initial mock data.
+    if (path_lower.contains("/hooks/use") || path_lower.starts_with("hooks/use"))
+        && !path_lower.contains("/api/")
+        && content.contains("useCallback(")
+        && !content.contains("useEffect(")
+        && (content.contains("fetch(") || content.contains("axios.get("))
+        && !content.contains("method: 'POST'")
+        && !content.contains("method: \"POST\"")
+    {
+        return Err(
+            "Custom data hook defines an async GET fetcher inside `useCallback` but NEVER invokes it inside `useEffect`. Always add `useEffect(() => { fetchFn(); }, [fetchFn]);` so live API data loads automatically on mount while keeping fallback mock state on error."
+                .to_string(),
+        );
     }
 
     let is_api_route = (path_lower.contains("/api/") || path_lower.starts_with("api/"))
@@ -738,6 +882,39 @@ pub async fn validate_file_with_project_context(
             || path_lower.ends_with("/route.js")
             || path_lower == "route.ts"
             || path_lower == "route.js");
+
+    // Next.js App Router route.ts contract: NEVER `export default` (fails `next build` with TS2344/TS2559);
+    // MUST export named HTTP handler(s) (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`).
+    // Specifically, `api/register/route.ts` MUST export `POST` (not a NextAuth handler).
+    if is_api_route {
+        let has_export_default = regex::Regex::new(r"(?m)^\s*export\s+default\b")
+            .map(|re| re.is_match(content))
+            .unwrap_or(false);
+        let has_named_http_export = regex::Regex::new(
+            r"(?m)^\s*export\s+(?:(?:async\s+)?function|const|let|var)\s+(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b|^\s*export\s*\{[^}]*\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b",
+        )
+        .map(|re| re.is_match(content))
+        .unwrap_or(false);
+        if has_export_default || !has_named_http_export {
+            return Err(
+                "Next.js App Router API route (`route.ts`) MUST NOT use `export default` (causes fatal `next build` TS2344/TS2559 error). Export named HTTP verb handlers instead (`export async function GET/POST/PUT/PATCH/DELETE(req: NextRequest)`)."
+                    .to_string(),
+            );
+        }
+        if path_lower.ends_with("/api/register/route.ts") || path_lower.ends_with("/api/register/route.js") {
+            let has_post_export = regex::Regex::new(
+                r"(?m)^\s*export\s+(?:(?:async\s+)?function|const|let|var)\s+POST\b|^\s*export\s*\{[^}]*\bPOST\b",
+            )
+            .map(|re| re.is_match(content))
+            .unwrap_or(false);
+            if !has_post_export || content.contains("NextAuth(") {
+                return Err(
+                    "`api/register/route.ts` MUST export `export async function POST(req: NextRequest)` that validates email/password, hashes password with `bcryptjs`, and creates the user via `prisma.user.create` — NEVER put `NextAuth(...)` inside `api/register/route.ts`."
+                        .to_string(),
+                );
+            }
+        }
+    }
 
     let trimmed = content.trim_start();
     let is_client_file = trimmed.starts_with("\"use client\"")
@@ -747,6 +924,53 @@ pub async fn validate_file_with_project_context(
             t == "\"use client\";" || t == "\"use client\"" || t == "'use client';" || t == "'use client'"
         });
     let is_hook_file = (path_lower.contains("/hooks/") || path_lower.starts_with("hooks/")) && !path_lower.contains("/api/");
+
+    // 1-hop Client -> Server Prisma boundary guard (prevents `"use client"` components from importing
+    // server DB helpers like `src/shared/database.js` that import `@/lib/prisma` or `@prisma/client`).
+    if (is_client_file || is_hook_file) && !is_api_route {
+        if let Ok(imp_re) = regex::Regex::new(r#"(?m)^[ \t]*import\s+([^;\n]*?)\bfrom\s+['"]([^'"]+)['"]"#) {
+            let file_dir = proj_dir.join(file_path).parent().map(|p| p.to_path_buf()).unwrap_or_else(|| proj_dir.to_path_buf());
+            for cap in imp_re.captures_iter(content) {
+                let clause = cap.get(1).map_or("", |m| m.as_str()).trim();
+                if clause.starts_with("type ") || clause.starts_with("type{") {
+                    continue;
+                }
+                let spec = cap.get(2).map_or("", |m| m.as_str()).trim();
+                let candidate_base = if let Some(rest) = spec.strip_prefix("@/") {
+                    proj_dir.join("src").join(rest)
+                } else if spec.starts_with("./") || spec.starts_with("../") {
+                    file_dir.join(spec)
+                } else {
+                    continue;
+                };
+                let resolved_target = [
+                    candidate_base.clone(),
+                    candidate_base.with_extension("ts"),
+                    candidate_base.with_extension("tsx"),
+                    candidate_base.with_extension("js"),
+                    candidate_base.with_extension("jsx"),
+                    candidate_base.join("index.ts"),
+                    candidate_base.join("index.js"),
+                ]
+                .into_iter()
+                .find(|p| p.is_file());
+                if let Some(target_path) = resolved_target {
+                    if let Ok(target_src) = std::fs::read_to_string(&target_path) {
+                        let imports_server_prisma = target_src.contains("from '@/lib/prisma'")
+                            || target_src.contains("from \"@/lib/prisma\"")
+                            || target_src.contains("require('@/lib/prisma')")
+                            || (target_src.contains("from '@prisma/client'") && !target_src.contains("import type"));
+                        if imports_server_prisma {
+                            return Err(format!(
+                                "Client Component / hook must NOT import server-only database module '{}' (which imports Prisma). Fetch data via `fetch('/api/...')` instead.",
+                                spec
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
     let uses_server_prisma = !is_client_file
         && !is_hook_file
         && (content.contains("prisma.")
@@ -2406,7 +2630,7 @@ Step 1 [Signature & Parameter Safety]:
 Step 2 [State Management]:
        - Declare state for data, loading, and error: `const [data, setData] = useState<T>(fallbackData);`, `const [isLoading, setIsLoading] = useState<boolean>(false);`, `const [error, setError] = useState<string | null>(null);`.
 Step 3 [Data Fetching & Resilience]:
-       - Fetch data from verified API endpoints using async/await inside useCallback or useEffect.
+       - Define the async GET fetcher inside a memoized `useCallback` AND ALWAYS invoke it on mount inside `useEffect(() => { fetchData(); }, [fetchData]);` so live API data loads automatically when the page mounts (while keeping fallback mock data if the API fails).
        - Wrap fetch in try/catch/finally: in finally, ALWAYS set `setIsLoading(false);`.
        - In catch, log error and maintain realistic fallback mock data so preview UI is never broken or trapped in endless loading.
 Step 4 [Dual Export Compatibility]:
@@ -5221,8 +5445,27 @@ export default function RegisterPage() {{
     injected
 }
 
+fn is_e2e_pause_active() -> bool {
+    std::env::var("AXIOM_E2E_PAUSE_FILE")
+        .ok()
+        .map(|p| std::path::Path::new(&p).exists())
+        .unwrap_or(false)
+}
+
 pub async fn run_orchestrator(
     window: tauri::Window,
+    task_id: String,
+    manifest_id: String,
+    project_id: String,
+    token: String,
+    model_id: String,
+    host: Option<String>,
+) -> Result<(), String> {
+    run_orchestrator_opt(Some(window), task_id, manifest_id, project_id, token, model_id, host).await
+}
+
+pub async fn run_orchestrator_opt(
+    window: Option<tauri::Window>,
     task_id: String,
     manifest_id: String,
     project_id: String,
@@ -5246,7 +5489,7 @@ pub async fn run_orchestrator(
             "[Orchestrator Progress] Emit event - phase: {}, message: {}, progress: {}%",
             phase, msg, progress
         ));
-        let _ = window.app_handle().emit("task:progress", serde_json::json!({
+        let payload = serde_json::json!({
             "taskId": task_id,
             "projectId": project_id,
             "phase": phase,
@@ -5254,7 +5497,12 @@ pub async fn run_orchestrator(
             "offlineWaiting": false,
             "message": msg,
             "progress": progress
-        }));
+        });
+        if let Some(ref win) = window {
+            let _ = win.app_handle().emit("task:progress", payload);
+        } else if std::env::var("AXIOM_E2E_HEADLESS").is_ok() {
+            println!("__AXIOM_PROGRESS__:{}", payload);
+        }
     };
     let emit_live_code = |phase: &str, msg: &str, progress: f64, current_file: &str, file_desc: &str, file_idx: usize, total_files: usize, token_count: usize, live_code: &str| {
         let status = match phase {
@@ -5264,21 +5512,36 @@ pub async fn run_orchestrator(
             "error" => "error",
             _ => "generating",
         };
-        let _ = window.app_handle().emit("task:progress", serde_json::json!({
-            "taskId": task_id,
-            "projectId": project_id,
-            "phase": phase,
-            "status": status,
-            "offlineWaiting": false,
-            "message": msg,
-            "progress": progress,
-            "currentFile": current_file,
-            "fileDescription": file_desc,
-            "fileIndex": file_idx,
-            "totalFiles": total_files,
-            "tokenCount": token_count,
-            "liveCode": live_code
-        }));
+        if let Some(ref win) = window {
+            let _ = win.app_handle().emit("task:progress", serde_json::json!({
+                "taskId": task_id,
+                "projectId": project_id,
+                "phase": phase,
+                "status": status,
+                "offlineWaiting": false,
+                "message": msg,
+                "progress": progress,
+                "currentFile": current_file,
+                "fileDescription": file_desc,
+                "fileIndex": file_idx,
+                "totalFiles": total_files,
+                "tokenCount": token_count,
+                "liveCode": live_code
+            }));
+        } else if std::env::var("AXIOM_E2E_HEADLESS").is_ok() && (token_count == 0 || token_count % 25 == 0) {
+            println!("__AXIOM_PROGRESS__:{}", serde_json::json!({
+                "taskId": task_id,
+                "projectId": project_id,
+                "phase": phase,
+                "status": status,
+                "message": msg,
+                "progress": progress,
+                "currentFile": current_file,
+                "fileIndex": file_idx,
+                "totalFiles": total_files,
+                "tokenCount": token_count
+            }));
+        }
     };
 
     let proj_dir = get_project_path(&project_id);
@@ -6860,8 +7123,8 @@ export default function RootLayout({
             return Ok(());
         }
 
-        // 2. Check if PAUSED
-        while task_control.paused.load(Ordering::SeqCst) {
+        // 2. Check if PAUSED (GUI button or E2E Monitor UI pause flag)
+        while task_control.paused.load(Ordering::SeqCst) || is_e2e_pause_active() {
             if task_control.stopped.load(Ordering::SeqCst) {
                 checkpoint_state["status"] = serde_json::json!("stopped");
                 checkpoint_state["phase"] = serde_json::json!("stopped");
@@ -7047,7 +7310,7 @@ export default function RootLayout({
             let mut stream_stalled = false;
 
             loop {
-                while task_control.paused.load(Ordering::SeqCst) {
+                while task_control.paused.load(Ordering::SeqCst) || is_e2e_pause_active() {
                     if task_control.stopped.load(Ordering::SeqCst) {
                         loop_detected = true;
                         break;
@@ -7334,7 +7597,7 @@ export default function RootLayout({
     save_generation_checkpoint(&proj_dir, &checkpoint_state);
 
     // Run npm install with automatic self-healing and version locking
-    let npm_install_outcome = run_npm_install_with_auto_healing(&proj_dir, &window, "", Some(&task_id)).await;
+    let npm_install_outcome = run_npm_install_with_auto_healing_opt(&proj_dir, window.as_ref(), "", Some(&task_id)).await;
     if npm_install_outcome == NpmInstallOutcome::OfflinePaused {
         debug_log_to_file(format!(
             "[Orchestrator] Pausing project '{}' ({}) at install-deps due to offline/network error.",
@@ -7356,7 +7619,7 @@ export default function RootLayout({
             }),
         );
 
-        let _ = window.app_handle().emit("task:progress", serde_json::json!({
+        let pause_payload = serde_json::json!({
             "taskId": task_id,
             "projectId": project_id,
             "phase": "paused",
@@ -7365,7 +7628,12 @@ export default function RootLayout({
             "pausedReason": "offline_npm_install",
             "message": "Nema internet konekcije — nastavljamo sa instalacijom paketa kada budemo ponovo online.",
             "progress": 75.0
-        }));
+        });
+        if let Some(ref win) = window {
+            let _ = win.app_handle().emit("task:progress", pause_payload);
+        } else if std::env::var("AXIOM_E2E_HEADLESS").is_ok() {
+            println!("__AXIOM_PROGRESS__:{}", pause_payload);
+        }
 
         unregister_task_control(&task_id, &project_id);
         return Ok(());
@@ -7379,7 +7647,7 @@ export default function RootLayout({
     let mut prisma_heal_err: Option<String> = None;
     let has_prisma = proj_dir.join("prisma/schema.prisma").exists() || proj_dir.join("schema.prisma").exists();
     if has_prisma {
-        if let Err(e) = heal_prisma_schema_loop(&proj_dir, &window, &model_id, "install-deps").await {
+        if let Err(e) = heal_prisma_schema_loop_opt(&proj_dir, window.as_ref(), &model_id, "install-deps").await {
             debug_log_to_file(format!("[Prisma Critical Error] Orchestrator schema healing failed: {}", e));
             prisma_heal_err = Some(e);
         }
@@ -7436,17 +7704,18 @@ export default function RootLayout({
     refresh_axiom_contracts_for_project(&proj_dir, &project_id, &files_to_generate);
 
     // Run self-healing compiler loop to automatically correct any compilation or syntax errors
+    let progress_ctx = window.as_ref().map(|w| (w, task_id.as_str(), project_id.as_str()));
     let heal_warnings = perform_self_healing_loop(
         &proj_dir,
         &model_id,
         &files_to_generate,
-        Some((&window, &task_id, &project_id)),
+        progress_ctx,
     )
     .await;
 
     // Run automated post-generation static, import, hook, and Prisma checks
     emit_progress("auto-testing", "Verifying routes, imports, and Prisma schema...", 97.0);
-    let auto_test_warnings = crate::self_healing::run_generation_auto_test_suite(&proj_dir, &window, &model_id).await;
+    let auto_test_warnings = crate::self_healing::run_generation_auto_test_suite_opt(&proj_dir, window.as_ref(), &model_id).await;
 
     // Refresh route links and write final up-to-date project graphs & contracts after healing
     let post_routes = get_project_routes_from_dir(&proj_dir);
@@ -7527,7 +7796,7 @@ export default function RootLayout({
         "[Orchestrator Progress] Emit final complete - hasWarnings={}, message={}",
         has_warnings, final_completion_msg
     ));
-    let _ = window.app_handle().emit("task:progress", serde_json::json!({
+    let final_payload = serde_json::json!({
         "taskId": task_id,
         "projectId": project_id,
         "phase": "complete",
@@ -7537,7 +7806,12 @@ export default function RootLayout({
         "warnings": completion_warnings,
         "message": final_completion_msg,
         "progress": 100.0
-    }));
+    });
+    if let Some(ref win) = window {
+        let _ = win.app_handle().emit("task:progress", final_payload);
+    } else if std::env::var("AXIOM_E2E_HEADLESS").is_ok() {
+        println!("__AXIOM_PROGRESS__:{}", final_payload);
+    }
 
     Ok(())
 }

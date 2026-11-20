@@ -1,0 +1,30 @@
+{
+  "manifestId": "desktop_5",
+  "platform": "desktop",
+  "projectType": "electron",
+  "resolvedStack": "Electron + Next.js 14 + TypeScript + Tailwind CSS + Prisma + NextAuth + Stripe",
+  "name": "DockFlow Container Desk",
+  "description": "DockFlow Container Desk is a native Electron developer workstation for orchestrating local container clusters, inspecting live service logs, managing environment profiles, and handling Pro license subscriptions.",
+  "metadata": {
+    "name": "DockFlow Container Desk",
+    "description": "Electron developer desktop manager for container clusters, service logs, and env profiles."
+  },
+  "files": [
+    { "path": "package.json", "description": "Electron, Next.js 14, React 18, TypeScript, Tailwind CSS, Prisma 5, NextAuth v4, stripe, zod, lucide-react, react-icons.", "language": "json" },
+    { "path": "main.js", "description": "Electron main process entry point.", "language": "javascript" },
+    { "path": "preload.js", "description": "Electron contextBridge IPC preload.", "language": "javascript" },
+    { "path": "prisma/schema.prisma", "description": "PostgreSQL Prisma schema with Role, ContainerState, LogLevel enums and User, ContainerCluster, ServiceLog, EnvProfile models.", "language": "prisma" },
+    { "path": "src/lib/prisma.ts", "description": "Singleton PrismaClient export.", "language": "typescript" },
+    { "path": "src/types/index.ts", "description": "Shared TypeScript interfaces for ContainerCluster, ServiceLog, EnvProfile.", "language": "typescript" },
+    { "path": "src/app/globals.css", "description": "Tailwind CSS directives for developer desktop console.", "language": "css" },
+    { "path": "src/app/layout.tsx", "description": "Root layout with SessionProvider, Navbar, and Footer.", "language": "typescript" },
+    { "path": "src/app/page.tsx", "description": "Desktop welcome screen for DockFlow Container Desk.", "language": "typescript" },
+    { "path": "src/app/dashboard/page.tsx", "description": "Desktop Command Center mounting ClusterOverview, ServiceLogsPanel, and EnvProfilesPanel.", "language": "typescript" },
+    { "path": "src/renderer/components/ClusterOverview.tsx", "description": "Client renderer component displaying container clusters from /api/clusters.", "language": "typescript" },
+    { "path": "src/renderer/components/ServiceLogsPanel.tsx", "description": "Client renderer component showing service logs from /api/logs with level filters.", "language": "typescript" },
+    { "path": "src/renderer/components/EnvProfilesPanel.tsx", "description": "Client renderer component managing environment variable profiles.", "language": "typescript" },
+    { "path": "src/hooks/useClusters.ts", "description": "Client hook fetching /api/clusters on mount via useEffect.", "language": "typescript" },
+    { "path": "src/app/api/clusters/route.ts", "description": "GET and POST API route for ContainerCluster records.", "language": "typescript" },
+    { "path": "src/app/api/logs/route.ts", "description": "GET and POST API route for ServiceLog records.", "language": "typescript" }
+  ]
+}

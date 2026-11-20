@@ -160,8 +160,8 @@ pub fn scrub_sensitive_text(raw: &str) -> String {
     if let Ok(unix_user_re) = regex::Regex::new(r#"(?i)(/Users/|/home/)[^/\s"'`]+"#) {
         out = unix_user_re.replace_all(&out, "<USER_DIR>").to_string();
     }
-    if let Ok(proj_uuid_re) = regex::Regex::new(r#"(?i)(projects[/\\])[0-9a-f]{8}-[0-9a-f-]{27}"#) {
-        out = proj_uuid_re.replace_all(&out, "${1}<PROJ>").to_string();
+    if let Ok(proj_id_re) = regex::Regex::new(r#"(?i)(projects[/\\])[A-Za-z0-9_-]{8,}"#) {
+        out = proj_id_re.replace_all(&out, "${1}<PROJ>").to_string();
     }
     if let Ok(db_url_re) = regex::Regex::new(r#"(?i)(postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://[^\s"'`]+"#) {
         out = db_url_re.replace_all(&out, "$1://<REDACTED>").to_string();

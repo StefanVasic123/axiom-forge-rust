@@ -1291,6 +1291,11 @@ pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
 
     crate::ast_engine::promote_typed_js_files_to_ts_in_project(proj_dir);
     crate::ast_engine::ensure_component_destructured_prop_defaults_in_project(proj_dir);
+    crate::ast_engine::ensure_hook_array_param_defaults_in_project(proj_dir);
+    crate::ast_engine::relax_prisma_inline_enum_fields_in_project(proj_dir);
+    crate::ast_engine::reconcile_prisma_relation_case_in_project(proj_dir);
+    crate::ast_engine::widen_local_component_view_models_in_project(proj_dir);
+    reconcile_misimported_prisma_enums_in_project(proj_dir);
     crate::sanitizer::ensure_valid_tsconfig(proj_dir);
     crate::sanitizer::sanitize_tailwind_config_in_project(proj_dir);
     crate::sanitizer::ensure_multiplatform_entry_routes_bridged(proj_dir);
@@ -1329,7 +1334,10 @@ pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
     crate::sanitizer::ensure_directory_barrel_files(proj_dir);
     ensure_nextauth_env_vars(proj_dir);
     crate::sanitizer::ensure_nextauth_type_declarations(proj_dir);
-    let _ = auto_import_missing_symbols_in_project(proj_dir);
+    let auto_imported = auto_import_missing_symbols_in_project(proj_dir);
+    if auto_imported > 0 {
+        crate::sanitizer::ensure_ui_primitives_reconciled(proj_dir);
+    }
 }
 
 pub fn extract_prisma_schema_summary_for_healing(proj_dir: &std::path::Path) -> String {
@@ -3120,9 +3128,53 @@ pub fn auto_import_missing_symbols_in_content(
     if !is_jsx && !is_ts {
         return None;
     }
+    let types_index_src = [proj_dir.join("src/types/index.ts"), proj_dir.join("types/index.ts")]
+        .into_iter()
+        .find(|p| p.is_file())
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+
     if lower.contains("/api/") && (lower.ends_with("route.ts") || lower.ends_with("route.js")) {
         let mut srv_content = crate::sanitizer::ensure_next_server_imports(orig_content, &lower);
         srv_content = crate::sanitizer::reconcile_server_prisma_enum_usage(proj_dir, rel_path, &srv_content);
+        let (prisma_models, prisma_enums) = collect_prisma_schema_symbol_names(proj_dir);
+        if !prisma_models.is_empty() || !prisma_enums.is_empty() || !types_index_src.is_empty() {
+            let known_srv = collect_declared_or_imported_idents(&srv_content);
+            let mut srv_type_cands = extract_missing_type_ident_candidates(&srv_content, &known_srv);
+            for ast_tc in crate::ast_engine::collect_missing_type_identifiers_ast(&srv_content, &known_srv) {
+                if !srv_type_cands.iter().any(|x| x == &ast_tc) {
+                    srv_type_cands.push(ast_tc);
+                }
+            }
+            for sym in srv_type_cands {
+                if prisma_models.contains(&sym) || prisma_enums.contains(&sym) {
+                    let used_as_value = prisma_enums.contains(&sym)
+                        && (srv_content.contains(&format!("{}.", sym))
+                            || srv_content.contains(&format!("nativeEnum({})", sym)));
+                    let already_has_prisma_imp = srv_content.contains("from '@prisma/client'")
+                        || srv_content.contains("from \"@prisma/client\"");
+                    if used_as_value {
+                        srv_content = merge_or_insert_import_statement(&srv_content, "@prisma/client", &sym, false);
+                    } else if !already_has_prisma_imp {
+                        let imp_line = format!("import type {{ {} }} from '@prisma/client';", sym);
+                        srv_content = crate::sanitizer::insert_import_after_use_client(&srv_content, &imp_line);
+                    } else {
+                        srv_content = merge_or_insert_import_statement(&srv_content, "@prisma/client", &format!("type {}", sym), false);
+                    }
+                } else if !types_index_src.is_empty()
+                    && crate::sanitizer::has_named_export_symbol(&types_index_src, &sym)
+                {
+                    let already_has_types_imp = srv_content.contains("from '@/types'")
+                        || srv_content.contains("from \"@/types\"");
+                    if !already_has_types_imp {
+                        let imp_line = format!("import type {{ {} }} from '@/types';", sym);
+                        srv_content = crate::sanitizer::insert_import_after_use_client(&srv_content, &imp_line);
+                    } else {
+                        srv_content = merge_or_insert_import_statement(&srv_content, "@/types", &format!("type {}", sym), false);
+                    }
+                }
+            }
+        }
         if srv_content != orig_content {
             return Some(srv_content);
         }
@@ -3145,6 +3197,15 @@ pub fn auto_import_missing_symbols_in_content(
     .unwrap_or_default();
 
     let known = collect_declared_or_imported_idents(&content);
+    // Auto-import `toast` from `@/components/ui/use-toast` when a client component calls
+    // `toast(...)` or `toast.success/error/loading/info(...)` without declaring or importing `toast`.
+    if !known.contains("toast")
+        && regex::Regex::new(r"(?:^|[^A-Za-z0-9_$.])toast(?:\s*\(|\s*\.\s*(?:success|error|loading|info|warning|warn|dismiss)\s*\()")
+            .map(|re| re.is_match(&content))
+            .unwrap_or(false)
+    {
+        content = merge_or_insert_import_statement(&content, "@/components/ui/use-toast", "toast", false);
+    }
     let mut missing_syms = extract_unimported_jsx_components(&content, &known, is_jsx, extra_missing_idents);
 
     let (prisma_models, prisma_enums) = collect_prisma_schema_symbol_names(proj_dir);
@@ -3158,23 +3219,53 @@ pub fn auto_import_missing_symbols_in_content(
         if !missing_syms.iter().any(|m| m == &tc)
             && (prisma_models.contains(&tc)
                 || prisma_enums.contains(&tc)
+                || (!types_index_src.is_empty() && crate::sanitizer::has_named_export_symbol(&types_index_src, &tc))
                 || find_unique_local_module_for_symbol(proj_dir, abs_file, &tc).is_some())
         {
             missing_syms.push(tc);
         }
     }
 
-    let is_client_or_hook = content.contains("\"use client\"")
-        || content.contains("'use client'")
-        || lower.contains("/hooks/")
-        || lower.starts_with("hooks/")
-        || lower.contains("/components/")
-        || lower.starts_with("components/")
-        || lower.contains("/renderer/");
+    let is_api_route = lower.contains("/api/") || lower.starts_with("api/");
+    let is_client_or_hook = !is_api_route
+        && (content.contains("\"use client\"")
+            || content.contains("'use client'")
+            || lower.contains("/hooks/")
+            || lower.starts_with("hooks/")
+            || lower.contains("/components/")
+            || lower.starts_with("components/")
+            || lower.contains("/renderer/"));
 
     for sym in missing_syms {
+        if is_api_route {
+            // In server API routes, only auto-import Prisma models/enums from `@prisma/client`
+            // (never UI/JSX components or client hooks).
+            if prisma_models.contains(&sym) || prisma_enums.contains(&sym) {
+                let used_as_value = prisma_enums.contains(&sym)
+                    && (content.contains(&format!("{}.", sym))
+                        || content.contains(&format!("nativeEnum({})", sym)));
+                let already_has_prisma_imp = content.contains("from '@prisma/client'")
+                    || content.contains("from \"@prisma/client\"");
+                if used_as_value {
+                    content = merge_or_insert_import_statement(&content, "@prisma/client", &sym, false);
+                } else if !already_has_prisma_imp {
+                    let imp_line = format!("import type {{ {} }} from '@prisma/client';", sym);
+                    content = crate::sanitizer::insert_import_after_use_client(&content, &imp_line);
+                } else {
+                    content = merge_or_insert_import_statement(&content, "@prisma/client", &format!("type {}", sym), false);
+                }
+            }
+            continue;
+        }
         if let Some((local_spec, is_def)) = find_unique_local_module_for_symbol(proj_dir, abs_file, &sym) {
             content = merge_or_insert_import_statement(&content, &local_spec, &sym, is_def);
+        } else if !types_index_src.is_empty()
+            && !lower.ends_with("types/index.ts")
+            && crate::sanitizer::has_named_export_symbol(&types_index_src, &sym)
+        {
+            // Canonical `@/types` disambiguation when a domain type (e.g. `Stop`) is exported in both
+            // `src/types/index.ts` and a hook (`src/hooks/useStops.ts`), causing unique-module lookup to return None.
+            content = merge_or_insert_import_statement(&content, "@/types", &sym, false);
         } else if let Some(pkg_spec) = find_installed_dts_package_for_symbol(proj_dir, &existing_specs, &sym) {
             content = merge_or_insert_import_statement(&content, &pkg_spec, &sym, false);
             if !existing_specs.iter().any(|s| s == &pkg_spec) {
@@ -3187,23 +3278,53 @@ pub fn auto_import_missing_symbols_in_content(
                 .into_iter()
                 .find(|p| p.is_file());
             let mut handled_via_local_types = false;
-            if is_client_or_hook && prisma_models.contains(&sym) && !prisma_enums.contains(&sym) {
-                if let Some(ref types_path) = types_index_candidate {
-                    if let Ok(mut tsrc) = std::fs::read_to_string(types_path) {
-                        if !crate::sanitizer::has_named_export_symbol(&tsrc, &sym) {
-                            if !tsrc.ends_with('\n') {
-                                tsrc.push('\n');
-                            }
-                            tsrc.push_str(&format!(
-                                "\nexport interface {} {{\n  id?: string;\n  [key: string]: any;\n}}\n",
-                                sym
-                            ));
-                            let _ = std::fs::write(types_path, &tsrc);
-                        }
-                        content = merge_or_insert_import_statement(&content, "@/types", &sym, false);
-                        handled_via_local_types = true;
-                    }
+            if is_client_or_hook && (prisma_models.contains(&sym) || prisma_enums.contains(&sym)) {
+                let types_path = types_index_candidate
+                    .clone()
+                    .unwrap_or_else(|| proj_dir.join("src/types/index.ts"));
+                if let Some(parent) = types_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
                 }
+                let mut tsrc = std::fs::read_to_string(&types_path).unwrap_or_default();
+                if !crate::sanitizer::has_named_export_symbol(&tsrc, &sym) {
+                    if !tsrc.ends_with('\n') && !tsrc.is_empty() {
+                        tsrc.push('\n');
+                    }
+                    if prisma_enums.contains(&sym) {
+                        let schema_src = std::fs::read_to_string(proj_dir.join("prisma/schema.prisma")).unwrap_or_default();
+                        let enum_re_str = format!(r"(?ms)^\s*enum\s+{}\s*\{{([^}}]+)\}}", regex::escape(&sym));
+                        let vals: Vec<String> = regex::Regex::new(&enum_re_str)
+                            .ok()
+                            .and_then(|re| re.captures(&schema_src))
+                            .and_then(|c| c.get(1))
+                            .map(|b| {
+                                b.as_str()
+                                    .lines()
+                                    .map(|l| l.trim())
+                                    .filter(|l| !l.is_empty() && !l.starts_with("//"))
+                                    .filter_map(|l| l.split_whitespace().next().map(|s| s.to_string()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let entries: Vec<String> = vals.iter().map(|v| format!("  {}: '{}',", v, v)).collect();
+                        tsrc.push_str(&format!(
+                            "\nexport const {} = {{\n{}\n}} as const;\nexport type {} = (typeof {})[keyof typeof {}] | string;\n",
+                            sym,
+                            entries.join("\n"),
+                            sym,
+                            sym,
+                            sym
+                        ));
+                    } else {
+                        tsrc.push_str(&format!(
+                            "\nexport interface {} {{\n  id?: string;\n  [key: string]: any;\n}}\n",
+                            sym
+                        ));
+                    }
+                    let _ = std::fs::write(&types_path, &tsrc);
+                }
+                content = merge_or_insert_import_statement(&content, "@/types", &sym, false);
+                handled_via_local_types = true;
             }
             if handled_via_local_types {
                 continue;
@@ -3255,7 +3376,7 @@ pub fn auto_import_missing_symbols_in_project(proj_dir: &std::path::Path) -> usi
             let p = entry.path();
             if p.is_dir() {
                 let n = p.file_name().and_then(|x| x.to_str()).unwrap_or("");
-                if n != "node_modules" && n != ".next" && n != ".git" && n != ".axiom" && n != "prisma" && n != "api" {
+                if n != "node_modules" && n != ".next" && n != ".git" && n != ".axiom" && n != "prisma" {
                     walk_tsx(&p, proj_dir, updated);
                 }
             } else if p.is_file() {
@@ -3544,6 +3665,275 @@ pub fn inspect_dts_exports_for_file(proj_dir: &std::path::Path, file_content: &s
 
 /// Extracts `(Some(module_specifier), missing_member_name)` pairs from TypeScript / Next.js
 /// `TS2305: Module '...' has no exported member '...'` diagnostics.
+/// Extracts missing module specifiers from TS2307 diagnostics
+/// (e.g. `Cannot find module '@/hooks/usePatient' or its corresponding type declarations.`).
+pub fn extract_ts2307_missing_modules(diag_text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(re) = regex::Regex::new(r#"TS2307[^\n]*?Cannot find module\s+['"]([^'"]+)['"]"#) else {
+        return out;
+    };
+    for cap in re.captures_iter(diag_text) {
+        if let Some(m) = cap.get(1) {
+            let spec = m.as_str().trim().to_string();
+            if !spec.is_empty() && !out.contains(&spec) {
+                out.push(spec);
+            }
+        }
+    }
+    out
+}
+
+/// When a client file imports a Prisma enum name (declared in `prisma/schema.prisma`) from a local
+/// hook/component module that does NOT export that enum (causing TS2614 and runtime `undefined`
+/// crashes on `Object.values(Enum)`), re-routes that enum import cleanly to `@/types` and ensures
+/// `src/types/index.ts` exports both the runtime const object and widened type for that enum.
+pub fn reconcile_misimported_prisma_enums_in_project(proj_dir: &std::path::Path) -> usize {
+    let schema_path = proj_dir.join("prisma").join("schema.prisma");
+    let Ok(schema_src) = std::fs::read_to_string(&schema_path) else {
+        return 0;
+    };
+    let mut enum_defs: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    if let Ok(enum_re) = regex::Regex::new(r"(?ms)^\s*enum\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{([^}]+)\}") {
+        for cap in enum_re.captures_iter(&schema_src) {
+            let Some(ename) = cap.get(1).map(|m| m.as_str().to_string()) else { continue };
+            let Some(body) = cap.get(2).map(|m| m.as_str()) else { continue };
+            let vals: Vec<String> = body
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty() && !l.starts_with("//"))
+                .filter_map(|l| l.split_whitespace().next().map(|s| s.to_string()))
+                .collect();
+            if !vals.is_empty() {
+                enum_defs.insert(ename, vals);
+            }
+        }
+    }
+    if enum_defs.is_empty() {
+        return 0;
+    }
+
+    let Ok(named_imp_re) = regex::Regex::new(
+        r#"(?m)^([ \t]*import\s+(?:type\s+)?)\{([^}]+)\}(\s*from\s*['"](@/(?:hooks|components)/[^'"]+|@prisma/client)['"]\s*;?[ \t]*)$"#,
+    ) else {
+        return 0;
+    };
+
+    let mut updated = 0usize;
+    let mut needed_enums_in_types: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let mut scan_files: Vec<std::path::PathBuf> = Vec::new();
+    fn walk_client_ts(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                let n = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if !matches!(n, "node_modules" | ".next" | ".git" | ".axiom" | "api") {
+                    walk_client_ts(&p, out);
+                }
+            } else if p.is_file() {
+                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if matches!(ext, "ts" | "tsx") {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    for root in ["src/app", "src/components", "src/hooks", "app", "components", "hooks"] {
+        let d = proj_dir.join(root);
+        if d.is_dir() {
+            walk_client_ts(&d, &mut scan_files);
+        }
+    }
+
+    for file_path in scan_files {
+        let Ok(orig) = std::fs::read_to_string(&file_path) else { continue };
+        if !orig.contains("@/hooks/") && !orig.contains("@/components/") && !orig.contains("@prisma/client") {
+            continue;
+        }
+        let mut enums_to_route: Vec<String> = Vec::new();
+        let next = named_imp_re.replace_all(&orig, |caps: &regex::Captures| {
+            let prefix = caps.get(1).map_or("", |m| m.as_str());
+            let inner = caps.get(2).map_or("", |m| m.as_str());
+            let suffix = caps.get(3).map_or("", |m| m.as_str());
+            let spec = caps.get(4).map_or("", |m| m.as_str());
+
+            let is_prisma_client_spec = spec == "@prisma/client";
+            let target_src = if is_prisma_client_spec {
+                String::new()
+            } else {
+                let rest = spec.trim_start_matches("@/");
+                let target_base = proj_dir.join("src").join(rest);
+                let target_file = [
+                    target_base.clone(),
+                    target_base.with_extension("ts"),
+                    target_base.with_extension("tsx"),
+                    target_base.join("index.ts"),
+                ]
+                .into_iter()
+                .find(|p| p.is_file());
+                target_file.and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default()
+            };
+
+            let mut kept = Vec::new();
+            let mut moved_any = false;
+            for raw_item in inner.split(',') {
+                let item = raw_item.trim();
+                if item.is_empty() {
+                    continue;
+                }
+                let sym = item.trim_start_matches("type ").split(" as ").next().unwrap_or("").trim();
+                let should_move = if is_prisma_client_spec {
+                    enum_defs.contains_key(sym)
+                } else {
+                    enum_defs.contains_key(sym) && !crate::sanitizer::has_named_export_symbol(&target_src, sym)
+                };
+                if should_move {
+                    moved_any = true;
+                    if !enums_to_route.iter().any(|e| e == sym) {
+                        enums_to_route.push(sym.to_string());
+                    }
+                    needed_enums_in_types.insert(sym.to_string());
+                } else {
+                    kept.push(item.to_string());
+                }
+            }
+            if !moved_any {
+                return caps[0].to_string();
+            }
+            if kept.is_empty() {
+                String::new()
+            } else {
+                format!("{}{{ {} }}{}", prefix, kept.join(", "), suffix)
+            }
+        }).into_owned();
+
+        if !enums_to_route.is_empty() {
+            let mut final_src = next;
+            for en in &enums_to_route {
+                final_src = merge_or_insert_import_statement(&final_src, "@/types", en, false);
+            }
+            if final_src != orig && std::fs::write(&file_path, &final_src).is_ok() {
+                updated += 1;
+            }
+        }
+    }
+
+    let types_idx = proj_dir.join("src/types/index.ts");
+    let types_exists = types_idx.is_file();
+    if types_exists || !needed_enums_in_types.is_empty() {
+        if let Some(parent) = types_idx.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut tsrc = std::fs::read_to_string(&types_idx).unwrap_or_default();
+        let mut t_changed = false;
+
+        let mut target_enums: Vec<String> = if types_exists {
+            enum_defs.keys().cloned().collect()
+        } else {
+            needed_enums_in_types.into_iter().collect()
+        };
+        target_enums.sort();
+
+        for ename in target_enums {
+            let Some(vals) = enum_defs.get(&ename) else { continue };
+            let esc = regex::escape(&ename);
+
+            // 1) Promote unexported `enum Name` / `const Name` to exported runtime binding if present.
+            if let Ok(unexp_enum_re) = regex::Regex::new(&format!(r"(?m)^([ \t]*)(enum\s+{}\b)", esc)) {
+                if unexp_enum_re.is_match(&tsrc) {
+                    let next = unexp_enum_re.replace(&tsrc, "${1}export ${2}").into_owned();
+                    if next != tsrc {
+                        tsrc = next;
+                        t_changed = true;
+                    }
+                }
+            }
+            if let Ok(unexp_const_re) = regex::Regex::new(&format!(r"(?m)^([ \t]*)((?:const|let|var)\s+{}\b)", esc)) {
+                if unexp_const_re.is_match(&tsrc) {
+                    let next = unexp_const_re.replace(&tsrc, "${1}export ${2}").into_owned();
+                    if next != tsrc {
+                        tsrc = next;
+                        t_changed = true;
+                    }
+                }
+            }
+            if let Ok(unexp_type_re) = regex::Regex::new(&format!(r"(?m)^([ \t]*)(type\s+{}\s*=)", esc)) {
+                if unexp_type_re.is_match(&tsrc) {
+                    let next = unexp_type_re.replace(&tsrc, "${1}export ${2}").into_owned();
+                    if next != tsrc {
+                        tsrc = next;
+                        t_changed = true;
+                    }
+                }
+            }
+
+            // 2) Check runtime value export vs type export separately (TS2693 prevention!).
+            // `export type Foo = 'A' | 'B'` is NOT a runtime value and crashes `Foo.A` at compile+runtime.
+            let has_runtime_export = regex::Regex::new(&format!(
+                r"(?m)^\s*export\s+(?:const|let|var|enum)\s+{}\b",
+                esc
+            ))
+            .map(|re| re.is_match(&tsrc))
+            .unwrap_or(false)
+                || regex::Regex::new(&format!(
+                    r"(?m)^\s*export\s*\{{[^}}]*\b{}\b[^}}]*\}}",
+                    esc
+                ))
+                .map(|re| re.is_match(&tsrc))
+                .unwrap_or(false);
+
+            let has_type_export = regex::Regex::new(&format!(
+                r"(?m)^\s*export\s+(?:type|interface|enum)\s+{}\b",
+                esc
+            ))
+            .map(|re| re.is_match(&tsrc))
+            .unwrap_or(false)
+                || regex::Regex::new(&format!(
+                    r"(?m)^\s*export\s+(?:type\s+)?\{{[^}}]*\b{}\b[^}}]*\}}",
+                    esc
+                ))
+                .map(|re| re.is_match(&tsrc))
+                .unwrap_or(false);
+
+            if !has_runtime_export {
+                let type_fields: Vec<String> = vals
+                    .iter()
+                    .map(|v| format!("readonly {}: '{}'", v, v))
+                    .collect();
+                let entries: Vec<String> = vals.iter().map(|v| format!("  {}: '{}',", v, v)).collect();
+                if !tsrc.ends_with('\n') && !tsrc.is_empty() {
+                    tsrc.push('\n');
+                }
+                tsrc.push_str(&format!(
+                    "\nexport const {}: {{ {}; [key: string]: any }} = {{\n{}\n}};\n",
+                    ename,
+                    type_fields.join("; "),
+                    entries.join("\n")
+                ));
+                t_changed = true;
+            }
+            if !has_type_export {
+                if !tsrc.ends_with('\n') && !tsrc.is_empty() {
+                    tsrc.push('\n');
+                }
+                tsrc.push_str(&format!(
+                    "export type {} = (typeof {})[keyof typeof {}] | string;\n",
+                    ename, ename, ename
+                ));
+                t_changed = true;
+            }
+        }
+        if t_changed {
+            if std::fs::write(&types_idx, tsrc).is_ok() {
+                updated += 1;
+            }
+        }
+    }
+
+    updated
+}
+
 pub fn extract_ts2305_missing_imports(diag_text: &str) -> Vec<(Option<String>, String)> {
     let mut out = Vec::new();
     let Ok(re) = regex::Regex::new(
@@ -3763,6 +4153,13 @@ fn emit_self_heal_progress(
             "phase": phase,
             "status": "generating",
             "offlineWaiting": false,
+            "message": msg,
+            "progress": progress
+        }));
+    } else if std::env::var("AXIOM_E2E_HEADLESS").is_ok() {
+        println!("__AXIOM_PROGRESS__:{}", serde_json::json!({
+            "phase": phase,
+            "status": "generating",
             "message": msg,
             "progress": progress
         }));
@@ -4376,13 +4773,25 @@ pub async fn perform_self_healing_loop(
                     continue;
                 }
                 let targets = extract_ts2305_missing_imports(&diag_text);
-                if targets.is_empty() {
+                let ts2307_mods = extract_ts2307_missing_modules(&diag_text);
+                if targets.is_empty() && ts2307_mods.is_empty() {
                     continue;
                 }
                 let full_path = proj_dir.join(path_str);
                 let Ok(orig_content) = std::fs::read_to_string(&full_path) else { continue };
-                if let Some(cleaned) = crate::ast_engine::remove_unused_named_import_specifiers(path_str, &orig_content, &targets) {
-                    if std::fs::write(&full_path, &cleaned).is_ok() {
+                let mut cur_content = orig_content.clone();
+                if !targets.is_empty() {
+                    if let Some(cleaned) = crate::ast_engine::remove_unused_named_import_specifiers(path_str, &cur_content, &targets) {
+                        cur_content = cleaned;
+                    }
+                }
+                if !ts2307_mods.is_empty() {
+                    if let Some(cleaned) = crate::ast_engine::remove_unused_missing_module_imports(path_str, &cur_content, &ts2307_mods) {
+                        cur_content = cleaned;
+                    }
+                }
+                if cur_content != orig_content {
+                    if std::fs::write(&full_path, &cur_content).is_ok() {
                         det_ts2305_applied = true;
                         debug_log_to_file(format!(
                             "[Self-Healing] Tier 1 deterministically removed unused nonexistent import(s) from '{}'.",
@@ -4830,21 +5239,89 @@ pub async fn perform_self_healing_loop(
         return unresolved_warnings;
     }
 
+    // Fast compiler-driven Tailwind CSS `@apply` pre-heal before running full `next build`.
+    // Runs local Tailwind CLI against `globals.css` (~0.5s/pass) so multiple invalid `@apply`
+    // tokens are stripped cleanly without consuming `next build` repair attempts.
+    let local_tw_cli = proj_dir.join("node_modules/tailwindcss/lib/cli.js");
+    if local_tw_cli.is_file() {
+        let tmp_tw_out = proj_dir.join(".axiom").join("_tw_dryrun.css");
+        for css_rel in ["src/app/globals.css", "app/globals.css", "src/styles/globals.css", "styles/globals.css"] {
+            let css_abs = proj_dir.join(css_rel);
+            if !css_abs.is_file() {
+                continue;
+            }
+            for _pass in 0..10 {
+                let Ok(orig_css) = std::fs::read_to_string(&css_abs) else { break };
+                if !orig_css.contains("@apply") {
+                    break;
+                }
+                let mut tw_cmd = std::process::Command::new("node");
+                tw_cmd
+                    .arg(&local_tw_cli)
+                    .arg("-i")
+                    .arg(&css_abs)
+                    .arg("-o")
+                    .arg(&tmp_tw_out)
+                    .current_dir(proj_dir)
+                    .env("PATH", &enriched_path)
+                    .env("NO_COLOR", "1");
+                #[cfg(target_os = "windows")]
+                {
+                    use std::os::windows::process::CommandExt;
+                    tw_cmd.creation_flags(0x08000000);
+                }
+                let Ok(tw_out) = tw_cmd.output() else { break };
+                if tw_out.status.success() {
+                    break;
+                }
+                let tw_err = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&tw_out.stdout),
+                    String::from_utf8_lossy(&tw_out.stderr)
+                );
+                let missing = crate::sanitizer::extract_missing_tailwind_classes_from_error(&tw_err);
+                if missing.is_empty() {
+                    break;
+                }
+                let mut next_css = orig_css.clone();
+                for cls in &missing {
+                    next_css = crate::sanitizer::strip_tailwind_apply_class(&next_css, cls);
+                }
+                if next_css == orig_css || std::fs::write(&css_abs, &next_css).is_err() {
+                    break;
+                }
+                debug_log_to_file(format!(
+                    "[Self-Healing] Tailwind CLI pre-heal stripped invalid @apply class(es) {:?} from '{}'.",
+                    missing, css_rel
+                ));
+            }
+        }
+        let _ = std::fs::remove_file(&tmp_tw_out);
+    }
+
     // =========================================================================
     // TIER 2: Full Next.js Production Build (`next build`)
     // Catches Webpack bundling, RSC server/client boundaries, and App Router issues.
     // =========================================================================
     let mut pending_fixes: Vec<PendingBuildFix> = Vec::new();
     const MAX_BUILD_REPAIRS: usize = 2;
-    for attempt in 1..=(MAX_BUILD_REPAIRS + 1) {
-        let build_pct = (91.5 + ((attempt - 1) as f64) * 1.8).min(96.0);
+    const MAX_DETERMINISTIC_BUILD_REPAIRS: usize = 8;
+    let mut ai_repairs: usize = 0;
+    let mut deterministic_repairs: usize = 0;
+    let mut attempt: usize = 0;
+    loop {
+        attempt += 1;
+        let build_pct = (91.5 + ((ai_repairs) as f64) * 1.8).min(96.0);
         emit_self_heal_progress(
             &progress_ctx,
             "compile-check",
-            &format!("Running Next.js production build (attempt {}/{})...", attempt, MAX_BUILD_REPAIRS + 1),
+            &format!("Running Next.js production build (attempt {})...", attempt),
             build_pct,
         );
-        debug_log_to_file(format!("[Self-Healing] Tier 2 Next.js build attempt {}/{}...", attempt, MAX_BUILD_REPAIRS + 1));
+        debug_log_to_file(format!(
+            "[Self-Healing] Tier 2 Next.js build attempt {} (ai_repairs={}/{}, det_repairs={}/{})...",
+            attempt, ai_repairs, MAX_BUILD_REPAIRS, deterministic_repairs, MAX_DETERMINISTIC_BUILD_REPAIRS
+        ));
 
         let mut cmd = std::process::Command::new("node");
         cmd.arg(&local_next_js).arg("build").current_dir(proj_dir);
@@ -4937,7 +5414,7 @@ pub async fn perform_self_healing_loop(
             pending_fixes = carried_over;
         }
 
-        if attempt > MAX_BUILD_REPAIRS {
+        if ai_repairs >= MAX_BUILD_REPAIRS && deterministic_repairs >= MAX_DETERMINISTIC_BUILD_REPAIRS {
             let err_lines: Vec<String> = build_output
                 .lines()
                 .map(|l| l.trim())
@@ -5120,7 +5597,8 @@ pub async fn perform_self_healing_loop(
                     ));
                 }
             }
-            if css_cleaned {
+            if css_cleaned && deterministic_repairs < MAX_DETERMINISTIC_BUILD_REPAIRS {
+                deterministic_repairs += 1;
                 continue;
             }
         }
@@ -5144,10 +5622,31 @@ pub async fn perform_self_healing_loop(
                     }
                 }
             }
-            if ts2305_cleaned {
+            if ts2305_cleaned && deterministic_repairs < MAX_DETERMINISTIC_BUILD_REPAIRS {
+                deterministic_repairs += 1;
                 continue;
             }
         }
+
+        if ai_repairs >= MAX_BUILD_REPAIRS {
+            let err_lines: Vec<String> = build_output
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| l.contains("Error:") || l.contains("Syntax error") || l.contains("Module not found") || l.contains("Type error:") || l.contains("Failed to compile"))
+                .take(3)
+                .map(|l| l.chars().take(120).collect())
+                .collect();
+            let tail_hint = if err_lines.is_empty() {
+                "next build nije uspeo (proveri dev logove)".to_string()
+            } else {
+                format!("next build greška: {}", err_lines.join(" | "))
+            };
+            if !unresolved_warnings.iter().any(|w| w.contains("next build")) {
+                unresolved_warnings.push(tail_hint);
+            }
+            break;
+        }
+        ai_repairs += 1;
 
         if files_with_errors.is_empty() {
             unresolved_warnings.push("next build nije uspeo bez prepoznate putanje fajla u logu".to_string());
@@ -5830,11 +6329,28 @@ pub async fn run_generation_auto_test_suite(
     window: &tauri::Window,
     _model_id: &str,
 ) -> Vec<String> {
-    let _ = window.emit("orchestrator:progress", serde_json::json!({
-        "phase": "auto-testing",
-        "message": "> [Auto-Test Suite] Započinjem automatsko testiranje ruta, importa i Prisma šeme...",
-        "progress": 74.0
-    }));
+    run_generation_auto_test_suite_opt(proj_dir, Some(window), _model_id).await
+}
+
+pub async fn run_generation_auto_test_suite_opt(
+    proj_dir: &std::path::Path,
+    window: Option<&tauri::Window>,
+    _model_id: &str,
+) -> Vec<String> {
+    if let Some(w) = window {
+        let _ = w.emit("orchestrator:progress", serde_json::json!({
+            "phase": "auto-testing",
+            "message": "> [Auto-Test Suite] Započinjem automatsko testiranje ruta, importa i Prisma šeme...",
+            "progress": 74.0
+        }));
+    } else if std::env::var("AXIOM_E2E_HEADLESS").is_ok() {
+        println!("__AXIOM_PROGRESS__:{}", serde_json::json!({
+            "phase": "auto-testing",
+            "status": "generating",
+            "message": "Auto-Test Suite: verifikacija ruta, importa i Prisma šeme...",
+            "progress": 96.0
+        }));
+    }
     debug_log_to_file("[Auto-Test Suite] Starting automated route verification and crawler...".to_string());
 
     let mut warnings: Vec<String> = Vec::new();
@@ -5897,7 +6413,7 @@ pub async fn run_generation_auto_test_suite(
             prose_files: &mut Vec<String>,
             client_prisma: &mut Vec<String>,
             bare_src: &mut Vec<String>,
-            window: &tauri::Window,
+            window: Option<&tauri::Window>,
         ) {
             if let Ok(entries) = std::fs::read_dir(dir) {
                 for entry in entries.flatten() {
@@ -5956,11 +6472,13 @@ pub async fn run_generation_auto_test_suite(
                                     let _ = std::fs::write(&p, &updated);
                                     *healed_count += 1;
                                     debug_log_to_file(format!("[Auto-Test Suite] Auto-healed: {}", rel_str));
-                                    let _ = window.emit("orchestrator:progress", serde_json::json!({
-                                        "phase": "auto-testing",
-                                        "message": format!("> [Auto-Test] Ispravljene nestabilne zavisnosti u: {}", rel_str),
-                                        "progress": 77.0
-                                    }));
+                                    if let Some(w) = window {
+                                        let _ = w.emit("orchestrator:progress", serde_json::json!({
+                                            "phase": "auto-testing",
+                                            "message": format!("> [Auto-Test] Ispravljene nestabilne zavisnosti u: {}", rel_str),
+                                            "progress": 77.0
+                                        }));
+                                    }
                                 }
                             }
                         }
@@ -6136,11 +6654,20 @@ pub async fn run_generation_auto_test_suite(
             warnings.join("; ")
         )
     };
-    let _ = window.emit("orchestrator:progress", serde_json::json!({
-        "phase": "auto-testing",
-        "message": summary_msg,
-        "progress": 98.0
-    }));
+    if let Some(w) = window {
+        let _ = w.emit("orchestrator:progress", serde_json::json!({
+            "phase": "auto-testing",
+            "message": summary_msg,
+            "progress": 98.0
+        }));
+    } else if std::env::var("AXIOM_E2E_HEADLESS").is_ok() {
+        println!("__AXIOM_PROGRESS__:{}", serde_json::json!({
+            "phase": "auto-testing",
+            "status": "generating",
+            "message": summary_msg,
+            "progress": 98.0
+        }));
+    }
     debug_log_to_file(format!(
         "[Auto-Test Suite] Verification finished. {} total routes, {} healed files, warnings={:?}.",
         total_routes, auto_healed_count, warnings

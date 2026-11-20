@@ -1,0 +1,30 @@
+{
+  "manifestId": "desktop_1",
+  "platform": "desktop",
+  "projectType": "electron",
+  "resolvedStack": "Electron + Next.js 14 + TypeScript + Tailwind CSS + Prisma",
+  "name": "CryoLab Telemetry Studio",
+  "description": "CryoLab Telemetry Studio is a native Electron desktop workstation for laboratory cryogenics monitoring, sensor stream diagnostics, and automated calibration alerts backed by Next.js renderer workspace and Prisma PostgreSQL.",
+  "metadata": {
+    "name": "CryoLab Telemetry Studio",
+    "description": "Native Electron desktop telemetry studio for lab instruments and calibration alerts."
+  },
+  "files": [
+    { "path": "package.json", "description": "Electron, Next.js 14, React 18, TypeScript, Tailwind CSS, Prisma 5, Zod, lucide-react, react-icons.", "language": "json" },
+    { "path": "main.js", "description": "Electron main process creating BrowserWindow with preload.js and loading local Next.js server.", "language": "javascript" },
+    { "path": "preload.js", "description": "Electron contextBridge exposing safe IPC channels to renderer.", "language": "javascript" },
+    { "path": "prisma/schema.prisma", "description": "PostgreSQL Prisma schema with Role, SensorStatus, AlertSeverity enums and User, SensorNode, TelemetryReading, CalibrationAlert models.", "language": "prisma" },
+    { "path": "src/lib/prisma.ts", "description": "Singleton PrismaClient export.", "language": "typescript" },
+    { "path": "src/types/index.ts", "description": "Shared TypeScript interfaces for SensorNode, TelemetryReading, CalibrationAlert.", "language": "typescript" },
+    { "path": "src/app/globals.css", "description": "Tailwind CSS base styles for desktop lab console.", "language": "css" },
+    { "path": "src/app/layout.tsx", "description": "Root layout wrapping SessionProvider, Navbar, main content, and Footer.", "language": "typescript" },
+    { "path": "src/app/page.tsx", "description": "Desktop welcome landing page for CryoLab Telemetry Studio with launch CTA to /dashboard.", "language": "typescript" },
+    { "path": "src/app/dashboard/page.tsx", "description": "Desktop Command Center switching between TelemetryMonitor, CalibrationAlerts, and LabSettings renderer modules.", "language": "typescript" },
+    { "path": "src/renderer/components/TelemetryMonitor.tsx", "description": "Client renderer component showing live cryogenic sensor nodes fetched from /api/sensors.", "language": "typescript" },
+    { "path": "src/renderer/components/CalibrationAlerts.tsx", "description": "Client renderer component listing calibration alerts from /api/alerts with severity badges.", "language": "typescript" },
+    { "path": "src/renderer/components/LabSettings.tsx", "description": "Client renderer component for lab sampling interval and threshold configuration.", "language": "typescript" },
+    { "path": "src/hooks/useSensors.ts", "description": "Client hook fetching /api/sensors on mount via useEffect with safe array fallback.", "language": "typescript" },
+    { "path": "src/app/api/sensors/route.ts", "description": "GET and POST API route for SensorNode records with Zod and Prisma.", "language": "typescript" },
+    { "path": "src/app/api/alerts/route.ts", "description": "GET and POST API route for CalibrationAlert records with Zod and Prisma.", "language": "typescript" }
+  ]
+}

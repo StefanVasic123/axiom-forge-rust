@@ -1,0 +1,32 @@
+{
+  "manifestId": "mobile_3",
+  "platform": "mobile",
+  "projectType": "react_native",
+  "resolvedStack": "React Native / Expo + Next.js 14 Web Preview + TypeScript + Tailwind CSS + Prisma",
+  "name": "FitTrack Rehab Coach",
+  "description": "FitTrack Rehab Coach is a mobile physical therapy companion helping patients follow daily exercise plans, log pain scores, and track mobility recovery milestones with NextAuth and Prisma PostgreSQL.",
+  "metadata": {
+    "name": "FitTrack Rehab Coach",
+    "description": "Mobile physical therapy app for rehab routines, pain logs, and recovery milestones."
+  },
+  "files": [
+    { "path": "package.json", "description": "Next.js 14, React 18, TypeScript, Tailwind CSS, Prisma 5, NextAuth v4, Zod, react-hook-form, lucide-react, react-icons.", "language": "json" },
+    { "path": "app.json", "description": "Expo app configuration for FitTrack Rehab Coach.", "language": "json" },
+    { "path": "prisma/schema.prisma", "description": "PostgreSQL Prisma schema with Role, SessionStatus, PainLevel enums and User, RehabExercise, PainEntry, RecoveryMilestone models.", "language": "prisma" },
+    { "path": "src/lib/prisma.ts", "description": "Singleton PrismaClient export.", "language": "typescript" },
+    { "path": "src/types/index.ts", "description": "Shared TypeScript interfaces for RehabExercise, PainEntry, RecoveryMilestone.", "language": "typescript" },
+    { "path": "src/app/globals.css", "description": "Tailwind CSS base styles.", "language": "css" },
+    { "path": "src/app/layout.tsx", "description": "Root layout with SessionProvider, Navbar, and Footer.", "language": "typescript" },
+    { "path": "src/app/page.tsx", "description": "Mobile landing screen for FitTrack Rehab Coach.", "language": "typescript" },
+    { "path": "src/app/dashboard/page.tsx", "description": "Patient recovery dashboard showing daily exercise progress, pain trend, and upcoming milestones.", "language": "typescript" },
+    { "path": "src/app/exercises/page.tsx", "description": "Daily rehab exercises checklist with completion toggles.", "language": "typescript" },
+    { "path": "src/app/pain-log/page.tsx", "description": "Pain score diary list and quick entry form.", "language": "typescript" },
+    { "path": "src/app/login/page.tsx", "description": "Login page using NextAuth credentials.", "language": "typescript" },
+    { "path": "src/app/register/page.tsx", "description": "Registration page calling POST /api/register then signing in.", "language": "typescript" },
+    { "path": "src/hooks/useExercises.ts", "description": "Client hook fetching /api/exercises on mount via useEffect.", "language": "typescript" },
+    { "path": "src/hooks/usePainLogs.ts", "description": "Client hook fetching /api/pain-logs on mount via useEffect.", "language": "typescript" },
+    { "path": "src/app/api/register/route.ts", "description": "Registration endpoint.", "language": "typescript" },
+    { "path": "src/app/api/exercises/route.ts", "description": "GET and POST API route for RehabExercise records.", "language": "typescript" },
+    { "path": "src/app/api/pain-logs/route.ts", "description": "GET and POST API route for PainEntry records.", "language": "typescript" }
+  ]
+}

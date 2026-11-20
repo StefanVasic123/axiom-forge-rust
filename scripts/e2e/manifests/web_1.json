@@ -1,0 +1,31 @@
+{
+  "manifestId": "web_1",
+  "platform": "web",
+  "projectType": "nextjs",
+  "resolvedStack": "Next.js 14 + TypeScript + Tailwind CSS + Prisma + NextAuth + Stripe",
+  "name": "PulseLedger FinOps Cloud",
+  "description": "PulseLedger FinOps Cloud is a multi-tenant B2B SaaS platform for automated cloud cost governance, invoice reconciliation, and budget anomaly alerts. It includes NextAuth authentication, Stripe subscription billing, Prisma PostgreSQL persistence, and interactive executive FinOps dashboards.",
+  "metadata": {
+    "name": "PulseLedger FinOps Cloud",
+    "description": "Multi-tenant B2B SaaS for cloud spend governance, invoicing, and budget alerts."
+  },
+  "files": [
+    { "path": "package.json", "description": "Next.js 14, React 18, TypeScript, Tailwind CSS, Prisma 5, NextAuth v4, Stripe, Zod, react-hook-form, lucide-react, react-icons.", "language": "json" },
+    { "path": "prisma/schema.prisma", "description": "PostgreSQL Prisma schema with Role/InvoiceStatus/AlertSeverity enums and User, Invoice, BudgetAlert, Subscription models.", "language": "prisma" },
+    { "path": "src/lib/prisma.ts", "description": "Singleton PrismaClient export.", "language": "typescript" },
+    { "path": "src/types/index.ts", "description": "Shared TypeScript domain interfaces for Invoice, BudgetAlert, Subscription.", "language": "typescript" },
+    { "path": "src/app/globals.css", "description": "Tailwind CSS directives and clean custom styles.", "language": "css" },
+    { "path": "src/app/layout.tsx", "description": "Root layout wrapping SessionProvider, Navbar, main content, and Footer.", "language": "typescript" },
+    { "path": "src/middleware.ts", "description": "Next.js Edge middleware protecting /dashboard and /account while keeping /, /pricing, /login, /register, /api/auth public.", "language": "typescript" },
+    { "path": "src/app/page.tsx", "description": "Public SaaS landing page for PulseLedger FinOps Cloud with hero, KPI metrics, and CTA to /dashboard and /pricing.", "language": "typescript" },
+    { "path": "src/app/login/page.tsx", "description": "Credentials login page using NextAuth signIn with link to /register.", "language": "typescript" },
+    { "path": "src/app/register/page.tsx", "description": "Registration page calling POST /api/register then NextAuth signIn and redirecting to /dashboard.", "language": "typescript" },
+    { "path": "src/app/dashboard/page.tsx", "description": "FinOps executive dashboard showing cloud spend KPIs, active invoices, and budget alerts.", "language": "typescript" },
+    { "path": "src/app/invoices/page.tsx", "description": "Invoice management page with filtering, status badges, and new invoice creation modal.", "language": "typescript" },
+    { "path": "src/app/pricing/page.tsx", "description": "Subscription pricing tiers page (Starter, Growth, Enterprise).", "language": "typescript" },
+    { "path": "src/hooks/useInvoices.ts", "description": "Client hook fetching /api/invoices with safe array fallback state.", "language": "typescript" },
+    { "path": "src/app/api/register/route.ts", "description": "User registration API using Zod safeParse, bcryptjs, and Prisma.", "language": "typescript" },
+    { "path": "src/app/api/invoices/route.ts", "description": "GET and POST API route for Invoice records with Zod validation and Prisma persistence.", "language": "typescript" },
+    { "path": "src/app/api/alerts/route.ts", "description": "GET and POST API route for BudgetAlert records.", "language": "typescript" }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "manifestId": "web_5",
+  "platform": "web",
+  "projectType": "nextjs",
+  "resolvedStack": "Next.js 14 + TypeScript + Tailwind CSS + Prisma + NextAuth + Stripe",
+  "name": "VaultAudit Compliance SaaS",
+  "description": "VaultAudit Compliance SaaS helps security teams automate SOC 2 and ISO 27001 readiness checks, track evidence artifacts, and manage compliance audits with role-based access control, Stripe billing, and Prisma PostgreSQL.",
+  "metadata": {
+    "name": "VaultAudit Compliance SaaS",
+    "description": "Automated SOC 2 / ISO 27001 compliance checks, policy controls, and audit reporting SaaS."
+  },
+  "files": [
+    { "path": "package.json", "description": "Next.js 14, React 18, TypeScript, Tailwind CSS, Prisma 5, NextAuth v4, stripe, zod, react-hook-form, lucide-react.", "language": "json" },
+    { "path": "prisma/schema.prisma", "description": "PostgreSQL Prisma schema with Role, ComplianceStatus, Severity enums and User, ControlCheck, EvidenceItem, AuditReport models.", "language": "prisma" },
+    { "path": "src/lib/prisma.ts", "description": "Singleton PrismaClient export.", "language": "typescript" },
+    { "path": "src/types/index.ts", "description": "Shared TypeScript interfaces for ControlCheck, EvidenceItem, AuditReport.", "language": "typescript" },
+    { "path": "src/app/globals.css", "description": "Tailwind CSS base styles.", "language": "css" },
+    { "path": "src/app/layout.tsx", "description": "Root layout with SessionProvider, Navbar, and Footer.", "language": "typescript" },
+    { "path": "src/middleware.ts", "description": "Edge middleware protecting /dashboard and /audits while keeping /, /pricing, /login, /register, /api/auth public.", "language": "typescript" },
+    { "path": "src/app/page.tsx", "description": "Public landing page for VaultAudit Compliance SaaS.", "language": "typescript" },
+    { "path": "src/app/dashboard/page.tsx", "description": "Compliance readiness score dashboard with control check breakdown and recent evidence.", "language": "typescript" },
+    { "path": "src/app/controls/page.tsx", "description": "Compliance controls checklist with status updates and evidence upload form.", "language": "typescript" },
+    { "path": "src/app/pricing/page.tsx", "description": "SaaS subscription pricing tiers.", "language": "typescript" },
+    { "path": "src/app/login/page.tsx", "description": "Login page using NextAuth credentials.", "language": "typescript" },
+    { "path": "src/app/register/page.tsx", "description": "Register page posting to /api/register then signing in.", "language": "typescript" },
+    { "path": "src/hooks/useControls.ts", "description": "Client hook fetching /api/controls with safe default array.", "language": "typescript" },
+    { "path": "src/app/api/register/route.ts", "description": "User registration API route.", "language": "typescript" },
+    { "path": "src/app/api/controls/route.ts", "description": "GET and POST API route for ControlCheck records with Zod and Prisma.", "language": "typescript" },
+    { "path": "src/app/api/audits/route.ts", "description": "GET and POST API route for AuditReport records.", "language": "typescript" }
+  ]
+}
