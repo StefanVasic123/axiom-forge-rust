@@ -608,6 +608,8 @@ pub struct HookSignature {
     pub explicit_return_type_name: Option<String>,
     pub return_type_end_byte: Option<usize>,
     pub return_type_already_any: bool,
+    pub local_declared_idents: Vec<String>,
+    pub array_state_idents: Vec<String>,
 }
 
 fn analyze_param(param: Node, src: &str) -> HookParam {
@@ -922,8 +924,84 @@ fn build_hook_signature(name: &str, decl_node: Node, func: Node, var_ret_type: O
         params.push(analyze_param(single, src));
     }
     let mut return_objects = Vec::new();
+    let mut local_declared_idents = Vec::new();
+    let mut array_state_idents = Vec::new();
     if let Some(body) = func.child_by_field_name("body") {
         collect_return_objects(body, src, &mut return_objects);
+        if body.kind() == "statement_block" {
+            for stmt in named_children_vec(body) {
+                match stmt.kind() {
+                    "function_declaration" | "generator_function_declaration" => {
+                        if let Some(nn) = stmt.child_by_field_name("name") {
+                            let id = node_text(nn, src).trim().to_string();
+                            if is_valid_js_identifier(&id) && !local_declared_idents.contains(&id) {
+                                local_declared_idents.push(id);
+                            }
+                        }
+                    }
+                    "lexical_declaration" | "variable_declaration" => {
+                        for vd in named_children_vec(stmt) {
+                            if vd.kind() != "variable_declarator" {
+                                continue;
+                            }
+                            let Some(lhs) = vd.child_by_field_name("name") else { continue };
+                            let rhs = vd.child_by_field_name("value").map(unwrap_expression);
+                            if lhs.kind() == "identifier" {
+                                let id = node_text(lhs, src).trim().to_string();
+                                if is_valid_js_identifier(&id) && !local_declared_idents.contains(&id) {
+                                    local_declared_idents.push(id.clone());
+                                }
+                                if let Some(v) = rhs {
+                                    if v.kind() == "array" && !array_state_idents.contains(&id) {
+                                        array_state_idents.push(id);
+                                    }
+                                }
+                            } else if lhs.kind() == "array_pattern" {
+                                let pat_idents: Vec<String> = named_children_vec(lhs)
+                                    .into_iter()
+                                    .filter(|c| c.kind() == "identifier")
+                                    .map(|c| node_text(c, src).trim().to_string())
+                                    .filter(|id| is_valid_js_identifier(id))
+                                    .collect();
+                                for id in &pat_idents {
+                                    if !local_declared_idents.contains(id) {
+                                        local_declared_idents.push(id.clone());
+                                    }
+                                }
+                                if let (Some(first_id), Some(v)) = (pat_idents.first(), rhs) {
+                                    if v.kind() == "call_expression" {
+                                        let fn_txt = v
+                                            .child_by_field_name("function")
+                                            .map(|n| node_text(n, src).trim())
+                                            .unwrap_or("");
+                                        if fn_txt == "useState" || fn_txt.ends_with(".useState") {
+                                            let ta_txt = v
+                                                .child_by_field_name("type_arguments")
+                                                .map(|n| node_text(n, src))
+                                                .unwrap_or("");
+                                            let first_arg_is_arr = v
+                                                .child_by_field_name("arguments")
+                                                .and_then(|a| named_children_vec(a).into_iter().next())
+                                                .map(|a| unwrap_expression(a).kind() == "array")
+                                                .unwrap_or(false);
+                                            if first_arg_is_arr
+                                                || ta_txt.contains("[]")
+                                                || ta_txt.contains("Array<")
+                                            {
+                                                if !array_state_idents.contains(first_id) {
+                                                    array_state_idents.push(first_id.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
     let explicit_return_type_name = extract_explicit_return_type_name(func, src).or(var_ret_type);
     let ret_ann_node = func.child_by_field_name("return_type");
@@ -942,6 +1020,8 @@ fn build_hook_signature(name: &str, decl_node: Node, func: Node, var_ret_type: O
         explicit_return_type_name,
         return_type_end_byte,
         return_type_already_any,
+        local_declared_idents,
+        array_state_idents,
     }
 }
 
@@ -1171,6 +1251,14 @@ pub fn default_value_for_missing_hook_key(key: &str, typed: bool) -> String {
     if matches!(low.as_str(), "count" | "total" | "page" | "totalpages" | "totalcount") {
         return "0".to_string();
     }
+    if matches!(
+        low.as_str(),
+        "items" | "data" | "list" | "records" | "rows" | "entries" | "results"
+    ) || low.ends_with("list")
+        || low.ends_with("items")
+    {
+        return any("[]");
+    }
     any("undefined")
 }
 
@@ -1197,7 +1285,7 @@ fn collect_source_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>
         if p.is_dir() {
             if !matches!(
                 name,
-                "node_modules" | ".next" | ".git" | ".axiom" | "dist" | "build" | "prisma" | "public" | "coverage"
+                "node_modules" | ".next" | ".expo" | ".expo-verify" | ".expo-e2e-dist" | ".git" | ".axiom" | "dist" | "build" | "prisma" | "public" | "coverage"
             ) {
                 collect_source_files(&p, out);
             }
@@ -1649,7 +1737,27 @@ pub fn plan_hook_and_interface_insertions(
             }
             let parts: Vec<String> = missing
                 .iter()
-                .map(|k| format!("{}: {}", k, default_value_for_missing_hook_key(k, typed)))
+                .map(|k| {
+                    if hook.local_declared_idents.iter().any(|id| id == *k) {
+                        (*k).clone()
+                    } else {
+                        let k_low = k.to_ascii_lowercase();
+                        let is_collection_alias = matches!(
+                            k_low.as_str(),
+                            "items" | "data" | "list" | "records" | "rows" | "entries" | "results"
+                        );
+                        if is_collection_alias {
+                            if let Some(arr_key) = ret
+                                .keys
+                                .iter()
+                                .find(|rk| hook.array_state_idents.iter().any(|a| a == *rk))
+                            {
+                                return format!("{}: {}", k, arr_key);
+                            }
+                        }
+                        format!("{}: {}", k, default_value_for_missing_hook_key(k, typed))
+                    }
+                })
                 .collect();
             let text = if ret.is_empty {
                 format!(" {} ", parts.join(", "))
@@ -2160,6 +2268,19 @@ fn reconcile_model_types_with_ui_hints(
             continue;
         }
 
+        if relax_optional_and_date && decl.kind() == "type_alias_declaration" {
+            if let Some(val) = decl.child_by_field_name("value") {
+                let val_txt = node_text(val, source).trim();
+                if (val_txt.starts_with("z.infer<") || val_txt.starts_with("zod.infer<"))
+                    && !val_txt.contains("Record<string, any>")
+                    && !val_txt.contains("[key: string]")
+                {
+                    edits.push((val.end_byte(), val.end_byte(), " & Record<string, any>".to_string()));
+                    continue;
+                }
+            }
+        }
+
         let body = match decl.kind() {
             "interface_declaration" => decl.child_by_field_name("body"),
             "type_alias_declaration" => decl.child_by_field_name("value").filter(|v| v.kind() == "object_type"),
@@ -2346,6 +2467,10 @@ pub fn reconcile_model_and_type_contracts_in_project(proj_dir: &std::path::Path)
             let low = rel.to_ascii_lowercase();
             (low.starts_with("src/hooks/") || low.starts_with("hooks/"))
                 && (low.ends_with(".ts") || low.ends_with(".tsx"))
+                && !low.ends_with("/useusertier.ts")
+                && !low.ends_with("/useusertier.tsx")
+                && low != "useusertier.ts"
+                && low != "useusertier.tsx"
         };
         if !is_model_or_type_rel_path(&rel) && !is_hook_file {
             continue;
@@ -3477,15 +3602,46 @@ pub fn deduplicate_local_domain_interfaces_against_types_in_project(proj_dir: &s
                 }
             }
 
+            let mut reexported_clause_names: HashSet<String> = HashSet::new();
+            for stmt in named_children_vec(tree.root_node()) {
+                if stmt.kind() == "export_statement"
+                    && stmt.child_by_field_name("declaration").is_none()
+                    && stmt.child_by_field_name("source").is_none()
+                {
+                    if let Some(clause) = first_named_of_kind(stmt, &["export_clause"]) {
+                        for spec in named_children_vec(clause) {
+                            if spec.kind() != "export_specifier" {
+                                continue;
+                            }
+                            let exported = spec
+                                .child_by_field_name("alias")
+                                .or_else(|| spec.child_by_field_name("name"))
+                                .or_else(|| named_children_vec(spec).into_iter().next())
+                                .map(|n| strip_string_quotes(node_text(n, &content)))
+                                .unwrap_or_default();
+                            if !exported.is_empty() {
+                                reexported_clause_names.insert(exported);
+                            }
+                        }
+                    }
+                }
+            }
+
             let mut edits: Vec<(usize, usize, String)> = Vec::new();
             let mut to_import: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
             for stmt in named_children_vec(tree.root_node()) {
-                // Only inspect NON-exported top-level `interface_declaration`
-                if stmt.kind() != "interface_declaration" {
+                let (is_exported, iface_decl) = if stmt.kind() == "interface_declaration" {
+                    (false, stmt)
+                } else if stmt.kind() == "export_statement" && !has_token_child(stmt, "default") {
+                    match stmt.child_by_field_name("declaration") {
+                        Some(d) if d.kind() == "interface_declaration" => (true, d),
+                        _ => continue,
+                    }
+                } else {
                     continue;
-                }
-                let Some(iface_name_node) = stmt.child_by_field_name("name") else { continue };
+                };
+                let Some(iface_name_node) = iface_decl.child_by_field_name("name") else { continue };
                 let iface_name = node_text(iface_name_node, &content).trim().to_string();
                 if iface_name.is_empty()
                     || iface_name.ends_with("Props")
@@ -3513,7 +3669,12 @@ pub fn deduplicate_local_domain_interfaces_against_types_in_project(proj_dir: &s
                 } else if content[del_end..].starts_with('\n') {
                     del_end += 1;
                 }
-                edits.push((stmt.start_byte(), del_end, String::new()));
+                let replacement = if is_exported && !reexported_clause_names.contains(&iface_name) {
+                    format!("export type {{ {} }};\n", iface_name)
+                } else {
+                    String::new()
+                };
+                edits.push((stmt.start_byte(), del_end, replacement));
 
                 let sym_list = to_import.entry(spec.clone()).or_default();
                 if !sym_list.contains(&iface_name) {
@@ -4487,4 +4648,156 @@ pub fn remove_unused_missing_module_imports(
     }
     let candidate = apply_byte_edits(src, edits);
     verified_rewrite(path, src, candidate)
+}
+
+/// Adds a companion `export type Name = (typeof Name)[keyof typeof Name] | string;`
+/// when a TypeScript module exports a PascalCase enum-like `const Name = { KEY: 'VAL', ... }`
+/// object literal without an accompanying type/interface/enum declaration (`TS2749`).
+pub fn ensure_companion_types_for_const_enums_in_source(rel_path: &str, source: &str) -> Option<String> {
+    use std::collections::HashSet;
+
+    if !is_typed_path(rel_path) {
+        return None;
+    }
+    let low = rel_path.replace('\\', "/").to_ascii_lowercase();
+    if low.ends_with(".d.ts") || low == "src/types/index.ts" || low == "types/index.ts" {
+        return None;
+    }
+    if !source.contains("export const ") {
+        return None;
+    }
+
+    let tree = parse_source(rel_path, source)?;
+    let mut existing_type_names: HashSet<String> = HashSet::new();
+
+    for imp in extract_imports(&tree, source) {
+        if let Some(d) = imp.default_local {
+            existing_type_names.insert(d);
+        }
+        if let Some(ns) = imp.namespace_local {
+            existing_type_names.insert(ns);
+        }
+        for b in imp.named {
+            existing_type_names.insert(b.local);
+        }
+    }
+
+    for stmt in named_children_vec(tree.root_node()) {
+        let decl = if stmt.kind() == "export_statement" {
+            match stmt.child_by_field_name("declaration") {
+                Some(d) => d,
+                None => continue,
+            }
+        } else {
+            stmt
+        };
+        if matches!(
+            decl.kind(),
+            "type_alias_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "class_declaration"
+                | "abstract_class_declaration"
+        ) {
+            if let Some(name_node) = decl.child_by_field_name("name") {
+                let n = node_text(name_node, source).trim();
+                if !n.is_empty() {
+                    existing_type_names.insert(n.to_string());
+                }
+            }
+        }
+    }
+
+    let excluded_suffixes = [
+        "Props", "Schema", "Config", "Options", "Context", "Provider", "Client", "Router",
+        "Store", "Mock", "Data", "Items", "List", "Map", "Styles", "Colors", "Theme",
+    ];
+
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+
+    for stmt in named_children_vec(tree.root_node()) {
+        if stmt.kind() != "export_statement" || has_token_child(stmt, "default") {
+            continue;
+        }
+        let Some(decl) = stmt.child_by_field_name("declaration") else { continue };
+        if decl.kind() != "lexical_declaration" || !has_token_child(decl, "const") {
+            continue;
+        }
+
+        let mut stmt_types: Vec<String> = Vec::new();
+        for var_decl in named_children_vec(decl) {
+            if var_decl.kind() != "variable_declarator" {
+                continue;
+            }
+            let Some(name_node) = var_decl.child_by_field_name("name") else { continue };
+            if name_node.kind() != "identifier" {
+                continue;
+            }
+            let name = node_text(name_node, source).trim();
+            if name.len() < 3
+                || !name.chars().next().map_or(false, |c| c.is_ascii_uppercase())
+                || !name.chars().any(|c| c.is_ascii_lowercase())
+                || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                || excluded_suffixes.iter().any(|suf| name.ends_with(suf))
+                || existing_type_names.contains(name)
+            {
+                continue;
+            }
+
+            let Some(mut val) = var_decl.child_by_field_name("value") else { continue };
+            while matches!(
+                val.kind(),
+                "as_expression" | "satisfies_expression" | "parenthesized_expression"
+            ) {
+                match named_children_vec(val).into_iter().next() {
+                    Some(inner) => val = inner,
+                    None => break,
+                }
+            }
+            if val.kind() != "object" {
+                continue;
+            }
+
+            let members = named_children_vec(val);
+            if members.len() < 2 {
+                continue;
+            }
+            let all_upper_string_pairs = members.iter().all(|m| {
+                if m.kind() != "pair" {
+                    return false;
+                }
+                let Some(k_node) = m.child_by_field_name("key") else { return false };
+                let Some(v_node) = m.child_by_field_name("value") else { return false };
+                let Some(key_name) = property_key_name(k_node, source) else { return false };
+                key_name.len() >= 2
+                    && key_name.chars().next().map_or(false, |c| c.is_ascii_uppercase())
+                    && key_name
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                    && v_node.kind() == "string"
+            });
+
+            if all_upper_string_pairs {
+                existing_type_names.insert(name.to_string());
+                stmt_types.push(format!(
+                    "export type {} = (typeof {})[keyof typeof {}] | string;",
+                    name, name, name
+                ));
+            }
+        }
+
+        if !stmt_types.is_empty() {
+            edits.push((
+                stmt.end_byte(),
+                stmt.end_byte(),
+                format!("\n{}\n", stmt_types.join("\n")),
+            ));
+        }
+    }
+
+    if edits.is_empty() {
+        return None;
+    }
+    let candidate = apply_byte_edits(source, edits);
+    verified_rewrite(rel_path, source, candidate)
 }

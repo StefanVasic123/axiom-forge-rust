@@ -15,6 +15,9 @@ pub mod ast_engine;
 pub mod reviewer;
 pub mod self_healing;
 pub mod orchestrator;
+pub mod templates;
+pub mod templates_expo;
+pub mod copilot;
 
 pub use ollama::*;
 pub use project::*;
@@ -316,6 +319,7 @@ pub fn run() {
         .manage(PendingDeepLink(Mutex::new(None)))
         .manage(ServerState(Mutex::new(HashMap::new())))
         .manage(mode::ModeState(Mutex::new(mode::load_mode_state(&get_base_dir()))))
+        .manage(copilot::CopilotState::default())
         .invoke_handler(tauri::generate_handler![
             greet, 
             get_hardware_profile,
@@ -383,7 +387,15 @@ pub fn run() {
             git_engine::git_checkout_proposal_branch,
             git_engine::git_restore_main_branch,
             git_engine::git_refine_proposal_with_ai,
-            relay::relay_submit_proposal
+            relay::relay_submit_proposal,
+            copilot::copilot_get_capability,
+            copilot::copilot_send_message,
+            copilot::copilot_cancel,
+            copilot::copilot_reset_session,
+            copilot::copilot_get_staged_changes,
+            copilot::copilot_discard_staged_file,
+            copilot::copilot_clear_staged_changes,
+            copilot::copilot_delete_file_on_disk
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

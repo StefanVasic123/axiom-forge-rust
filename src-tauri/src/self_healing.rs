@@ -731,7 +731,12 @@ pub async fn repair_broken_imports(proj_dir: &std::path::Path, model: &str) {
                     if let Ok(resp_json) = resp.json::<serde_json::Value>().await {
                         if let Some(ai_msg) = resp_json.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
                             let clean_content = extract_code_content(ai_msg);
-                            let processed = post_process_generated_file(&relative_target_norm, &clean_content, &serde_json::json!({}), has_tailwind);
+                            let import_mm = if crate::templates_expo::is_expo_project_dir(proj_dir) {
+                                serde_json::json!({ "framework": "expo" })
+                            } else {
+                                serde_json::json!({})
+                            };
+                            let processed = post_process_generated_file(&relative_target_norm, &clean_content, &import_mm, has_tailwind);
 
                             if !crate::healer::looks_like_code_payload(&processed) {
                                 debug_log_to_file(format!(
@@ -1047,7 +1052,7 @@ pub struct TscDiagnostic {
 
 pub fn parse_tsc_diagnostics(tsc_output: &str) -> Vec<TscDiagnostic> {
     let mut diagnostics = Vec::new();
-    let Ok(re) = regex::Regex::new(r#"^([^\(\r\n]+)\((\d+),(\d+)\):\s*(?:error|warning)\s+(TS\d+):\s*(.+)$"#) else {
+    let Ok(re) = regex::Regex::new(r#"^([^\r\n]+?)\((\d+),(\d+)\):\s*(?:error|warning)\s+(TS\d+):\s*(.+)$"#) else {
         return diagnostics;
     };
     for line in tsc_output.lines() {
@@ -1205,6 +1210,49 @@ fn restore_pending_file_snapshot(proj_dir: &std::path::Path, rel_path: &str, bef
 }
 
 pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
+    if crate::templates_expo::is_expo_project_dir(proj_dir) {
+        crate::packages::repair_package_json_dependencies(proj_dir);
+        fn walk_expo_hygiene(dir: &std::path::Path, proj_dir: &std::path::Path) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    let n = p.file_name().and_then(|x| x.to_str()).unwrap_or("");
+                    if !matches!(n, "node_modules" | ".expo" | ".expo-verify" | ".git" | ".axiom" | "dist" | "build") {
+                        walk_expo_hygiene(&p, proj_dir);
+                    }
+                } else if p.is_file() {
+                    let rel = p.strip_prefix(proj_dir).ok().map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+                    let rel_lower = rel.to_lowercase();
+                    if rel_lower.ends_with(".ts") || rel_lower.ends_with(".tsx") || rel_lower.ends_with(".js") || rel_lower.ends_with(".jsx") {
+                        if let Ok(c) = std::fs::read_to_string(&p) {
+                            let mut next = crate::sanitizer::sanitize_expo_react_native_file(&c, &rel);
+                            next = crate::sanitizer::sanitize_truncated_import_repetition_loop(&next);
+                            next = crate::sanitizer::sanitize_try_catch_body_scope(&next);
+                            next = crate::sanitizer::sanitize_const_body_reassignment(&next);
+                            next = crate::sanitizer::hoist_enums_before_usage(&next);
+                            next = crate::sanitizer::strip_self_conflicting_local_imports(&next);
+                            if next != c {
+                                let _ = std::fs::write(&p, next);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for root_dir in ["app", "src", "components", "hooks", "store", "utils", "types"] {
+            let d = proj_dir.join(root_dir);
+            if d.is_dir() {
+                walk_expo_hygiene(&d, proj_dir);
+            }
+        }
+        crate::sanitizer::reconcile_expo_types_and_unions_in_project(proj_dir);
+        let _ = crate::ast_engine::reconcile_hook_contracts_in_project(proj_dir);
+        let _ = auto_import_missing_symbols_in_project(proj_dir);
+        crate::templates_expo::ensure_expo_html_inspector_injected(proj_dir);
+        return;
+    }
+
     crate::sanitizer::ensure_valid_tsconfig(proj_dir);
     crate::packages::repair_package_json_dependencies(proj_dir);
 
@@ -1245,6 +1293,7 @@ pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
                                 next = crate::sanitizer::sanitize_jsx_in_ts_file(&next, &rel);
                             }
                             if rel_lower.ends_with("middleware.ts") || rel_lower.ends_with("middleware.js") {
+                                next = crate::sanitizer::strip_bogus_middleware_locale_rewrite(&next, &rel, Some(proj_dir));
                                 next = crate::sanitizer::sanitize_middleware_redundancy(&next, &rel);
                             }
                             next = crate::sanitizer::sanitize_optional_user_password_access(&next);
@@ -1296,6 +1345,24 @@ pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
     crate::ast_engine::reconcile_prisma_relation_case_in_project(proj_dir);
     crate::ast_engine::widen_local_component_view_models_in_project(proj_dir);
     reconcile_misimported_prisma_enums_in_project(proj_dir);
+    if proj_dir.join("src/app/api").is_dir() || proj_dir.join("app/api").is_dir() {
+        for pages_api in ["src/pages/api", "pages/api"] {
+            let d = proj_dir.join(pages_api);
+            if d.is_dir() {
+                let _ = std::fs::remove_dir_all(&d);
+            }
+        }
+        for pages_root in ["src/pages", "pages"] {
+            let d = proj_dir.join(pages_root);
+            if d.is_dir() {
+                if let Ok(mut rd) = std::fs::read_dir(&d) {
+                    if rd.next().is_none() {
+                        let _ = std::fs::remove_dir(&d);
+                    }
+                }
+            }
+        }
+    }
     crate::sanitizer::ensure_valid_tsconfig(proj_dir);
     crate::sanitizer::sanitize_tailwind_config_in_project(proj_dir);
     crate::sanitizer::ensure_multiplatform_entry_routes_bridged(proj_dir);
@@ -1416,9 +1483,10 @@ pub fn extract_prisma_schema_summary_for_healing(proj_dir: &std::path::Path) -> 
     )
 }
 
-pub const ZOD_PRISMA_TS2322_HEAL_GUIDE: &str = "\nTS2322 / ZOD-VS-PRISMA HEALING GUIDE (tsconfig uses \"strict\": false):\n\
+pub const ZOD_PRISMA_TS2322_HEAL_GUIDE: &str = "\nTS2322 / TS2353 / ZOD-VS-PRISMA HEALING GUIDE (tsconfig uses \"strict\": false):\n\
 - Under \"strict\": false, `z.infer<typeof schema>` makes properties optional (`{ field?: T }`), so `prisma.<model>.create({ data: validatedBody })` fails with TS2322 on required fields!\n\
 - NEVER pass `validatedBody` directly into `.create({ data: validatedBody })`: build an EXPLICIT typed `data: { requiredField: parsed.requiredField, ... }` object (guaranteeing every required field is defined via guard/default).\n\
+- When `TS2353` reports that a property does not exist on a Prisma `*CreateInput` or `*UpdateInput`, inspect `ACTUAL PRISMA SCHEMA CONTRACT`: remove the undeclared scalar field from `data` OR map it through an existing relation on that model (e.g. related `user`), NEVER keep undeclared fields in `data`.\n\
 - For Prisma Enum fields: import the Enum from '@prisma/client' and use `z.nativeEnum(EnumName)` (or cast `parsed.status as EnumName`), NEVER bare `z.string()`.\n\
 - For DateTime fields: use `z.coerce.date()` or `new Date(parsed.date)`.\n\
 - Use ONLY exact delegates, field names, and relation names from ACTUAL PRISMA SCHEMA CONTRACT.\n";
@@ -2182,8 +2250,27 @@ pub fn collect_declared_or_imported_idents(content: &str) -> std::collections::H
     .map(|s| s.to_string())
     .collect();
 
-    // 1. All imported bindings (supports multiline imports, aliases `Orig as Alias`, default + braced)
-    if let Ok(imp_re) = regex::Regex::new(r#"(?ms)\bimport\s+(?:type\s+)?([\s\S]*?)\s+from\s+['"][^'"]+['"]"#) {
+    // 1. All imported bindings (AST-based so side-effect imports like `import "./globals.css";`
+    // can never span newlines into the following `import ... from` statement)
+    if let Some(tree) = crate::ast_engine::parse_source("file.tsx", content) {
+        for decl in crate::ast_engine::extract_imports(&tree, content) {
+            if let Some(def) = decl.default_local {
+                if !def.is_empty() {
+                    known.insert(def);
+                }
+            }
+            if let Some(ns) = decl.namespace_local {
+                if !ns.is_empty() {
+                    known.insert(ns);
+                }
+            }
+            for b in decl.named {
+                if !b.local.is_empty() {
+                    known.insert(b.local);
+                }
+            }
+        }
+    } else if let Ok(imp_re) = regex::Regex::new(r#"(?m)^[ \t]*import\s+(?:type\s+)?([^;\r\n'"`]+?)\s+from\s+['"][^'"]+['"]"#) {
         for cap in imp_re.captures_iter(content) {
             let clause = cap.get(1).map(|m| m.as_str()).unwrap_or("");
             if let Some(ob) = clause.find('{') {
@@ -2402,7 +2489,7 @@ fn find_unique_local_module_for_symbol(
     if raw_src.is_dir() {
         stack.push(raw_src.clone());
     }
-    for root_dir in ["app", "components", "hooks", "lib", "utils", "models", "types", "services", "config"] {
+    for root_dir in ["app", "components", "hooks", "store", "lib", "utils", "models", "types", "services", "config"] {
         let d = proj_dir.join(root_dir);
         if d.is_dir() {
             stack.push(d);
@@ -2418,7 +2505,7 @@ fn find_unique_local_module_for_symbol(
             let p = entry.path();
             if p.is_dir() {
                 let n = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                if n != "node_modules" && n != ".next" && n != ".git" && n != ".axiom" && n != "prisma" && n != "api" {
+                if !matches!(n, "node_modules" | ".next" | ".expo" | ".expo-verify" | ".expo-e2e-dist" | ".git" | ".axiom" | "prisma" | "api") {
                     stack.push(p);
                 }
             } else if p.is_file() && p != abs_file {
@@ -2848,6 +2935,17 @@ pub fn merge_or_insert_import_statement(
     sym: &str,
     is_default: bool,
 ) -> String {
+    let local_sym = sym
+        .split(" as ")
+        .last()
+        .unwrap_or(sym)
+        .trim()
+        .trim_start_matches("type ")
+        .trim();
+    if !local_sym.is_empty() && collect_declared_or_imported_idents(content).contains(local_sym) {
+        return content.to_string();
+    }
+
     if !is_default {
         let esc_mod = regex::escape(module_spec);
         let pat = format!(
@@ -3181,9 +3279,14 @@ pub fn auto_import_missing_symbols_in_content(
         return None;
     }
 
-    let mut content = reconcile_external_icon_imports_in_content(proj_dir, orig_content);
-    content = reconcile_ui_barrel_hook_imports(proj_dir, abs_file, &content);
-    content = reconcile_hook_generic_array_args(proj_dir, &content);
+    let is_expo_proj = crate::templates_expo::is_expo_project_dir(proj_dir);
+    let mut content = if is_expo_proj {
+        reconcile_hook_generic_array_args(proj_dir, orig_content)
+    } else {
+        let c = reconcile_external_icon_imports_in_content(proj_dir, orig_content);
+        let c = reconcile_ui_barrel_hook_imports(proj_dir, abs_file, &c);
+        reconcile_hook_generic_array_args(proj_dir, &c)
+    };
 
     let mut existing_specs: Vec<String> = regex::Regex::new(
         r#"(?ms)(?:import\s+(?:type\s+)?[\s\S]*?\s+from\s+|import\s+|require\s*\(\s*)['"]([^'"]+)['"]"#,
@@ -3199,7 +3302,8 @@ pub fn auto_import_missing_symbols_in_content(
     let known = collect_declared_or_imported_idents(&content);
     // Auto-import `toast` from `@/components/ui/use-toast` when a client component calls
     // `toast(...)` or `toast.success/error/loading/info(...)` without declaring or importing `toast`.
-    if !known.contains("toast")
+    if !is_expo_proj
+        && !known.contains("toast")
         && regex::Regex::new(r"(?:^|[^A-Za-z0-9_$.])toast(?:\s*\(|\s*\.\s*(?:success|error|loading|info|warning|warn|dismiss)\s*\()")
             .map(|re| re.is_match(&content))
             .unwrap_or(false)
@@ -3237,6 +3341,17 @@ pub fn auto_import_missing_symbols_in_content(
             || lower.contains("/renderer/"));
 
     for sym in missing_syms {
+        if is_expo_proj {
+            if let Some((local_spec, is_def)) = find_unique_local_module_for_symbol(proj_dir, abs_file, &sym) {
+                content = merge_or_insert_import_statement(&content, &local_spec, &sym, is_def);
+            } else if !types_index_src.is_empty()
+                && !lower.ends_with("types/index.ts")
+                && crate::sanitizer::has_named_export_symbol(&types_index_src, &sym)
+            {
+                content = merge_or_insert_import_statement(&content, "@/types", &sym, false);
+            }
+            continue;
+        }
         if is_api_route {
             // In server API routes, only auto-import Prisma models/enums from `@prisma/client`
             // (never UI/JSX components or client hooks).
@@ -3347,7 +3462,9 @@ pub fn auto_import_missing_symbols_in_content(
         }
     }
 
-    content = reconcile_external_icon_imports_in_content(proj_dir, &content);
+    if !is_expo_proj {
+        content = reconcile_external_icon_imports_in_content(proj_dir, &content);
+    }
 
     if content != orig_content {
         Some(content)
@@ -3376,7 +3493,7 @@ pub fn auto_import_missing_symbols_in_project(proj_dir: &std::path::Path) -> usi
             let p = entry.path();
             if p.is_dir() {
                 let n = p.file_name().and_then(|x| x.to_str()).unwrap_or("");
-                if n != "node_modules" && n != ".next" && n != ".git" && n != ".axiom" && n != "prisma" {
+                if !matches!(n, "node_modules" | ".next" | ".expo" | ".expo-verify" | ".expo-e2e-dist" | ".git" | ".axiom" | "prisma") {
                     walk_tsx(&p, proj_dir, updated);
                 }
             } else if p.is_file() {
@@ -3398,7 +3515,7 @@ pub fn auto_import_missing_symbols_in_project(proj_dir: &std::path::Path) -> usi
     if proj_dir.join("src").is_dir() {
         walk_tsx(&proj_dir.join("src"), proj_dir, &mut updated);
     }
-    for d_name in ["app", "components", "hooks", "lib", "pages", "services", "models", "types", "utils"] {
+    for d_name in ["app", "components", "hooks", "store", "lib", "pages", "services", "models", "types", "utils"] {
         let d = proj_dir.join(d_name);
         if d.is_dir() {
             walk_tsx(&d, proj_dir, &mut updated);
@@ -4350,7 +4467,12 @@ async fn regenerate_broken_file_from_scratch(
     if !crate::healer::looks_like_code_payload(&content_str) {
         return None;
     }
-    let processed = post_process_generated_file(path_str, &content_str, &serde_json::json!({}), has_tailwind);
+    let regen_mm = if crate::templates_expo::is_expo_project_dir(proj_dir) {
+        serde_json::json!({ "framework": "expo" })
+    } else {
+        serde_json::json!({})
+    };
+    let processed = post_process_generated_file(path_str, &content_str, &regen_mm, has_tailwind);
     if crate::ast_engine::detect_truncated_or_degenerate_ts_js(path_str, &processed).is_some() {
         return None;
     }
@@ -4378,8 +4500,15 @@ pub async fn perform_self_healing_loop(
     progress_ctx: Option<(&tauri::Window, &str, &str)>,
 ) -> Vec<String> {
     let mut unresolved_warnings: Vec<String> = Vec::new();
-    let has_tailwind = proj_dir.join("tailwind.config.js").exists() || proj_dir.join("tailwind.config.ts").exists();
-    let is_nextjs = proj_dir.join("next.config.js").exists()
+    let is_expo = crate::templates_expo::is_expo_project_dir(proj_dir);
+    let heal_mm = if is_expo {
+        serde_json::json!({ "framework": "expo" })
+    } else {
+        serde_json::json!({})
+    };
+    let has_tailwind = !is_expo && (proj_dir.join("tailwind.config.js").exists() || proj_dir.join("tailwind.config.ts").exists());
+    let is_nextjs = is_expo
+        || proj_dir.join("next.config.js").exists()
         || proj_dir.join("next.config.mjs").exists()
         || proj_dir.join("package.json").exists();
     if !is_nextjs {
@@ -4391,11 +4520,11 @@ pub async fn perform_self_healing_loop(
 
     let enriched_path = ensure_node_toolchain_ready(None, "self-heal").await;
     let local_next_js = proj_dir.join("node_modules").join("next").join("dist").join("bin").join("next");
-    let has_local_next = local_next_js.exists();
+    let has_local_next = !is_expo && local_next_js.exists();
     let local_tsc_js = proj_dir.join("node_modules").join("typescript").join("bin").join("tsc");
     let has_local_tsc = local_tsc_js.exists();
 
-    if !has_local_next && !has_local_tsc {
+    if !has_local_next && !has_local_tsc && !is_expo {
         let msg = "TypeScript i Next.js nisu pronađeni u node_modules (npm install nije završen).".to_string();
         debug_log_to_file(format!("[Self-Healing] Skipping build loop: {}", msg));
         unresolved_warnings.push(msg);
@@ -4456,7 +4585,11 @@ pub async fn perform_self_healing_loop(
     let mut tried_katastar_ids: Vec<String> = Vec::new();
 
     // Extract project specs once for context
-    let mut category_stack_info = "Next.js App Router + Tailwind".to_string();
+    let mut category_stack_info = if is_expo {
+        "React Native + Expo SDK 52 (Expo Router, TypeScript, StyleSheet.create, @expo/vector-icons, AsyncStorage)".to_string()
+    } else {
+        "Next.js App Router + Tailwind".to_string()
+    };
     let mut lbg_file_specs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let lbg_path = proj_dir.join(".axiom").join("live_builder_guide.json");
     if lbg_path.exists() {
@@ -4464,7 +4597,9 @@ pub async fn perform_self_healing_loop(
             if let Ok(lbg_json) = serde_json::from_str::<Value>(&lbg_content) {
                 let cat = lbg_json.get("projectSpecification").and_then(|s| s.get("category")).and_then(|c| c.as_str()).unwrap_or("web-app");
                 let stk = lbg_json.get("projectSpecification").and_then(|s| s.get("stack")).and_then(|c| c.as_str()).unwrap_or("Next.js");
-                category_stack_info = format!("Stack: {}, Category: {}", stk, cat);
+                if !is_expo {
+                    category_stack_info = format!("Stack: {}, Category: {}", stk, cat);
+                }
                 if let Some(req_routes) = lbg_json.get("projectSpecification").and_then(|s| s.get("categoryRequirements")).and_then(|r| r.get("requiredRoutes")).and_then(|r| r.as_array()) {
                     for rr in req_routes {
                         if let Some(rr_str) = rr.as_str() {
@@ -4825,7 +4960,7 @@ pub async fn perform_self_healing_loop(
                 }
                 if let Some(best) = lookup.applicable_patches.first() {
                     let candidate = orig_content.replace(&best.patch.search, &best.patch.replace);
-                    let processed = post_process_generated_file(path_str, &candidate, &serde_json::json!({}), has_tailwind);
+                    let processed = post_process_generated_file(path_str, &candidate, &heal_mm, has_tailwind);
                     if processed != orig_content
                         && crate::healer::looks_like_code_payload(&processed)
                         && std::fs::write(&full_path, &processed).is_ok()
@@ -5066,6 +5201,13 @@ pub async fn perform_self_healing_loop(
             if !extra_rulepacks.is_empty() {
                 system_prompt.push_str(&extra_rulepacks);
             }
+            if is_expo && (diag_summary.contains("TS2339") || diag_summary.contains("TS2304")) {
+                system_prompt.push_str(
+                    "\n\nEXPO / REACT NATIVE STYLESHEET RULES:\n\
+                     - Every `styles.<key>` property referenced in JSX MUST be defined inside `StyleSheet.create({ ... })` in that file.\n\
+                     - NEVER reference component props, state, or local component variables inside top-level `StyleSheet.create({ ... })`; place dynamic/conditional styles inline in JSX `style={[styles.base, cond && { ... }]}`.\n"
+                );
+            }
 
             let user_prompt = format!(
                 "TypeScript Diagnostics:{}\n\n{}{}{}{}\nFiles to fix (JSON):\n{}\n\nReturn ONLY a JSON object `{{\"files\": [{{\"path\": \"...\", \"content\": \"...\"}}]}}` containing the complete repaired files.",
@@ -5108,7 +5250,7 @@ pub async fn perform_self_healing_loop(
                                 }
                                 let path_key_low = path_str.to_lowercase();
                                 let before = std::fs::read_to_string(&full_path).unwrap_or_default();
-                                let processed = post_process_generated_file(&path_str, &content_str, &serde_json::json!({}), has_tailwind);
+                                let processed = post_process_generated_file(&path_str, &content_str, &heal_mm, has_tailwind);
                                 let prev_diags = per_file_diag_lines
                                     .get(&path_key_low)
                                     .cloned()
@@ -5234,6 +5376,119 @@ pub async fn perform_self_healing_loop(
         91.0,
     );
     run_hygiene_pass_on_project(proj_dir);
+
+    if is_expo {
+        emit_self_heal_progress(
+            &progress_ctx,
+            "compile-check",
+            "Verifying Expo Metro Web bundle (expo export --platform web)...",
+            93.0,
+        );
+        let verify_dir = proj_dir.join(".expo-verify");
+        let _ = std::fs::remove_dir_all(&verify_dir);
+        let local_expo_cli = proj_dir.join("node_modules").join("expo").join("bin").join("cli");
+        let has_local_expo = local_expo_cli.is_file() || proj_dir.join("node_modules").join("expo").is_dir();
+
+        if has_local_expo {
+            let mut exp_cmd = if local_expo_cli.is_file() {
+                let mut c = std::process::Command::new("node");
+                c.arg(&local_expo_cli)
+                    .arg("export")
+                    .arg("--platform")
+                    .arg("web")
+                    .arg("--output-dir")
+                    .arg(".expo-verify");
+                c
+            } else {
+                #[cfg(target_os = "windows")]
+                let c = {
+                    let mut cc = std::process::Command::new("cmd");
+                    cc.arg("/C")
+                        .arg("npx")
+                        .arg("--no-install")
+                        .arg("expo")
+                        .arg("export")
+                        .arg("--platform")
+                        .arg("web")
+                        .arg("--output-dir")
+                        .arg(".expo-verify");
+                    cc
+                };
+                #[cfg(not(target_os = "windows"))]
+                let c = {
+                    let mut cc = std::process::Command::new("npx");
+                    cc.arg("--no-install")
+                        .arg("expo")
+                        .arg("export")
+                        .arg("--platform")
+                        .arg("web")
+                        .arg("--output-dir")
+                        .arg(".expo-verify");
+                    cc
+                };
+                c
+            };
+
+            exp_cmd
+                .current_dir(proj_dir)
+                .env("PATH", &enriched_path)
+                .env("CI", "1")
+                .env("EXPO_NO_TELEMETRY", "1")
+                .env("NO_COLOR", "1");
+
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                exp_cmd.creation_flags(0x08000000);
+            }
+
+            match exp_cmd.output() {
+                Ok(out) => {
+                    let combined = format!(
+                        "{}\n{}",
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    if out.status.success() {
+                        debug_log_to_file("[Self-Healing] Tier 2 Expo Metro web export completed successfully!".to_string());
+                    } else {
+                        let clean_exp = clean_cli_output_for_llm(&combined);
+                        let err_lines: Vec<String> = clean_exp
+                            .lines()
+                            .map(|l| l.trim())
+                            .filter(|l| {
+                                l.contains("Error:")
+                                    || l.contains("Unable to resolve")
+                                    || l.contains("Bundling failed")
+                                    || l.contains("SyntaxError")
+                                    || l.contains("TransformError")
+                            })
+                            .take(3)
+                            .map(|l| l.chars().take(120).collect())
+                            .collect();
+                        let hint = if err_lines.is_empty() {
+                            "expo export --platform web nije uspeo (proveri dev logove)".to_string()
+                        } else {
+                            format!("expo export --platform web greška: {}", err_lines.join(" | "))
+                        };
+                        debug_log_to_file(format!("[Self-Healing] Expo Tier 2 export failed: {}", hint));
+                        unresolved_warnings.push(hint);
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("Nije moguće pokrenuti expo export --platform web: {}", e);
+                    debug_log_to_file(format!("[Self-Healing] {}", msg));
+                    unresolved_warnings.push(msg);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&verify_dir);
+        } else {
+            let msg = "Expo CLI nije pronađen u node_modules (npm install nije završen).".to_string();
+            debug_log_to_file(format!("[Self-Healing] {}", msg));
+            unresolved_warnings.push(msg);
+        }
+        return unresolved_warnings;
+    }
 
     if !has_local_next {
         return unresolved_warnings;
@@ -5669,7 +5924,7 @@ pub async fn perform_self_healing_loop(
                 }
                 if let Some(best) = lookup.applicable_patches.first() {
                     let candidate = orig_content.replace(&best.patch.search, &best.patch.replace);
-                    let processed = post_process_generated_file(path_str, &candidate, &serde_json::json!({}), has_tailwind);
+                    let processed = post_process_generated_file(path_str, &candidate, &heal_mm, has_tailwind);
                     if processed != orig_content
                         && crate::healer::looks_like_code_payload(&processed)
                         && std::fs::write(proj_dir.join(path_str), &processed).is_ok()
@@ -6156,11 +6411,16 @@ pub async fn setup_local_postgres(_proj_dir: &std::path::Path, db_name: &str) ->
         }
     }
     
+    let pg_log = pg_data_dir.join("postgres.log");
     let pg_ctl_exe = pg_bin.join("pg_ctl.exe");
     let mut start_cmd = std::process::Command::new(pg_ctl_exe);
     start_cmd.arg("start")
         .arg("-D").arg(&pg_data_dir)
-        .arg("-o").arg("-p 54321 -h 127.0.0.1 -N 20 -B 1024 -c work_mem=1MB -c maintenance_work_mem=8MB -c shared_buffers=16MB");
+        .arg("-l").arg(&pg_log)
+        .arg("-o").arg("-p 54321 -h 127.0.0.1 -N 20 -B 1024 -c work_mem=1MB -c maintenance_work_mem=8MB -c shared_buffers=16MB")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
         
     #[cfg(target_os = "windows")]
     {
@@ -6178,7 +6438,10 @@ pub async fn setup_local_postgres(_proj_dir: &std::path::Path, db_name: &str) ->
         .arg("-p").arg("54321")
         .arg("-U").arg("postgres")
         .arg("-d").arg("postgres")
-        .arg("-c").arg(format!("CREATE DATABASE {};", db_name));
+        .arg("-c").arg(format!("CREATE DATABASE {};", db_name))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
         
     #[cfg(target_os = "windows")]
     {
@@ -6354,6 +6617,59 @@ pub async fn run_generation_auto_test_suite_opt(
     debug_log_to_file("[Auto-Test Suite] Starting automated route verification and crawler...".to_string());
 
     let mut warnings: Vec<String> = Vec::new();
+
+    if crate::templates_expo::is_expo_project_dir(proj_dir) {
+        run_hygiene_pass_on_project(proj_dir);
+        let app_dir = proj_dir.join("app");
+        let mut screen_count = 0usize;
+        if app_dir.join("_layout.tsx").is_file() || app_dir.join("_layout.jsx").is_file() {
+            screen_count += 1;
+        } else {
+            warnings.push("Nedostaje app/_layout.tsx za Expo Router.".to_string());
+        }
+        let mut has_screen = false;
+        let tabs_dir = app_dir.join("(tabs)");
+        for dir_check in [&tabs_dir, &app_dir] {
+            if let Ok(entries) = std::fs::read_dir(dir_check) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_file() {
+                        let fname = entry.file_name().to_string_lossy().to_lowercase();
+                        if (fname.ends_with(".tsx") || fname.ends_with(".jsx"))
+                            && !fname.starts_with('_')
+                            && !fname.starts_with('+')
+                        {
+                            has_screen = true;
+                            screen_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        if !has_screen {
+            warnings.push("Nedostaje početni Expo ekran (npr. app/(tabs)/index.tsx).".to_string());
+        }
+        let summary_msg = if warnings.is_empty() {
+            format!("> [Auto-Test Suite] Verifikovano {} Expo fajlova/ekrana. Statičke i Expo Router provere su prošle.", screen_count)
+        } else {
+            format!("> [Auto-Test Suite] Verifikovano {} Expo fajlova, upozorenja: {}.", screen_count, warnings.join("; "))
+        };
+        if let Some(w) = window {
+            let _ = w.emit("orchestrator:progress", serde_json::json!({
+                "phase": "auto-testing",
+                "message": summary_msg,
+                "progress": 98.0
+            }));
+        } else if std::env::var("AXIOM_E2E_HEADLESS").is_ok() {
+            println!("__AXIOM_PROGRESS__:{}", serde_json::json!({
+                "phase": "auto-testing",
+                "status": "generating",
+                "message": summary_msg,
+                "progress": 98.0
+            }));
+        }
+        return warnings;
+    }
 
     // 1. Discover all page routes from src/app
     let mut page_routes: Vec<String> = Vec::new();

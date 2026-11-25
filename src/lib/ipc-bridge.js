@@ -212,6 +212,9 @@ window.electronAPI = {
         settings.editorModel = modelId;
         await invoke('save_axiom_settings', { settings });
       } catch (e) {}
+      try {
+        window.dispatchEvent(new CustomEvent('axiom:editor-model-changed', { detail: { modelId } }));
+      } catch (e) {}
       console.log("Editor model selected:", modelId);
     }
   },
@@ -913,6 +916,83 @@ window.electronAPI = {
         console.error('Failed to record error in Katastar:', e);
         return null;
       }
+    }
+  },
+  copilot: {
+    getCapability: async (modelId) => {
+      try {
+        const resolved = modelId || localStorage.getItem('axiom-forge-editor-model') || localStorage.getItem('axiom-forge-model') || '';
+        if (!resolved) {
+          return {
+            eligible: false,
+            modelId: '',
+            isLargeModel: false,
+            supportsNativeTools: false,
+            supportsThinking: false,
+            recommendedNumCtx: 12288,
+            statusCode: 'too_small',
+            message: 'No Editor Model selected.'
+          };
+        }
+        return await invoke('copilot_get_capability', { modelId: resolved });
+      } catch (e) {
+        return {
+          eligible: false,
+          modelId: modelId || '',
+          isLargeModel: false,
+          supportsNativeTools: false,
+          supportsThinking: false,
+          recommendedNumCtx: 12288,
+          statusCode: 'ollama_offline',
+          message: e?.toString() || 'Could not inspect Copilot capability.'
+        };
+      }
+    },
+    sendMessage: async ({ projectId, modelId, mode = 'ask', prompt, activeFile = null, numCtxOverride = null }) => {
+      const resolved = modelId || localStorage.getItem('axiom-forge-editor-model') || localStorage.getItem('axiom-forge-model') || '';
+      return await invoke('copilot_send_message', {
+        projectId,
+        modelId: resolved,
+        mode,
+        prompt,
+        activeFile,
+        numCtxOverride
+      });
+    },
+    cancel: async (projectId) => {
+      try {
+        await invoke('copilot_cancel', { projectId });
+      } catch {}
+    },
+    resetSession: async (projectId, keepStaged = false) => {
+      try {
+        await invoke('copilot_reset_session', { projectId, keepStaged });
+      } catch {}
+    },
+    getStagedChanges: async (projectId) => {
+      try {
+        return await invoke('copilot_get_staged_changes', { projectId });
+      } catch {
+        return [];
+      }
+    },
+    discardStagedFile: async (projectId, filePath) => {
+      try {
+        return await invoke('copilot_discard_staged_file', { projectId, filePath });
+      } catch {
+        return [];
+      }
+    },
+    clearStagedChanges: async (projectId) => {
+      try {
+        await invoke('copilot_clear_staged_changes', { projectId });
+      } catch {}
+    },
+    deleteFileOnDisk: async (projectId, filePath) => {
+      return await invoke('copilot_delete_file_on_disk', { projectId, filePath });
+    },
+    onEvent: (callback) => {
+      return registerGlobalListener('copilot:event', callback);
     }
   }
 };

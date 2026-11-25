@@ -627,6 +627,51 @@ pub fn repair_package_json_dependencies(proj_dir: &std::path::Path) {
     if !pkg_path.exists() {
         return;
     }
+
+    if crate::templates_expo::is_expo_project_dir(proj_dir) {
+        if let Ok(raw_pkg) = std::fs::read_to_string(&pkg_path) {
+            if let Ok(mut pkg_json) = serde_json::from_str::<Value>(&raw_pkg) {
+                if let Some(pkg_obj) = pkg_json.as_object_mut() {
+                    let defaults = crate::templates_expo::expo_default_dependencies();
+                    let mut changed = false;
+                    if pkg_obj.get("main").and_then(|v| v.as_str()) != Some("expo-router/entry") {
+                        pkg_obj.insert("main".to_string(), serde_json::json!("expo-router/entry"));
+                        changed = true;
+                    }
+                    if let Some(def_scripts) = defaults.get("scripts").and_then(|v| v.as_object()) {
+                        let scripts = pkg_obj.entry("scripts").or_insert_with(|| serde_json::json!({}));
+                        if let Some(scripts_obj) = scripts.as_object_mut() {
+                            for (k, v) in def_scripts {
+                                if !scripts_obj.contains_key(k) {
+                                    scripts_obj.insert(k.clone(), v.clone());
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    for section in ["dependencies", "devDependencies"] {
+                        if let Some(def_map) = defaults.get(section).and_then(|v| v.as_object()) {
+                            let target = pkg_obj.entry(section).or_insert_with(|| serde_json::json!({}));
+                            if let Some(target_obj) = target.as_object_mut() {
+                                for (k, v) in def_map {
+                                    if !target_obj.contains_key(k) {
+                                        target_obj.insert(k.clone(), v.clone());
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if changed {
+                        if let Ok(pretty) = serde_json::to_string_pretty(&pkg_json) {
+                            let _ = std::fs::write(&pkg_path, format!("{}\n", pretty));
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
     
     let packages_db = load_packages_db();
     let has_src_dir = proj_dir.join("src").exists();
@@ -1653,6 +1698,26 @@ pub fn sanitize_package_json_for_offline(pkg_path: &std::path::Path) -> bool {
                         }
                     }
                 }
+                // Remove stale/nonexistent `prisma.schema` path when `prisma/schema.prisma` exists
+                let remove_prisma_obj = if let Some(prisma_obj) = obj.get_mut("prisma").and_then(|v| v.as_object_mut()) {
+                    if let Some(schema_val) = prisma_obj.get("schema").and_then(|v| v.as_str()).map(|s| s.to_string()) {
+                        let trimmed = schema_val.trim().trim_start_matches("./").replace('\\', "/");
+                        if !trimmed.is_empty()
+                            && !proj_dir.join(&trimmed).is_file()
+                            && proj_dir.join("prisma/schema.prisma").is_file()
+                        {
+                            prisma_obj.remove("schema");
+                            changed = true;
+                        }
+                    }
+                    prisma_obj.is_empty()
+                } else {
+                    false
+                };
+                if remove_prisma_obj {
+                    obj.remove("prisma");
+                    changed = true;
+                }
             }
             if changed {
                 if let Ok(pretty) = serde_json::to_string_pretty(&json_val) {
@@ -2586,5 +2651,67 @@ pub async fn run_npm_install_with_auto_healing_opt(
     }
 
     NpmInstallOutcome::Failed
+}
+
+#[cfg(test)]
+mod prisma_schema_pkg_tests {
+    use super::sanitize_package_json_for_offline;
+
+    #[test]
+    fn cleans_invalid_prisma_schema_path_and_preserves_valid_custom_path() {
+        let base = std::env::temp_dir().join(format!("axiom-prisma-pkg-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        // Case 1: Invalid `prisma.schema` removed when `prisma/schema.prisma` exists
+        let invalid_dir = base.join("invalid");
+        std::fs::create_dir_all(invalid_dir.join("prisma")).unwrap();
+        std::fs::write(invalid_dir.join("prisma/schema.prisma"), "datasource db { provider = \"postgresql\" url = env(\"DATABASE_URL\") }\n").unwrap();
+        let pkg_invalid = invalid_dir.join("package.json");
+        std::fs::write(
+            &pkg_invalid,
+            serde_json::json!({
+                "name": "test-app",
+                "version": "1.0.0",
+                "prisma": { "schema": "./src/lib/prisma/schema.prisma" },
+                "dependencies": { "next": "14.2.35", "react": "^18.2.0", "react-dom": "^18.2.0" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(sanitize_package_json_for_offline(&pkg_invalid));
+        let cleaned: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&pkg_invalid).unwrap()).unwrap();
+        assert!(cleaned.get("prisma").is_none());
+
+        // Case 2: Valid custom `prisma.schema` path is preserved
+        let valid_dir = base.join("valid");
+        std::fs::create_dir_all(valid_dir.join("prisma")).unwrap();
+        std::fs::create_dir_all(valid_dir.join("custom")).unwrap();
+        std::fs::write(valid_dir.join("prisma/schema.prisma"), "").unwrap();
+        std::fs::write(valid_dir.join("custom/schema.prisma"), "").unwrap();
+        let pkg_valid = valid_dir.join("package.json");
+        std::fs::write(
+            &pkg_valid,
+            serde_json::json!({
+                "name": "test-valid-custom",
+                "version": "1.0.0",
+                "prisma": { "schema": "./custom/schema.prisma" },
+                "dependencies": { "next": "14.2.35", "react": "^18.2.0", "react-dom": "^18.2.0" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let _ = sanitize_package_json_for_offline(&pkg_valid);
+        let preserved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&pkg_valid).unwrap()).unwrap();
+        assert_eq!(
+            preserved.get("prisma").and_then(|p| p.get("schema")).and_then(|s| s.as_str()),
+            Some("./custom/schema.prisma")
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
 

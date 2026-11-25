@@ -150,10 +150,25 @@ pub fn inject_axiom_attrs(content: &str, relative_path: &str) -> String {
 
 pub fn detect_project_type(manifest: &Value) -> String {
     if let Some(t) = manifest.get("projectType").and_then(|s| s.as_str()) {
-        return t.to_lowercase();
+        let low = t.trim().to_lowercase();
+        if crate::templates_expo::is_expo_project_type(&low) {
+            return "expo".to_string();
+        }
+        return low;
     }
-    if let Some(stack) = manifest.get("resolvedStack").and_then(|s| s.as_str()) {
+    let stack_opt = manifest
+        .get("resolvedStack")
+        .or_else(|| manifest.get("techStack"))
+        .and_then(|s| s.as_str());
+    if let Some(stack) = stack_opt {
         let stack_lower = stack.to_lowercase();
+        if stack_lower.contains("expo")
+            || stack_lower.contains("react native")
+            || stack_lower.contains("react-native")
+            || stack_lower.contains("react_native")
+        {
+            return "expo".to_string();
+        }
         if stack_lower.contains("next") {
             return "nextjs".to_string();
         }
@@ -173,7 +188,7 @@ pub fn detect_project_type(manifest: &Value) -> String {
     if let Some(p) = manifest.get("platform").and_then(|s| s.as_str()) {
         let p_lower = p.to_lowercase();
         if p_lower == "mobile" {
-            return "flutter".to_string();
+            return "expo".to_string();
         }
         if p_lower == "desktop" {
             return "electron".to_string();
@@ -183,6 +198,38 @@ pub fn detect_project_type(manifest: &Value) -> String {
 }
 
 pub fn normalize_project_structure(files: &mut Vec<Value>, metamanifest: &Value, project_type: &str) {
+    let is_expo = crate::templates_expo::is_expo_project_type(project_type);
+
+    if is_expo {
+        files.retain(|file| {
+            let Some(path_str) = file.get("path").and_then(|p| p.as_str()) else {
+                return true;
+            };
+            let norm = path_str.trim().replace('\\', "/").trim_start_matches("./").to_lowercase();
+            let is_web_only = norm.starts_with("next.config.")
+                || norm.starts_with("tailwind.config.")
+                || norm.starts_with("postcss.config.")
+                || norm == "next-env.d.ts"
+                || norm == "prisma/schema.prisma"
+                || norm == "schema.prisma"
+                || norm == "src/lib/prisma.ts"
+                || norm == "src/lib/prisma.js"
+                || norm == "src/app/globals.css"
+                || norm == "app/globals.css"
+                || norm == "src/app/layout.tsx"
+                || norm == "src/app/layout.jsx"
+                || norm.starts_with("src/app/api/")
+                || norm.starts_with("app/api/")
+                || norm.starts_with("src/api/")
+                || norm.starts_with("api/")
+                || norm.ends_with("/route.ts")
+                || norm.ends_with("/route.js")
+                || norm == "middleware.ts"
+                || norm == "middleware.js";
+            !is_web_only
+        });
+    }
+
     let root_files: Vec<String> = metamanifest
         .get("rootFiles")
         .and_then(|rf| rf.as_array())
@@ -204,6 +251,23 @@ pub fn normalize_project_structure(files: &mut Vec<Value>, metamanifest: &Value,
             // 1. Move root configuration files to root
             if root_files.contains(&filename) {
                 file["path"] = serde_json::json!(parts.last().unwrap());
+                continue;
+            }
+
+            if is_expo {
+                if let Some(rest) = normalized.strip_prefix("src/app/") {
+                    let mapped = if rest.eq_ignore_ascii_case("page.tsx") || rest.eq_ignore_ascii_case("page.jsx") {
+                        "app/(tabs)/index.tsx".to_string()
+                    } else {
+                        format!("app/{}", rest)
+                    };
+                    file["path"] = serde_json::json!(mapped);
+                    continue;
+                }
+                if path_lower == "app/page.tsx" || path_lower == "app/page.jsx" {
+                    file["path"] = serde_json::json!("app/(tabs)/index.tsx");
+                    continue;
+                }
                 continue;
             }
 
@@ -482,6 +546,23 @@ pub fn filter_runaway_manifest_expansion(
                     }
                 }
             }
+        } else if crate::templates_expo::is_expo_project_type(project_type) {
+            let is_expo_leak = norm_low.starts_with("src/api/")
+                || norm_low.starts_with("api/")
+                || norm_low.starts_with("src/app/")
+                || norm_low.starts_with("prisma/")
+                || norm_low == "schema.prisma"
+                || norm_low.ends_with("/route.ts")
+                || norm_low.ends_with("/route.js")
+                || norm_low.starts_with("next.config.")
+                || norm_low.starts_with("tailwind.config.")
+                || norm_low.starts_with("postcss.config.")
+                || norm_low == "middleware.ts"
+                || norm_low == "middleware.js"
+                || (orig_paths.contains("src/types/index.ts") && norm_low.starts_with("src/models/"));
+            if is_expo_leak {
+                continue;
+            }
         }
 
         out.push(item);
@@ -491,7 +572,7 @@ pub fn filter_runaway_manifest_expansion(
 }
 
 pub fn get_axiom_inspector_script() -> &'static str {
-    "      <script dangerouslySetInnerHTML={{ __html: `\n        if (!window.__axiom_inspect_injected) {\n          window.__axiom_inspect_injected = true;\n          let isInspectActive = false;\n          let lastReportedOverlaySig = '';\n          function extractProjectFileFromStack(txt) {\n            try {\n              if (!txt) return null;\n              const norm = String(txt).split(String.fromCharCode(92)).join('/');\n              const ch = 'A-Za-z0-9_@()' + String.fromCharCode(92, 91, 92, 93) + '~-';\n              const re = new RegExp('(?:[.]/)*(?:[' + ch + ']+/)+[' + ch + '.]+[.](?:tsx|ts|jsx|js|mjs|cjs|css|scss)', 'gi');\n              const leadRe = new RegExp('^(?:[.]|/)+');\n              const matches = norm.match(re) || [];\n              for (const raw of matches) {\n                let c = raw.replace(leadRe, '');\n                const low = c.toLowerCase();\n                if (low.includes('node_modules/') || low.includes('_next/') || low.includes('.next/') || low.includes('webpack-internal:')) continue;\n                const srcIdx = low.lastIndexOf('/src/');\n                if (srcIdx !== -1) c = c.slice(srcIdx + 1);\n                if (c) return c;\n              }\n              return null;\n            } catch (e) { return null; }\n          }\n          function extractNextjsOverlay() {\n            try {\n              const portal = document.querySelector('nextjs-portal');\n              const root = (portal && portal.shadowRoot) ? portal.shadowRoot : document;\n              const dialog = root.querySelector('[data-nextjs-dialog], [role=\"dialog\"], #nextjs__container_errors_label');\n              let rawText = dialog ? (dialog.innerText || dialog.textContent || '').trim() : '';\n              if (!rawText && root !== document) {\n                rawText = Array.from(root.children || []).filter(el => el.tagName !== 'STYLE' && el.tagName !== 'SCRIPT').map(el => el.innerText || el.textContent || '').join(String.fromCharCode(10)).trim();\n              }\n              if (!rawText || (!rawText.includes('Error') && !rawText.includes('Failed to compile') && !rawText.includes('Module not found'))) return null;\n              const normText = rawText.split(String.fromCharCode(92)).join('/');\n              const sourceFile = extractProjectFileFromStack(normText);\n              const lines = normText.split(String.fromCharCode(10)).map(l => l.trim()).filter(l => l && !l.startsWith(':host') && !l.startsWith('/*!'));\n              const errLine = lines.find(l => l.includes('Module not found:') || l.includes('Error:') || l.includes('Failed to compile')) || lines[0] || '';\n              const message = errLine.substring(0, 220);\n              return { hasError: true, message, sourceFile, rawText: rawText.substring(0, 1200) };\n            } catch (e) { return null; }\n          }\n          function collectAxiomUiSnapshot() {\n            try {\n              const isVis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };\n              const headings = Array.from(document.querySelectorAll('h1, h2, h3')).slice(0, 20).map(h => ({ tag: h.tagName.toLowerCase(), text: (h.innerText || '').trim().substring(0, 120) })).filter(h => h.text);\n              const buttons = Array.from(document.querySelectorAll('button, [role=\"button\"]')).slice(0, 35).map(b => ({ text: (b.innerText || '').trim().substring(0, 80), ariaLabel: b.getAttribute('aria-label') || '', disabled: !!b.disabled, visible: isVis(b) }));\n              const links = Array.from(document.querySelectorAll('a')).slice(0, 35).map(a => ({ text: (a.innerText || '').trim().substring(0, 80), href: a.getAttribute('href') || '', visible: isVis(a) }));\n              const inputs = Array.from(document.querySelectorAll('input, select, textarea')).slice(0, 25).map(i => ({ tag: i.tagName.toLowerCase(), type: i.getAttribute('type') || '', name: i.getAttribute('name') || '', placeholder: i.getAttribute('placeholder') || '', value: (i.value || '').substring(0, 80) }));\n              const overlay = extractNextjsOverlay();\n              const bodyText = (document.body ? document.body.innerText : '').trim();\n              return {\n                url: window.location.href,\n                pathname: window.location.pathname,\n                title: document.title || '',\n                nextjsOverlay: overlay,\n                headings,\n                buttons,\n                links,\n                inputs,\n                layout: {\n                  viewportWidth: window.innerWidth,\n                  viewportHeight: window.innerHeight,\n                  scrollWidth: document.documentElement ? document.documentElement.scrollWidth : 0,\n                  scrollHeight: document.documentElement ? document.documentElement.scrollHeight : 0,\n                  hasHorizontalOverflow: (document.documentElement ? document.documentElement.scrollWidth : 0) > window.innerWidth + 4,\n                  hasNavbar: !!document.querySelector('nav, header'),\n                  hasFooter: !!document.querySelector('footer'),\n                  visibleTextPreview: bodyText.substring(0, 600)\n                }\n              };\n            } catch (e) { return { error: String(e) }; }\n          }\n          function reportAxiomRoute() {\n            try {\n              const overlay = extractNextjsOverlay();\n              if (overlay && overlay.hasError) {\n                const sig = window.location.pathname + '::' + (overlay.sourceFile || '') + '::' + overlay.message;\n                if (sig !== lastReportedOverlaySig) {\n                  lastReportedOverlaySig = sig;\n                  window.parent.postMessage({ channel: 'axiom-preview-error', message: overlay.message, sourceFile: overlay.sourceFile, details: overlay.rawText, path: window.location.pathname }, '*');\n                }\n              } else {\n                lastReportedOverlaySig = '';\n              }\n              window.parent.postMessage({ channel: 'axiom-preview-route', pathname: window.location.pathname, url: window.location.href, snapshot: collectAxiomUiSnapshot() }, '*');\n            } catch(e) {}\n          }\n          setTimeout(reportAxiomRoute, 400);\n          window.addEventListener('popstate', reportAxiomRoute);\n          setInterval(reportAxiomRoute, 2000);\n          window.addEventListener('error', function(e) { try { const srcFromStack = extractProjectFileFromStack(e.error && e.error.stack); const det = e.error && e.error.stack ? String(e.error.stack).substring(0, 1200) : (e.message || ''); window.parent.postMessage({ channel: 'axiom-preview-error', message: e.message || 'Unknown runtime error', sourceFile: srcFromStack || e.filename || null, details: det, path: window.location.pathname }, '*'); } catch(err) {} });\n          window.addEventListener('unhandledrejection', function(e) { try { const srcFromStack = extractProjectFileFromStack(e.reason && e.reason.stack); const det = e.reason && e.reason.stack ? String(e.reason.stack).substring(0, 1200) : ''; window.parent.postMessage({ channel: 'axiom-preview-error', message: e.reason?.message || String(e.reason || 'Unhandled promise rejection'), sourceFile: srcFromStack, details: det, path: window.location.pathname }, '*'); } catch(err) {} });\n          window.addEventListener('message', (e) => {\n            if (e.data && e.data.channel === 'axiom-toggle-inspect') {\n              isInspectActive = !!e.data.enabled;\n              if (!isInspectActive && highlightedElement) {\n                highlightedElement.classList.remove('axiom-inspect-highlight');\n                highlightedElement = null;\n              }\n            }\n            if (e.data && e.data.channel === 'axiom-agent-dom-cmd') {\n              const cmd = e.data;\n              try {\n                if (cmd.action === 'snapshot') {\n                  window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'ok', snapshot: collectAxiomUiSnapshot() }, '*');\n                } else if (cmd.action === 'click') {\n                  let el = cmd.selector ? document.querySelector(cmd.selector) : null;\n                  if (!el && cmd.text) {\n                    const needle = cmd.text.toLowerCase();\n                    const candidates = Array.from(document.querySelectorAll('button, a, [role=\"button\"], li, span'));\n                    el = candidates.find(c => ((c.innerText || '').trim().toLowerCase().includes(needle)) || ((c.getAttribute('aria-label') || '').toLowerCase().includes(needle)));\n                  }\n                  if (el) {\n                    el.click();\n                    setTimeout(() => {\n                      window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'clicked: ' + (el.innerText || el.tagName).trim().substring(0, 50), snapshot: collectAxiomUiSnapshot() }, '*');\n                    }, 600);\n                  } else {\n                    window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'element_not_found', snapshot: collectAxiomUiSnapshot() }, '*');\n                  }\n                } else if (cmd.action === 'type') {\n                  let el = cmd.selector ? document.querySelector(cmd.selector) : null;\n                  if (!el && cmd.placeholder) {\n                    const needle = cmd.placeholder.toLowerCase();\n                    el = Array.from(document.querySelectorAll('input, textarea')).find(i => (i.getAttribute('placeholder') || '').toLowerCase().includes(needle) || (i.getAttribute('name') || '').toLowerCase().includes(needle));\n                  }\n                  if (el) {\n                    const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;\n                    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;\n                    if (setter) setter.call(el, cmd.value || ''); else el.value = cmd.value || '';\n                    el.dispatchEvent(new Event('input', { bubbles: true }));\n                    el.dispatchEvent(new Event('change', { bubbles: true }));\n                    setTimeout(() => {\n                      window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'typed', snapshot: collectAxiomUiSnapshot() }, '*');\n                    }, 300);\n                  } else {\n                    window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'input_not_found', snapshot: collectAxiomUiSnapshot() }, '*');\n                  }\n                } else if (cmd.action === 'navigate' && cmd.route) {\n                  window.location.href = cmd.route;\n                }\n              } catch (err) {\n                window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'error: ' + String(err), snapshot: collectAxiomUiSnapshot() }, '*');\n              }\n            }\n          });\n          const styleEl = document.createElement('style');\n          styleEl.textContent = '.axiom-inspect-highlight { outline: 2px solid #6366f1 !important; outline-offset: -2px !important; cursor: crosshair !important; background-color: rgba(99, 102, 241, 0.12) !important; transition: all 0.1s ease; }';\n          document.head.appendChild(styleEl);\n          let highlightedElement = null;\n          function findAxiomTarget(el) {\n            if (!el || el === document.body || el === document.documentElement) return null;\n            let cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              if (cur.dataset && (cur.dataset.axiomFile || cur.dataset.axiomComponent)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            const validTags = ['h1','h2','h3','h4','h5','h6','p','button','a','input','textarea','select','header','footer','nav','section','article','aside','li'];\n            cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              const tag = cur.tagName.toLowerCase();\n              if (validTags.includes(tag) || (cur.innerText && cur.innerText.trim().length > 0 && cur.children.length === 0)) {\n                return cur;\n              }\n              cur = cur.parentElement;\n            }\n            return el !== document.body && el !== document.documentElement ? el : null;\n          }\n          document.addEventListener('mouseover', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (highlightedElement && highlightedElement !== target) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n            }\n            if (target) {\n              target.classList.add('axiom-inspect-highlight');\n              highlightedElement = target;\n            }\n          }, true);\n          document.addEventListener('mouseout', (e) => {\n            if (highlightedElement) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n              highlightedElement = null;\n            }\n          }, true);\n          document.addEventListener('click', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findAxiomTarget(e.target);\n            if (target) {\n              e.preventDefault();\n              e.stopPropagation();\n              const payload = {\n                file: target.dataset?.axiomFile || null,\n                component: target.dataset?.axiomComponent || null,\n                tagName: target.tagName.toLowerCase(),\n                text: (target.innerText || target.value || '').trim().substring(0, 80),\n                path: window.location.pathname\n              };\n              window.parent.postMessage({ channel: 'axiom-inspect-click', payload }, '*');\n            }\n          }, true);\n        }\n      ` }} />"
+    "      <script dangerouslySetInnerHTML={{ __html: `\n        if (!window.__axiom_inspect_injected) {\n          window.__axiom_inspect_injected = true;\n          let isInspectActive = false;\n          let lastReportedOverlaySig = '';\n          function extractProjectFileFromStack(txt) {\n            try {\n              if (!txt) return null;\n              const norm = String(txt).split(String.fromCharCode(92)).join('/');\n              const ch = 'A-Za-z0-9_@()' + String.fromCharCode(92, 91, 92, 93) + '~-';\n              const re = new RegExp('(?:[.]/)*(?:[' + ch + ']+/)+[' + ch + '.]+[.](?:tsx|ts|jsx|js|mjs|cjs|css|scss)', 'gi');\n              const leadRe = new RegExp('^(?:[.]|/)+');\n              const matches = norm.match(re) || [];\n              for (const raw of matches) {\n                let c = raw.replace(leadRe, '');\n                const low = c.toLowerCase();\n                if (low.includes('node_modules/') || low.includes('_next/') || low.includes('.next/') || low.includes('webpack-internal:')) continue;\n                const srcIdx = low.lastIndexOf('/src/');\n                if (srcIdx !== -1) c = c.slice(srcIdx + 1);\n                if (c) return c;\n              }\n              return null;\n            } catch (e) { return null; }\n          }\n          function extractNextjsOverlay() {\n            try {\n              const portal = document.querySelector('nextjs-portal');\n              const root = (portal && portal.shadowRoot) ? portal.shadowRoot : document;\n              const dialog = root.querySelector('[data-nextjs-dialog], [role=\"dialog\"], #nextjs__container_errors_label');\n              let rawText = dialog ? (dialog.innerText || dialog.textContent || '').trim() : '';\n              if (!rawText && root !== document) {\n                rawText = Array.from(root.children || []).filter(el => el.tagName !== 'STYLE' && el.tagName !== 'SCRIPT').map(el => el.innerText || el.textContent || '').join(String.fromCharCode(10)).trim();\n              }\n              if (!rawText || (!rawText.includes('Error') && !rawText.includes('Failed to compile') && !rawText.includes('Module not found'))) return null;\n              const normText = rawText.split(String.fromCharCode(92)).join('/');\n              const sourceFile = extractProjectFileFromStack(normText);\n              const lines = normText.split(String.fromCharCode(10)).map(l => l.trim()).filter(l => l && !l.startsWith(':host') && !l.startsWith('/*!'));\n              const errLine = lines.find(l => l.includes('Module not found:') || l.includes('Error:') || l.includes('Failed to compile')) || lines[0] || '';\n              const message = errLine.substring(0, 220);\n              return { hasError: true, message, sourceFile, rawText: rawText.substring(0, 1200) };\n            } catch (e) { return null; }\n          }\n          function collectAxiomUiSnapshot() {\n            try {\n              const isVis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };\n              const headings = Array.from(document.querySelectorAll('h1, h2, h3')).slice(0, 20).map(h => ({ tag: h.tagName.toLowerCase(), text: (h.innerText || '').trim().substring(0, 120) })).filter(h => h.text);\n              const buttons = Array.from(document.querySelectorAll('button, [role=\"button\"]')).slice(0, 35).map(b => ({ text: (b.innerText || '').trim().substring(0, 80), ariaLabel: b.getAttribute('aria-label') || '', disabled: !!b.disabled, visible: isVis(b) }));\n              const links = Array.from(document.querySelectorAll('a')).slice(0, 35).map(a => ({ text: (a.innerText || '').trim().substring(0, 80), href: a.getAttribute('href') || '', visible: isVis(a) }));\n              const inputs = Array.from(document.querySelectorAll('input, select, textarea')).slice(0, 25).map(i => ({ tag: i.tagName.toLowerCase(), type: i.getAttribute('type') || '', name: i.getAttribute('name') || '', placeholder: i.getAttribute('placeholder') || '', value: (i.value || '').substring(0, 80) }));\n              const overlay = extractNextjsOverlay();\n              const bodyText = (document.body ? document.body.innerText : '').trim();\n              return {\n                url: window.location.href,\n                pathname: window.location.pathname,\n                title: document.title || '',\n                nextjsOverlay: overlay,\n                headings,\n                buttons,\n                links,\n                inputs,\n                layout: {\n                  viewportWidth: window.innerWidth,\n                  viewportHeight: window.innerHeight,\n                  scrollWidth: document.documentElement ? document.documentElement.scrollWidth : 0,\n                  scrollHeight: document.documentElement ? document.documentElement.scrollHeight : 0,\n                  hasHorizontalOverflow: (document.documentElement ? document.documentElement.scrollWidth : 0) > window.innerWidth + 4,\n                  hasNavbar: !!document.querySelector('nav, header'),\n                  hasFooter: !!document.querySelector('footer'),\n                  visibleTextPreview: bodyText.substring(0, 600)\n                }\n              };\n            } catch (e) { return { error: String(e) }; }\n          }\n          function reportAxiomRoute() {\n            try {\n              const overlay = extractNextjsOverlay();\n              if (overlay && overlay.hasError) {\n                const sig = window.location.pathname + '::' + (overlay.sourceFile || '') + '::' + overlay.message;\n                if (sig !== lastReportedOverlaySig) {\n                  lastReportedOverlaySig = sig;\n                  window.parent.postMessage({ channel: 'axiom-preview-error', message: overlay.message, sourceFile: overlay.sourceFile, details: overlay.rawText, path: window.location.pathname }, '*');\n                }\n              } else {\n                lastReportedOverlaySig = '';\n              }\n              window.parent.postMessage({ channel: 'axiom-preview-route', pathname: window.location.pathname, url: window.location.href, snapshot: collectAxiomUiSnapshot() }, '*');\n            } catch(e) {}\n          }\n          setTimeout(reportAxiomRoute, 400);\n          window.addEventListener('popstate', reportAxiomRoute);\n          setInterval(reportAxiomRoute, 2000);\n          window.addEventListener('error', function(e) { try { const srcFromStack = extractProjectFileFromStack(e.error && e.error.stack); const det = e.error && e.error.stack ? String(e.error.stack).substring(0, 1200) : (e.message || ''); window.parent.postMessage({ channel: 'axiom-preview-error', message: e.message || 'Unknown runtime error', sourceFile: srcFromStack || e.filename || null, details: det, path: window.location.pathname }, '*'); } catch(err) {} });\n          window.addEventListener('unhandledrejection', function(e) { try { const srcFromStack = extractProjectFileFromStack(e.reason && e.reason.stack); const det = e.reason && e.reason.stack ? String(e.reason.stack).substring(0, 1200) : ''; window.parent.postMessage({ channel: 'axiom-preview-error', message: e.reason?.message || String(e.reason || 'Unhandled promise rejection'), sourceFile: srcFromStack, details: det, path: window.location.pathname }, '*'); } catch(err) {} });\n          window.addEventListener('message', (e) => {\n            if (e.data && e.data.channel === 'axiom-toggle-inspect') {\n              isInspectActive = !!e.data.enabled;\n              if (!isInspectActive && highlightedElement) {\n                highlightedElement.classList.remove('axiom-inspect-highlight');\n                highlightedElement = null;\n              }\n            }\n            if (e.data && e.data.channel === 'axiom-agent-dom-cmd') {\n              const cmd = e.data;\n              try {\n                if (cmd.action === 'snapshot') {\n                  window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'ok', snapshot: collectAxiomUiSnapshot() }, '*');\n                } else if (cmd.action === 'click') {\n                  let el = cmd.selector ? document.querySelector(cmd.selector) : null;\n                  if (!el && cmd.text) {\n                    const needle = cmd.text.toLowerCase();\n                    const candidates = Array.from(document.querySelectorAll('button, a, [role=\"button\"], li, span'));\n                    el = candidates.find(c => ((c.innerText || '').trim().toLowerCase().includes(needle)) || ((c.getAttribute('aria-label') || '').toLowerCase().includes(needle)));\n                  }\n                  if (el) {\n                    el.click();\n                    setTimeout(() => {\n                      window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'clicked: ' + (el.innerText || el.tagName).trim().substring(0, 50), snapshot: collectAxiomUiSnapshot() }, '*');\n                    }, 600);\n                  } else {\n                    window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'element_not_found', snapshot: collectAxiomUiSnapshot() }, '*');\n                  }\n                } else if (cmd.action === 'type') {\n                  let el = cmd.selector ? document.querySelector(cmd.selector) : null;\n                  if (!el && cmd.placeholder) {\n                    const needle = cmd.placeholder.toLowerCase();\n                    el = Array.from(document.querySelectorAll('input, textarea')).find(i => (i.getAttribute('placeholder') || '').toLowerCase().includes(needle) || (i.getAttribute('name') || '').toLowerCase().includes(needle));\n                  }\n                  if (el) {\n                    const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;\n                    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;\n                    if (setter) setter.call(el, cmd.value || ''); else el.value = cmd.value || '';\n                    el.dispatchEvent(new Event('input', { bubbles: true }));\n                    el.dispatchEvent(new Event('change', { bubbles: true }));\n                    setTimeout(() => {\n                      window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'typed', snapshot: collectAxiomUiSnapshot() }, '*');\n                    }, 300);\n                  } else {\n                    window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'input_not_found', snapshot: collectAxiomUiSnapshot() }, '*');\n                  }\n                } else if (cmd.action === 'navigate' && cmd.route) {\n                  window.location.href = cmd.route;\n                }\n              } catch (err) {\n                window.parent.postMessage({ channel: 'axiom-ui-snapshot', cmdId: cmd.cmdId, actionResult: 'error: ' + String(err), snapshot: collectAxiomUiSnapshot() }, '*');\n              }\n            }\n          });\n          const styleEl = document.createElement('style');\n          styleEl.textContent = '.axiom-inspect-highlight { outline: 2px solid #6366f1 !important; outline-offset: -2px !important; cursor: crosshair !important; background-color: rgba(99, 102, 241, 0.12) !important; transition: all 0.1s ease; }';\n          document.head.appendChild(styleEl);\n          let highlightedElement = null;\n          function findAxiomOwner(el) {\n            let cur = el;\n            let file = null;\n            let component = null;\n            while (cur && cur !== document.body && cur !== document.documentElement) {\n              if (!file && cur.dataset && cur.dataset.axiomFile) file = cur.dataset.axiomFile;\n              if (!component && cur.dataset && cur.dataset.axiomComponent) component = cur.dataset.axiomComponent;\n              if (file && component) break;\n              cur = cur.parentElement;\n            }\n            return { file, component };\n          }\n          function findVisualElement(el) {\n            if (!el || el === document.body || el === document.documentElement) return null;\n            const svgTags = ['svg', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'ellipse', 'use', 'g'];\n            const semanticTags = ['button', 'a', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'span', 'label', 'input', 'textarea', 'select', 'img', 'li', 'td', 'th', 'article', 'section', 'header', 'footer', 'nav'];\n            let cur = el;\n            while (cur && cur !== document.body && cur !== document.documentElement && svgTags.includes((cur.tagName || '').toLowerCase())) {\n              cur = cur.parentElement;\n            }\n            if (!cur || cur === document.body || cur === document.documentElement) return null;\n            const curTag = (cur.tagName || '').toLowerCase();\n            if (semanticTags.includes(curTag)) return cur;\n            let scan = cur;\n            while (scan && scan !== document.body && scan !== document.documentElement) {\n              const tag = (scan.tagName || '').toLowerCase();\n              if (['button', 'a', 'label', 'li'].includes(tag)) return scan;\n              if (scan.dataset && (scan.dataset.axiomFile || scan.dataset.axiomComponent) && scan !== cur) break;\n              scan = scan.parentElement;\n            }\n            return cur;\n          }\n          document.addEventListener('mouseover', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findVisualElement(e.target);\n            if (highlightedElement && highlightedElement !== target) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n            }\n            if (target) {\n              target.classList.add('axiom-inspect-highlight');\n              highlightedElement = target;\n            }\n          }, true);\n          document.addEventListener('mouseout', (e) => {\n            if (highlightedElement) {\n              highlightedElement.classList.remove('axiom-inspect-highlight');\n              highlightedElement = null;\n            }\n          }, true);\n          document.addEventListener('click', (e) => {\n            if (!isInspectActive && !e.altKey) return;\n            const target = findVisualElement(e.target);\n            if (target) {\n              e.preventDefault();\n              e.stopPropagation();\n              const owner = findAxiomOwner(target);\n              const rawCls = typeof target.className === 'string' ? target.className : '';\n              const payload = {\n                file: owner.file,\n                component: owner.component,\n                tagName: target.tagName.toLowerCase(),\n                text: (target.innerText || target.value || '').trim().substring(0, 80),\n                className: rawCls.split('axiom-inspect-highlight').join('').trim().substring(0, 180),\n                path: window.location.pathname\n              };\n              window.parent.postMessage({ channel: 'axiom-inspect-click', payload }, '*');\n            }\n          }, true);\n        }\n      ` }} />"
 }
 
 pub fn strip_axiom_inspector_script(content: &str) -> String {
@@ -508,6 +589,10 @@ pub fn strip_axiom_inspector_script(content: &str) -> String {
 }
 
 pub fn ensure_axiom_inspector_injected(proj_dir: &std::path::Path) {
+    if crate::templates_expo::is_expo_project_dir(proj_dir) {
+        crate::templates_expo::ensure_expo_html_inspector_injected(proj_dir);
+        return;
+    }
     let candidate_layouts = [
         "src/app/[locale]/layout.tsx",
         "src/app/[locale]/layout.jsx",
@@ -529,6 +614,7 @@ pub fn ensure_axiom_inspector_injected(proj_dir: &std::path::Path) {
             if let Ok(content) = std::fs::read_to_string(&full_path) {
                 let needs_upgrade = !content.contains("axiom-agent-dom-cmd")
                     || !content.contains("extractProjectFileFromStack")
+                    || !content.contains("findAxiomOwner")
                     || content.contains("(?:src/(?:app|pages|components|hooks|lib|utils|services|models)/")
                     || content.contains("rawText.match(/(?:")
                     || content.contains("styleEl.textContent = \\`")
@@ -1556,7 +1642,7 @@ pub fn sanitize_try_catch_body_scope(content: &str) -> String {
         return content.to_string();
     };
     let Ok(decl_re) = regex::Regex::new(
-        r"(?m)^([ \t]*)(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=\n]+)?=\s*((?:await\s+)?(?:req|request)\s*\.\s*json\s*\([^)]*\)\s*;?)",
+        r"(?m)^([ \t]*)(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=\n]+)?=\s*((?:await\s+)?(?:req|request)\s*\.\s*json\s*\([^)]*\)\s*;?|\{\s*\}\s*;?)",
     ) else {
         return content.to_string();
     };
@@ -1689,10 +1775,46 @@ pub fn normalize_auth_navigation_links(content: &str) -> String {
         .replace("`/dashboard/register`", "`/register`")
 }
 
-/// Fixes JSX double-currency glitches (`$${item.price}` when mock data also holds `'$50'`)
-/// and normalizes `/dashboard/login` & `/dashboard/register` links.
+/// Adds `legacyBehavior` ONLY to Next.js `<Link>` opening tags whose direct child is an `<a>`
+/// element (including multiline `<a\n...>`), leaving modern `<Link>` tags untouched.
+pub fn ensure_link_legacy_behavior_for_anchor(content: &str, rel_path: &str) -> String {
+    let low = rel_path.replace('\\', "/").to_ascii_lowercase();
+    if !(low.ends_with(".tsx") || low.ends_with(".jsx")) || !content.contains("<Link") {
+        return content.to_string();
+    }
+
+    let Ok(re_link) = regex::Regex::new(r"<Link\b([^>]*)>") else {
+        return content.to_string();
+    };
+    re_link
+        .replace_all(content, |caps: &regex::Captures| {
+            let full = caps.get(0).unwrap();
+            let attrs = caps.get(1).map_or("", |m| m.as_str());
+            if attrs.contains("legacyBehavior") || attrs.trim_end().ends_with('/') {
+                return full.as_str().to_string();
+            }
+            let after = content[full.end()..].trim_start();
+            let direct_anchor_child = after.starts_with("<a ")
+                || after.starts_with("<a>")
+                || after.starts_with("<a\n")
+                || after.starts_with("<a\r")
+                || after.starts_with("<a\t");
+            if !direct_anchor_child {
+                full.as_str().to_string()
+            } else if attrs.is_empty() {
+                "<Link legacyBehavior>".to_string()
+            } else {
+                format!("<Link legacyBehavior{}>", attrs)
+            }
+        })
+        .into_owned()
+}
+
+/// Fixes JSX double-currency glitches (`$${item.price}` when mock data also holds `'$50'`),
+/// adds `legacyBehavior` on `<Link><a>`, and normalizes `/dashboard/login` & `/dashboard/register` links.
 pub fn sanitize_tsx_ux_glitches(content: &str, rel_path: &str) -> String {
     let mut out = normalize_auth_navigation_links(content);
+    out = ensure_link_legacy_behavior_for_anchor(&out, rel_path);
     let low = rel_path.replace('\\', "/").to_ascii_lowercase();
     if !(low.ends_with(".tsx") || low.ends_with(".jsx")) {
         return out;
@@ -3026,8 +3148,94 @@ pub fn sanitize_jsx_in_ts_file(content: &str, rel_path: &str) -> String {
 
 /// Removes redundant/unreachable prefix branches inside `middleware()` based on
 /// the actual negative lookahead exclusions parsed from `export const config.matcher`.
+/// Strips hallucinated i18n `NextResponse.rewrite(new URL(\`/\${locale}\${pathname}\`, ...))`
+/// blocks from Next.js `middleware.ts` / `middleware.js` when no `[locale]` / `[lang]` dynamic
+/// route segment exists on disk (which otherwise rewrites `/login` -> `/login/login` and 404s).
+pub fn strip_bogus_middleware_locale_rewrite(
+    content: &str,
+    rel_path: &str,
+    proj_dir: Option<&std::path::Path>,
+) -> String {
+    let low = rel_path.replace('\\', "/").to_ascii_lowercase();
+    if !(low.ends_with("middleware.ts") || low.ends_with("middleware.js")) {
+        return content.to_string();
+    }
+    if let Some(dir) = proj_dir {
+        for candidate in ["src/app/[locale]", "src/app/[lang]", "app/[locale]", "app/[lang]"] {
+            if dir.join(candidate).is_dir() {
+                return content.to_string();
+            }
+        }
+    }
+    if !content.contains("NextResponse.rewrite") {
+        return content.to_string();
+    }
+
+    let mut out = content.to_string();
+    let mut changed = false;
+    if let Ok(re_if) = regex::Regex::new(r"(?m)^[ \t]*if\s*\(([^\r\n]+)\)\s*\{") {
+        let mut search_from = 0usize;
+        while let Some(m) = re_if.find_at(&out, search_from) {
+            let m_start = m.start();
+            let m_end = m.end();
+            let open_brace = m_end - 1;
+            let Some(close_brace) = find_balanced_delimiter_bytes(&out, open_brace, b'{', b'}') else {
+                search_from = m_end;
+                continue;
+            };
+            let header = &out[m_start..m_end];
+            let block_body = &out[open_brace..=close_brace];
+            let has_locale_rewrite = block_body.contains("NextResponse.rewrite")
+                && (header.contains("locale") || block_body.contains("${locale}") || block_body.contains("`${locale}"));
+            if has_locale_rewrite {
+                let mut del_end = close_brace + 1;
+                let bytes = out.as_bytes();
+                while del_end < bytes.len() && matches!(bytes[del_end], b' ' | b'\t') {
+                    del_end += 1;
+                }
+                if out[del_end..].starts_with("\r\n") {
+                    del_end += 2;
+                } else if out[del_end..].starts_with('\n') {
+                    del_end += 1;
+                }
+                out.replace_range(m_start..del_end, "");
+                changed = true;
+                search_from = m_start;
+            } else {
+                search_from = close_brace + 1;
+            }
+        }
+    }
+
+    if !changed {
+        return out;
+    }
+
+    let non_locale_decl: String = out
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !(t.starts_with("const locale") || t.starts_with("let locale") || t.starts_with("var locale"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let locale_still_used = regex::Regex::new(r"\blocale\b")
+        .ok()
+        .map_or(false, |re| re.is_match(&non_locale_decl));
+    if !locale_still_used {
+        if let Ok(re_decl) = regex::Regex::new(
+            r"(?m)^[ \t]*(?:const|let|var)\s+locale\s*=\s*pathname\.split\([^)\r\n]+\)\s*\[\s*1\s*\]\s*;?[ \t]*\r?\n?",
+        ) {
+            out = re_decl.replace_all(&out, "").to_string();
+        }
+    }
+
+    out
+}
+
 pub fn sanitize_middleware_redundancy(content: &str, rel_path: &str) -> String {
-    crate::reviewer::sanitize_middleware_principled(content, rel_path)
+    let stripped = strip_bogus_middleware_locale_rewrite(content, rel_path, None);
+    crate::reviewer::sanitize_middleware_principled(&stripped, rel_path)
 }
 
 fn normalize_rel_fs_components(p: &std::path::Path) -> std::path::PathBuf {
@@ -4360,6 +4568,9 @@ pub fn ensure_window_ambient_declarations(proj_dir: &std::path::Path) {
 }
 
 pub fn ensure_valid_tsconfig(proj_dir: &std::path::Path) {
+    if crate::templates_expo::is_expo_project_dir(proj_dir) {
+        return;
+    }
     let tsconfig_path = proj_dir.join("tsconfig.json");
     let has_src = proj_dir.join("src").exists();
     let has_root_dirs = proj_dir.join("app").exists()
@@ -4403,6 +4614,12 @@ pub fn ensure_valid_tsconfig(proj_dir: &std::path::Path) {
                             paths_obj.insert("@/*".to_string(), serde_json::json!(expected_alias_targets));
                             needs_write = true;
                         }
+                    }
+                    if co.get("strict").and_then(|v| v.as_bool()) == Some(false)
+                        && co.get("strictNullChecks").and_then(|v| v.as_bool()) != Some(false)
+                    {
+                        co.insert("strictNullChecks".to_string(), serde_json::json!(false));
+                        needs_write = true;
                     }
                 }
                 if let Some(root_obj) = val.as_object_mut() {
@@ -4448,6 +4665,7 @@ pub fn ensure_valid_tsconfig(proj_dir: &std::path::Path) {
                     "allowJs": true,
                     "skipLibCheck": true,
                     "strict": false,
+                    "strictNullChecks": false,
                     "noEmit": true,
                     "esModuleInterop": true,
                     "module": "esnext",
@@ -6084,10 +6302,21 @@ pub fn sanitize_nextjs_and_zod_hallucinations(content: &str, rel_path: &str) -> 
         }
     }
 
-    // 3b. Inverted Zod coercion chain: `z.date().coerce()` -> `z.coerce.date()` (also number/string/boolean)
-    if out.contains(".coerce(") {
+    // 3b. Inverted Zod coercion chains & non-existent Zod v3 `.time()`:
+    // `z.date().coerce.date()` -> `z.coerce.date()`, `z.time().coerce.string()` -> `z.coerce.string()`, `z.time()` -> `z.string()`
+    if out.contains(".coerce") || out.contains("z.time(") {
+        if let Ok(re_zod_chained_coerce) = regex::Regex::new(
+            r"\bz\.(?:date|number|string|boolean|bigint|time)\s*\(\s*\)\s*\.coerce\s*\.\s*(date|number|string|boolean|bigint)\s*\(\s*\)",
+        ) {
+            out = re_zod_chained_coerce.replace_all(&out, "z.coerce.$1()").to_string();
+        }
         if let Ok(re_zod_coerce) = regex::Regex::new(r"\bz\.(date|number|string|boolean|bigint)\s*\(\s*\)\s*\.coerce\s*\(\s*\)") {
             out = re_zod_coerce.replace_all(&out, "z.coerce.$1()").to_string();
+        }
+        if out.contains("z.time(") {
+            if let Ok(re_zod_time) = regex::Regex::new(r"\bz\.time\s*\(\s*\)") {
+                out = re_zod_time.replace_all(&out, "z.string()").to_string();
+            }
         }
     }
 
@@ -6161,13 +6390,12 @@ pub fn sanitize_nextjs_and_zod_hallucinations(content: &str, rel_path: &str) -> 
         out = insert_import_after_use_client(&out, "import type { NextAuthOptions } from 'next-auth';");
     }
 
-    // 3h. Default import from `lucide-react` (`import LucideLock from 'lucide-react'` -> `import { LucideLock } from 'lucide-react'`)
-    // `lucide-react` has no default export; default imports resolve to the module namespace causing TS2604/TS2786.
-    if out.contains("lucide-react") {
-        if let Ok(re_lucide_def) = regex::Regex::new(
-            r#"(?m)^([ \t]*import\s+)([A-Z][A-Za-z0-9_$]*)(\s+from\s+['"]lucide-react['"]\s*;?[ \t]*)$"#,
+    // 3h. Default imports from named-only icon packages (`lucide-react`, `react-icons/<pack>`) -> named imports (TS2604/TS2786)
+    if out.contains("lucide-react") || out.contains("react-icons/") {
+        if let Ok(re_icon_def) = regex::Regex::new(
+            r#"(?m)^([ \t]*import\s+)([A-Z][A-Za-z0-9_$]*)(\s+from\s+['"](?:lucide-react|react-icons/[a-z0-9]+)['"]\s*;?[ \t]*)\r?$"#,
         ) {
-            out = re_lucide_def.replace_all(&out, "${1}{ ${2} }${3}").to_string();
+            out = re_icon_def.replace_all(&out, "${1}{ ${2} }${3}").to_string();
         }
     }
 
@@ -6264,6 +6492,59 @@ pub fn sanitize_nextjs_and_zod_hallucinations(content: &str, rel_path: &str) -> 
             "ChangeEvent<HTMLInputElement>",
             "ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>",
         );
+    }
+
+    // 3m. Generic array-constrained hook cast: `<T extends Item[]>` calling `setData(initialFallbackData as T[])` -> `as T`
+    // and `useState<T>(fallbackData)` -> `useState<T>(fallbackData as any)` (TS2345/TS2352)
+    if is_ts && (low.contains("/hooks/") || low.starts_with("hooks/")) {
+        let has_arr_generic = regex::Regex::new(r"<T\s+extends\s+[^>\r\n]+\[\s*\]>")
+            .ok()
+            .map_or(false, |re| re.is_match(&out));
+        if has_arr_generic {
+            if out.contains(" as T[]") {
+                out = out.replace(" as T[]", " as T");
+            }
+            if out.contains("useState<T>(") || out.contains("useState< T >(") {
+                if let Ok(re_us_t) = regex::Regex::new(r"\buseState\s*<\s*T\s*>\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\)") {
+                    out = re_us_t.replace_all(&out, "useState<T>($1 as any)").into_owned();
+                }
+            }
+        }
+    }
+
+    // 3n. URLSearchParams object destructuring (`const { id } = request.nextUrl.searchParams;` -> `.get('id')`)
+    if out.contains("searchParams") {
+        if let Ok(re_sp_destr) = regex::Regex::new(
+            r"(?m)^([ \t]*)const\s*\{\s*([A-Za-z_$][A-Za-z0-9_$, \t]*)\s*\}\s*=\s*((?:req|request)\.nextUrl\.searchParams)\s*;?[ \t]*\r?$",
+        ) {
+            out = re_sp_destr
+                .replace_all(&out, |caps: &regex::Captures| {
+                    let indent = caps.get(1).map_or("", |m| m.as_str());
+                    let vars = caps.get(2).map_or("", |m| m.as_str());
+                    let sp = caps.get(3).map_or("", |m| m.as_str());
+                    let stmts: Vec<String> = vars
+                        .split(',')
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .map(|k| format!("{}const {} = {}.get('{}');", indent, k, sp, k))
+                        .collect();
+                    if stmts.is_empty() {
+                        caps[0].to_string()
+                    } else {
+                        stmts.join("\n")
+                    }
+                })
+                .into_owned();
+        }
+    }
+
+    // 3o. Prisma `*CreateInput` / `*UpdateInput` variable passed directly to `prisma.<model>.create/update({ data: x })`
+    if is_ts && (out.contains("CreateInput") || out.contains("UpdateInput")) && out.contains("prisma.") {
+        if let Ok(re_prisma_data_var) = regex::Regex::new(
+            r"(\bprisma\.[A-Za-z0-9_]+\.(?:create|update)\(\s*\{(?:[^{}]|\{[^{}]*\})*?\bdata\s*:\s*)([A-Za-z_$][A-Za-z0-9_$]*)(\s*[,}])",
+        ) {
+            out = re_prisma_data_var.replace_all(&out, "${1}${2} as any${3}").to_string();
+        }
     }
 
     // 4. TS2749: local value `const Foo =` / `function Foo(` also used in a type position without `type Foo` / `interface Foo`
@@ -6431,6 +6712,36 @@ pub fn sanitize_nextjs_and_zod_hallucinations(content: &str, rel_path: &str) -> 
             if !has_zod_import {
                 out = insert_import_after_use_client(&out, "import { z } from 'zod';");
             }
+        }
+    }
+
+    // 6b. Redirect react-hook-form hooks/components mistakenly imported from `zod` -> `react-hook-form`
+    if out.contains("'zod'") || out.contains("\"zod\"") {
+        let mut moved_rhf: Vec<&str> = Vec::new();
+        for sym in [
+            "useForm",
+            "useController",
+            "useFieldArray",
+            "useWatch",
+            "useFormContext",
+            "Controller",
+            "FormProvider",
+        ] {
+            if out.contains(sym) {
+                let (next, stripped) = strip_named_from_pkg(&out, "zod", sym);
+                if stripped {
+                    out = next;
+                    moved_rhf.push(sym);
+                }
+            }
+        }
+        for sym in moved_rhf {
+            out = crate::self_healing::merge_or_insert_import_statement(
+                &out,
+                "react-hook-form",
+                sym,
+                false,
+            );
         }
     }
 
@@ -6676,6 +6987,13 @@ pub fn sanitize_nextjs_and_zod_hallucinations(content: &str, rel_path: &str) -> 
     if low.ends_with(".tsx") || low.ends_with(".jsx") {
         if let Some(with_defaults) = crate::ast_engine::ensure_component_destructured_prop_defaults_in_source(rel_path, &out) {
             out = with_defaults;
+        }
+    }
+
+    // 25. Add companion `export type Foo = (typeof Foo)[keyof typeof Foo] | string;` for enum-like `export const Foo = { ... }`
+    if is_ts && low != "src/types/index.ts" && low != "types/index.ts" && out.contains("export const ") {
+        if let Some(with_enum_types) = crate::ast_engine::ensure_companion_types_for_const_enums_in_source(rel_path, &out) {
+            out = with_enum_types;
         }
     }
 
@@ -6964,6 +7282,1006 @@ pub fn synchronize_global_types_and_dedup_api(proj_dir: &std::path::Path) {
     }
 }
 
+pub fn sanitize_expo_react_native_file(content: &str, rel_path: &str) -> String {
+    let norm = rel_path.replace('\\', "/").to_lowercase();
+    if norm.ends_with("app/+html.tsx") || norm.ends_with("+html.tsx") {
+        return content.to_string();
+    }
+
+    let mut lines: Vec<&str> = content.lines().collect();
+    while let Some(first) = lines.first() {
+        let t = first.trim();
+        if t == "\"use client\";"
+            || t == "\"use client\""
+            || t == "'use client';"
+            || t == "'use client'"
+            || t.is_empty()
+        {
+            if t.is_empty() && lines.get(1).map_or(true, |n| {
+                let nt = n.trim();
+                nt != "\"use client\";" && nt != "\"use client\"" && nt != "'use client';" && nt != "'use client'"
+            }) {
+                break;
+            }
+            lines.remove(0);
+        } else {
+            break;
+        }
+    }
+    let mut out = lines.join("\n");
+    if content.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+
+    // Strip forbidden Next.js / NextAuth / Prisma import statements
+    if let Ok(re_bad_imp) = regex::Regex::new(
+        r#"(?m)^[ \t]*import\s+[^\n;]*(?:;|\r?\n)*from\s+['"](?:next(?:/[^'"]*)?|next-auth(?:/[^'"]*)?|@prisma/client|@/lib/prisma|~/lib/prisma)['"][ \t]*;?[ \t]*\r?\n?"#,
+    ) {
+        out = re_bad_imp.replace_all(&out, "").to_string();
+    }
+    if let Ok(re_bad_single) = regex::Regex::new(
+        r#"(?ms)^[ \t]*import\s+(?:type\s+)?(?:\*\s+as\s+[A-Za-z_$][A-Za-z0-9_$]*|\{[^}]*\}|[A-Za-z_$][A-Za-z0-9_$]*(?:\s*,\s*\{[^}]*\})?)\s+from\s+['"](?:next(?:/[^'"]*)?|next-auth(?:/[^'"]*)?|@prisma/client|@/lib/prisma|~/lib/prisma)['"][ \t]*;?[ \t]*\r?\n?"#,
+    ) {
+        out = re_bad_single.replace_all(&out, "").to_string();
+    }
+
+    if let Ok(re_touchable_onclick) = regex::Regex::new(r"(?s)(<(?:Pressable|TouchableOpacity)\b[^>]*?)\bonClick\s*=") {
+        out = re_touchable_onclick.replace_all(&out, "${1}onPress=").to_string();
+    }
+
+    // Normalize expo-secure-store method names hallucinated on AsyncStorage
+    if out.contains("AsyncStorage") {
+        out = out
+            .replace("AsyncStorage.getItemAsync(", "AsyncStorage.getItem(")
+            .replace("AsyncStorage.setItemAsync(", "AsyncStorage.setItem(")
+            .replace("AsyncStorage.deleteItemAsync(", "AsyncStorage.removeItem(")
+            .replace("AsyncStorage.removeItemAsync(", "AsyncStorage.removeItem(");
+    }
+
+    // Convert namespace AsyncStorage import (`import * as AsyncStorage from ...`) to default import BEFORE auto-import check
+    if out.contains("@react-native-async-storage/async-storage") && out.contains("* as AsyncStorage") {
+        if let Ok(re_ns_async) = regex::Regex::new(
+            r#"(?m)^[ \t]*import\s+\*\s+as\s+AsyncStorage\s+from\s+['"]@react-native-async-storage/async-storage['"]\s*;?"#,
+        ) {
+            out = re_ns_async
+                .replace_all(&out, "import AsyncStorage from '@react-native-async-storage/async-storage';")
+                .to_string();
+        }
+    }
+
+    // Auto-add AsyncStorage import if referenced without being imported/declared
+    let uses_async_storage = out.contains("AsyncStorage.")
+        && !out.contains("@react-native-async-storage/async-storage")
+        && !out.contains("import AsyncStorage");
+    if uses_async_storage {
+        out = format!("import AsyncStorage from '@react-native-async-storage/async-storage';\n{}", out);
+    }
+
+    // Auto-add `theme` import if `theme.*` tokens are referenced without importing/declaring `theme`
+    let is_theme_file = norm == "src/theme.ts" || norm == "theme.ts";
+    let uses_theme = !is_theme_file
+        && (out.contains("theme.colors")
+            || out.contains("theme.spacing")
+            || out.contains("theme.radius")
+            || out.contains("theme.typography"));
+    let has_theme_binding = out.contains("from '@/theme'")
+        || out.contains("from \"@/theme\"")
+        || out.contains("from '../../src/theme'")
+        || out.contains("from \"../../src/theme\"")
+        || out.contains("from '../theme'")
+        || out.contains("from \"../theme\"")
+        || out.contains("from './theme'")
+        || out.contains("from \"./theme\"")
+        || out.contains("import theme")
+        || out.contains("import { theme")
+        || out.contains("const theme")
+        || out.contains("let theme")
+        || out.contains("function theme");
+    if uses_theme && !has_theme_binding {
+        out = format!("import {{ theme }} from '@/theme';\n{}", out);
+    }
+
+    // Normalize nonexistent theme.spacing/radius sub-keys hallucinated relative to src/theme.ts
+    if !is_theme_file && out.contains("theme.") {
+        out = out
+            .replace("theme.spacing.xxs", "theme.spacing.xs")
+            .replace("theme.spacing.xxl", "theme.spacing.xl")
+            .replace("theme.radius.xs", "theme.radius.sm")
+            .replace("theme.radius.xl", "theme.radius.lg");
+        if out.contains(".fontFamily") {
+            if let Ok(re_font_fam) = regex::Regex::new(
+                r"(?m)^[ \t]*fontFamily\s*:\s*theme\.typography\.[A-Za-z0-9_]+\.fontFamily\s*,?[ \t]*\r?\n?",
+            ) {
+                out = re_font_fam.replace_all(&out, "").to_string();
+            }
+        }
+        if (norm.ends_with(".tsx") || norm.ends_with(".jsx")) && out.contains("style={") && out.contains("theme.colors.") {
+            if let (Ok(re_style_arr), Ok(re_color_elem)) = (
+                regex::Regex::new(r"\bstyle\s*=\s*\{\s*(\[[^\]\r\n]*\])\s*\}"),
+                regex::Regex::new(r"([,\[]\s*)(theme\.colors\.[A-Za-z0-9_]+)(\s*[,\]])"),
+            ) {
+                out = re_style_arr
+                    .replace_all(&out, |caps: &regex::Captures| {
+                        let mut arr = caps.get(1).map_or("", |m| m.as_str()).to_string();
+                        for _ in 0..4 {
+                            let next_arr = re_color_elem.replace_all(&arr, "${1}{ color: ${2} }${3}").into_owned();
+                            if next_arr == arr {
+                                break;
+                            }
+                            arr = next_arr;
+                        }
+                        format!("style={{{}}}", arr)
+                    })
+                    .into_owned();
+            }
+        }
+    }
+
+    // Map common MaterialCommunityIcons hallucinations to valid Ionicons glyph names
+    if out.contains("Ionicons") {
+        for (bad_icon, good_icon) in [
+            ("weight-lifter", "barbell-outline"),
+            ("heart-pulse", "heart-outline"),
+            ("circle-outline", "ellipse-outline"),
+            ("check-circle-outline", "checkmark-circle-outline"),
+            ("dumbbell", "barbell-outline"),
+            ("ellipsis-outline", "ellipsis-horizontal-outline"),
+        ] {
+            out = out
+                .replace(&format!("'{}'", bad_icon), &format!("'{}'", good_icon))
+                .replace(&format!("\"{}\"", bad_icon), &format!("\"{}\"", good_icon));
+        }
+    }
+
+    if norm.ends_with(".tsx") || norm.ends_with(".jsx") {
+        let known_expo = crate::self_healing::collect_declared_or_imported_idents(&out);
+        if out.contains("<Ionicons") && !known_expo.contains("Ionicons") {
+            out = insert_import_after_use_client(&out, "import { Ionicons } from '@expo/vector-icons';");
+        }
+        if out.contains("<SafeAreaView") && !known_expo.contains("SafeAreaView") {
+            out = insert_import_after_use_client(
+                &out,
+                "import { SafeAreaView } from 'react-native-safe-area-context';",
+            );
+        }
+    }
+
+    // Cast template-string percentage dimensions (`width: \`${pct}%\``) to satisfy strict React Native DimensionValue
+    if (norm.ends_with(".tsx") || norm.ends_with(".ts")) && out.contains("%`") {
+        if let Ok(re_pct_dim) = regex::Regex::new(
+            r"(?m)(\b(?:width|height|minWidth|maxWidth)\s*:\s*`[^`\r\n]*\$\{[^}\r\n]+\}%`)(\s*[,}])",
+        ) {
+            out = re_pct_dim.replace_all(&out, "${1} as any${2}").to_string();
+        }
+    }
+
+    // Rewrite erroneous zero-arg invocations of StyleSheet objects (`const useStyles = StyleSheet.create(...); ... useStyles()`)
+    if (norm.ends_with(".tsx") || norm.ends_with(".jsx") || norm.ends_with(".ts") || norm.ends_with(".js"))
+        && out.contains("StyleSheet.create(")
+    {
+        if let Ok(re_ss_var) = regex::Regex::new(
+            r"(?m)\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*StyleSheet\.create\s*\(",
+        ) {
+            let mut ss_idents: Vec<String> = Vec::new();
+            for cap in re_ss_var.captures_iter(&out) {
+                if let Some(m) = cap.get(1) {
+                    let ident = m.as_str().to_string();
+                    if !ss_idents.contains(&ident) {
+                        ss_idents.push(ident);
+                    }
+                }
+            }
+            for ident in ss_idents {
+                let pat = format!(r"(^|[^A-Za-z0-9_$.])({})\s*\(\s*\)", regex::escape(&ident));
+                if let Ok(re_call) = regex::Regex::new(&pat) {
+                    out = re_call
+                        .replace_all(&out, |caps: &regex::Captures| {
+                            format!("{}{}", &caps[1], ident)
+                        })
+                        .to_string();
+                }
+            }
+        }
+    }
+
+    // Inject safe fallback entries for commonly referenced `styles.<key>` missing from `StyleSheet.create({...})`
+    if (norm.ends_with(".tsx") || norm.ends_with(".jsx")) && out.contains("StyleSheet.create(") && out.contains("styles.") {
+        if let Ok(re_ss_open) = regex::Regex::new(r"StyleSheet\.create\s*\(\s*\{") {
+            if let Some(m) = re_ss_open.find(&out) {
+                let open_brace = m.end() - 1;
+                if let Some(close_brace) = find_balanced_delimiter_bytes(&out, open_brace, b'{', b'}') {
+                    let block_inner = &out[open_brace + 1..close_brace];
+                    let fallback_styles: [(&str, &str); 9] = [
+                        ("text", "{ color: '#f8fafc' }"),
+                        ("subtitle", "{ fontSize: 16, fontWeight: '600', color: '#cbd5e1' }"),
+                        ("body", "{ fontSize: 14, color: '#e2e8f0' }"),
+                        ("caption", "{ fontSize: 12, color: '#94a3b8' }"),
+                        ("title", "{ fontSize: 20, fontWeight: '700', color: '#ffffff' }"),
+                        ("label", "{ fontSize: 13, fontWeight: '600', color: '#cbd5e1' }"),
+                        ("muted", "{ color: '#94a3b8' }"),
+                        ("emptyText", "{ fontSize: 14, color: '#94a3b8', textAlign: 'center' }"),
+                        ("emptyState", "{ fontSize: 14, color: '#94a3b8', textAlign: 'center', padding: 16 }"),
+                    ];
+                    let mut additions: Vec<String> = Vec::new();
+                    for (key, def_val) in fallback_styles {
+                        let ref_pat = format!(r"\bstyles\.{}\b", key);
+                        let def_pat = format!(r"(?m)^\s*{}\s*:", key);
+                        let is_ref = regex::Regex::new(&ref_pat).ok().map_or(false, |re| re.is_match(&out));
+                        let is_def = regex::Regex::new(&def_pat).ok().map_or(false, |re| re.is_match(block_inner));
+                        if is_ref && !is_def {
+                            additions.push(format!("  {}: {},", key, def_val));
+                        }
+                    }
+                    if !additions.is_empty() {
+                        let trimmed_inner = block_inner.trim_end();
+                        let insert_pos = open_brace + 1 + trimmed_inner.len();
+                        let needs_comma = !trimmed_inner.is_empty() && !trimmed_inner.ends_with(',');
+                        let prefix = if needs_comma { ",\n" } else if trimmed_inner.is_empty() { "\n" } else { "\n" };
+                        let inject = format!("{}{}", prefix, additions.join("\n"));
+                        out.insert_str(insert_pos, &inject);
+                    }
+                }
+            }
+        }
+    }
+
+    // Merge missing React Native core primitives used in TSX/styles into existing `from 'react-native'` import
+    if norm.ends_with(".tsx") || norm.ends_with(".jsx") {
+        let rn_prims = [
+            "View",
+            "Text",
+            "Pressable",
+            "TouchableOpacity",
+            "ScrollView",
+            "FlatList",
+            "TextInput",
+            "StyleSheet",
+            "Modal",
+            "Switch",
+            "ActivityIndicator",
+        ];
+        if let Ok(re_rn_imp) = regex::Regex::new(r#"(?ms)^([ \t]*import\s*\{)([^}]*)(\}\s*from\s*['"]react-native['"]\s*;?)"#) {
+            if let Some(cap) = re_rn_imp.captures(&out) {
+                let prefix = cap.get(1).map_or("", |m| m.as_str());
+                let body = cap.get(2).map_or("", |m| m.as_str());
+                let suffix = cap.get(3).map_or("", |m| m.as_str());
+                let full_match = cap.get(0).unwrap();
+                let mut existing: Vec<String> = body
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let existing_names: Vec<String> = existing
+                    .iter()
+                    .map(|s| s.split(" as ").next().unwrap_or(s).trim().to_string())
+                    .collect();
+                let rest_code = format!("{}{}", &out[..full_match.start()], &out[full_match.end()..]);
+                let mut added = false;
+                for prim in rn_prims {
+                    if existing_names.iter().any(|e| e == prim) {
+                        continue;
+                    }
+                    let used = if prim == "StyleSheet" {
+                        rest_code.contains("StyleSheet.create") || rest_code.contains("StyleSheet.flatten")
+                    } else {
+                        rest_code.contains(&format!("<{}", prim))
+                    };
+                    if used {
+                        existing.push(prim.to_string());
+                        added = true;
+                    }
+                }
+                if added {
+                    let multiline = body.contains('\n');
+                    let joined = if multiline {
+                        format!("\n  {},\n", existing.join(",\n  "))
+                    } else {
+                        format!(" {} ", existing.join(", "))
+                    };
+                    let replacement = format!("{}{}{}", prefix, joined, suffix);
+                    out = format!("{}{}{}", &out[..full_match.start()], replacement, &out[full_match.end()..]);
+                }
+            }
+        }
+    }
+
+    // Dual-export safeguard for Expo stores, hooks, and components (prevents TS2614 named/default mismatches)
+    let is_modular_expo_helper = (norm.starts_with("src/store/")
+        || norm.starts_with("store/")
+        || norm.starts_with("src/hooks/")
+        || norm.starts_with("hooks/")
+        || norm.starts_with("src/components/")
+        || norm.starts_with("components/"))
+        && !norm.ends_with("/index.ts")
+        && !norm.ends_with("/index.tsx")
+        && !norm.ends_with("/index.js")
+        && !norm.ends_with("/index.jsx");
+    if is_modular_expo_helper {
+        let has_default = regex::Regex::new(r"(?m)^\s*export\s+default\b")
+            .ok()
+            .map_or(false, |re| re.is_match(&out));
+        let stem = std::path::Path::new(&norm)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if has_default {
+            let def_ident_opt = regex::Regex::new(
+                r"(?m)^\s*export\s+default\s+(?:(?:async\s+)?function\s+|class\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\b",
+            )
+            .ok()
+            .and_then(|re| re.captures(&out))
+            .and_then(|cap| cap.get(1).map(|m| m.as_str().to_string()))
+            .filter(|id| !matches!(id.as_str(), "function" | "class" | "async"));
+            if let Some(ident) = def_ident_opt {
+                let already_named = regex::Regex::new(&format!(
+                    r"(?m)^\s*export\s+(?:(?:async\s+)?function\s+{}\b|(?:const|let|var|class)\s+{}\b|\{{[^}}]*\b{}\b[^}}]*\}})",
+                    regex::escape(&ident),
+                    regex::escape(&ident),
+                    regex::escape(&ident)
+                ))
+                .ok()
+                .map_or(false, |re| re.is_match(&out));
+                if !already_named {
+                    if !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    out.push_str(&format!("export {{ {} }};\n", ident));
+                }
+            }
+        } else if let Ok(re_named_exp) = regex::Regex::new(
+            r"(?m)^\s*export\s+(?:(?:async\s+)?function|const|class)\s+([A-Za-z_$][A-Za-z0-9_$]*)\b",
+        ) {
+            let candidates: Vec<String> = re_named_exp
+                .captures_iter(&out)
+                .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+                .collect();
+            let chosen = candidates
+                .iter()
+                .find(|c| c.eq_ignore_ascii_case(stem))
+                .or_else(|| candidates.first())
+                .cloned();
+            if let Some(ident) = chosen {
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str(&format!("export default {};\n", ident));
+            }
+        }
+    }
+
+    out
+}
+
+/// Project-wide deterministic hygiene pass for Expo React Native workspaces:
+/// 1. Replaces `Object.values(UnionType)` and `UnionType.VARIANT` on string-literal union types
+///    exported from `src/types/index.ts` (avoiding TS2693 runtime enum errors).
+/// 2. Rewrites array destructuring (`const [a, b] = useFooStore()`) to object destructuring
+///    (`const { a, b } = useFooStore()`) when the store hook returns a plain object.
+/// 3. Auto-imports missing exported types/interfaces from `'@/types'`.
+pub fn reconcile_expo_types_and_unions_in_project(proj_dir: &std::path::Path) {
+    let mut types_src = String::new();
+    for candidate in ["src/types/index.ts", "types/index.ts"] {
+        let p = proj_dir.join(candidate);
+        if p.is_file() {
+            if let Ok(c) = std::fs::read_to_string(&p) {
+                types_src = c;
+                break;
+            }
+        }
+    }
+
+    let mut union_map: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    let mut exported_types: Vec<String> = Vec::new();
+
+    if !types_src.is_empty() {
+        if let Ok(re_union) = regex::Regex::new(r"(?m)^\s*export\s+type\s+([A-Z][A-Za-z0-9_]*)\s*=\s*([^;\r\n]+);?") {
+            for cap in re_union.captures_iter(&types_src) {
+                let Some(uname) = cap.get(1).map(|m| m.as_str()) else { continue };
+                let Some(rhs) = cap.get(2).map(|m| m.as_str()) else { continue };
+                let raw_parts: Vec<&str> = rhs.split('|').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                if raw_parts.len() < 2 {
+                    continue;
+                }
+                let mut variants = Vec::new();
+                let mut all_valid = true;
+                for part in raw_parts {
+                    let unquoted = if (part.starts_with('\'') && part.ends_with('\'') && part.len() >= 2)
+                        || (part.starts_with('"') && part.ends_with('"') && part.len() >= 2)
+                    {
+                        &part[1..part.len() - 1]
+                    } else {
+                        all_valid = false;
+                        break;
+                    };
+                    if unquoted.is_empty()
+                        || !unquoted
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ' ')
+                    {
+                        all_valid = false;
+                        break;
+                    }
+                    variants.push(unquoted.to_string());
+                }
+                if all_valid && !variants.is_empty() {
+                    union_map.insert(uname.to_string(), variants);
+                }
+            }
+        }
+
+        if let Ok(re_exp) = regex::Regex::new(r"(?m)^\s*export\s+(?:type|interface|enum)\s+([A-Z][A-Za-z0-9_]*)\b") {
+            for cap in re_exp.captures_iter(&types_src) {
+                if let Some(m) = cap.get(1) {
+                    let name = m.as_str().to_string();
+                    if !exported_types.contains(&name) {
+                        exported_types.push(name);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut object_store_hooks: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut hook_to_store_file: std::collections::BTreeMap<String, std::path::PathBuf> = std::collections::BTreeMap::new();
+    let mut symbol_to_module: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut module_exports: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    let mut store_hooks: Vec<(String, String)> = Vec::new();
+    let re_hook_export = regex::Regex::new(
+        r"(?m)^\s*export\s+(?:default\s+)?(?:function|const)\s+(use[A-Z][A-Za-z0-9_]*)\b|^\s*export\s*\{[^}]*\b(use[A-Z][A-Za-z0-9_]*)\b",
+    )
+    .ok();
+    let re_val_decl_exp = regex::Regex::new(
+        r"(?m)^\s*export\s+(?:default\s+)?(?:async\s+)?(?:function|const|let|var|class|interface|type|enum)\s+([A-Za-z_$][A-Za-z0-9_$]*)\b",
+    )
+    .ok();
+    let re_brace_exp = regex::Regex::new(r"(?m)^\s*export\s*\{([^}\r\n]+)\}").ok();
+    let re_def_ident = regex::Regex::new(r"(?m)^\s*export\s+default\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*;?[ \t]*$").ok();
+
+    for dir_rel in ["src/store", "store", "src/hooks", "hooks", "src/components", "components"] {
+        let dir_abs = proj_dir.join(dir_rel);
+        let Ok(entries) = std::fs::read_dir(&dir_abs) else { continue };
+        let mut paths: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
+        paths.sort();
+        for p in paths {
+            let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+            if !matches!(ext.as_str(), "ts" | "tsx" | "js" | "jsx") {
+                continue;
+            }
+            let Ok(src) = std::fs::read_to_string(&p) else { continue };
+            let rel_mod = p
+                .strip_prefix(proj_dir)
+                .ok()
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            let stem_rel = rel_mod
+                .strip_suffix(".tsx")
+                .or_else(|| rel_mod.strip_suffix(".ts"))
+                .or_else(|| rel_mod.strip_suffix(".jsx"))
+                .or_else(|| rel_mod.strip_suffix(".js"))
+                .unwrap_or(&rel_mod);
+            let stem_rel_no_src = stem_rel.strip_prefix("src/").unwrap_or(stem_rel);
+            let mod_spec = format!("@/{}", stem_rel_no_src);
+            let file_stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            let is_store_dir = dir_rel == "src/store" || dir_rel == "store";
+
+            let mut mod_syms: Vec<String> = Vec::new();
+            let mut push_sym = |sym: &str| {
+                let s = sym.trim();
+                if s.is_empty() || matches!(s, "function" | "class" | "async" | "index") {
+                    return;
+                }
+                if !mod_syms.iter().any(|x| x == s) {
+                    mod_syms.push(s.to_string());
+                }
+                symbol_to_module.entry(s.to_string()).or_insert_with(|| mod_spec.clone());
+                if is_store_dir
+                    && s.starts_with("use")
+                    && s.chars().nth(3).map_or(false, |c| c.is_ascii_uppercase())
+                    && !store_hooks.iter().any(|(h, m)| h == s && m == &mod_spec)
+                {
+                    store_hooks.push((s.to_string(), mod_spec.clone()));
+                }
+            };
+
+            if !file_stem.is_empty() && file_stem != "index" {
+                push_sym(file_stem);
+            }
+            if let Some(ref re_v) = re_val_decl_exp {
+                for cap in re_v.captures_iter(&src) {
+                    if let Some(m) = cap.get(1) {
+                        push_sym(m.as_str());
+                    }
+                }
+            }
+            if let Some(ref re_b) = re_brace_exp {
+                for cap in re_b.captures_iter(&src) {
+                    if let Some(inner) = cap.get(1) {
+                        for item in inner.as_str().split(',') {
+                            let exported = item.split(" as ").last().unwrap_or(item).trim();
+                            push_sym(exported);
+                        }
+                    }
+                }
+            }
+            if let Some(ref re_d) = re_def_ident {
+                for cap in re_d.captures_iter(&src) {
+                    if let Some(m) = cap.get(1) {
+                        push_sym(m.as_str());
+                    }
+                }
+            }
+            if !mod_syms.is_empty() {
+                module_exports.insert(mod_spec.clone(), mod_syms);
+            }
+
+            let is_plain_react_store = !src.contains("zustand");
+            if (dir_rel.contains("store") || dir_rel.contains("hooks")) && src.contains("return {") && !src.contains("return [") {
+                if let Some(ref re_h) = re_hook_export {
+                    for cap in re_h.captures_iter(&src) {
+                        if let Some(m) = cap.get(1).or_else(|| cap.get(2)) {
+                            let hname = m.as_str().to_string();
+                            if is_plain_react_store && (dir_rel == "src/store" || dir_rel == "store") {
+                                hook_to_store_file.entry(hname.clone()).or_insert_with(|| p.clone());
+                            }
+                            object_store_hooks.insert(hname);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if union_map.is_empty() && exported_types.is_empty() && object_store_hooks.is_empty() && symbol_to_module.is_empty() {
+        return;
+    }
+
+    fn expo_module_exists_on_disk(proj_dir: &std::path::Path, spec: &str, cur_file: &std::path::Path) -> bool {
+        if spec.contains('*') {
+            return false;
+        }
+        let mut bases: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(sub) = spec.strip_prefix("@/") {
+            bases.push(proj_dir.join("src").join(sub));
+            bases.push(proj_dir.join(sub));
+        } else if spec.starts_with("./") || spec.starts_with("../") {
+            if let Some(parent) = cur_file.parent() {
+                bases.push(normalize_rel_fs_components(&parent.join(spec)));
+            }
+        } else {
+            return true;
+        }
+        for base in bases {
+            if base.is_file() {
+                return true;
+            }
+            for ext in [".ts", ".tsx", ".js", ".jsx"] {
+                if std::path::PathBuf::from(format!("{}{}", base.display(), ext)).is_file() {
+                    return true;
+                }
+            }
+            for idx in ["index.ts", "index.tsx", "index.js", "index.jsx"] {
+                if base.join(idx).is_file() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    let mut target_files: Vec<std::path::PathBuf> = Vec::new();
+    fn collect_ts_files(dir: &std::path::Path, acc: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                let n = p.file_name().and_then(|x| x.to_str()).unwrap_or("");
+                if !matches!(n, "node_modules" | ".expo" | ".expo-verify" | ".git" | ".axiom" | "dist" | "build") {
+                    collect_ts_files(&p, acc);
+                }
+            } else if p.is_file() {
+                let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+                if matches!(ext.as_str(), "ts" | "tsx") {
+                    acc.push(p);
+                }
+            }
+        }
+    }
+    for root_dir in ["app", "src", "components", "hooks", "store"] {
+        let d = proj_dir.join(root_dir);
+        if d.is_dir() {
+            collect_ts_files(&d, &mut target_files);
+        }
+    }
+
+    let re_broken_named_imp = regex::Regex::new(
+        r#"(?m)^([ \t]*import\s+(?:type\s+)?)\{([^}\r\n]+)\}(\s*from\s*['"]([^'"\r\n]+)['"]\s*;?[ \t]*)\r?$"#,
+    )
+    .ok();
+    let re_store_named_imp = regex::Regex::new(
+        r#"(?m)^([ \t]*import\s+)\{([^}\r\n]+)\}(\s*from\s*['"](@\/(?:store|hooks)\/[^'"\r\n]+)['"]\s*;?[ \t]*)\r?$"#,
+    )
+    .ok();
+    let mut shimmed_hooks: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    for p in target_files {
+        let rel = p
+            .strip_prefix(proj_dir)
+            .ok()
+            .map(|r| r.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let rel_low = rel.to_ascii_lowercase();
+        if matches!(
+            rel_low.as_str(),
+            "src/types/index.ts"
+                | "types/index.ts"
+                | "src/theme.ts"
+                | "theme.ts"
+                | "src/axiominspector.ts"
+                | "app/+html.tsx"
+        ) {
+            continue;
+        }
+
+        let Ok(orig) = std::fs::read_to_string(&p) else { continue };
+        let mut out = orig.clone();
+
+        // 0a. Pass A: Resolve broken barrel (`@/components/ui`, `@/store`) or glob (`@/store/use*`) imports
+        if !symbol_to_module.is_empty() {
+            if let Some(ref re_imp) = re_broken_named_imp {
+                out = re_imp
+                    .replace_all(&out, |caps: &regex::Captures| {
+                        let inner = caps.get(2).map_or("", |m| m.as_str());
+                        let spec = caps.get(4).map_or("", |m| m.as_str()).trim();
+                        if !(spec.contains('*') || spec.starts_with("@/") || spec.starts_with("./") || spec.starts_with("../")) {
+                            return caps[0].to_string();
+                        }
+                        if expo_module_exists_on_disk(proj_dir, spec, &p) {
+                            return caps[0].to_string();
+                        }
+                        let mut grouped: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+                        for raw_item in inner.split(',') {
+                            let item = raw_item.trim();
+                            if item.is_empty() {
+                                continue;
+                            }
+                            let mut parts = item.split(" as ").map(|s| s.trim());
+                            let orig_sym = parts.next().unwrap_or("");
+                            let alias_sym = parts.next();
+                            if let Some(target_mod) = symbol_to_module.get(orig_sym) {
+                                grouped.entry(target_mod.clone()).or_default().push(item.to_string());
+                            } else if orig_sym.starts_with("use")
+                                && orig_sym.chars().nth(3).map_or(false, |c| c.is_ascii_uppercase())
+                                && store_hooks.len() == 1
+                            {
+                                let (real_hook, real_mod) = &store_hooks[0];
+                                let wanted = alias_sym.unwrap_or(orig_sym);
+                                let spec_item = if real_hook == wanted {
+                                    real_hook.clone()
+                                } else {
+                                    format!("{} as {}", real_hook, wanted)
+                                };
+                                grouped.entry(real_mod.clone()).or_default().push(spec_item);
+                            }
+                        }
+                        if !grouped.is_empty() {
+                            grouped
+                                .into_iter()
+                                .map(|(target_mod, syms)| format!("import {{ {} }} from '{}';", syms.join(", "), target_mod))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        } else if spec.contains('*') {
+                            String::new()
+                        } else {
+                            caps[0].to_string()
+                        }
+                    })
+                    .into_owned();
+            }
+        }
+
+        // 0b. Pass B: Alias wrong named hook or redirect exported types imported from `@/store/*` / `@/hooks/*`
+        if !module_exports.is_empty() {
+            let mut existing_types_imports: std::collections::HashSet<String> = std::collections::HashSet::new();
+            if let Ok(re_types_ex) = regex::Regex::new(
+                r#"(?m)^\s*import\s+(?:type\s+)?\{([^}\r\n]+)\}\s*from\s*['"]@/types['"]"#,
+            ) {
+                for cap in re_types_ex.captures_iter(&out) {
+                    if let Some(inner) = cap.get(1) {
+                        for raw_it in inner.as_str().split(',') {
+                            let local = raw_it.trim().trim_start_matches("type ").split(" as ").last().unwrap_or("").trim();
+                            if !local.is_empty() {
+                                existing_types_imports.insert(local.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(ref re_s) = re_store_named_imp {
+                out = re_s
+                    .replace_all(&out, |caps: &regex::Captures| {
+                        let prefix = caps.get(1).map_or("", |m| m.as_str());
+                        let inner = caps.get(2).map_or("", |m| m.as_str());
+                        let suffix = caps.get(3).map_or("", |m| m.as_str());
+                        let spec = caps.get(4).map_or("", |m| m.as_str()).trim();
+                        let Some(exports) = module_exports.get(spec) else {
+                            return caps[0].to_string();
+                        };
+                        let use_hooks: Vec<&String> = exports
+                            .iter()
+                            .filter(|s| s.starts_with("use") && s.chars().nth(3).map_or(false, |c| c.is_ascii_uppercase()))
+                            .collect();
+                        let single_hook_opt = if use_hooks.len() == 1 { Some(use_hooks[0]) } else { None };
+                        let mut changed = false;
+                        let mut items_out: Vec<String> = Vec::new();
+                        let mut moved_types: Vec<String> = Vec::new();
+                        for raw_item in inner.split(',') {
+                            let item = raw_item.trim();
+                            if item.is_empty() {
+                                continue;
+                            }
+                            let mut parts = item.split(" as ").map(|s| s.trim());
+                            let orig_sym = parts.next().unwrap_or("");
+                            let alias_sym = parts.next();
+                            if orig_sym.starts_with("use")
+                                && orig_sym.chars().nth(3).map_or(false, |c| c.is_ascii_uppercase())
+                                && !exports.iter().any(|e| e == orig_sym)
+                            {
+                                if let Some(real_hook) = single_hook_opt {
+                                    let wanted = alias_sym.unwrap_or(orig_sym);
+                                    items_out.push(format!("{} as {}", real_hook, wanted));
+                                    changed = true;
+                                } else {
+                                    items_out.push(item.to_string());
+                                }
+                            } else if orig_sym.chars().next().map_or(false, |c| c.is_ascii_uppercase())
+                                && !exports.iter().any(|e| e == orig_sym)
+                                && exported_types.iter().any(|t| t == orig_sym)
+                            {
+                                changed = true;
+                                let local_sym = alias_sym.unwrap_or(orig_sym);
+                                if !existing_types_imports.contains(local_sym)
+                                    && !moved_types.iter().any(|t| t == item)
+                                {
+                                    moved_types.push(item.to_string());
+                                }
+                            } else {
+                                items_out.push(item.to_string());
+                            }
+                        }
+                        if !changed {
+                            return caps[0].to_string();
+                        }
+                        let mut lines: Vec<String> = Vec::new();
+                        if !items_out.is_empty() {
+                            lines.push(format!("{}{{ {} }}{}", prefix, items_out.join(", "), suffix));
+                        }
+                        if !moved_types.is_empty() {
+                            lines.push(format!("import type {{ {} }} from '@/types';", moved_types.join(", ")));
+                        }
+                        lines.join("\n")
+                    })
+                    .into_owned();
+            }
+        }
+
+        // 1. Replace `Object.values(UnionType)` and `UnionType.VARIANT` outside comment lines
+        if !union_map.is_empty() {
+            for (uname, variants) in &union_map {
+                let esc_u = regex::escape(uname);
+                let formatted_arr = variants
+                    .iter()
+                    .map(|v| format!("'{}'", v))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if out.contains(uname.as_str()) {
+                    if let Ok(re_obj_vals) = regex::Regex::new(&format!(
+                        r"\bObject\s*\.\s*values\s*\(\s*{}\s*\)",
+                        esc_u
+                    )) {
+                        let repl = format!("([{}] as const)", formatted_arr);
+                        let lines_out: Vec<String> = out
+                            .lines()
+                            .map(|line| {
+                                if line.trim_start().starts_with("//") {
+                                    line.to_string()
+                                } else {
+                                    re_obj_vals.replace_all(line, repl.as_str()).to_string()
+                                }
+                            })
+                            .collect();
+                        let trailing_nl = out.ends_with('\n');
+                        out = lines_out.join("\n");
+                        if trailing_nl && !out.ends_with('\n') {
+                            out.push('\n');
+                        }
+                    }
+
+                    for v in variants {
+                        let esc_v = regex::escape(v);
+                        let member_needle = format!("{}.{}", uname, v);
+                        if out.contains(&member_needle) {
+                            if let Ok(re_member) = regex::Regex::new(&format!(
+                                r#"(^|[^A-Za-z0-9_$.'"`/:]){}\.{}\b"#,
+                                esc_u, esc_v
+                            )) {
+                                let repl = format!("${{1}}'{}'", v);
+                                let lines_out: Vec<String> = out
+                                    .lines()
+                                    .map(|line| {
+                                        if line.trim_start().starts_with("//") {
+                                            line.to_string()
+                                        } else {
+                                            re_member.replace_all(line, repl.as_str()).to_string()
+                                        }
+                                    })
+                                    .collect();
+                                let trailing_nl = out.ends_with('\n');
+                                out = lines_out.join("\n");
+                                if trailing_nl && !out.ends_with('\n') {
+                                    out.push('\n');
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Fix tuple destructuring on object-returning store hooks
+        for hook_name in &object_store_hooks {
+            if out.contains(hook_name.as_str()) {
+                let esc_h = regex::escape(hook_name);
+                if let Ok(re_tuple_call) = regex::Regex::new(&format!(
+                    r"(?m)^([ \t]*const\s+)\[([A-Za-z0-9_,\s]+)\](\s*=\s*{}\s*\(\s*\)\s*;?[ \t]*)\r?$",
+                    esc_h
+                )) {
+                    out = re_tuple_call
+                        .replace_all(&out, |caps: &regex::Captures| {
+                            let prefix = caps.get(1).map_or("", |m| m.as_str());
+                            let vars = caps.get(2).map_or("", |m| m.as_str()).trim();
+                            let suffix = caps.get(3).map_or("", |m| m.as_str());
+                            format!("{}{{ {} }}{}", prefix, vars, suffix)
+                        })
+                        .to_string();
+                }
+            }
+        }
+
+        // 2b. Normalize static `.getState()` / `.setState()` calls on plain React store hooks
+        for hook_name in &object_store_hooks {
+            if !hook_to_store_file.contains_key(hook_name.as_str()) {
+                continue;
+            }
+            if !out.contains(&format!("{}.getState(", hook_name))
+                && !out.contains(&format!("{}.setState(", hook_name))
+            {
+                continue;
+            }
+            let esc_h = regex::escape(hook_name);
+            if let Ok(re_zustand) = regex::Regex::new(&format!(r"\b{}\.(getState|setState)\s*\(", esc_h)) {
+                let next_out = re_zustand
+                    .replace_all(&out, |caps: &regex::Captures| {
+                        let start = caps.get(0).map(|m| m.start()).unwrap_or(0);
+                        let method = caps.get(1).map_or("", |m| m.as_str());
+                        if start > 0 && out.as_bytes().get(start - 1) == Some(&b'.') {
+                            caps[0].to_string()
+                        } else {
+                            format!("({} as any).{}(", hook_name, method)
+                        }
+                    })
+                    .into_owned();
+                if next_out != out {
+                    out = next_out;
+                    shimmed_hooks.insert(hook_name.clone());
+                }
+            }
+        }
+
+        // 3. Auto-import missing exported types from '@/types'
+        if !exported_types.is_empty() {
+            let import_block: String = out
+                .lines()
+                .filter(|l| l.trim_start().starts_with("import ") || l.trim_start().starts_with("import{"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let usage_body: String = out
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !t.starts_with("import ") && !t.starts_with("import{") && !t.starts_with("//") && !t.starts_with("/*") && !t.starts_with('*')
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let mut missing_syms: Vec<String> = Vec::new();
+            for sym in &exported_types {
+                if !usage_body.contains(sym.as_str()) {
+                    continue;
+                }
+                let esc_s = regex::escape(sym);
+                let used_word = regex::Regex::new(&format!(r"\b{}\b", esc_s))
+                    .ok()
+                    .map_or(false, |re| re.is_match(&usage_body));
+                if !used_word {
+                    continue;
+                }
+                let already_imported = regex::Regex::new(&format!(r"\b{}\b", esc_s))
+                    .ok()
+                    .map_or(false, |re| re.is_match(&import_block));
+                let already_declared = regex::Regex::new(&format!(
+                    r"(?m)(?:export\s+)?(?:type|interface|enum|class|const|let|var|function)\s+{}\b",
+                    esc_s
+                ))
+                .ok()
+                .map_or(false, |re| re.is_match(&out));
+                if !already_imported && !already_declared {
+                    missing_syms.push(sym.clone());
+                }
+            }
+
+            if !missing_syms.is_empty() {
+                if let Ok(re_types_imp) = regex::Regex::new(
+                    r#"(?m)^([ \t]*import\s+(?:type\s+)?\{)([^}\r\n]+)(\}\s*from\s*['"]@/types['"]\s*;?[ \t]*)\r?$"#,
+                ) {
+                    if re_types_imp.is_match(&out) {
+                        out = re_types_imp
+                            .replace(&out, |caps: &regex::Captures| {
+                                let prefix = caps.get(1).map_or("", |m| m.as_str());
+                                let existing = caps.get(2).map_or("", |m| m.as_str()).trim().trim_end_matches(',');
+                                let suffix = caps.get(3).map_or("", |m| m.as_str());
+                                format!("{} {}, {} {}", prefix, existing, missing_syms.join(", "), suffix)
+                            })
+                            .to_string();
+                    } else {
+                        out = insert_import_after_use_client(
+                            &out,
+                            &format!("import type {{ {} }} from '@/types';", missing_syms.join(", ")),
+                        );
+                    }
+                }
+            }
+        }
+
+        if out != orig {
+            let _ = std::fs::write(&p, out);
+        }
+    }
+
+    for hook_name in shimmed_hooks {
+        let Some(store_path) = hook_to_store_file.get(&hook_name) else { continue };
+        let Ok(orig_store) = std::fs::read_to_string(store_path) else { continue };
+        let mut next_store = orig_store.clone();
+        if !next_store.is_empty() && !next_store.ends_with('\n') {
+            next_store.push('\n');
+        }
+        if !orig_store.contains(".getState =") {
+            next_store.push_str(&format!(
+                "if (typeof ({} as any).getState !== 'function') {{ ({} as any).getState = () => ({{}}); }}\n",
+                hook_name, hook_name
+            ));
+        }
+        if !orig_store.contains(".setState =") {
+            next_store.push_str(&format!(
+                "if (typeof ({} as any).setState !== 'function') {{ ({} as any).setState = () => {{}}; }}\n",
+                hook_name, hook_name
+            ));
+        }
+        if next_store != orig_store {
+            let rel_store = store_path
+                .strip_prefix(proj_dir)
+                .ok()
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|| "store.ts".to_string());
+            let syntax_ok = crate::ast_engine::parse_source(&rel_store, &next_store)
+                .map(|t| !t.root_node().has_error())
+                .unwrap_or(false);
+            if syntax_ok {
+                let _ = std::fs::write(store_path, next_store);
+            }
+        }
+    }
+}
+
 pub fn post_process_generated_file(
     file_path: &str,
     content: &str,
@@ -6972,6 +8290,10 @@ pub fn post_process_generated_file(
 ) -> String {
     let normalized_path = file_path.replace('\\', "/");
     let path_lower = normalized_path.to_lowercase();
+    let is_expo_mm = metamanifest
+        .get("framework")
+        .and_then(|v| v.as_str())
+        .map_or(false, |f| f.eq_ignore_ascii_case("expo"));
 
     let mut raw_content = content.to_string();
 
@@ -7023,6 +8345,14 @@ pub fn post_process_generated_file(
     }
 
     if path_lower.ends_with("tsconfig.json") {
+        if is_expo_mm {
+            if let Ok(ts_val) = serde_json::from_str::<Value>(content) {
+                if let Ok(pretty) = serde_json::to_string_pretty(&ts_val) {
+                    return pretty;
+                }
+            }
+            return content.to_string();
+        }
         let mut ts_val = match serde_json::from_str::<Value>(content) {
             Ok(val) => val,
             Err(_) => serde_json::json!({
@@ -7169,6 +8499,24 @@ pub fn post_process_generated_file(
         return cleaned_css;
     }
 
+    if is_expo_mm {
+        let mut processed = if path_lower.ends_with(".tsx")
+            || path_lower.ends_with(".jsx")
+            || path_lower.ends_with(".ts")
+            || path_lower.ends_with(".js")
+        {
+            sanitize_expo_react_native_file(content, &normalized_path)
+        } else {
+            content.to_string()
+        };
+        for (search, replace) in crate::katastar::get_verified_sanitizer_patches(file_path) {
+            if processed.contains(&search) {
+                processed = processed.replace(&search, &replace);
+            }
+        }
+        return processed;
+    }
+
     let pre_sanitized_content = if (path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx"))
         && (content.contains("useSession")
             || content.contains("!session")
@@ -7199,12 +8547,8 @@ pub fn post_process_generated_file(
         }
     }
 
-    // Fix Next.js 13/14 invalid <Link> with <a> child
-    if (path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx")) && processed.contains("<Link") && (processed.contains("<a ") || processed.contains("<a>")) {
-        if !processed.contains("legacyBehavior") {
-            processed = processed.replace("<Link ", "<Link legacyBehavior ");
-        }
-    }
+    // Fix Next.js 13/14 invalid <Link> with <a> child (including multiline `<a\n...`)
+    processed = ensure_link_legacy_behavior_for_anchor(&processed, &normalized_path);
 
     // Apply ONLY verified safe atomic rules from the Local Error & Solution Katastar
     for (search, replace) in crate::katastar::get_verified_sanitizer_patches(file_path) {
@@ -7676,7 +9020,10 @@ pub fn post_process_generated_file(
                     })
                 });
 
-            if (had_use_session || processed.contains("useSession") || has_nextauth_dep) && !processed.contains("<SessionProvider") {
+            if (had_use_session || processed.contains("useSession") || has_nextauth_dep)
+                && !processed.contains("<SessionProvider")
+                && !processed.contains("<Providers")
+            {
                 if !processed.contains("SessionProvider") {
                     processed = format!("import {{ SessionProvider }} from 'next-auth/react';\n{}", processed);
                 }
@@ -7818,6 +9165,7 @@ pub fn post_process_generated_file(
                 processed = format!("\"use client\";\n\n{}", processed);
             }
             processed = hoist_use_client_directive(&processed);
+            processed = strip_metadata_from_client_layout(&processed, &normalized_path);
             processed = sanitize_root_layout_missing_children(&processed, &normalized_path, false);
         }
 
@@ -10062,6 +11410,9 @@ pub fn ensure_react_and_next_hook_imports(content: &str) -> String {
 /// Traverses all source files in `src/` and runs AST import sanitization
 /// (removes invalid React navigation imports, verifies @/ alias imports, hoists 'use client').
 pub fn apply_ast_sanity_pass_to_project(proj_dir: &std::path::Path) {
+    if crate::templates_expo::is_expo_project_dir(proj_dir) {
+        return;
+    }
     let src_dir = proj_dir.join("src");
     if !src_dir.exists() {
         return;
@@ -11057,6 +12408,128 @@ pub fn ensure_hook_type_exports(content: &str, rel_path: &str) -> String {
     joined
 }
 
+/// Strips `export const metadata` and `export [async] function generateMetadata` from Next.js
+/// App Router layout files marked `'use client'` / `"use client"` (which webpack rejects), and
+/// cleans up an orphaned `Metadata` import from `'next'` if nothing else references it.
+pub fn strip_metadata_from_client_layout(content: &str, rel_path: &str) -> String {
+    let norm = rel_path.replace('\\', "/").to_lowercase();
+    let is_layout = norm == "layout.tsx"
+        || norm == "layout.jsx"
+        || norm.ends_with("/layout.tsx")
+        || norm.ends_with("/layout.jsx");
+    if !is_layout {
+        return content.to_string();
+    }
+
+    let trimmed_start = content.trim_start();
+    let is_client = trimmed_start.starts_with("\"use client\"") || trimmed_start.starts_with("'use client'");
+    if !is_client {
+        return content.to_string();
+    }
+
+    let mut out = content.to_string();
+    let mut changed = false;
+
+    let remove_balanced_at = |buf: &mut String, start: usize, open_brace: usize| -> bool {
+        let Some(close_brace) = find_balanced_delimiter_bytes(buf, open_brace, b'{', b'}') else {
+            return false;
+        };
+        let mut del_end = close_brace + 1;
+        let rest = &buf[del_end..];
+        let after_satisfies = if rest.trim_start().starts_with("as const") {
+            let off = rest.find("as const").unwrap_or(0) + "as const".len();
+            del_end + off
+        } else {
+            del_end
+        };
+        del_end = after_satisfies;
+        let bytes = buf.as_bytes();
+        while del_end < bytes.len() && matches!(bytes[del_end], b' ' | b'\t') {
+            del_end += 1;
+        }
+        if del_end < bytes.len() && bytes[del_end] == b';' {
+            del_end += 1;
+        }
+        while del_end < bytes.len() && matches!(bytes[del_end], b' ' | b'\t') {
+            del_end += 1;
+        }
+        if buf[del_end..].starts_with("\r\n") {
+            del_end += 2;
+        } else if buf[del_end..].starts_with('\n') {
+            del_end += 1;
+        }
+        buf.replace_range(start..del_end, "");
+        true
+    };
+
+    if let Ok(re_meta) = regex::Regex::new(r"(?m)^[ \t]*export\s+const\s+metadata(?:\s*:[^=\r\n]+)?\s*=\s*\{") {
+        while let Some(m) = re_meta.find(&out) {
+            let start = m.start();
+            let open_brace = m.end() - 1;
+            if !remove_balanced_at(&mut out, start, open_brace) {
+                break;
+            }
+            changed = true;
+        }
+    }
+
+    if let Ok(re_gen_meta) = regex::Regex::new(
+        r"(?m)^[ \t]*export\s+(?:async\s+)?function\s+generateMetadata\s*\([^)]*\)(?:\s*:\s*[^\{\r\n]+)?\s*\{",
+    ) {
+        while let Some(m) = re_gen_meta.find(&out) {
+            let start = m.start();
+            let open_brace = m.end() - 1;
+            if !remove_balanced_at(&mut out, start, open_brace) {
+                break;
+            }
+            changed = true;
+        }
+    }
+
+    if !changed {
+        return out;
+    }
+
+    let non_import_body: String = out
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("import ") && !l.trim_start().starts_with("import{"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let metadata_still_used = regex::Regex::new(r"\bMetadata\b")
+        .ok()
+        .map_or(false, |re| re.is_match(&non_import_body));
+    if !metadata_still_used {
+        if let Ok(re_solo_imp) = regex::Regex::new(
+            r#"(?m)^[ \t]*import\s+(?:type\s+)?\{\s*Metadata\s*(?:as\s+[A-Za-z_$][A-Za-z0-9_$]*)?\s*,?\s*\}\s*from\s*['"]next['"]\s*;?[ \t]*\r?\n?"#,
+        ) {
+            out = re_solo_imp.replace_all(&out, "").to_string();
+        }
+        if let Ok(re_multi_imp) = regex::Regex::new(
+            r#"(?m)^([ \t]*import\s+(?:type\s+)?\{)([^}\r\n]+)(\}\s*from\s*['"]next['"]\s*;?[ \t]*)\r?$"#,
+        ) {
+            out = re_multi_imp
+                .replace_all(&out, |caps: &regex::Captures| {
+                    let prefix = caps.get(1).map_or("", |m| m.as_str());
+                    let inner = caps.get(2).map_or("", |m| m.as_str());
+                    let suffix = caps.get(3).map_or("", |m| m.as_str());
+                    let kept: Vec<&str> = inner
+                        .split(',')
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty() && *s != "Metadata" && !s.starts_with("Metadata "))
+                        .collect();
+                    if kept.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{} {} {}", prefix, kept.join(", "), suffix)
+                    }
+                })
+                .to_string();
+        }
+    }
+
+    out
+}
+
 /// Ensures Next.js App Router `layout.tsx` / `layout.jsx` accepts `{ children }: { children: React.ReactNode }`
 /// and actually renders `{children}` in its JSX tree. When `allow_even_if_table` is false, a
 /// dashboard-stuffed RootLayout with `<table>` is left intact so generation validation can reject & retry it.
@@ -11070,25 +12543,27 @@ pub fn sanitize_root_layout_missing_children(content: &str, rel_path: &str, allo
         return content.to_string();
     }
 
+    let base = strip_metadata_from_client_layout(content, rel_path);
+
     let already_has_children = if let Ok(re) = regex::Regex::new(r"\{\s*children\s*\}") {
-        re.find_iter(content).any(|m| {
-            let next_ch = content[m.end()..].chars().find(|c| !c.is_whitespace());
+        re.find_iter(&base).any(|m| {
+            let next_ch = base[m.end()..].chars().find(|c| !c.is_whitespace());
             !matches!(next_ch, Some(':') | Some(',') | Some('=') | Some(')'))
         })
     } else {
-        content.contains("{children}")
+        base.contains("{children}")
     };
     if already_has_children {
-        return content.to_string();
+        return base;
     }
-    if !allow_even_if_table && norm.ends_with("/app/layout.tsx") && content.to_lowercase().contains("<table") {
-        return content.to_string();
+    if !allow_even_if_table && norm.ends_with("/app/layout.tsx") && base.to_lowercase().contains("<table") {
+        return base;
     }
-    if !allow_even_if_table && norm.ends_with("/app/layout.jsx") && content.to_lowercase().contains("<table") {
-        return content.to_string();
+    if !allow_even_if_table && norm.ends_with("/app/layout.jsx") && base.to_lowercase().contains("<table") {
+        return base;
     }
 
-    let mut out = content.to_string();
+    let mut out = base;
     if let Ok(empty_fn_re) = regex::Regex::new(r"(export\s+default\s+(?:async\s+)?function\s+\w+\s*)\(\s*\)") {
         out = empty_fn_re
             .replace(&out, "${1}({ children }: { children: React.ReactNode })")
@@ -11726,6 +13201,9 @@ pub fn sanitize_openai_v3_to_v4(content: &str) -> String {
 /// with a flat hex string (e.g. `gray: '#7f8c8d'`), which breaks `@apply bg-gray-100` in `globals.css`.
 /// Also ensures `./app/**/*.{js,ts,jsx,tsx,mdx}` and `./components/**/*.{js,ts,jsx,tsx,mdx}` are in `content`.
 pub fn sanitize_tailwind_config_in_project(proj_dir: &std::path::Path) {
+    if crate::templates_expo::is_expo_project_dir(proj_dir) {
+        return;
+    }
     for fname in ["tailwind.config.js", "tailwind.config.ts", "tailwind.config.mjs"] {
         let p = proj_dir.join(fname);
         if !p.is_file() {
@@ -14288,6 +15766,9 @@ fn sync_src_app_into_root_app_if_present(proj_dir: &std::path::Path) {
 /// ensures complete industry-adapted service pages (`/`, `/about`, `/pricing`, `/account`, `/legal/*`),
 /// synthesizes any missing static link routes, and unifies `src/app/` with root `app/` to prevent 404s.
 pub fn ensure_multiplatform_entry_routes_bridged(proj_dir: &std::path::Path) {
+    if crate::templates_expo::is_expo_project_dir(proj_dir) {
+        return;
+    }
     let src_app = proj_dir.join("src/app");
     if !src_app.is_dir() && !proj_dir.join("src/renderer").is_dir() && !proj_dir.join("app").is_dir() {
         return;

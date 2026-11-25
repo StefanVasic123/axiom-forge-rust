@@ -64,9 +64,26 @@ function sleep(ms) {
 
 async function waitWhilePaused(contextLabel) {
   let announced = false;
+  let lastWasThermal = false;
   while (fs.existsSync(PAUSE_FLAG)) {
-    if (!announced) {
-      updateState({ status: 'paused', message: `Pauzirano (${contextLabel}) — klikni Nastavi u Monitor UI.` }, `⏸ Pauzirano (${contextLabel})`);
+    let isThermal = false;
+    try {
+      const content = fs.readFileSync(PAUSE_FLAG, 'utf8');
+      isThermal = content.startsWith('THERMAL_AUTO_PAUSE:');
+    } catch {}
+    if (!announced || isThermal !== lastWasThermal) {
+      lastWasThermal = isThermal;
+      if (isThermal) {
+        updateState(
+          { status: 'cooldown', message: `🌡 Termalna auto-pauza (${contextLabel}) — hlađenje CPU 30s...` },
+          `🌡 Termalna auto-pauza aktivna (${contextLabel})`
+        );
+      } else {
+        updateState(
+          { status: 'paused', message: `Pauzirano (${contextLabel}) — klikni Nastavi u Monitor UI.` },
+          `⏸ Pauzirano (${contextLabel})`
+        );
+      }
       announced = true;
     }
     await sleep(1000);
@@ -144,7 +161,13 @@ async function probeRoute(baseUrl, routePath, method = 'GET', bodyObj = null) {
     }
     const text = await finalRes.text();
     const low = text.toLowerCase();
+    const hasMetroError =
+      text.includes('Unable to resolve') ||
+      text.includes('Metro has encountered an error') ||
+      text.includes('Bundling failed') ||
+      text.includes('Web Bundling failed');
     const hasNextError =
+      hasMetroError ||
       text.includes('__next_error__') ||
       text.includes('Unhandled Runtime Error') ||
       text.includes('Application error: a client-side exception') ||
@@ -154,12 +177,14 @@ async function probeRoute(baseUrl, routePath, method = 'GET', bodyObj = null) {
       routePath === '/' &&
       text.includes("window.location.href = '/login'") &&
       text.includes("const status = 'unauthenticated'");
-    const ok = finalRes.status < 500 && !hasNextError && !hasInlineLoginLoop;
+    const isApiRoute = routePath.startsWith('/api/');
+    const badHttp = isApiRoute ? finalRes.status >= 500 : finalRes.status >= 400;
+    const ok = !badHttp && !hasNextError && !hasInlineLoginLoop;
     let issue = null;
-    if (finalRes.status >= 500) issue = `HTTP_${finalRes.status}`;
+    if (badHttp) issue = `HTTP_${finalRes.status}`;
     else if (hasInlineLoginLoop) issue = 'ROOT_LAYOUT_LOGIN_REDIRECT_LOOP';
     else if (hasNextError) {
-      const m = text.match(/(?:TypeError|ReferenceError|SyntaxError|Module not found)[^<\n]{0,140}/);
+      const m = text.match(/(?:Unable to resolve|Metro has encountered an error|Bundling failed|TypeError|ReferenceError|SyntaxError|Module not found)[^<\n]{0,140}/);
       issue = m ? m[0] : 'NEXT_RUNTIME_OR_COMPILE_ERROR';
     }
     return {
@@ -211,6 +236,159 @@ async function verifyProject(projDir, projectId) {
     result.tscOutput = out.slice(0, 6000);
     const matches = out.match(/error TS\d+:/g) || [];
     result.tscErrors = matches.length || 1;
+  }
+
+  // 2b. Check if this is a pure Expo Mobile project
+  let isExpo = false;
+  try {
+    const pkgRaw = fs.readFileSync(path.join(projDir, 'package.json'), 'utf8');
+    const pkgJson = JSON.parse(pkgRaw);
+    const deps = pkgJson.dependencies || {};
+    const devDeps = pkgJson.devDependencies || {};
+    isExpo = Boolean((deps.expo || deps['expo-router'] || devDeps.expo) && !deps.next);
+  } catch {}
+
+  if (isExpo) {
+    result.isExpo = true;
+    result.inspectorInjected = false;
+    result.expoExportOk = false;
+    result.expoExportError = '';
+    result.nextjsContamination = ['next.config.js', 'tailwind.config.js', 'prisma/schema.prisma', 'src/app/layout.tsx', 'src/app/page.tsx']
+      .filter((rel) => fs.existsSync(path.join(projDir, rel)));
+
+    // Run npx expo export --platform web
+    const exportOutDir = '.expo-e2e-dist';
+    const exportAbsDir = path.join(projDir, exportOutDir);
+    try { fs.rmSync(exportAbsDir, { recursive: true, force: true }); } catch {}
+    updateState({ message: 'Verifikacija: npx expo export --platform web...' }, '📦 Pokrećem expo export --platform web...');
+    try {
+      execSync(`npx --no-install expo export --platform web --output-dir ${exportOutDir}`, {
+        cwd: projDir,
+        encoding: 'utf8',
+        stdio: 'pipe',
+        timeout: 180000,
+        env: { ...process.env, CI: '1', EXPO_NO_TELEMETRY: '1', NO_COLOR: '1' },
+      });
+      const indexHtmlPath = path.join(exportAbsDir, 'index.html');
+      result.expoExportOk = fs.existsSync(indexHtmlPath);
+      if (result.expoExportOk) {
+        const htmlStr = fs.readFileSync(indexHtmlPath, 'utf8');
+        let foundInspector = htmlStr.includes('axiom-inspect-click') && htmlStr.includes('findAxiomOwner');
+        const jsWebDir = path.join(exportAbsDir, '_expo', 'static', 'js', 'web');
+        if (!foundInspector && fs.existsSync(jsWebDir)) {
+          for (const f of fs.readdirSync(jsWebDir)) {
+            if (f.endsWith('.js')) {
+              const jsStr = fs.readFileSync(path.join(jsWebDir, f), 'utf8');
+              if (jsStr.includes('axiom-inspect-click') && jsStr.includes('findAxiomOwner')) {
+                foundInspector = true;
+                break;
+              }
+            }
+          }
+        }
+        result.inspectorInjected = foundInspector;
+      }
+    } catch (e) {
+      const out = ((e.stdout || '') + '\n' + (e.stderr || '')).trim();
+      result.expoExportError = out.slice(-3000);
+      result.expoExportOk = false;
+    } finally {
+      try { fs.rmSync(exportAbsDir, { recursive: true, force: true }); } catch {}
+    }
+    result.nextBuildOk = result.expoExportOk;
+    result.nextBuildError = result.expoExportError;
+
+    // Discover Expo tab routes under app/(tabs)/
+    const expoRoutes = new Set(['/']);
+    const tabsDir = path.join(projDir, 'app', '(tabs)');
+    if (fs.existsSync(tabsDir)) {
+      for (const ent of fs.readdirSync(tabsDir, { withFileTypes: true })) {
+        if (ent.isFile() && /\.(tsx|jsx)$/.test(ent.name)) {
+          const stem = ent.name.replace(/\.(tsx|jsx)$/, '');
+          if (stem !== '_layout' && stem !== 'index' && !stem.startsWith('[')) {
+            expoRoutes.add('/' + stem);
+          }
+        }
+      }
+    }
+
+    const port = await getFreePort(8091);
+    updateState({ message: `Verifikacija: Expo Metro web smoke test na portu ${port}...` }, `📱 Pokrećem Expo Metro web na portu ${port}...`);
+    const spawnCmd = process.platform === 'win32' ? 'cmd' : 'npx';
+    const spawnArgs = process.platform === 'win32'
+      ? ['/C', 'npx', '--no-install', 'expo', 'start', '--web', '--port', String(port), '--non-interactive']
+      : ['--no-install', 'expo', 'start', '--web', '--port', String(port), '--non-interactive'];
+    const srv = spawn(spawnCmd, spawnArgs, {
+      cwd: projDir,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, BROWSER: 'none', EXPO_NO_TELEMETRY: '1', NO_COLOR: '1' },
+    });
+
+    let metroLogs = '';
+    srv.stdout.on('data', (d) => { metroLogs = (metroLogs + d.toString()).slice(-8000); });
+    srv.stderr.on('data', (d) => { metroLogs = (metroLogs + d.toString()).slice(-8000); });
+
+    let ready = false;
+    const deadline = Date.now() + 75000;
+    while (Date.now() < deadline) {
+      try {
+        const r = await fetch(`http://127.0.0.1:${port}/`, { redirect: 'manual' });
+        if (r.status > 0) { ready = true; break; }
+      } catch {}
+      await sleep(1000);
+    }
+
+    try {
+      if (ready) {
+        const baseUrl = `http://127.0.0.1:${port}`;
+        for (const r of expoRoutes) {
+          const probe = await probeRoute(baseUrl, r, 'GET');
+          result.routes.push(probe);
+        }
+        try {
+          const homeHtml = await (await fetch(`${baseUrl}/`)).text();
+          if (homeHtml.includes('axiom-inspect-click') && homeHtml.includes('findAxiomOwner')) {
+            result.inspectorInjected = true;
+          }
+          const bundleMatch = homeHtml.match(/<script[^>]+src=["']([^"']*bundle[^"']*)["']/i);
+          if (bundleMatch && bundleMatch[1]) {
+            const bundleUrl = bundleMatch[1].startsWith('http')
+              ? bundleMatch[1]
+              : `${baseUrl}${bundleMatch[1].startsWith('/') ? '' : '/'}${bundleMatch[1]}`;
+            const bundleRes = await fetch(bundleUrl);
+            const bundleTxt = await bundleRes.text();
+            const isMetroJsonErr = bundleTxt.trimStart().startsWith('{') && (bundleTxt.includes('"type":') || bundleTxt.includes('Unable to resolve'));
+            const hasBundleErr = bundleRes.status >= 400 || isMetroJsonErr;
+            result.metroBundleOk = !hasBundleErr;
+            result.metroBundleStatus = bundleRes.status;
+            if (!hasBundleErr && bundleTxt.includes('axiom-inspect-click') && bundleTxt.includes('findAxiomOwner')) {
+              result.inspectorInjected = true;
+            }
+          }
+          if (result.metroBundleOk === false) {
+            const bundleIssue = `METRO_BUNDLE_FAILED_HTTP_${result.metroBundleStatus || 'ERR'}`;
+            for (const entry of result.routes) {
+              entry.ok = false;
+              entry.issue = bundleIssue;
+            }
+          }
+        } catch {}
+      } else {
+        result.routes.push({
+          route: '/',
+          method: 'GET',
+          ok: false,
+          status: 0,
+          issue: `EXPO_METRO_FAILED_TO_START: ${metroLogs.slice(-400)}`,
+        });
+      }
+    } finally {
+      killTree(srv.pid);
+    }
+
+    result.routesPassed = result.routes.filter(r => r.ok).length;
+    result.routesFailed = result.routes.filter(r => !r.ok).length;
+    return result;
   }
 
   // 3. Check next build
@@ -386,7 +564,23 @@ async function main() {
       }
     );
 
+    let settled = false;
+    let drainTimer = null;
     let buf = '';
+    const finish = (code) => {
+      if (settled) return;
+      settled = true;
+      if (drainTimer) {
+        clearTimeout(drainTimer);
+        drainTimer = null;
+      }
+      if (buf.trim()) {
+        updateState({}, buf.trim());
+        buf = '';
+      }
+      resolve(code ?? 1);
+    };
+
     child.stdout.on('data', (chunk) => {
       buf += chunk.toString();
       const lines = buf.split(/\r?\n/);
@@ -416,9 +610,18 @@ async function main() {
       if (txt) updateState({}, `[stderr] ${txt}`);
     });
 
-    child.on('close', (code) => resolve(code ?? 1));
+    child.on('exit', (code) => {
+      drainTimer = setTimeout(() => {
+        try { child.stdout?.destroy(); } catch {}
+        try { child.stderr?.destroy(); } catch {}
+        finish(code ?? 1);
+      }, 1500);
+    });
+
+    child.on('close', (code) => finish(code ?? 1));
   });
 
+  await waitWhilePaused('pre-verify');
   const projDir = path.join(PROJECTS_ROOT, projectId);
   let verify = null;
   if (fs.existsSync(projDir)) {

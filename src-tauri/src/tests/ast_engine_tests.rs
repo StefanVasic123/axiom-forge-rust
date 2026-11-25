@@ -1407,6 +1407,83 @@ export const config = { matcher: ['/dashboard/:path*', '/settings/:path*'] };
         assert_eq!(manifest_files.len(), 2, "{:?}", manifest_files);
         assert!(!manifest_files.iter().any(|f| f["path"].as_str().unwrap_or("").contains("pages/api")), "{:?}", manifest_files);
 
+        // 23. Celina 1 fixes: AI edit router canonicalization & theme expansion, partial JSX splice, line-range heal fallback, upgraded Live Edit inspector, and Electron auth routes
+        let existing = vec![
+            "src/app/globals.css".to_string(),
+            "tailwind.config.js".to_string(),
+            "src/app/layout.tsx".to_string(),
+            "src/app/page.tsx".to_string(),
+            "src/components/Navbar.tsx".to_string(),
+        ];
+        let reconciled = crate::editor_ai::reconcile_router_target_files(
+            vec!["src/globals.css".to_string(), "src/nonexistent/Ghost.tsx".to_string(), "tailwind.config.js".to_string()],
+            &existing,
+            "promenis boje svuda na kombinaciju zuto/crna",
+        );
+        assert!(reconciled.contains(&"src/app/globals.css".to_string()), "{:?}", reconciled);
+        assert!(reconciled.contains(&"tailwind.config.js".to_string()), "{:?}", reconciled);
+        assert!(!reconciled.iter().any(|p| p.contains("Ghost.tsx") || p == "src/globals.css"), "{:?}", reconciled);
+
+        let theme_proj = temp_dir.join("theme_proj_legacy");
+        std::fs::create_dir_all(theme_proj.join("src/app")).unwrap();
+        std::fs::write(theme_proj.join("src/app/globals.css"), "@tailwind base;\n@tailwind utilities;\n").unwrap();
+        std::fs::write(theme_proj.join("src/app/page.tsx"), "export default function P() { return <div className=\"bg-emerald-500\" />; }\n").unwrap();
+        let expanded_legacy = crate::editor_ai::expand_global_theme_targets(
+            reconciled.clone(),
+            &existing,
+            "promenis boje svuda na zuto/crna",
+            &theme_proj,
+        );
+        assert!(expanded_legacy.contains(&"src/app/page.tsx".to_string()), "{:?}", expanded_legacy);
+        assert!(expanded_legacy.contains(&"src/components/Navbar.tsx".to_string()), "{:?}", expanded_legacy);
+
+        std::fs::write(theme_proj.join("src/app/globals.css"), ":root {\n  --primary: 79 70 229;\n}\n").unwrap();
+        std::fs::write(theme_proj.join("src/app/page.tsx"), "export default function P() { return <div className=\"bg-background text-primary\" />; }\n").unwrap();
+        let tokenized = crate::editor_ai::expand_global_theme_targets(
+            vec!["src/app/globals.css".to_string()],
+            &existing,
+            "promenis boje svuda na zuto/crna",
+            &theme_proj,
+        );
+        assert_eq!(tokenized, vec!["src/app/globals.css".to_string()]);
+
+        let full_jsx = "\"use client\";\nexport default function Home() {\n  return (\n    <div>\n      <section>\n        <h1>Welcome to ForgeCAD</h1>\n      </section>\n      <section className=\"space-y-4\">\n        <h2>How It Works</h2>\n        <div className=\"flex flex-col gap-4\">\n          <div>Import BOM</div>\n          <div>Manage Revisions</div>\n        </div>\n      </section>\n    </div>\n  );\n}\n";
+        let partial_section = "<section className=\"space-y-4\">\n  <h2>How It Works</h2>\n  <div className=\"grid grid-cols-3 gap-4\">\n    <div>Import BOM</div>\n    <div>Manage Revisions</div>\n  </div>\n</section>";
+        let spliced = crate::editor_ai::try_splice_partial_jsx_snippet(full_jsx, partial_section).unwrap();
+        assert!(spliced.contains("grid-cols-3") && spliced.contains("Welcome to ForgeCAD") && spliced.contains("export default function Home"), "{}", spliced);
+
+        let line_file = "line1\nline2\nconst x = ShipmentStatus.ACTIVE;\nline4\n";
+        let coord_json = serde_json::json!({
+            "explanation": "Use safe fallback",
+            "edits": [{ "path": "src/app/page.tsx", "startLine": 3, "endLine": 3, "replacement": "const x = 'ACTIVE';" }]
+        });
+        assert!(crate::healer::extract_edits_from_json(&coord_json, "src/app/page.tsx").is_empty());
+        let line_resolved = crate::healer::resolve_line_range_edits_against_content(&coord_json, "src/app/page.tsx", line_file);
+        assert_eq!(line_resolved.len(), 1);
+        assert_eq!(line_resolved[0]["target"], "const x = ShipmentStatus.ACTIVE;");
+
+        let insp = crate::sanitizer::get_axiom_inspector_script();
+        assert!(insp.contains("findAxiomOwner") && insp.contains("findVisualElement") && insp.contains("className:"));
+        let upg_dir = temp_dir.join("insp_upgrade");
+        std::fs::create_dir_all(upg_dir.join("src/app")).unwrap();
+        std::fs::write(
+            upg_dir.join("src/app/layout.tsx"),
+            "export default function L({ children }: any) { return <html><body>{children}<script dangerouslySetInnerHTML={{ __html: `axiom-agent-dom-cmd extractProjectFileFromStack` }} /></body></html>; }\n",
+        ).unwrap();
+        crate::sanitizer::ensure_axiom_inspector_injected(&upg_dir);
+        let upg_layout = std::fs::read_to_string(upg_dir.join("src/app/layout.tsx")).unwrap();
+        assert!(upg_layout.contains("findAxiomOwner"), "Must upgrade old inspector script");
+
+        let electron_mm = crate::orchestrator::build_default_metamanifest("electron");
+        let electron_paths: Vec<&str> = electron_mm["requiredFilesTemplates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["path"].as_str())
+            .collect();
+        assert!(electron_paths.contains(&"src/app/api/auth/[...nextauth]/route.ts"), "{:?}", electron_paths);
+        assert!(electron_paths.contains(&"src/app/api/register/route.ts"), "{:?}", electron_paths);
+
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

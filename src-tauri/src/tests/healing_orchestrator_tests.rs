@@ -1657,4 +1657,162 @@ export async function PUT(request: Request) {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    #[test]
+    fn test_vertical_features_router_context_and_expo_ai_edit_safety() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "axiom_ai_edit_v62_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join(".axiom")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/app/patients")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/app/api/patients/[id]")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/hooks")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/components")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("src/models")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("prisma")).unwrap();
+        std::fs::write(
+            temp_dir.join("prisma/schema.prisma"),
+            "model Patient {\n  id String @id\n  phone String?\n}\n",
+        )
+        .unwrap();
+
+        std::fs::write(
+            temp_dir.join(".axiom/axiom-contracts.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "version": "1.0",
+                "files": [
+                    {
+                        "path": "src/app/patients/page.tsx",
+                        "role": "page-route",
+                        "dependencies": { "internal": ["src/hooks/usePatients.ts", "src/components/PatientCard.tsx", "src/types"], "external": [] },
+                        "capabilities": { "exports": ["default"], "endpoints": ["GET", "POST"], "models": [] },
+                        "consumedContracts": { "apiCalls": ["/api/patients", "/api/patients/${id}?active=true"] },
+                        "connectedRoutes": ["/patients"]
+                    },
+                    {
+                        "path": "src/hooks/usePatients.ts",
+                        "role": "client-hook",
+                        "dependencies": { "internal": ["src/models/Patient.ts"], "external": [] },
+                        "capabilities": { "exports": ["usePatients"], "endpoints": [], "models": [] },
+                        "consumedContracts": { "apiCalls": ["/api/patients"] },
+                        "connectedRoutes": []
+                    },
+                    {
+                        "path": "src/components/PatientCard.tsx",
+                        "role": "ui-component",
+                        "dependencies": { "internal": ["src/hooks/usePatients.ts"], "external": [] },
+                        "capabilities": { "exports": ["PatientCard"], "endpoints": [], "models": [] },
+                        "consumedContracts": { "apiCalls": [] },
+                        "connectedRoutes": []
+                    },
+                    {
+                        "path": "src/app/api/patients/[id]/route.ts",
+                        "role": "api-route",
+                        "dependencies": { "internal": ["src/lib/prisma.ts"], "external": [] },
+                        "capabilities": { "exports": ["GET", "POST"], "endpoints": ["/api/patients/[id]"], "models": ["Patient"] },
+                        "consumedContracts": { "apiCalls": [] },
+                        "connectedRoutes": []
+                    }
+                ]
+            })).unwrap(),
+        ).unwrap();
+
+        let files_specs = vec![
+            serde_json::json!({ "path": "src/app/patients/page.tsx" }),
+            serde_json::json!({ "path": "src/hooks/usePatients.ts" }),
+            serde_json::json!({ "path": "src/components/PatientCard.tsx" }),
+            serde_json::json!({ "path": "src/app/api/patients/[id]/route.ts" }),
+            serde_json::json!({ "path": "src/models/Patient.ts" }),
+            serde_json::json!({ "path": "src/services/mailer.ts" }),
+            serde_json::json!({ "path": "src/types/index.ts" }),
+            serde_json::json!({ "path": "src/config/site.ts" }),
+        ];
+
+        // 1. Backward-compatible `features` + new `verticalFeatures`
+        crate::editor_ai::generate_axiom_features_json(&temp_dir, "clinic-app", &files_specs);
+        let feat_val: Value = serde_json::from_str(&std::fs::read_to_string(temp_dir.join("axiom-features.json")).unwrap()).unwrap();
+        assert_eq!(feat_val["totalFiles"].as_u64(), Some(8));
+        let layer_names: Vec<String> = feat_val["features"].as_array().unwrap().iter()
+            .filter_map(|f| f["name"].as_str().map(|s| s.to_string())).collect();
+        assert!(layer_names.contains(&"API & Backend".to_string()), "{:?}", layer_names);
+        assert!(layer_names.contains(&"App Pages & Routes".to_string()), "{:?}", layer_names);
+        assert!(layer_names.contains(&"Services".to_string()), "{:?}", layer_names);
+        let verticals = feat_val["verticalFeatures"].as_array().unwrap();
+        let patient_vf = verticals.iter().find(|v| v["id"].as_str() == Some("patient")).expect("expected patient vertical feature");
+        let vf_paths: Vec<String> = patient_vf["files"].as_array().unwrap().iter()
+            .filter_map(|f| f["path"].as_str().map(|s| s.to_string())).collect();
+        assert!(vf_paths.contains(&"src/app/patients/page.tsx".to_string()), "{:?}", vf_paths);
+        assert!(vf_paths.contains(&"src/hooks/usePatients.ts".to_string()), "{:?}", vf_paths);
+        assert!(vf_paths.contains(&"src/components/PatientCard.tsx".to_string()), "{:?}", vf_paths);
+        assert!(vf_paths.contains(&"src/app/api/patients/[id]/route.ts".to_string()), "{:?}", vf_paths);
+        assert!(vf_paths.contains(&"src/models/Patient.ts".to_string()), "{:?}", vf_paths);
+        assert!(!vf_paths.contains(&"src/types".to_string()), "extensionless directory entry must be filtered: {:?}", vf_paths);
+        let vf_endpoints: Vec<String> = patient_vf["apiEndpoints"].as_array().unwrap().iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+        assert!(!vf_endpoints.contains(&"GET".to_string()) && !vf_endpoints.contains(&"POST".to_string()), "{:?}", vf_endpoints);
+        assert!(vf_endpoints.contains(&"/api/patients/[id]".to_string()), "{:?}", vf_endpoints);
+        let vf_models: Vec<String> = patient_vf["models"].as_array().unwrap().iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+        assert!(vf_models.contains(&"Patient".to_string()), "{:?}", vf_models);
+
+        // 2. Router summary + reverse dependents prompt
+        let router_ctx = crate::editor_ai::format_features_for_router(&temp_dir, 2000);
+        assert!(router_ctx.contains("src/app/patients/page.tsx") && router_ctx.contains("/patients"), "{}", router_ctx);
+        let rev = crate::editor_ai::format_reverse_dependents_prompt(&temp_dir, "src/hooks/usePatients.ts", 1000);
+        assert!(rev.contains("src/app/patients/page.tsx") && rev.contains("src/components/PatientCard.tsx"), "{}", rev);
+
+        // 3. Reconciler strips internal metadata/lock files
+        let mut existing: Vec<String> = files_specs.iter().filter_map(|v| v["path"].as_str().map(|s| s.to_string())).collect();
+        existing.push("axiom-features.json".to_string());
+        existing.push("package-lock.json".to_string());
+        existing.push(".axiom/axiom-contracts.json".to_string());
+        let routed = crate::editor_ai::reconcile_router_target_files(
+            vec![
+                "src/app/patients/page.tsx".to_string(),
+                "axiom-features.json".to_string(),
+                "axiom-map.json".to_string(),
+                "package-lock.json".to_string(),
+                ".axiom/axiom-contracts.json".to_string(),
+            ],
+            &existing,
+            "rename title on patients page",
+        );
+        assert_eq!(routed, vec!["src/app/patients/page.tsx".to_string()]);
+
+        // 4. Layer ordering priority: prisma -> types/models -> api -> hooks -> components -> pages
+        let mut unordered = vec![
+            "src/app/patients/page.tsx".to_string(),
+            "src/hooks/usePatients.ts".to_string(),
+            "src/app/api/patients/route.ts".to_string(),
+            "src/models/Patient.ts".to_string(),
+            "prisma/schema.prisma".to_string(),
+            "src/components/PatientCard.tsx".to_string(),
+        ];
+        unordered.sort_by_key(|p| crate::editor_ai::target_layer_priority(p));
+        assert_eq!(
+            unordered,
+            vec![
+                "prisma/schema.prisma".to_string(),
+                "src/models/Patient.ts".to_string(),
+                "src/app/api/patients/route.ts".to_string(),
+                "src/hooks/usePatients.ts".to_string(),
+                "src/components/PatientCard.tsx".to_string(),
+                "src/app/patients/page.tsx".to_string(),
+            ]
+        );
+
+        // 5. TS2353 guidance present in Zod-Prisma guide
+        assert!(crate::self_healing::ZOD_PRISMA_TS2322_HEAL_GUIDE.contains("TS2353"));
+
+        // 6. Expo AI edit post-processing never injects Next.js directives
+        let expo_dir = temp_dir.join("expo_proj");
+        std::fs::create_dir_all(expo_dir.join("app/(tabs)")).unwrap();
+        std::fs::write(expo_dir.join("package.json"), r#"{"name":"expo-app","dependencies":{"expo":"~52.0.0","react-native":"0.76.0"}}"#).unwrap();
+        let rn_code = "import React from 'react';\nimport { View, Text } from 'react-native';\nexport default function Screen() { return <View><Text>Hi</Text></View>; }\n";
+        let post_expo = crate::editor_ai::post_process_edited_file(&expo_dir, "app/(tabs)/index.tsx", rn_code, true);
+        assert!(!post_expo.contains("\"use client\""), "Expo post-process must not inject use client:\n{}", post_expo);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
 

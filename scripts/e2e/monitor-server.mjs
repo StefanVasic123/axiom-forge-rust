@@ -8,12 +8,16 @@ const __dirname = path.dirname(__filename);
 const STATE_DIR = path.join(__dirname, '.state');
 const MANIFESTS_DIR = path.join(__dirname, 'manifests');
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
+const EDIT_STATE_FILE = path.join(STATE_DIR, 'edit-state.json');
+const SCREENSHOTS_DIR = path.join(STATE_DIR, 'screenshots');
+const THERMAL_FILE = path.join(STATE_DIR, 'thermal.json');
 const PAUSE_FLAG = path.join(STATE_DIR, 'pause.flag');
 const STOP_FLAG = path.join(STATE_DIR, 'stop.flag');
 const PORT = Number(process.env.AXIOM_E2E_PORT || 4789);
 
 fs.mkdirSync(STATE_DIR, { recursive: true });
 fs.mkdirSync(MANIFESTS_DIR, { recursive: true });
+fs.mkdirSync(SCREENSHOTS_DIR, { recursive: true });
 
 function defaultState() {
   return {
@@ -52,6 +56,26 @@ function writeState(patch) {
   const next = { ...cur, ...patch, updatedAt: new Date().toISOString() };
   fs.writeFileSync(STATE_FILE, JSON.stringify(next, null, 2));
   return next;
+}
+
+function readThermal() {
+  try {
+    if (!fs.existsSync(THERMAL_FILE)) return null;
+    const data = JSON.parse(fs.readFileSync(THERMAL_FILE, 'utf8'));
+    const updatedMs = data?.updatedAt ? Date.parse(data.updatedAt) : 0;
+    if (!updatedMs || Date.now() - updatedMs > 15000) return null;
+    return data;
+  } catch {}
+  return null;
+}
+
+function readEditState() {
+  try {
+    if (fs.existsSync(EDIT_STATE_FILE)) {
+      return JSON.parse(fs.readFileSync(EDIT_STATE_FILE, 'utf8'));
+    }
+  } catch {}
+  return { status: 'idle', activeTest: null, tests: [], logs: [], updatedAt: null };
 }
 
 if (!fs.existsSync(STATE_FILE)) {
@@ -102,6 +126,13 @@ const DASHBOARD_HTML = `<!doctype html>
     .ok { color:var(--ok); font-weight:700; }
     .err { color:var(--err); font-weight:700; }
     .warn { color:var(--warn); font-weight:700; }
+    .shot-row { display:flex; gap:8px; margin-top:6px; flex-wrap:wrap; }
+    .shot-link { display:inline-flex; flex-direction:column; align-items:center; gap:3px; text-decoration:none; color:var(--muted); font-size:11px; }
+    .shot-link img { width:112px; height:68px; object-fit:cover; border-radius:6px; border:1px solid var(--border); background:#070b15; }
+    .pill { display:inline-block; padding:2px 7px; border-radius:999px; font-size:11px; font-weight:600; background:rgba(148,163,184,.14); color:#cbd5e1; margin:2px 4px 2px 0; }
+    .pill.ok { background:rgba(16,185,129,.18); color:#6ee7b7; }
+    .pill.err { background:rgba(239,68,68,.2); color:#fca5a5; }
+    .pill.warn { background:rgba(245,158,11,.2); color:#fcd34d; }
     pre { margin:10px 0 0; background:#070b15; border:1px solid var(--border); border-radius:10px; padding:12px; height:250px; overflow:auto; font-size:12px; line-height:1.45; color:#cbd5e1; white-space:pre-wrap; }
   </style>
 </head>
@@ -121,8 +152,8 @@ const DASHBOARD_HTML = `<!doctype html>
 
     <div id="cooldownBanner" class="cooldown-banner">
       <div>
-        <strong>❄ Termalna pauza za hlađenje CPU/GPU komponenti</strong>
-        <div class="sub">Ollama miruje da se temperatura procesora spusti pre sledećeg generisanja.</div>
+        <strong id="cooldownTitle">❄ Termalna pauza za hlađenje CPU/GPU komponenti</strong>
+        <div class="sub" id="cooldownSub">Ollama miruje da se temperatura procesora spusti pre sledećeg generisanja.</div>
       </div>
       <div id="cooldownTimer" style="font-size:26px;font-weight:800;color:#7dd3fc;">02:00</div>
     </div>
@@ -146,6 +177,11 @@ const DASHBOARD_HTML = `<!doctype html>
         <div class="label">Proteklo vreme</div>
         <div class="val" id="elapsedVal">00:00</div>
       </div>
+      <div class="card">
+        <div class="label">CPU Temperatura</div>
+        <div class="val sm" id="cpuTempVal">Čeka senzor</div>
+        <div class="sub" id="cpuTempSub">Limit: &gt; 95 °C (5s → 30s)</div>
+      </div>
     </div>
 
     <div class="card">
@@ -155,6 +191,31 @@ const DASHBOARD_HTML = `<!doctype html>
       </div>
       <div class="bar-wrap"><div id="progressBar" class="bar" style="width:0%"></div></div>
       <div class="sub" id="msgVal" style="margin-top:8px;">—</div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+        <div>
+          <div class="label">AI Edit Live Testovi &amp; Analize (UI PRE → POSLE + Router/Mape)</div>
+          <div class="sub" id="editSummarySub">Nema pokrenutih AI Edit testova.</div>
+        </div>
+        <span id="editStatusBadge" class="badge b-idle">IDLE</span>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Test &amp; Projekat</th>
+            <th>Upit &amp; Kliknuti Element</th>
+            <th>Router / Fajlovi / Guard</th>
+            <th>tsc &amp; Build / Mape</th>
+            <th>UI Verifikacija (PRE → POSLE)</th>
+          </tr>
+        </thead>
+        <tbody id="editBody">
+          <tr><td colspan="6" style="color:var(--muted)">Još nema pokrenutih AI Edit testova.</td></tr>
+        </tbody>
+      </table>
     </div>
 
     <div class="card">
@@ -209,13 +270,15 @@ const DASHBOARD_HTML = `<!doctype html>
         const res = await fetch('/api/state');
         const data = await res.json();
         const st = data.state;
+        const th = data.thermal || null;
         isPaused = !!data.paused;
         isStopPending = !!data.stopAfterCurrent;
 
+        const isThermalPause = Boolean(th && th.thermalPaused);
         const badge = document.getElementById('statusBadge');
-        const effStatus = isPaused ? 'paused' : (st.cooldownSecondsRemaining > 0 ? 'cooldown' : (st.status || 'idle'));
+        const effStatus = isThermalPause ? 'cooldown' : (isPaused ? 'paused' : (st.cooldownSecondsRemaining > 0 ? 'cooldown' : (st.status || 'idle')));
         badge.className = 'badge b-' + effStatus;
-        badge.textContent = isPaused ? 'PAUZIRANO' : (st.cooldownSecondsRemaining > 0 ? 'HLAĐENJE' : effStatus.toUpperCase());
+        badge.textContent = isThermalPause ? 'CPU HLAĐENJE' : (isPaused ? 'PAUZIRANO' : (st.cooldownSecondsRemaining > 0 ? 'HLAĐENJE' : effStatus.toUpperCase()));
 
         const pBtn = document.getElementById('pauseBtn');
         pBtn.className = isPaused ? 'btn-resume' : 'btn-pause';
@@ -226,11 +289,32 @@ const DASHBOARD_HTML = `<!doctype html>
         sBtn.textContent = isStopPending ? '⏹ Zaustavljanje zakazano (poništi)' : '⏹ Zaustavi posle iteracije';
 
         const cdBanner = document.getElementById('cooldownBanner');
-        if (st.cooldownSecondsRemaining > 0) {
+        const thPauseRem = isThermalPause ? Math.max(1, Number(th.thermalPauseRemainingSec || th.pauseSec || 30)) : 0;
+        const bannerRem = isThermalPause ? thPauseRem : Number(st.cooldownSecondsRemaining || 0);
+        if (bannerRem > 0) {
           cdBanner.classList.add('show');
-          document.getElementById('cooldownTimer').textContent = fmtTime(st.cooldownSecondsRemaining);
+          document.getElementById('cooldownTitle').textContent = isThermalPause
+            ? '🌡 Automatska termalna pauza CPU (> ' + (th.thresholdC || 95) + ' °C)'
+            : '❄ Termalna pauza za hlađenje CPU/GPU komponenti';
+          document.getElementById('cooldownSub').textContent = isThermalPause
+            ? 'CPU prešao ' + (th.thresholdC || 95) + ' °C duže od ' + (th.sustainSec || 5) + 's (trenutno ' + (typeof th.tempC === 'number' ? th.tempC.toFixed(1) + ' °C' : '—') + ') — pauza 30s radi hlađenja.'
+            : 'Ollama miruje da se temperatura procesora spusti pre sledećeg generisanja.';
+          document.getElementById('cooldownTimer').textContent = fmtTime(bannerRem);
         } else {
           cdBanner.classList.remove('show');
+        }
+
+        const cpuTempVal = document.getElementById('cpuTempVal');
+        const cpuTempSub = document.getElementById('cpuTempSub');
+        if (th && typeof th.tempC === 'number') {
+          cpuTempVal.textContent = th.tempC.toFixed(1) + ' °C';
+          cpuTempVal.className = 'val ' + (th.tempC > (th.thresholdC || 95) ? 'err' : (th.tempC >= 80 ? 'warn' : 'ok'));
+          const peakStr = typeof th.maxObservedTempC === 'number' ? ' • Max: ' + th.maxObservedTempC.toFixed(1) + ' °C' : '';
+          cpuTempSub.textContent = (th.sensor || 'CPU') + peakStr + ' • Pauze: ' + (th.thermalPauseCount || 0);
+        } else {
+          cpuTempVal.textContent = 'Čeka senzor';
+          cpuTempVal.className = 'val sm';
+          cpuTempSub.textContent = th && th.active ? 'Pokreni LibreHardwareMonitor (limit > ' + (th.thresholdC || 95) + ' °C)' : 'Limit: > 95 °C (5s → 30s)';
         }
 
         document.getElementById('iterVal').textContent = (st.track || 'Web') + ' • ' + (st.iteration || 0) + ' / ' + (st.totalIterations || 5);
@@ -275,6 +359,61 @@ const DASHBOARD_HTML = `<!doctype html>
         const atBottom = logBox.scrollTop + logBox.clientHeight >= logBox.scrollHeight - 25;
         logBox.textContent = (st.logs || []).join('\\n') || 'Nema logova još.';
         if (atBottom) logBox.scrollTop = logBox.scrollHeight;
+
+        const ed = data.editState || { status: 'idle', tests: [] };
+        const edBadge = document.getElementById('editStatusBadge');
+        const edStatus = ed.status || 'idle';
+        edBadge.className = 'badge b-' + (edStatus === 'running' ? 'generating' : (edStatus === 'done' ? 'completed' : edStatus));
+        edBadge.textContent = edStatus.toUpperCase();
+        const edSub = document.getElementById('editSummarySub');
+        const tests = Array.isArray(ed.tests) ? ed.tests : [];
+        const passedUi = tests.filter(t => t.uiStatus === 'pass').length;
+        edSub.textContent = tests.length
+          ? 'Testova: ' + tests.length + ' • UI potvrđeno: ' + passedUi + '/' + tests.length + (ed.activeTest ? ' • Aktivan: #' + ed.activeTest : '') + (ed.note ? ' • ' + ed.note : '')
+          : 'Spremno za žive AI Edit testove.';
+
+        const esc = (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const editBody = document.getElementById('editBody');
+        if (!tests.length) {
+          editBody.innerHTML = '<tr><td colspan="6" style="color:var(--muted)">Još nema pokrenutih AI Edit testova.</td></tr>';
+        } else {
+          editBody.innerHTML = tests.map(t => {
+            const filesList = Array.isArray(t.modifiedFiles) && t.modifiedFiles.length ? t.modifiedFiles : (t.filePath ? [t.filePath] : []);
+            const guardPills = [];
+            if (t.mode === 'project') {
+              guardPills.push('<span class="pill ' + (t.touchedSchema ? 'warn' : 'ok') + '">schema: ' + (t.touchedSchema ? 'DIRANA' : 'NETAKNUTA') + '</span>');
+              guardPills.push('<span class="pill ' + (t.touchedApi ? 'warn' : 'ok') + '">api: ' + (t.touchedApi ? 'DIRAN' : 'NETAKNUT') + '</span>');
+            }
+            if (t.platform === 'Mobile-Expo') {
+              guardPills.push('<span class="pill ' + (t.hasUseClient ? 'err' : 'ok') + '">use client: ' + (t.hasUseClient ? 'UBACEN' : 'NE') + '</span>');
+            }
+            const vcText = t.visualContext
+              ? '&lt;' + esc(t.visualContext.tagName || '?') + '&gt; "' + esc((t.visualContext.text || '').slice(0, 40)) + '"' + (t.visualContext.component ? ' [' + esc(t.visualContext.component) + ']' : '')
+              : '—';
+            const shots = [];
+            if (t.beforeScreenshot) {
+              shots.push('<a class="shot-link" target="_blank" href="/api/edit-screenshot/' + encodeURIComponent(t.beforeScreenshot) + '"><img src="/api/edit-screenshot/' + encodeURIComponent(t.beforeScreenshot) + '" alt="PRE" /><span>PRE</span></a>');
+            }
+            if (t.afterScreenshot) {
+              shots.push('<a class="shot-link" target="_blank" href="/api/edit-screenshot/' + encodeURIComponent(t.afterScreenshot) + '"><img src="/api/edit-screenshot/' + encodeURIComponent(t.afterScreenshot) + '" alt="POSLE" /><span>POSLE</span></a>');
+            }
+            const buildLabel = t.buildOk === true ? '<span class="ok">✓ PROŠAO</span>' : (t.buildOk === false ? '<span class="err">✗ PAO</span>' : '<span class="warn">U TOKU</span>');
+            const tscLabel = typeof t.tscErrors === 'number' ? '<span class="' + (t.tscErrors === 0 ? 'ok' : (t.tscErrors <= 2 ? 'warn' : 'err')) + '">TS=' + t.tscErrors + '</span>' : 'TS=—';
+            const mapsLabel = t.mapsRefreshed === true ? '<span class="pill ok">JSON mape osvežene</span>' : (t.mapsRefreshed === false ? '<span class="pill warn">mape nepromenjene</span>' : '');
+            const uiCls = t.uiStatus === 'pass' ? 'ok' : (t.uiStatus === 'fail' ? 'err' : 'warn');
+            const uiBadge = t.uiStatus === 'pass' ? '✓ PRIMENJENO NA UI' : (t.uiStatus === 'fail' ? '✗ NIJE NA UI' : '⏳ ČEKA PROVERU');
+            return \`
+              <tr>
+                <td><strong>#\${t.id}</strong><div class="sub">\${esc(t.mode || '')}</div></td>
+                <td><strong>\${esc(t.title || '')}</strong><div class="sub">\${esc(t.platform || '')} • \${esc(t.projectId || '')}</div><div class="sub">\${t.durationSec ? fmtTime(t.durationSec) : '—'}</div></td>
+                <td style="max-width:250px;"><div>\${esc(t.prompt || '')}</div><div class="sub" style="margin-top:4px;">Klik: \${vcText}</div></td>
+                <td style="max-width:220px;"><div style="font-size:12px;">\${filesList.map(f => '<code>' + esc(f) + '</code>').join('<br/>') || '—'}</div><div style="margin-top:4px;">\${guardPills.join('')}</div>\${t.error ? '<div class="err" style="font-size:11px;margin-top:4px;">' + esc(t.error) + '</div>' : ''}</td>
+                <td><div>\${tscLabel} • \${buildLabel}</div><div style="margin-top:4px;">\${mapsLabel}</div></td>
+                <td><div class="\${uiCls}">\${uiBadge}</div><div class="sub" style="margin-top:4px;">\${esc(t.uiSummary || '—')}</div><div class="shot-row">\${shots.join('')}</div></td>
+              </tr>
+            \`;
+          }).join('');
+        }
       } catch (e) {
         console.error(e);
       }
@@ -301,9 +440,25 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({
       state: readState(),
+      editState: readEditState(),
       paused: fs.existsSync(PAUSE_FLAG),
       stopAfterCurrent: fs.existsSync(STOP_FLAG),
+      thermal: readThermal(),
     }));
+    return;
+  }
+
+  // 2b. Serve verified AI Edit screenshots
+  const shotMatch = url.pathname.match(/^\/api\/edit-screenshot\/([A-Za-z0-9._-]+\.png)$/);
+  if (req.method === 'GET' && shotMatch) {
+    const filePath = path.join(SCREENSHOTS_DIR, shotMatch[1]);
+    if (fs.existsSync(filePath)) {
+      res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'no-cache' });
+      fs.createReadStream(filePath).pipe(res);
+    } else {
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      res.end('Screenshot not found');
+    }
     return;
   }
 

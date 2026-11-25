@@ -206,6 +206,7 @@ function Settings() {
   const [ollamaHost, setOllamaHost] = useState('http://127.0.0.1:11434');
   const [builderModel, setBuilderModel] = useState('');
   const [editorModel, setEditorModel] = useState('');
+  const [copilotCap, setCopilotCap] = useState(null);
   const [activeRole, setActiveRole] = useState('builder'); // 'builder' or 'editor'
   const [hardwareProfile, setHardwareProfile] = useState(null);
   const [ollamaStatus, setOllamaStatus] = useState('unknown');
@@ -234,6 +235,20 @@ function Settings() {
     loadTechOverrides();
     loadLocalTools();
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!editorModel || !window.electronAPI?.copilot?.getCapability) {
+      setCopilotCap(null);
+      return;
+    }
+    window.electronAPI.copilot.getCapability(editorModel).then((cap) => {
+      if (!cancelled) setCopilotCap(cap || null);
+    }).catch(() => {
+      if (!cancelled) setCopilotCap(null);
+    });
+    return () => { cancelled = true; };
+  }, [editorModel, installedOllamaModels.length]);
 
   const loadTechOverrides = async () => {
     try {
@@ -862,6 +877,37 @@ function Settings() {
                       </option>
                     ))}
                   </select>
+                  {copilotCap && (
+                    <div
+                      className={`mt-2 px-3 py-2 rounded-lg border text-xs flex items-start gap-2 ${
+                        copilotCap.eligible
+                          ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                          : copilotCap.statusCode === 'missing_tools' || copilotCap.statusCode === 'ollama_offline'
+                          ? 'bg-amber-500/10 border-amber-500/30 text-amber-300'
+                          : 'bg-slate-800/60 border-slate-700/60 text-slate-400'
+                      }`}
+                    >
+                      {copilotCap.eligible ? (
+                        <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5 text-emerald-400" />
+                      ) : copilotCap.statusCode === 'missing_tools' || copilotCap.statusCode === 'ollama_offline' ? (
+                        <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-400" />
+                      ) : (
+                        <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-slate-500" />
+                      )}
+                      <div>
+                        <p className="font-medium">
+                          {copilotCap.eligible
+                            ? 'Floating AI Copilot Unlocked'
+                            : copilotCap.statusCode === 'missing_tools'
+                            ? 'Floating AI Copilot Hidden (Missing Native Tool-Calling)'
+                            : copilotCap.statusCode === 'ollama_offline'
+                            ? 'Floating AI Copilot Hidden (Verification Pending)'
+                            : 'Optimized Small-Model Edit Mode Active'}
+                        </p>
+                        <p className="opacity-85 mt-0.5">{copilotCap.message}</p>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             )}

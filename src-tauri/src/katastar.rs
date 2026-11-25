@@ -611,6 +611,23 @@ pub fn is_safe_auto_patch(file_path: &str, patch: &KatastarPatch) -> bool {
         return false;
     }
 
+    // Never bleed project-local imports (`@/`, `./`, `../`, `~/`, `src/`) or domain declarations across projects
+    for local_marker in ["'@/", "\"@/", "'./", "\"./", "'../", "\"../", "'~/", "\"~/", "'src/", "\"src/"] {
+        if patch.search.contains(local_marker) || patch.replace.contains(local_marker) {
+            return false;
+        }
+    }
+    if search_trimmed.starts_with("export async function ")
+        || search_trimmed.starts_with("export function ")
+        || search_trimmed.starts_with("export const ")
+        || search_trimmed.starts_with("export class ")
+    {
+        return false;
+    }
+    if (path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx")) && patch.replace.contains("@prisma/client") {
+        return false;
+    }
+
     // Only allow atomic import / export / directive / config / type-level patterns
     let is_atomic_code_pattern = search_trimmed.starts_with("import ")
         || search_trimmed.starts_with("import{")

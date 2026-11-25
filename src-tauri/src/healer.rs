@@ -1984,6 +1984,108 @@ pub fn extract_edits_from_json(parsed_json: &Value, default_path: &str) -> Vec<V
     edits
 }
 
+/// Deterministic fallback when the local LLM ignores verbatim `'target'` rules and returns
+/// 1-based line coordinates (`startLine`/`endLine`, `start_line`/`end_line`, `line`, `start.line`).
+/// Slices the exact lines from `file_content` into a verbatim `'target'` block so the edit applies safely.
+pub fn resolve_line_range_edits_against_content(
+    parsed_json: &Value,
+    default_path: &str,
+    file_content: &str,
+) -> Vec<Value> {
+    let mut raw_objs: Vec<&serde_json::Map<String, Value>> = Vec::new();
+    if let Some(obj) = parsed_json.as_object() {
+        raw_objs.push(obj);
+        for key in ["edits", "fixes", "changes", "edit", "fix"] {
+            if let Some(arr) = obj.get(key).and_then(|v| v.as_array()) {
+                for item in arr {
+                    if let Some(item_obj) = item.as_object() {
+                        raw_objs.push(item_obj);
+                    }
+                }
+            } else if let Some(sub) = obj.get(key).and_then(|v| v.as_object()) {
+                raw_objs.push(sub);
+            }
+        }
+    } else if let Some(arr) = parsed_json.as_array() {
+        for item in arr {
+            if let Some(item_obj) = item.as_object() {
+                raw_objs.push(item_obj);
+            }
+        }
+    }
+
+    let lines: Vec<&str> = file_content.lines().collect();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let norm_default = normalize_rel_path_str(default_path);
+    let mut resolved = Vec::new();
+
+    for obj in raw_objs {
+        let Some(repl) = obj
+            .get("replacement")
+            .or_else(|| obj.get("newCode"))
+            .or_else(|| obj.get("code"))
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        let has_target = obj
+            .get("target")
+            .and_then(|v| v.as_str())
+            .map_or(false, |t| !t.trim().is_empty());
+        if has_target {
+            continue;
+        }
+        let raw_path = obj
+            .get("path")
+            .or_else(|| obj.get("file"))
+            .or_else(|| obj.get("filePath"))
+            .and_then(|v| v.as_str())
+            .map(normalize_rel_path_str)
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| norm_default.clone());
+        if !raw_path.eq_ignore_ascii_case(&norm_default) {
+            continue;
+        }
+
+        let start_line = obj
+            .get("startLine")
+            .or_else(|| obj.get("start_line"))
+            .or_else(|| obj.get("lineNumber"))
+            .or_else(|| obj.get("line"))
+            .and_then(|v| v.as_u64())
+            .or_else(|| obj.get("start").and_then(|s| s.get("line")).and_then(|l| l.as_u64()))
+            .or_else(|| obj.get("range").and_then(|r| r.get("start")).and_then(|s| s.get("line")).and_then(|l| l.as_u64()));
+
+        let Some(start) = start_line else { continue };
+        let end = obj
+            .get("endLine")
+            .or_else(|| obj.get("end_line"))
+            .and_then(|v| v.as_u64())
+            .or_else(|| obj.get("end").and_then(|e| e.get("line")).and_then(|l| l.as_u64()))
+            .or_else(|| obj.get("range").and_then(|r| r.get("end")).and_then(|e| e.get("line")).and_then(|l| l.as_u64()))
+            .unwrap_or(start);
+
+        let start_idx = start as usize;
+        let end_idx = end as usize;
+        if start_idx == 0 || end_idx < start_idx || end_idx > lines.len() || (end_idx - start_idx) > 40 {
+            continue;
+        }
+        let target_slice = lines[start_idx - 1..end_idx].join("\n");
+        if target_slice.trim().is_empty() || target_slice == repl {
+            continue;
+        }
+        resolved.push(serde_json::json!({
+            "path": norm_default,
+            "target": target_slice,
+            "replacement": repl
+        }));
+    }
+
+    resolved
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SingleFileVerifyOutcome {
     Passed(&'static str),
@@ -3490,6 +3592,15 @@ pub async fn project_heal_compile_error(
                 explanation = exp.to_string();
             }
             resolved_edits = extract_edits_from_json(parsed_json, &rel_file_path);
+            if resolved_edits.is_empty() {
+                resolved_edits = resolve_line_range_edits_against_content(parsed_json, &rel_file_path, &file_content);
+                if !resolved_edits.is_empty() {
+                    debug_log_to_file(format!(
+                        "[AI Auto-Healing] Converted {} line-range edit(s) against {} into verbatim target blocks.",
+                        resolved_edits.len(), rel_file_path
+                    ));
+                }
+            }
         }
 
         resolved_edits.retain(|e| {

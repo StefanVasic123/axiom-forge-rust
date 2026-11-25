@@ -121,7 +121,43 @@ pub fn get_generation_phase(file_path: &str, project_type: &str) -> GenerationPh
     let is_api_path = path_lower.starts_with("api/") || path_lower.contains("/api/");
 
     match project_type {
-        "nextjs" | "mern" | "electron" | "react_native" | "react-native" | "expo" => {
+        "expo" | "react_native" | "react-native" => {
+            let is_layout_or_html = path_lower.ends_with("/_layout.tsx")
+                || path_lower.ends_with("/_layout.jsx")
+                || path_lower == "_layout.tsx"
+                || path_lower == "+html.tsx"
+                || path_lower.ends_with("/+html.tsx");
+            if path_lower == "package.json"
+                || path_lower == "app.json"
+                || path_lower == "babel.config.js"
+                || path_lower == "metro.config.js"
+                || path_lower == "tsconfig.json"
+                || path_lower == "src/theme.ts"
+                || path_lower == "theme.ts"
+                || is_config_location
+                || is_root_json
+            {
+                GenerationPhase::Config
+            } else if path_lower.contains("types/") || path_lower.starts_with("types/") || path_lower.contains("models/") || path_lower.starts_with("models/") {
+                GenerationPhase::DatabaseOrMain
+            } else if path_lower.contains("store/")
+                || path_lower.starts_with("store/")
+                || path_lower.contains("hooks/")
+                || path_lower.starts_with("hooks/")
+                || path_lower.contains("utils/")
+                || path_lower.starts_with("utils/")
+                || path_lower.contains("lib/")
+            {
+                GenerationPhase::ApiOrState
+            } else if path_lower.contains("components/") || path_lower.starts_with("components/") {
+                GenerationPhase::LogicOrHooks
+            } else if is_layout_or_html {
+                GenerationPhase::ShellOrWidgets
+            } else {
+                GenerationPhase::PagesOrUi
+            }
+        }
+        "nextjs" | "mern" | "electron" => {
             if path_lower == "package.json"
                 || path_lower == "tsconfig.json"
                 || path_lower == "components.json"
@@ -204,6 +240,104 @@ pub fn get_context_files_for(file_path: &str, proj_dir: &std::path::Path) -> Str
 pub fn get_context_files_for_with_desc(file_path: &str, file_desc: &str, proj_dir: &std::path::Path) -> String {
     let mut context = String::new();
     let path_lower = file_path.to_lowercase().replace('\\', "/");
+
+    if crate::templates_expo::is_expo_project_dir(proj_dir) {
+        let is_theme_self = path_lower == "src/theme.ts" || path_lower == "theme.ts";
+        let is_types_self = path_lower == "src/types/index.ts" || path_lower == "types/index.ts";
+        let is_code = path_lower.ends_with(".ts")
+            || path_lower.ends_with(".tsx")
+            || path_lower.ends_with(".js")
+            || path_lower.ends_with(".jsx");
+        if is_code && !is_theme_self {
+            for rel_theme in ["src/theme.ts", "theme.ts"] {
+                let tp = proj_dir.join(rel_theme);
+                if tp.is_file() {
+                    if let Ok(tc) = std::fs::read_to_string(&tp) {
+                        context.push_str(&format!(
+                            "\nReference: Theme tokens ({}) — use ONLY these exact keys:\n```typescript\n{}\n```\n",
+                            rel_theme, tc
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+        if is_code && !is_types_self {
+            for rel_types in ["src/types/index.ts", "types/index.ts"] {
+                let tp = proj_dir.join(rel_types);
+                if tp.is_file() {
+                    if let Ok(tc) = std::fs::read_to_string(&tp) {
+                        let snippet: String = tc.chars().take(2500).collect();
+                        context.push_str(&format!(
+                            "\nReference: Shared TypeScript types ({}):\n```typescript\n{}\n```\n",
+                            rel_types, snippet
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+        let is_screen_or_component = path_lower.starts_with("app/") || path_lower.contains("/components/");
+        if is_screen_or_component {
+            let mut store_count = 0usize;
+            for dir_rel in ["src/store", "store", "src/hooks", "hooks"] {
+                let dir_abs = proj_dir.join(dir_rel);
+                if let Ok(entries) = std::fs::read_dir(&dir_abs) {
+                    let mut paths: Vec<_> = entries.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
+                    paths.sort();
+                    for p in paths {
+                        let p_norm = p.strip_prefix(proj_dir).ok().map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+                        if p_norm.eq_ignore_ascii_case(&path_lower) || p_norm.ends_with("/index.ts") {
+                            continue;
+                        }
+                        if let Ok(c) = std::fs::read_to_string(&p) {
+                            let snippet: String = c.chars().take(2500).collect();
+                            context.push_str(&format!(
+                                "\nReference: State / Hook ({}) — match exact export names, parameters & return fields:\n```typescript\n{}\n```\n",
+                                p_norm, snippet
+                            ));
+                            store_count += 1;
+                            if store_count >= 3 {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if store_count >= 3 {
+                    break;
+                }
+            }
+        }
+        if path_lower.starts_with("app/") && !path_lower.ends_with("+html.tsx") {
+            let mut comp_count = 0usize;
+            for dir_rel in ["src/components", "components"] {
+                let dir_abs = proj_dir.join(dir_rel);
+                if let Ok(entries) = std::fs::read_dir(&dir_abs) {
+                    let mut paths: Vec<_> = entries.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
+                    paths.sort();
+                    for p in paths {
+                        let p_norm = p.strip_prefix(proj_dir).ok().map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+                        if let Ok(c) = std::fs::read_to_string(&p) {
+                            let header: String = c.lines().take(35).collect::<Vec<_>>().join("\n");
+                            context.push_str(&format!(
+                                "\nReference: Component signature ({}) — match exact props:\n```typescript\n{}\n```\n",
+                                p_norm, header
+                            ));
+                            comp_count += 1;
+                            if comp_count >= 4 {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if comp_count >= 4 {
+                    break;
+                }
+            }
+        }
+        return context;
+    }
+
     let desc_low = file_desc.to_lowercase();
     let is_app_route = crate::sanitizer::is_app_router_route_file(file_path);
     let is_tsx_or_jsx = path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx");
@@ -796,6 +930,33 @@ pub async fn validate_file_with_project_context(
         || path_lower.ends_with(".js")
         || path_lower.ends_with(".jsx");
     if !is_ts_js {
+        return Ok(());
+    }
+
+    let is_expo_proj = crate::templates_expo::is_expo_project_dir(proj_dir)
+        || path_lower.starts_with("app/(tabs)/")
+        || path_lower == "app/_layout.tsx"
+        || path_lower == "app/+html.tsx";
+    if is_expo_proj {
+        if path_lower != "app/+html.tsx" && (path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx")) {
+            let code_check = strip_ts_js_comments_preserving_strings(content);
+            for html_tag in ["<div", "</div>", "<span", "</span>", "<button", "</button>", "<h1", "<p ", "<p>"] {
+                if code_check.contains(html_tag) {
+                    return Err(format!(
+                        "Expo React Native screen/component `{}` must NEVER use web HTML DOM tags (`{}`). Use React Native core primitives (`View`, `Text`, `Pressable`, `ScrollView`, `TextInput`).",
+                        file_path, html_tag
+                    ));
+                }
+            }
+            for bad_pkg in ["next/link", "next/navigation", "next/router", "next-auth", "@prisma/client", "lucide-react", "react-icons"] {
+                if code_check.contains(bad_pkg) {
+                    return Err(format!(
+                        "Expo React Native file `{}` must NEVER import `{}`. Use `expo-router`, `@expo/vector-icons`, and `@react-native-async-storage/async-storage`.",
+                        file_path, bad_pkg
+                    ));
+                }
+            }
+        }
         return Ok(());
     }
 
@@ -4553,20 +4714,37 @@ pub fn get_expert_system_prompt(
     }
 
     // 3. REACT NATIVE / EXPO MOBILE SCOPE
-    let is_mobile_rn = proj_type_lower == "react-native" || proj_type_lower == "expo" || path_lower.contains("app.json");
-    if is_mobile_rn && (path_lower.ends_with(".tsx") || path_lower.ends_with(".jsx")) {
+    let is_mobile_rn = crate::templates_expo::is_expo_project_type(&proj_type_lower) || path_lower.contains("app.json");
+    if is_mobile_rn
+        && (path_lower.ends_with(".tsx")
+            || path_lower.ends_with(".jsx")
+            || path_lower.ends_with(".ts")
+            || path_lower.ends_with(".js"))
+    {
         return format!(
-            "You are a Senior React Native Mobile Engineer. Write only clean, production-ready React Native / Expo code wrapped in markdown code blocks. No explanations.\n\n\
-             REACT NATIVE RULES:\n\
-             - MOBILE UI ONLY: NEVER use HTML DOM tags (no <div>, <p>, <span>, <a>, <button>, or <html>). ALWAYS use React Native core components (<View>, <Text>, <TouchableOpacity>, <ScrollView>, <FlatList>, <TextInput>, <SafeAreaView>).\n\
-             - NO CSS STRINGS OR BOXSHADOW: Never write `border: \"1px solid ...\"` or `boxShadow`. Use individual border properties (`borderWidth: 1, borderColor: '#...'`) and elevation (Android) / shadow* (iOS).\n\
-             - SCROLL CONTAINER STYLING: Always use `contentContainerStyle={{ padding: 16 }}` on ScrollView and FlatList for inner padding, not `style`.\n\
-             - ICONS: NEVER import from 'lucide-react' or 'react-icons'. Import from '@expo/vector-icons' (e.g. Ionicons) or 'lucide-react-native'.\n\
-             - NAVIGATION: Use Expo Router (`import {{ useRouter }} from 'expo-router'`) or React Navigation. Never use Next.js Link or router.\n\
-             - OFFLINE RESILIENCE: Wrap fetch calls in try/catch and provide fallback data or cached AsyncStorage state.\n\
-             - CLIENT-SIDE ONLY: Never import @prisma/client or Node.js server modules.\n\
-             FILE: {}\n",
-            file_path
+            "You are a Senior React Native & Expo SDK 52 Mobile Engineer. Write ONLY clean, complete, production-ready React Native TypeScript/JavaScript code wrapped in a markdown code block. No explanations outside code.\n\n\
+             EXPO MOBILE ARCHITECTURE & UI RULES:\n\
+             - REACT NATIVE PRIMITIVES ONLY: NEVER use HTML DOM tags (<div>, <p>, <span>, <a>, <button>, <h1>, <ul>, <li>, <input>, <html>). ALWAYS use `react-native` primitives (`View`, `Text`, `Pressable`, `TouchableOpacity`, `ScrollView`, `FlatList`, `TextInput`, `StyleSheet`, `Modal`, `Switch`, `ActivityIndicator`) and `SafeAreaView` from `react-native-safe-area-context`.\n\
+             - STYLING & DESIGN TOKENS: Use `StyleSheet.create(...)` and import shared semantic design tokens from `@/theme` (`import {{ theme }} from '@/theme'`). Use ONLY exact keys declared in `src/theme.ts`: `theme.colors.{{background, surface, surfaceAlt, primary, primaryText, secondary, text, textMuted, border, success, warning, danger}}`, `theme.spacing.{{xs, sm, md, lg, xl}}`, `theme.radius.{{sm, md, lg, full}}`, `theme.typography.{{title, subtitle, body, caption}}`. Never invent keys like `theme.colors.white`, `theme.colors.error`, `theme.colors.cardBackground`, `theme.fontSizes`, or `theme.borderRadius`. Never use web CSS strings or `boxShadow`.\n\
+             - CONTRACT ADHERENCE: Import ONLY exact types, store hooks, functions, and component props shown in PROJECT CONTEXT below using concrete individual file paths (for example `'@/store/useExpenseStore'` and `'@/components/ExpenseCard'`). Import shared types ONLY from `'@/types'`, and when a filter state accepts `'ALL'` alongside a union/enum type, explicitly type it as `useState<MyType | 'ALL'>('ALL')`. Custom store hooks under `src/store` are plain React `useState` hooks — always call them inside the component body using object destructuring (`const {{ items, addItem }} = useMyStore();`) and invoke returned actions directly. For string union types (`export type Foo = 'A' | 'B'`), iterate over a typed constant array (`(['A', 'B'] as const)`) and pass string literals directly (`'A'`).\n\
+             - DUAL EXPORTS FOR MODULES: For modules in `src/store`, `src/hooks`, and `src/components`, ALWAYS export BOTH a named export AND default export (e.g. `export function useWorkoutStore() ... export default useWorkoutStore;`).\n\
+             - SCROLL CONTAINERS: Use `contentContainerStyle={{ padding: 16, gap: 12 }}` on `ScrollView` and `FlatList` for inner spacing.\n\
+             - ICONS: Import icons ONLY from `@expo/vector-icons` (`Ionicons`, `MaterialIcons`, `Feather`). For `Ionicons`, use valid Ionicons names such as `home-outline`, `list-outline`, `fitness-outline`, `barbell-outline`, `heart-outline`, `checkmark-circle-outline`, `ellipse-outline`, `alert-circle-outline`, `add-circle-outline`, `settings-outline`, `person-outline`, `time-outline`, `flame-outline`, `trash-outline`, `cloud-download-outline`, `cloud-upload-outline`.\n\
+             - EXPO ROUTER NAVIGATION: Use `useRouter`, `Link`, `useLocalSearchParams`, `Stack`, `Tabs` from `expo-router`. NEVER import `next/link`, `next/navigation`, `next-auth`, `@prisma/client`, or `window.localStorage`.\n\
+             - OFFLINE-FIRST PERSISTENCE: Persist local mobile state cleanly using `@react-native-async-storage/async-storage` (`AsyncStorage.getItem`, `AsyncStorage.setItem`, `AsyncStorage.removeItem` ONLY — NEVER call `getItemAsync`/`setItemAsync`) backed by realistic domain seed data and responsive interactive state (filters, modals, toggles, CRUD actions).\n\
+             - POLISHED MOBILE UX: Craft rich, thumb-friendly mobile layouts with clear typographic hierarchy, >=44px touch targets, summary KPI cards, interactive lists, empty states, and status pills.\n\
+             - TARGET FILE: {}\n{}{}\n",
+            file_path,
+            if routes_ref.trim().is_empty() {
+                String::new()
+            } else {
+                format!("\n{}\n", routes_ref)
+            },
+            if context_ref.trim().is_empty() {
+                String::new()
+            } else {
+                format!("\nPROJECT CONTEXT (existing files, stores & types):\n{}\n", context_ref)
+            }
         );
     }
 
@@ -4864,6 +5042,19 @@ pub fn get_expert_system_prompt(
         // Inject tailored Design Archetype tokens based on the project's domain & category
         let design_archetype = get_project_design_archetype_from_dir(proj_dir);
         prompt.push_str(&design_archetype);
+
+        let has_semantic_tokens = ["src/app/globals.css", "app/globals.css"]
+            .iter()
+            .any(|p| fs::read_to_string(proj_dir.join(p)).map_or(false, |s| s.contains("--primary:")))
+            || (crate::templates::templates_enabled()
+                && (proj_type_lower == "nextjs" || proj_type_lower == "electron"));
+        if has_semantic_tokens {
+            prompt.push_str(
+                "SEMANTIC THEME TOKENS (Preferred for Global Re-Theming):\n\
+                 - This project defines CSS-variable Tailwind tokens in `tailwind.config.js` / `globals.css`: `bg-background`, `text-foreground`, `bg-surface`, `bg-primary`, `text-primary-foreground`, `bg-secondary`, `bg-accent`, `bg-muted`, `text-muted-foreground`, `border-border`.\n\
+                 - Use these semantic classes for main page backgrounds, card surfaces, borders, headings, muted labels, and primary CTA buttons (instead of hardcoding colors everywhere) so theme changes update the whole UI.\n\n"
+            );
+        }
 
         if path_lower.ends_with("layout.tsx") || path_lower.ends_with("layout.jsx") {
             prompt.push_str(
@@ -5452,6 +5643,741 @@ fn is_e2e_pause_active() -> bool {
         .unwrap_or(false)
 }
 
+fn nextauth_route_template_entry() -> serde_json::Value {
+    serde_json::json!({
+        "path": "src/app/api/auth/[...nextauth]/route.ts",
+        "description": "NextAuth App Router route handler.",
+        "language": "typescript",
+        "defaultContent": r#"import NextAuth from "next-auth";
+import CredentialsProvider from "next-auth/providers/credentials";
+import { PrismaAdapter } from "@auth/prisma-adapter";
+import bcrypt from "bcryptjs";
+import prisma from "@/lib/prisma";
+
+export const authOptions = {
+  adapter: PrismaAdapter(prisma) as any,
+  providers: [
+    CredentialsProvider({
+      name: "credentials",
+      credentials: {
+        email: { label: "Email", type: "email" },
+        password: { label: "Password", type: "password" },
+      },
+      async authorize(credentials) {
+        if (!credentials?.email || !credentials?.password) return null;
+        try {
+          const user = await prisma.user.findUnique({ where: { email: credentials.email } });
+          if (!user) return null;
+          const passwordToCompare = user.hashedPassword || (user as any).password || "";
+          const passwordMatch = await bcrypt.compare(credentials.password, passwordToCompare);
+          if (!passwordMatch) return null;
+          return { id: String(user.id), email: user.email, name: user.name, role: user.role };
+        } catch (error) {
+          console.error("Auth error in CredentialsProvider:", error);
+          return null;
+        }
+      },
+    }),
+  ],
+  session: { strategy: "jwt" as const },
+  callbacks: {
+    async jwt({ token, user }: any) {
+      if (user) {
+        token.id = user.id;
+        token.role = user.role;
+      }
+      return token;
+    },
+    async session({ session, token }: any) {
+      if (session.user && token) {
+        session.user.id = token.id;
+        session.user.role = token.role;
+      }
+      return session;
+    },
+  },
+  pages: {
+    signIn: "/login",
+  },
+  secret: process.env.NEXTAUTH_SECRET || "axiom-dev-secret-change-in-production",
+};
+
+const handler = NextAuth(authOptions);
+export { handler as GET, handler as POST };"#
+    })
+}
+
+fn register_route_template_entry() -> serde_json::Value {
+    serde_json::json!({
+        "path": "src/app/api/register/route.ts",
+        "description": "User registration App Router API endpoint.",
+        "language": "typescript",
+        "defaultContent": r#"import { NextResponse } from "next/server";
+import bcrypt from "bcryptjs";
+import prisma from "@/lib/prisma";
+import { z } from "zod";
+
+const registerSchema = z.object({
+  name: z.string().trim().min(1).max(100).optional(),
+  email: z.string().email(),
+  password: z.string().min(8)
+});
+
+export async function POST(request: Request) {
+  try {
+    const body = await request.json();
+    const parsed = registerSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(
+        { message: parsed.error.issues[0]?.message || "Invalid registration payload" },
+        { status: 400 }
+      );
+    }
+    const { name, email, password } = parsed.data;
+    const displayName = name || email.split("@")[0];
+
+    const existingUser = await prisma.user.findUnique({ where: { email } });
+    if (existingUser) {
+      return NextResponse.json({ message: "Email already in use" }, { status: 400 });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const newUser = await prisma.user.create({
+      data: {
+        name: displayName,
+        email,
+        hashedPassword,
+        role: "USER"
+      }
+    });
+
+    return NextResponse.json(
+      { message: "User registered successfully", user: { id: newUser.id, name: newUser.name, email: newUser.email } },
+      { status: 201 }
+    );
+  } catch (error: any) {
+    console.error("Registration error:", error);
+    return NextResponse.json({ message: error.message || "Internal server error" }, { status: 500 });
+  }
+}"#
+    })
+}
+
+pub fn build_default_metamanifest(project_type: &str) -> serde_json::Value {
+    if project_type == "nextjs" {
+        serde_json::json!({
+            "rootFiles": ["package.json", "tsconfig.json", "next.config.js", "tailwind.config.js", "postcss.config.js", "next-env.d.ts"],
+            "rootFilesMoveFromSrc": true,
+            "requiredFilesTemplates": [
+                {
+                    "path": "package.json",
+                    "description": "Standard package.json for Next.js project with Tailwind CSS.",
+                    "language": "json",
+                    "mergeDependencies": {
+                        "dependencies": {
+                            "next": "14.2.35",
+                            "react": "^18.2.0",
+                            "react-dom": "^18.2.0",
+                            "next-auth": "^4.24.7",
+                            "@auth/prisma-adapter": "^1.0.12",
+                            "@prisma/client": "5.22.0",
+                            "lucide-react": "^0.460.0",
+                            "clsx": "^2.1.1",
+                            "tailwind-merge": "^2.3.0",
+                            "class-variance-authority": "^0.7.0",
+                            "tailwindcss-animate": "^1.0.7",
+                            "zod": "^3.23.8",
+                            "react-hook-form": "^7.51.5",
+                            "bcryptjs": "^2.4.3",
+                            "jsonwebtoken": "^9.0.2"
+                        },
+                        "devDependencies": {
+                            "prisma": "5.22.0",
+                            "tailwindcss": "^3.4.0",
+                            "postcss": "^8.4.32",
+                            "autoprefixer": "^10.4.16",
+                            "typescript": "^5.3.3",
+                            "@types/react": "^18.2.45",
+                            "@types/react-dom": "^18.2.18",
+                            "@types/node": "^20.10.5",
+                            "@types/bcryptjs": "^2.4.6",
+                            "@types/jsonwebtoken": "^9.0.6"
+                        },
+                        "scripts": {
+                            "dev": "next dev",
+                            "build": "next build",
+                            "start": "next start"
+                        }
+                    }
+                },
+                {
+                    "path": "tailwind.config.js",
+                    "description": "Configuration file for Tailwind CSS.",
+                    "language": "javascript",
+                    "defaultContent": "/** @type {import('tailwindcss').Config} */\nmodule.exports = {\n  content: [\n    \"./src/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./app/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./components/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./pages/**/*.{js,ts,jsx,tsx,mdx}\"\n  ],\n  theme: {\n    extend: {},\n  },\n  plugins: [],\n}"
+                },
+                {
+                    "path": "postcss.config.js",
+                    "description": "Configuration file for PostCSS.",
+                    "language": "javascript",
+                    "defaultContent": "module.exports = {\n  plugins: {\n    tailwindcss: {},\n    autoprefixer: {},\n  },\n}"
+                },
+                {
+                    "path": "tsconfig.json",
+                    "description": "TypeScript compiler settings.",
+                    "language": "json",
+                    "defaultContent": "{\n  \"compilerOptions\": {\n    \"lib\": [\"dom\", \"dom.iterable\", \"esnext\"],\n    \"allowJs\": true,\n    \"skipLibCheck\": true,\n    \"strict\": false,\n    \"noEmit\": true,\n    \"esModuleInterop\": true,\n    \"module\": \"esnext\",\n    \"moduleResolution\": \"bundler\",\n    \"resolveJsonModule\": true,\n    \"isolatedModules\": true,\n    \"jsx\": \"preserve\",\n    \"incremental\": true,\n    \"plugins\": [\n      {\n        \"name\": \"next\"\n      }\n    ],\n    \"paths\": {\n      \"@/*\": [\"./src/*\"]\n    }\n  },\n  \"include\": [\"next-env.d.ts\", \"**/*.ts\", \"**/*.tsx\", \".next/types/**/*.ts\"],\n  \"exclude\": [\"node_modules\"]\n}"
+                },
+                {
+                    "path": "next.config.js",
+                    "description": "Next.js configuration.",
+                    "language": "javascript",
+                    "defaultContent": "/** @type {import('next').NextConfig} */\nconst nextConfig = {\n  reactStrictMode: true,\n  swcMinify: true,\n};\nmodule.exports = nextConfig;"
+                },
+                {
+                    "path": "src/app/globals.css",
+                    "description": "Global CSS file containing Tailwind directives.",
+                    "language": "css",
+                    "defaultContent": "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n\n"
+                },
+                {
+                    "path": "src/middleware.ts",
+                    "description": "Resource-optimized middleware that bypasses static asset queries at the matcher layer.",
+                    "language": "typescript",
+                    "defaultContent": r#"import { withAuth } from "next-auth/middleware";
+import { NextRequest, NextResponse } from "next/server";
+
+const authMiddleware = withAuth(
+  function middleware(_req: NextRequest) {
+    return NextResponse.next();
+  },
+  {
+    callbacks: {
+      authorized: ({ token }) => !!token,
+    },
+    pages: {
+      signIn: "/login",
+    },
+  }
+);
+
+export default function middleware(req: NextRequest) {
+  const { pathname } = req.nextUrl;
+
+  // Protected user & admin routes (static assets & /api are already excluded in config.matcher)
+  const isProtectedPage =
+    pathname.startsWith("/dashboard") ||
+    pathname.startsWith("/admin") ||
+    pathname.startsWith("/profile");
+
+  if (isProtectedPage) {
+    return (authMiddleware as any)(req);
+  }
+
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: [
+    "/((?!api|_next/static|_next/image|_vercel|favicon\\.ico|robots\\.txt|sitemap\\.xml|.*\\..*).*)",
+  ],
+};"#
+                },
+                {
+                    "path": "prisma/schema.prisma",
+                    "description": "Pre-configured Prisma schema for SQLite database.",
+                    "language": "prisma",
+                    "defaultContent": r#"generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+model User {
+  id             String    @id @default(cuid())
+  name           String?
+  email          String    @unique
+  emailVerified  DateTime?
+  image          String?
+  hashedPassword String?
+  role           String    @default("USER")
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  accounts       Account[]
+  sessions       Session[]
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}"#
+                },
+                {
+                    "path": "src/lib/prisma.ts",
+                    "description": "PrismaClient singleton generator.",
+                    "language": "typescript",
+                    "defaultContent": r#"import { PrismaClient } from "@prisma/client";
+
+const globalForPrisma = globalThis as unknown as { prisma: PrismaClient | undefined };
+
+export const prisma =
+  globalForPrisma.prisma ??
+  new PrismaClient({
+    log: ["query"],
+  });
+
+if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
+
+export default prisma;"#
+                },
+                nextauth_route_template_entry(),
+                register_route_template_entry(),
+                {
+                    "path": "src/components/Navbar.tsx",
+                    "description": "Modern responsive Navbar with inline SVG brand lockup and mobile hamburger drawer.",
+                    "language": "typescript",
+                    "defaultContent": r#""use client";
+
+import React, { useState } from "react";
+import Link from "next/link";
+import { usePathname } from "next/navigation";
+import { useSession, signOut } from "next-auth/react";
+
+const Navbar: React.FC = () => {
+  const pathname = usePathname();
+  const { data: session } = useSession();
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+
+  return (
+    <header className="sticky top-0 z-50 w-full backdrop-blur-md bg-white/90 border-b border-slate-200/80 shadow-sm">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">
+        <Link href="/" prefetch={false} className="flex items-center gap-2.5 group shrink-0">
+          <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-600 to-blue-600 flex items-center justify-center text-white shadow-md shadow-indigo-500/20">
+            <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
+            </svg>
+          </div>
+          <span className="text-lg font-extrabold tracking-tight text-slate-900">AxiomApp</span>
+        </Link>
+
+        <div className="hidden md:flex items-center gap-1">
+          <Link
+            href="/dashboard"
+            prefetch={false}
+            className={`px-3.5 py-2 rounded-lg text-sm transition-colors ${
+              pathname === "/dashboard"
+                ? "bg-indigo-50 text-indigo-600 font-semibold"
+                : "text-slate-600 hover:text-slate-900 hover:bg-slate-100 font-medium"
+            }`}
+          >
+            Dashboard
+          </Link>
+        </div>
+
+        <div className="hidden md:flex items-center gap-3 shrink-0">
+          {session ? (
+            <>
+              <span className="text-sm font-medium text-slate-600">{session.user?.name || session.user?.email}</span>
+              <button
+                onClick={() => signOut({ callbackUrl: "/" })}
+                className="inline-flex items-center justify-center bg-slate-100 hover:bg-slate-200 text-slate-800 px-4 py-2 rounded-xl text-sm font-semibold transition-colors"
+              >
+                Logout
+              </button>
+            </>
+          ) : (
+            <>
+              <Link href="/login" prefetch={false} className="text-sm font-semibold text-slate-700 hover:text-indigo-600 px-3.5 py-2 rounded-lg transition-colors">
+                Sign In
+              </Link>
+              <Link href="/register" prefetch={false} className="inline-flex items-center justify-center bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold px-4 py-2 rounded-xl shadow-sm transition-colors">
+                Register
+              </Link>
+            </>
+          )}
+        </div>
+
+        <div className="flex md:hidden">
+          <button
+            type="button"
+            onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
+            className="inline-flex items-center justify-center p-2 rounded-lg text-slate-600 hover:text-slate-900 hover:bg-slate-100 focus:outline-none"
+            aria-label="Toggle Menu"
+          >
+            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              {isMobileMenuOpen ? (
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              ) : (
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+              )}
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      {isMobileMenuOpen && (
+        <div className="md:hidden border-t border-slate-200 bg-white px-4 pt-3 pb-4 space-y-1.5 shadow-lg">
+          <Link
+            href="/dashboard"
+            prefetch={false}
+            onClick={() => setIsMobileMenuOpen(false)}
+            className="block px-3 py-2 rounded-lg text-base font-medium text-slate-700 hover:bg-slate-100"
+          >
+            Dashboard
+          </Link>
+          <Link
+            href="/login"
+            prefetch={false}
+            onClick={() => setIsMobileMenuOpen(false)}
+            className="block px-3 py-2 rounded-lg text-base font-medium text-slate-700 hover:bg-slate-100"
+          >
+            Sign In
+          </Link>
+          <Link
+            href="/register"
+            prefetch={false}
+            onClick={() => setIsMobileMenuOpen(false)}
+            className="block px-3 py-2 rounded-lg text-base font-semibold text-indigo-600 hover:bg-indigo-50"
+          >
+            Register
+          </Link>
+        </div>
+      )}
+    </header>
+  );
+};
+
+export { Navbar };
+export default Navbar;"#
+                },
+                {
+                    "path": "src/components/Footer.tsx",
+                    "description": "Compact horizontal footer utilizing prefetch-disabled links.",
+                    "language": "typescript",
+                    "defaultContent": r#"import React from "react";
+import Link from "next/link";
+
+const Footer: React.FC = () => {
+  return (
+    <footer className="bg-slate-900 text-slate-400 border-t border-slate-800 py-8 mt-auto w-full">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col md:flex-row items-center justify-between gap-6">
+        <div className="flex items-center gap-2.5">
+          <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-indigo-600 to-blue-600 flex items-center justify-center text-white">
+            <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
+            </svg>
+          </div>
+          <p className="text-sm text-slate-400">&copy; {new Date().getFullYear()} AxiomApp. All rights reserved.</p>
+        </div>
+        <nav className="flex flex-wrap items-center justify-center gap-x-6 gap-y-2 text-sm">
+          <Link href="/" prefetch={false} className="text-slate-400 hover:text-white transition-colors">
+            Home
+          </Link>
+          <Link href="/dashboard" prefetch={false} className="text-slate-400 hover:text-white transition-colors">
+            Dashboard
+          </Link>
+        </nav>
+      </div>
+    </footer>
+  );
+};
+
+export { Footer };
+export default Footer;"#
+                },
+                {
+                    "path": "src/app/layout.tsx",
+                    "description": "Root layout wrapped in SessionProvider.",
+                    "language": "typescript",
+                    "defaultContent": r#""use client";
+
+import React from "react";
+import { SessionProvider } from "next-auth/react";
+import Navbar from "@/components/Navbar";
+import Footer from "@/components/Footer";
+import "./globals.css";
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <html lang="en">
+      <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      </head>
+      <body className="flex flex-col min-h-screen bg-slate-50 text-slate-900 antialiased">
+        <SessionProvider>
+          <Navbar />
+          <main className="flex-1 flex flex-col w-full">{children}</main>
+          <Footer />
+        </SessionProvider>
+      </body>
+    </html>
+  );
+}"#
+                }
+            ],
+            "injectTailwindDirectives": {
+                "targetCssFiles": ["globals.css", "styles.css"]
+            }
+        })
+    } else if project_type == "mern" {
+        serde_json::json!({
+            "rootFiles": ["package.json"],
+            "rootFilesMoveFromSrc": true,
+            "requiredFilesTemplates": [
+                {
+                    "path": "package.json",
+                    "description": "Root package.json for MERN stack workspace.",
+                    "language": "json",
+                    "mergeDependencies": {
+                        "dependencies": {
+                            "express": "^4.19.2",
+                            "cors": "^2.8.5",
+                            "dotenv": "^16.4.5",
+                            "jsonwebtoken": "^9.0.2",
+                            "bcryptjs": "^2.4.3"
+                        },
+                        "devDependencies": {
+                            "nodemon": "^3.1.0",
+                            "concurrently": "^8.2.2"
+                        },
+                        "scripts": {
+                            "dev": "concurrently \"npm run server\" \"npm run client\"",
+                            "server": "nodemon src/server.js",
+                            "client": "npm run dev --prefix client",
+                            "start": "node src/server.js"
+                        }
+                    }
+                },
+                {
+                    "path": "src/server.js",
+                    "description": "Entry point for Express backend.",
+                    "language": "javascript"
+                },
+                {
+                    "path": "client/package.json",
+                    "description": "Package settings for MERN frontend.",
+                    "language": "json",
+                    "mergeDependencies": {
+                        "dependencies": {
+                            "react": "^18.3.1",
+                            "react-dom": "^18.3.1",
+                            "react-router-dom": "^6.22.3",
+                            "axios": "^1.6.8"
+                        },
+                        "devDependencies": {
+                            "vite": "^5.2.0",
+                            "tailwindcss": "^3.4.1"
+                        }
+                    }
+                }
+            ]
+        })
+    } else if project_type == "electron" {
+        serde_json::json!({
+            "rootFiles": ["package.json", "tsconfig.json", "next.config.js", "tailwind.config.js", "postcss.config.js", "next-env.d.ts", "main.js", "preload.js"],
+            "rootFilesMoveFromSrc": true,
+            "requiredFilesTemplates": [
+                {
+                    "path": "package.json",
+                    "description": "Package settings for Electron + Next.js desktop application.",
+                    "language": "json",
+                    "mergeDependencies": {
+                        "dependencies": {
+                            "next": "14.2.35",
+                            "react": "^18.2.0",
+                            "react-dom": "^18.2.0",
+                            "next-auth": "^4.24.7",
+                            "@auth/prisma-adapter": "^1.0.12",
+                            "@prisma/client": "5.22.0",
+                            "lucide-react": "^0.460.0",
+                            "clsx": "^2.1.1",
+                            "tailwind-merge": "^2.3.0",
+                            "zod": "^3.23.8",
+                            "bcryptjs": "^2.4.3"
+                        },
+                        "devDependencies": {
+                            "electron": "^30.0.0",
+                            "prisma": "5.22.0",
+                            "tailwindcss": "^3.4.0",
+                            "postcss": "^8.4.32",
+                            "autoprefixer": "^10.4.16",
+                            "typescript": "^5.3.3",
+                            "@types/react": "^18.2.45",
+                            "@types/react-dom": "^18.2.18",
+                            "@types/node": "^20.10.5",
+                            "@types/bcryptjs": "^2.4.6"
+                        },
+                        "scripts": {
+                            "dev": "next dev",
+                            "build": "next build",
+                            "start": "next start",
+                            "electron": "electron ."
+                        }
+                    }
+                },
+                {
+                    "path": "tsconfig.json",
+                    "description": "TypeScript compiler settings for Electron + Next.js.",
+                    "language": "json",
+                    "defaultContent": "{\n  \"compilerOptions\": {\n    \"lib\": [\"dom\", \"dom.iterable\", \"esnext\"],\n    \"allowJs\": true,\n    \"skipLibCheck\": true,\n    \"strict\": false,\n    \"noEmit\": true,\n    \"esModuleInterop\": true,\n    \"module\": \"esnext\",\n    \"moduleResolution\": \"bundler\",\n    \"resolveJsonModule\": true,\n    \"isolatedModules\": true,\n    \"jsx\": \"preserve\",\n    \"incremental\": true,\n    \"plugins\": [{ \"name\": \"next\" }],\n    \"paths\": {\n      \"@/*\": [\"./src/*\", \"./*\"]\n    }\n  },\n  \"include\": [\"next-env.d.ts\", \"**/*.ts\", \"**/*.tsx\", \".next/types/**/*.ts\"],\n  \"exclude\": [\"node_modules\"]\n}"
+                },
+                {
+                    "path": "tailwind.config.js",
+                    "description": "Configuration file for Tailwind CSS.",
+                    "language": "javascript",
+                    "defaultContent": "/** @type {import('tailwindcss').Config} */\nmodule.exports = {\n  content: [\n    \"./src/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./app/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./components/**/*.{js,ts,jsx,tsx,mdx}\"\n  ],\n  theme: {\n    extend: {},\n  },\n  plugins: [],\n}"
+                },
+                {
+                    "path": "postcss.config.js",
+                    "description": "Configuration file for PostCSS.",
+                    "language": "javascript",
+                    "defaultContent": "module.exports = {\n  plugins: {\n    tailwindcss: {},\n    autoprefixer: {},\n  },\n}"
+                },
+                {
+                    "path": "next.config.js",
+                    "description": "Next.js configuration.",
+                    "language": "javascript",
+                    "defaultContent": "/** @type {import('next').NextConfig} */\nconst nextConfig = {\n  reactStrictMode: true,\n  swcMinify: true,\n};\nmodule.exports = nextConfig;"
+                },
+                {
+                    "path": "src/app/globals.css",
+                    "description": "Global CSS file containing Tailwind directives.",
+                    "language": "css",
+                    "defaultContent": "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n\n"
+                },
+                {
+                    "path": "src/lib/prisma.ts",
+                    "description": "PrismaClient singleton generator.",
+                    "language": "typescript",
+                    "defaultContent": "import { PrismaClient } from \"@prisma/client\";\n\nconst globalForPrisma = globalThis as unknown as { prisma: PrismaClient | undefined };\n\nexport const prisma =\n  globalForPrisma.prisma ??\n  new PrismaClient({\n    log: [\"query\"],\n  });\n\nif (process.env.NODE_ENV !== \"production\") globalForPrisma.prisma = prisma;\n\nexport default prisma;"
+                },
+                nextauth_route_template_entry(),
+                register_route_template_entry(),
+                {
+                    "path": "src/app/layout.tsx",
+                    "description": "Root layout for Electron Next.js renderer.",
+                    "language": "typescript",
+                    "defaultContent": "\"use client\";\n\nimport React from \"react\";\nimport { SessionProvider } from \"next-auth/react\";\nimport \"./globals.css\";\n\nexport default function RootLayout({ children }: { children: React.ReactNode }) {\n  return (\n    <html lang=\"en\">\n      <body className=\"flex flex-col min-h-screen bg-slate-50 text-slate-900 antialiased\">\n        <SessionProvider>\n          <main className=\"flex-1 flex flex-col w-full\">{children}</main>\n        </SessionProvider>\n      </body>\n    </html>\n  );\n}"
+                },
+                {
+                    "path": "main.js",
+                    "description": "Main process file for Electron app.",
+                    "language": "javascript",
+                    "defaultContent": "const { app, BrowserWindow, ipcMain } = require('electron');\nconst path = require('path');\n\nlet mainWindow = null;\n\nfunction createWindow() {\n  mainWindow = new BrowserWindow({\n    width: 1280,\n    height: 820,\n    webPreferences: {\n      preload: path.join(__dirname, 'preload.js'),\n      contextIsolation: true,\n      nodeIntegration: false,\n    },\n  });\n\n  const startUrl = process.env.ELECTRON_START_URL || 'http://localhost:3000';\n  mainWindow.loadURL(startUrl);\n\n  mainWindow.on('closed', () => {\n    mainWindow = null;\n  });\n}\n\napp.whenReady().then(createWindow);\n\napp.on('window-all-closed', () => {\n  if (process.platform !== 'darwin') app.quit();\n});\n\napp.on('activate', () => {\n  if (BrowserWindow.getAllWindows().length === 0) createWindow();\n});\n"
+                },
+                {
+                    "path": "preload.js",
+                    "description": "Preload script exposing secure APIs to renderer process.",
+                    "language": "javascript",
+                    "defaultContent": "const { contextBridge, ipcRenderer } = require('electron');\n\ncontextBridge.exposeInMainWorld('electronAPI', {\n  invoke: (channel, data) => ipcRenderer.invoke(channel, data),\n  on: (channel, callback) => ipcRenderer.on(channel, (_event, ...args) => callback(...args)),\n});\n"
+                }
+            ],
+            "injectTailwindDirectives": {
+                "targetCssFiles": ["globals.css", "styles.css"]
+            }
+        })
+    } else if crate::templates_expo::is_expo_project_type(project_type) {
+        let expo_pkg = crate::templates_expo::expo_default_dependencies();
+        serde_json::json!({
+            "framework": "expo",
+            "rootFiles": ["package.json", "app.json", "babel.config.js", "metro.config.js", "tsconfig.json"],
+            "rootFilesMoveFromSrc": true,
+            "requiredFilesTemplates": [
+                {
+                    "path": "package.json",
+                    "description": "Package settings for Expo SDK 52 + Expo Router React Native project.",
+                    "language": "json",
+                    "mergeDependencies": expo_pkg
+                },
+                {
+                    "path": "app.json",
+                    "description": "Expo configuration file with scheme, metro web bundler, and expo-router plugin.",
+                    "language": "json"
+                },
+                {
+                    "path": "babel.config.js",
+                    "description": "Babel preset configuration for Expo.",
+                    "language": "javascript"
+                },
+                {
+                    "path": "metro.config.js",
+                    "description": "Metro bundler default configuration for Expo.",
+                    "language": "javascript"
+                },
+                {
+                    "path": "tsconfig.json",
+                    "description": "TypeScript configuration extending expo/tsconfig.base with @/* paths.",
+                    "language": "json"
+                },
+                {
+                    "path": "src/theme.ts",
+                    "description": "Shared semantic React Native StyleSheet design tokens.",
+                    "language": "typescript"
+                },
+                {
+                    "path": "app/+html.tsx",
+                    "description": "Expo Router Web HTML document shell embedding Axiom Live Edit inspector.",
+                    "language": "typescript"
+                },
+                {
+                    "path": "app/_layout.tsx",
+                    "description": "Expo Router root Stack layout wrapped in SafeAreaProvider.",
+                    "language": "typescript"
+                },
+                {
+                    "path": "app/(tabs)/_layout.tsx",
+                    "description": "Expo Router bottom tabs navigation shell.",
+                    "language": "typescript"
+                },
+                {
+                    "path": "app/(tabs)/index.tsx",
+                    "description": "Primary mobile Home screen implemented with React Native View, Text, ScrollView, Pressable, StyleSheet, Ionicons, and theme tokens.",
+                    "language": "typescript"
+                }
+            ]
+        })
+    } else {
+        serde_json::Value::Null
+    }
+}
+
 pub async fn run_orchestrator(
     window: tauri::Window,
     task_id: String,
@@ -5745,6 +6671,19 @@ pub async fn run_orchestrator_opt(
     );
     let name = name_owned.as_str();
     let project_type = detect_project_type(&manifest);
+    let resolved_platform = manifest
+        .get("platform")
+        .and_then(|p| p.as_str())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_else(|| {
+            if crate::templates_expo::is_expo_project_type(&project_type) {
+                "mobile".to_string()
+            } else if project_type == "electron" {
+                "desktop".to_string()
+            } else {
+                "web".to_string()
+            }
+        });
 
     // Immediately register/update the project in projects.json with "generating" status
     // so it appears on the Dashboard right away with its real name and description.
@@ -5752,6 +6691,8 @@ pub async fn run_orchestrator_opt(
         "id": project_id,
         "name": name,
         "description": project_description,
+        "projectType": project_type,
+        "platform": resolved_platform,
         "status": "generating",
         "metadata": {
             "appVersion": env!("CARGO_PKG_VERSION"),
@@ -5765,755 +6706,7 @@ pub async fn run_orchestrator_opt(
     let mut metamanifest = manifest.get("metamanifest").cloned().unwrap_or(serde_json::json!({}));
     
     // Load default metamanifest definitions based on project type
-    let mut default_metamanifest = serde_json::Value::Null;
-    if project_type == "nextjs" {
-        default_metamanifest = serde_json::json!({
-            "rootFiles": ["package.json", "tsconfig.json", "next.config.js", "tailwind.config.js", "postcss.config.js", "next-env.d.ts"],
-            "rootFilesMoveFromSrc": true,
-            "requiredFilesTemplates": [
-                {
-                    "path": "package.json",
-                    "description": "Standard package.json for Next.js project with Tailwind CSS.",
-                    "language": "json",
-                    "mergeDependencies": {
-                        "dependencies": {
-                            "next": "14.2.35",
-                            "react": "^18.2.0",
-                            "react-dom": "^18.2.0",
-                            "next-auth": "^4.24.7",
-                            "@auth/prisma-adapter": "^1.0.12",
-                            "@prisma/client": "5.22.0",
-                            "lucide-react": "^0.460.0",
-                            "clsx": "^2.1.1",
-                            "tailwind-merge": "^2.3.0",
-                            "class-variance-authority": "^0.7.0",
-                            "tailwindcss-animate": "^1.0.7",
-                            "zod": "^3.23.8",
-                            "react-hook-form": "^7.51.5",
-                            "bcryptjs": "^2.4.3",
-                            "jsonwebtoken": "^9.0.2"
-                        },
-                        "devDependencies": {
-                            "prisma": "5.22.0",
-                            "tailwindcss": "^3.4.0",
-                            "postcss": "^8.4.32",
-                            "autoprefixer": "^10.4.16",
-                            "typescript": "^5.3.3",
-                            "@types/react": "^18.2.45",
-                            "@types/react-dom": "^18.2.18",
-                            "@types/node": "^20.10.5",
-                            "@types/bcryptjs": "^2.4.6",
-                            "@types/jsonwebtoken": "^9.0.6"
-                        },
-                        "scripts": {
-                            "dev": "next dev",
-                            "build": "next build",
-                            "start": "next start"
-                        }
-                    }
-                },
-                {
-                    "path": "tailwind.config.js",
-                    "description": "Configuration file for Tailwind CSS.",
-                    "language": "javascript",
-                    "defaultContent": "/** @type {import('tailwindcss').Config} */\nmodule.exports = {\n  content: [\n    \"./src/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./app/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./components/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./pages/**/*.{js,ts,jsx,tsx,mdx}\"\n  ],\n  theme: {\n    extend: {},\n  },\n  plugins: [],\n}"
-                },
-                {
-                    "path": "postcss.config.js",
-                    "description": "Configuration file for PostCSS.",
-                    "language": "javascript",
-                    "defaultContent": "module.exports = {\n  plugins: {\n    tailwindcss: {},\n    autoprefixer: {},\n  },\n}"
-                },
-                {
-                    "path": "tsconfig.json",
-                    "description": "TypeScript compiler settings.",
-                    "language": "json",
-                    "defaultContent": "{\n  \"compilerOptions\": {\n    \"lib\": [\"dom\", \"dom.iterable\", \"esnext\"],\n    \"allowJs\": true,\n    \"skipLibCheck\": true,\n    \"strict\": false,\n    \"noEmit\": true,\n    \"esModuleInterop\": true,\n    \"module\": \"esnext\",\n    \"moduleResolution\": \"bundler\",\n    \"resolveJsonModule\": true,\n    \"isolatedModules\": true,\n    \"jsx\": \"preserve\",\n    \"incremental\": true,\n    \"plugins\": [\n      {\n        \"name\": \"next\"\n      }\n    ],\n    \"paths\": {\n      \"@/*\": [\"./src/*\"]\n    }\n  },\n  \"include\": [\"next-env.d.ts\", \"**/*.ts\", \"**/*.tsx\", \".next/types/**/*.ts\"],\n  \"exclude\": [\"node_modules\"]\n}"
-                },
-                {
-                    "path": "next.config.js",
-                    "description": "Next.js configuration.",
-                    "language": "javascript",
-                    "defaultContent": "/** @type {import('next').NextConfig} */\nconst nextConfig = {\n  reactStrictMode: true,\n  swcMinify: true,\n};\nmodule.exports = nextConfig;"
-                },
-                {
-                    "path": "src/app/globals.css",
-                    "description": "Global CSS file containing Tailwind directives.",
-                    "language": "css",
-                    "defaultContent": "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n\n"
-                },
-                {
-                    "path": "src/middleware.ts",
-                    "description": "Resource-optimized middleware that bypasses static asset queries at the matcher layer.",
-                    "language": "typescript",
-                    "defaultContent": r#"import { withAuth } from "next-auth/middleware";
-import { NextRequest, NextResponse } from "next/server";
-
-const authMiddleware = withAuth(
-  function middleware(_req: NextRequest) {
-    return NextResponse.next();
-  },
-  {
-    callbacks: {
-      authorized: ({ token }) => !!token,
-    },
-    pages: {
-      signIn: "/login",
-    },
-  }
-);
-
-export default function middleware(req: NextRequest) {
-  const { pathname } = req.nextUrl;
-
-  // Protected user & admin routes (static assets & /api are already excluded in config.matcher)
-  const isProtectedPage =
-    pathname.startsWith("/dashboard") ||
-    pathname.startsWith("/admin") ||
-    pathname.startsWith("/profile");
-
-  if (isProtectedPage) {
-    return (authMiddleware as any)(req);
-  }
-
-  return NextResponse.next();
-}
-
-export const config = {
-  matcher: [
-    "/((?!api|_next/static|_next/image|_vercel|favicon\\.ico|robots\\.txt|sitemap\\.xml|.*\\..*).*)",
-  ],
-};"#
-                },
-                {
-                    "path": "prisma/schema.prisma",
-                    "description": "Pre-configured Prisma schema for SQLite database.",
-                    "language": "prisma",
-                    "defaultContent": r#"generator client {
-  provider = "prisma-client-js"
-}
-
-datasource db {
-  provider = "sqlite"
-  url      = "file:./dev.db"
-}
-
-model User {
-  id             String    @id @default(cuid())
-  name           String?
-  email          String    @unique
-  emailVerified  DateTime?
-  image          String?
-  hashedPassword String?
-  role           String    @default("USER")
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
-  accounts       Account[]
-  sessions       Session[]
-}
-
-model Account {
-  id                String  @id @default(cuid())
-  userId            String
-  type              String
-  provider          String
-  providerAccountId String
-  refresh_token     String?
-  access_token      String?
-  expires_at        Int?
-  token_type        String?
-  scope             String?
-  id_token          String?
-  session_state     String?
-  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@unique([provider, providerAccountId])
-}
-
-model Session {
-  id           String   @id @default(cuid())
-  sessionToken String   @unique
-  userId       String
-  expires      DateTime
-  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-}
-
-model VerificationToken {
-  identifier String
-  token      String   @unique
-  expires    DateTime
-
-  @@unique([identifier, token])
-}"#
-                },
-                {
-                    "path": "src/lib/prisma.ts",
-                    "description": "PrismaClient singleton generator.",
-                    "language": "typescript",
-                    "defaultContent": r#"import { PrismaClient } from "@prisma/client";
-
-const globalForPrisma = globalThis as unknown as { prisma: PrismaClient | undefined };
-
-export const prisma =
-  globalForPrisma.prisma ??
-  new PrismaClient({
-    log: ["query"],
-  });
-
-if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
-
-export default prisma;"#
-                },
-                {
-                    "path": "src/app/api/auth/[...nextauth]/route.ts",
-                    "description": "NextAuth App Router route handler.",
-                    "language": "typescript",
-                    "defaultContent": r#"import NextAuth from "next-auth";
-import CredentialsProvider from "next-auth/providers/credentials";
-import { PrismaAdapter } from "@auth/prisma-adapter";
-import bcrypt from "bcryptjs";
-import prisma from "@/lib/prisma";
-
-export const authOptions = {
-  adapter: PrismaAdapter(prisma) as any,
-  providers: [
-    CredentialsProvider({
-      name: "credentials",
-      credentials: {
-        email: { label: "Email", type: "email" },
-        password: { label: "Password", type: "password" },
-      },
-      async authorize(credentials) {
-        if (!credentials?.email || !credentials?.password) return null;
-        try {
-          const user = await prisma.user.findUnique({ where: { email: credentials.email } });
-          if (!user) return null;
-          const passwordToCompare = user.hashedPassword || (user as any).password || "";
-          const passwordMatch = await bcrypt.compare(credentials.password, passwordToCompare);
-          if (!passwordMatch) return null;
-          return { id: String(user.id), email: user.email, name: user.name, role: user.role };
-        } catch (error) {
-          console.error("Auth error in CredentialsProvider:", error);
-          return null;
-        }
-      },
-    }),
-  ],
-  session: { strategy: "jwt" as const },
-  callbacks: {
-    async jwt({ token, user }: any) {
-      if (user) {
-        token.id = user.id;
-        token.role = user.role;
-      }
-      return token;
-    },
-    async session({ session, token }: any) {
-      if (session.user && token) {
-        session.user.id = token.id;
-        session.user.role = token.role;
-      }
-      return session;
-    },
-  },
-  pages: {
-    signIn: "/login",
-  },
-  secret: process.env.NEXTAUTH_SECRET || "axiom-dev-secret-change-in-production",
-};
-
-const handler = NextAuth(authOptions);
-export { handler as GET, handler as POST };"#
-                },
-                {
-                    "path": "src/app/api/register/route.ts",
-                    "description": "User registration App Router API endpoint.",
-                    "language": "typescript",
-                    "defaultContent": r#"import { NextResponse } from "next/server";
-import bcrypt from "bcryptjs";
-import prisma from "@/lib/prisma";
-import { z } from "zod";
-
-const registerSchema = z.object({
-  name: z.string().trim().min(1).max(100).optional(),
-  email: z.string().email(),
-  password: z.string().min(8)
-});
-
-export async function POST(request: Request) {
-  try {
-    const body = await request.json();
-    const parsed = registerSchema.safeParse(body);
-    if (!parsed.success) {
-      return NextResponse.json(
-        { message: parsed.error.issues[0]?.message || "Invalid registration payload" },
-        { status: 400 }
-      );
-    }
-    const { name, email, password } = parsed.data;
-    const displayName = name || email.split("@")[0];
-
-    const existingUser = await prisma.user.findUnique({ where: { email } });
-    if (existingUser) {
-      return NextResponse.json({ message: "Email already in use" }, { status: 400 });
-    }
-
-    const hashedPassword = await bcrypt.hash(password, 10);
-
-    const newUser = await prisma.user.create({
-      data: {
-        name: displayName,
-        email,
-        hashedPassword,
-        role: "USER"
-      }
-    });
-
-    return NextResponse.json(
-      { message: "User registered successfully", user: { id: newUser.id, name: newUser.name, email: newUser.email } },
-      { status: 201 }
-    );
-  } catch (error: any) {
-    console.error("Registration error:", error);
-    return NextResponse.json({ message: error.message || "Internal server error" }, { status: 500 });
-  }
-}"#
-                },
-                {
-                    "path": "src/components/Navbar.tsx",
-                    "description": "Modern responsive Navbar with inline SVG brand lockup and mobile hamburger drawer.",
-                    "language": "typescript",
-                    "defaultContent": r#""use client";
-
-import React, { useState } from "react";
-import Link from "next/link";
-import { usePathname } from "next/navigation";
-import { useSession, signOut } from "next-auth/react";
-
-const Navbar: React.FC = () => {
-  const pathname = usePathname();
-  const { data: session } = useSession();
-  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
-
-  return (
-    <header className="sticky top-0 z-50 w-full backdrop-blur-md bg-white/90 border-b border-slate-200/80 shadow-sm">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">
-        <Link href="/" prefetch={false} className="flex items-center gap-2.5 group shrink-0">
-          <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-600 to-blue-600 flex items-center justify-center text-white shadow-md shadow-indigo-500/20">
-            <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
-            </svg>
-          </div>
-          <span className="text-lg font-extrabold tracking-tight text-slate-900">AxiomApp</span>
-        </Link>
-
-        <div className="hidden md:flex items-center gap-1">
-          <Link
-            href="/dashboard"
-            prefetch={false}
-            className={`px-3.5 py-2 rounded-lg text-sm transition-colors ${
-              pathname === "/dashboard"
-                ? "bg-indigo-50 text-indigo-600 font-semibold"
-                : "text-slate-600 hover:text-slate-900 hover:bg-slate-100 font-medium"
-            }`}
-          >
-            Dashboard
-          </Link>
-        </div>
-
-        <div className="hidden md:flex items-center gap-3 shrink-0">
-          {session ? (
-            <>
-              <span className="text-sm font-medium text-slate-600">{session.user?.name || session.user?.email}</span>
-              <button
-                onClick={() => signOut({ callbackUrl: "/" })}
-                className="inline-flex items-center justify-center bg-slate-100 hover:bg-slate-200 text-slate-800 px-4 py-2 rounded-xl text-sm font-semibold transition-colors"
-              >
-                Logout
-              </button>
-            </>
-          ) : (
-            <>
-              <Link href="/login" prefetch={false} className="text-sm font-semibold text-slate-700 hover:text-indigo-600 px-3.5 py-2 rounded-lg transition-colors">
-                Sign In
-              </Link>
-              <Link href="/register" prefetch={false} className="inline-flex items-center justify-center bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold px-4 py-2 rounded-xl shadow-sm transition-colors">
-                Register
-              </Link>
-            </>
-          )}
-        </div>
-
-        <div className="flex md:hidden">
-          <button
-            type="button"
-            onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
-            className="inline-flex items-center justify-center p-2 rounded-lg text-slate-600 hover:text-slate-900 hover:bg-slate-100 focus:outline-none"
-            aria-label="Toggle Menu"
-          >
-            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              {isMobileMenuOpen ? (
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-              ) : (
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
-              )}
-            </svg>
-          </button>
-        </div>
-      </div>
-
-      {isMobileMenuOpen && (
-        <div className="md:hidden border-t border-slate-200 bg-white px-4 pt-3 pb-4 space-y-1.5 shadow-lg">
-          <Link
-            href="/dashboard"
-            prefetch={false}
-            onClick={() => setIsMobileMenuOpen(false)}
-            className="block px-3 py-2 rounded-lg text-base font-medium text-slate-700 hover:bg-slate-100"
-          >
-            Dashboard
-          </Link>
-          <Link
-            href="/login"
-            prefetch={false}
-            onClick={() => setIsMobileMenuOpen(false)}
-            className="block px-3 py-2 rounded-lg text-base font-medium text-slate-700 hover:bg-slate-100"
-          >
-            Sign In
-          </Link>
-          <Link
-            href="/register"
-            prefetch={false}
-            onClick={() => setIsMobileMenuOpen(false)}
-            className="block px-3 py-2 rounded-lg text-base font-semibold text-indigo-600 hover:bg-indigo-50"
-          >
-            Register
-          </Link>
-        </div>
-      )}
-    </header>
-  );
-};
-
-export { Navbar };
-export default Navbar;"#
-                },
-                {
-                    "path": "src/components/Footer.tsx",
-                    "description": "Compact horizontal footer utilizing prefetch-disabled links.",
-                    "language": "typescript",
-                    "defaultContent": r#"import React from "react";
-import Link from "next/link";
-
-const Footer: React.FC = () => {
-  return (
-    <footer className="bg-slate-900 text-slate-400 border-t border-slate-800 py-8 mt-auto w-full">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col md:flex-row items-center justify-between gap-6">
-        <div className="flex items-center gap-2.5">
-          <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-indigo-600 to-blue-600 flex items-center justify-center text-white">
-            <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
-            </svg>
-          </div>
-          <p className="text-sm text-slate-400">&copy; {new Date().getFullYear()} AxiomApp. All rights reserved.</p>
-        </div>
-        <nav className="flex flex-wrap items-center justify-center gap-x-6 gap-y-2 text-sm">
-          <Link href="/" prefetch={false} className="text-slate-400 hover:text-white transition-colors">
-            Home
-          </Link>
-          <Link href="/dashboard" prefetch={false} className="text-slate-400 hover:text-white transition-colors">
-            Dashboard
-          </Link>
-        </nav>
-      </div>
-    </footer>
-  );
-};
-
-export { Footer };
-export default Footer;"#
-                },
-                {
-                    "path": "src/app/layout.tsx",
-                    "description": "Root layout wrapped in SessionProvider.",
-                    "language": "typescript",
-                    "defaultContent": r#""use client";
-
-import React from "react";
-import { SessionProvider } from "next-auth/react";
-import Navbar from "@/components/Navbar";
-import Footer from "@/components/Footer";
-import "./globals.css";
-
-export default function RootLayout({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
-  return (
-    <html lang="en">
-      <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-      </head>
-      <body className="flex flex-col min-h-screen bg-slate-50 text-slate-900 antialiased">
-        <SessionProvider>
-          <Navbar />
-          <main className="flex-1 flex flex-col w-full">{children}</main>
-          <Footer />
-        </SessionProvider>
-      </body>
-    </html>
-  );
-}"#
-                }
-            ],
-            "injectTailwindDirectives": {
-                "targetCssFiles": ["globals.css", "styles.css"]
-            }
-        });
-    } else if project_type == "mern" {
-        default_metamanifest = serde_json::json!({
-            "rootFiles": ["package.json"],
-            "rootFilesMoveFromSrc": true,
-            "requiredFilesTemplates": [
-                {
-                    "path": "package.json",
-                    "description": "Root package.json for MERN stack workspace.",
-                    "language": "json",
-                    "mergeDependencies": {
-                        "dependencies": {
-                            "express": "^4.19.2",
-                            "cors": "^2.8.5",
-                            "dotenv": "^16.4.5",
-                            "jsonwebtoken": "^9.0.2",
-                            "bcryptjs": "^2.4.3"
-                        },
-                        "devDependencies": {
-                            "nodemon": "^3.1.0",
-                            "concurrently": "^8.2.2"
-                        },
-                        "scripts": {
-                            "dev": "concurrently \"npm run server\" \"npm run client\"",
-                            "server": "nodemon src/server.js",
-                            "client": "npm run dev --prefix client",
-                            "start": "node src/server.js"
-                        }
-                    }
-                },
-                {
-                    "path": "src/server.js",
-                    "description": "Entry point for Express backend.",
-                    "language": "javascript"
-                },
-                {
-                    "path": "client/package.json",
-                    "description": "Package settings for MERN frontend.",
-                    "language": "json",
-                    "mergeDependencies": {
-                        "dependencies": {
-                            "react": "^18.3.1",
-                            "react-dom": "^18.3.1",
-                            "react-router-dom": "^6.22.3",
-                            "axios": "^1.6.8"
-                        },
-                        "devDependencies": {
-                            "vite": "^5.2.0",
-                            "tailwindcss": "^3.4.1"
-                        }
-                    }
-                }
-            ]
-        });
-    } else if project_type == "electron" {
-        default_metamanifest = serde_json::json!({
-            "rootFiles": ["package.json", "tsconfig.json", "next.config.js", "tailwind.config.js", "postcss.config.js", "next-env.d.ts", "main.js", "preload.js"],
-            "rootFilesMoveFromSrc": true,
-            "requiredFilesTemplates": [
-                {
-                    "path": "package.json",
-                    "description": "Package settings for Electron + Next.js desktop application.",
-                    "language": "json",
-                    "mergeDependencies": {
-                        "dependencies": {
-                            "next": "14.2.35",
-                            "react": "^18.2.0",
-                            "react-dom": "^18.2.0",
-                            "next-auth": "^4.24.7",
-                            "@auth/prisma-adapter": "^1.0.12",
-                            "@prisma/client": "5.22.0",
-                            "lucide-react": "^0.460.0",
-                            "clsx": "^2.1.1",
-                            "tailwind-merge": "^2.3.0",
-                            "zod": "^3.23.8",
-                            "bcryptjs": "^2.4.3"
-                        },
-                        "devDependencies": {
-                            "electron": "^30.0.0",
-                            "prisma": "5.22.0",
-                            "tailwindcss": "^3.4.0",
-                            "postcss": "^8.4.32",
-                            "autoprefixer": "^10.4.16",
-                            "typescript": "^5.3.3",
-                            "@types/react": "^18.2.45",
-                            "@types/react-dom": "^18.2.18",
-                            "@types/node": "^20.10.5",
-                            "@types/bcryptjs": "^2.4.6"
-                        },
-                        "scripts": {
-                            "dev": "next dev",
-                            "build": "next build",
-                            "start": "next start",
-                            "electron": "electron ."
-                        }
-                    }
-                },
-                {
-                    "path": "tsconfig.json",
-                    "description": "TypeScript compiler settings for Electron + Next.js.",
-                    "language": "json",
-                    "defaultContent": "{\n  \"compilerOptions\": {\n    \"lib\": [\"dom\", \"dom.iterable\", \"esnext\"],\n    \"allowJs\": true,\n    \"skipLibCheck\": true,\n    \"strict\": false,\n    \"noEmit\": true,\n    \"esModuleInterop\": true,\n    \"module\": \"esnext\",\n    \"moduleResolution\": \"bundler\",\n    \"resolveJsonModule\": true,\n    \"isolatedModules\": true,\n    \"jsx\": \"preserve\",\n    \"incremental\": true,\n    \"plugins\": [{ \"name\": \"next\" }],\n    \"paths\": {\n      \"@/*\": [\"./src/*\", \"./*\"]\n    }\n  },\n  \"include\": [\"next-env.d.ts\", \"**/*.ts\", \"**/*.tsx\", \".next/types/**/*.ts\"],\n  \"exclude\": [\"node_modules\"]\n}"
-                },
-                {
-                    "path": "tailwind.config.js",
-                    "description": "Configuration file for Tailwind CSS.",
-                    "language": "javascript",
-                    "defaultContent": "/** @type {import('tailwindcss').Config} */\nmodule.exports = {\n  content: [\n    \"./src/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./app/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./components/**/*.{js,ts,jsx,tsx,mdx}\"\n  ],\n  theme: {\n    extend: {},\n  },\n  plugins: [],\n}"
-                },
-                {
-                    "path": "postcss.config.js",
-                    "description": "Configuration file for PostCSS.",
-                    "language": "javascript",
-                    "defaultContent": "module.exports = {\n  plugins: {\n    tailwindcss: {},\n    autoprefixer: {},\n  },\n}"
-                },
-                {
-                    "path": "next.config.js",
-                    "description": "Next.js configuration.",
-                    "language": "javascript",
-                    "defaultContent": "/** @type {import('next').NextConfig} */\nconst nextConfig = {\n  reactStrictMode: true,\n  swcMinify: true,\n};\nmodule.exports = nextConfig;"
-                },
-                {
-                    "path": "src/app/globals.css",
-                    "description": "Global CSS file containing Tailwind directives.",
-                    "language": "css",
-                    "defaultContent": "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n\n"
-                },
-                {
-                    "path": "src/lib/prisma.ts",
-                    "description": "PrismaClient singleton generator.",
-                    "language": "typescript",
-                    "defaultContent": "import { PrismaClient } from \"@prisma/client\";\n\nconst globalForPrisma = globalThis as unknown as { prisma: PrismaClient | undefined };\n\nexport const prisma =\n  globalForPrisma.prisma ??\n  new PrismaClient({\n    log: [\"query\"],\n  });\n\nif (process.env.NODE_ENV !== \"production\") globalForPrisma.prisma = prisma;\n\nexport default prisma;"
-                },
-                {
-                    "path": "src/app/layout.tsx",
-                    "description": "Root layout for Electron Next.js renderer.",
-                    "language": "typescript",
-                    "defaultContent": "\"use client\";\n\nimport React from \"react\";\nimport { SessionProvider } from \"next-auth/react\";\nimport \"./globals.css\";\n\nexport default function RootLayout({ children }: { children: React.ReactNode }) {\n  return (\n    <html lang=\"en\">\n      <body className=\"flex flex-col min-h-screen bg-slate-50 text-slate-900 antialiased\">\n        <SessionProvider>\n          <main className=\"flex-1 flex flex-col w-full\">{children}</main>\n        </SessionProvider>\n      </body>\n    </html>\n  );\n}"
-                },
-                {
-                    "path": "main.js",
-                    "description": "Main process file for Electron app.",
-                    "language": "javascript",
-                    "defaultContent": "const { app, BrowserWindow, ipcMain } = require('electron');\nconst path = require('path');\n\nlet mainWindow = null;\n\nfunction createWindow() {\n  mainWindow = new BrowserWindow({\n    width: 1280,\n    height: 820,\n    webPreferences: {\n      preload: path.join(__dirname, 'preload.js'),\n      contextIsolation: true,\n      nodeIntegration: false,\n    },\n  });\n\n  const startUrl = process.env.ELECTRON_START_URL || 'http://localhost:3000';\n  mainWindow.loadURL(startUrl);\n\n  mainWindow.on('closed', () => {\n    mainWindow = null;\n  });\n}\n\napp.whenReady().then(createWindow);\n\napp.on('window-all-closed', () => {\n  if (process.platform !== 'darwin') app.quit();\n});\n\napp.on('activate', () => {\n  if (BrowserWindow.getAllWindows().length === 0) createWindow();\n});\n"
-                },
-                {
-                    "path": "preload.js",
-                    "description": "Preload script exposing secure APIs to renderer process.",
-                    "language": "javascript",
-                    "defaultContent": "const { contextBridge, ipcRenderer } = require('electron');\n\ncontextBridge.exposeInMainWorld('electronAPI', {\n  invoke: (channel, data) => ipcRenderer.invoke(channel, data),\n  on: (channel, callback) => ipcRenderer.on(channel, (_event, ...args) => callback(...args)),\n});\n"
-                }
-            ],
-            "injectTailwindDirectives": {
-                "targetCssFiles": ["globals.css", "styles.css"]
-            }
-        });
-    } else if project_type == "react_native" || project_type == "react-native" || project_type == "expo" {
-        default_metamanifest = serde_json::json!({
-            "rootFiles": ["package.json", "tsconfig.json", "next.config.js", "tailwind.config.js", "postcss.config.js", "next-env.d.ts"],
-            "rootFilesMoveFromSrc": true,
-            "requiredFilesTemplates": [
-                {
-                    "path": "package.json",
-                    "description": "Package settings for Mobile + Next.js hybrid workspace.",
-                    "language": "json",
-                    "mergeDependencies": {
-                        "dependencies": {
-                            "next": "14.2.35",
-                            "react": "^18.2.0",
-                            "react-dom": "^18.2.0",
-                            "next-auth": "^4.24.7",
-                            "@auth/prisma-adapter": "^1.0.12",
-                            "@prisma/client": "5.22.0",
-                            "lucide-react": "^0.460.0",
-                            "clsx": "^2.1.1",
-                            "tailwind-merge": "^2.3.0",
-                            "zod": "^3.23.8",
-                            "bcryptjs": "^2.4.3"
-                        },
-                        "devDependencies": {
-                            "prisma": "5.22.0",
-                            "tailwindcss": "^3.4.0",
-                            "postcss": "^8.4.32",
-                            "autoprefixer": "^10.4.16",
-                            "typescript": "^5.3.3",
-                            "@types/react": "^18.2.45",
-                            "@types/react-dom": "^18.2.18",
-                            "@types/node": "^20.10.5",
-                            "@types/bcryptjs": "^2.4.6"
-                        },
-                        "scripts": {
-                            "dev": "next dev",
-                            "build": "next build",
-                            "start": "next start"
-                        }
-                    }
-                },
-                {
-                    "path": "tsconfig.json",
-                    "description": "TypeScript compiler settings for Mobile + Next.js workspace.",
-                    "language": "json",
-                    "defaultContent": "{\n  \"compilerOptions\": {\n    \"lib\": [\"dom\", \"dom.iterable\", \"esnext\"],\n    \"allowJs\": true,\n    \"skipLibCheck\": true,\n    \"strict\": false,\n    \"noEmit\": true,\n    \"esModuleInterop\": true,\n    \"module\": \"esnext\",\n    \"moduleResolution\": \"bundler\",\n    \"resolveJsonModule\": true,\n    \"isolatedModules\": true,\n    \"jsx\": \"preserve\",\n    \"incremental\": true,\n    \"plugins\": [{ \"name\": \"next\" }],\n    \"paths\": {\n      \"@/*\": [\"./src/*\", \"./*\"]\n    }\n  },\n  \"include\": [\"next-env.d.ts\", \"**/*.ts\", \"**/*.tsx\", \".next/types/**/*.ts\"],\n  \"exclude\": [\"node_modules\"]\n}"
-                },
-                {
-                    "path": "tailwind.config.js",
-                    "description": "Configuration file for Tailwind CSS.",
-                    "language": "javascript",
-                    "defaultContent": "/** @type {import('tailwindcss').Config} */\nmodule.exports = {\n  content: [\n    \"./src/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./app/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./components/**/*.{js,ts,jsx,tsx,mdx}\"\n  ],\n  theme: {\n    extend: {},\n  },\n  plugins: [],\n}"
-                },
-                {
-                    "path": "postcss.config.js",
-                    "description": "Configuration file for PostCSS.",
-                    "language": "javascript",
-                    "defaultContent": "module.exports = {\n  plugins: {\n    tailwindcss: {},\n    autoprefixer: {},\n  },\n}"
-                },
-                {
-                    "path": "next.config.js",
-                    "description": "Next.js configuration.",
-                    "language": "javascript",
-                    "defaultContent": "/** @type {import('next').NextConfig} */\nconst nextConfig = {\n  reactStrictMode: true,\n  swcMinify: true,\n};\nmodule.exports = nextConfig;"
-                },
-                {
-                    "path": "src/app/globals.css",
-                    "description": "Global CSS file containing Tailwind directives.",
-                    "language": "css",
-                    "defaultContent": "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n\n"
-                },
-                {
-                    "path": "src/lib/prisma.ts",
-                    "description": "PrismaClient singleton generator.",
-                    "language": "typescript",
-                    "defaultContent": "import { PrismaClient } from \"@prisma/client\";\n\nconst globalForPrisma = globalThis as unknown as { prisma: PrismaClient | undefined };\n\nexport const prisma =\n  globalForPrisma.prisma ??\n  new PrismaClient({\n    log: [\"query\"],\n  });\n\nif (process.env.NODE_ENV !== \"production\") globalForPrisma.prisma = prisma;\n\nexport default prisma;"
-                },
-                {
-                    "path": "src/app/layout.tsx",
-                    "description": "Root layout for Mobile Next.js preview.",
-                    "language": "typescript",
-                    "defaultContent": "\"use client\";\n\nimport React from \"react\";\nimport { SessionProvider } from \"next-auth/react\";\nimport \"./globals.css\";\n\nexport default function RootLayout({ children }: { children: React.ReactNode }) {\n  return (\n    <html lang=\"en\">\n      <body className=\"flex flex-col min-h-screen bg-slate-50 text-slate-900 antialiased\">\n        <SessionProvider>\n          <main className=\"flex-1 flex flex-col w-full\">{children}</main>\n        </SessionProvider>\n      </body>\n    </html>\n  );\n}"
-                }
-            ],
-            "injectTailwindDirectives": {
-                "targetCssFiles": ["globals.css", "styles.css"]
-            }
-        });
-    }
+    let default_metamanifest = build_default_metamanifest(&project_type);
 
     // Deep merge default_metamanifest into metamanifest
     if !default_metamanifest.is_null() {
@@ -6568,6 +6761,13 @@ export default function RootLayout({
             if !mm_obj.contains_key("injectTailwindDirectives") {
                 if let Some(val) = dm_obj.get("injectTailwindDirectives") {
                     mm_obj.insert("injectTailwindDirectives".to_string(), val.clone());
+                }
+            }
+
+            // 5. Preserve framework identifier (e.g. "expo") so post-processing isolates mobile cleanly
+            if !mm_obj.contains_key("framework") {
+                if let Some(val) = dm_obj.get("framework") {
+                    mm_obj.insert("framework".to_string(), val.clone());
                 }
             }
         }
@@ -6631,30 +6831,48 @@ export default function RootLayout({
     }).collect();
     let original_files_json = serde_json::to_string(&original_files_summary).unwrap_or_else(|_| "[]".to_string());
 
-    let expansion_prompt = format!(
-        "You are a Senior Project Architect. We are generating a complete {} application named '{}' using {}.\n\
-         Project Idea & Core Domain Description: \"{}\"\n\
-         The user requested a fully complete, production-ready implementation tailored specifically to this business domain.\n\
-         Version Overrides requested by user:\n\
-         {}\n\n\
-         Original files skeleton in the manifest:\n\
-         {}\n\n\
-         Identify all missing files, routes, state management, components, configuration files, or database schemas needed to make this project complete.\n\
-         CRITICAL DOMAIN RULE: Ensure the pages, dashboard, API routes, and Prisma schema models directly implement the core business features described in the Project Idea (not just generic user authentication).\n\
-         IMPORTANT ARCHITECTURAL RULE: If the project uses next-auth (NextAuth) for authentication, you MUST always include 'src/app/api/register/route.ts' in the expanded files list to handle new user registration (creating user record using bcryptjs), since NextAuth does not natively provide a user registration route.\n\
-         STRICT SCOPE & STACK GUARDRAILS:\n\
-         - Stick strictly to Next.js + React + TypeScript. NEVER add Vue, Svelte, or Angular files (`.vue`, `.svelte`, `vue-i18n`, `vue-router`).\n\
-         - NEVER expand a matrix of dozens of regional locale/translation JSON files (`translations/*.json`, `locales/*.json`); keep at most 1-2 locale files if localization is needed.\n\
-         - NEVER duplicate shared folders inside `src/app/` (`src/app/components/...`, `src/app/utils/...`, `src/app/config/...`); keep shared code in `src/components/`, `src/lib/`, `src/hooks/`, `src/utils/`.\n\
-         - API ROUTE COMPLETENESS: Ensure EVERY core domain entity in `prisma/schema.prisma` and every `/api/...` endpoint called by hooks or pages has a real matching App Router handler (`src/app/api/<resource>/route.ts`).\n\
-         - SHARED TYPES PLACEMENT: Keep shared TypeScript interfaces, types, and enums in `src/types/...` or `src/models/...`, NEVER exported from `src/app/**/page.tsx`.\n\
-         - Keep the expanded file list cohesive and lean (~15-30 essential files total).\n\
-         Output a JSON array containing the expanded, complete list of files. For each file, provide 'path', 'description' (concise, 1-2 sentences), and 'language'.\n\
-         Keep each file description concise (1-2 sentences) so the manifest generates quickly.\n\
-         Ensure all files from the original list are preserved.\n\
-         Respond ONLY with a valid JSON array. Do not include any introductory or concluding text, or markdown code blocks.",
-         platform, name, resolved_stack, project_description, overrides_desc, original_files_json
-    );
+    let expansion_prompt = if crate::templates_expo::is_expo_project_type(&project_type) {
+        format!(
+            "You are a Senior Mobile Architect. We are generating a complete Expo SDK 52 React Native mobile application named '{}' using {}.\n\
+             Project Idea & Core Domain Description: \"{}\"\n\
+             Version Overrides:\n\
+             {}\n\n\
+             Original files skeleton in the manifest:\n\
+             {}\n\n\
+             Identify only truly missing mobile screens (`app/(tabs)/*.tsx` or detail routes under `app/`), local AsyncStorage state helpers (`src/store/*.ts`), or reusable React Native UI components (`src/components/*.tsx`) needed for a complete offline-first mobile app.\n\
+             STRICT EXPO MOBILE GUARDRAILS:\n\
+             - Pure client-side React Native + Expo Router + TypeScript + `@react-native-async-storage/async-storage` ONLY.\n\
+             - NEVER add backend API routes (`src/api/**`, `src/app/api/**`, `**/route.ts`), Prisma (`prisma/schema.prisma`), Next.js files (`next.config.*`, `src/app/**`, `globals.css`, `tailwind.config.*`, `middleware.ts`), or duplicate `src/models/*` / `src/hooks/*` when `src/types/index.ts` and `src/store/*` already exist.\n\
+             - Keep the expanded file list lean (~14-20 files total) and preserve ALL original files verbatim.\n\
+             Output ONLY a valid JSON array of objects with 'path', 'description' (1-2 concise sentences), and 'language'. No markdown fences or prose.",
+            name, resolved_stack, project_description, overrides_desc, original_files_json
+        )
+    } else {
+        format!(
+            "You are a Senior Project Architect. We are generating a complete {} application named '{}' using {}.\n\
+             Project Idea & Core Domain Description: \"{}\"\n\
+             The user requested a fully complete, production-ready implementation tailored specifically to this business domain.\n\
+             Version Overrides requested by user:\n\
+             {}\n\n\
+             Original files skeleton in the manifest:\n\
+             {}\n\n\
+             Identify all missing files, routes, state management, components, configuration files, or database schemas needed to make this project complete.\n\
+             CRITICAL DOMAIN RULE: Ensure the pages, dashboard, API routes, and Prisma schema models directly implement the core business features described in the Project Idea (not just generic user authentication).\n\
+             IMPORTANT ARCHITECTURAL RULE: If the project uses next-auth (NextAuth) for authentication, you MUST always include 'src/app/api/register/route.ts' in the expanded files list to handle new user registration (creating user record using bcryptjs), since NextAuth does not natively provide a user registration route.\n\
+             STRICT SCOPE & STACK GUARDRAILS:\n\
+             - Stick strictly to Next.js + React + TypeScript. NEVER add Vue, Svelte, or Angular files (`.vue`, `.svelte`, `vue-i18n`, `vue-router`).\n\
+             - NEVER expand a matrix of dozens of regional locale/translation JSON files (`translations/*.json`, `locales/*.json`); keep at most 1-2 locale files if localization is needed.\n\
+             - NEVER duplicate shared folders inside `src/app/` (`src/app/components/...`, `src/app/utils/...`, `src/app/config/...`); keep shared code in `src/components/`, `src/lib/`, `src/hooks/`, `src/utils/`.\n\
+             - API ROUTE COMPLETENESS: Ensure EVERY core domain entity in `prisma/schema.prisma` and every `/api/...` endpoint called by hooks or pages has a real matching App Router handler (`src/app/api/<resource>/route.ts`).\n\
+             - SHARED TYPES PLACEMENT: Keep shared TypeScript interfaces, types, and enums in `src/types/...` or `src/models/...`, NEVER exported from `src/app/**/page.tsx`.\n\
+             - Keep the expanded file list cohesive and lean (~15-30 essential files total).\n\
+             Output a JSON array containing the expanded, complete list of files. For each file, provide 'path', 'description' (concise, 1-2 sentences), and 'language'.\n\
+             Keep each file description concise (1-2 sentences) so the manifest generates quickly.\n\
+             Ensure all files from the original list are preserved.\n\
+             Respond ONLY with a valid JSON array. Do not include any introductory or concluding text, or markdown code blocks.",
+            platform, name, resolved_stack, project_description, overrides_desc, original_files_json
+        )
+    };
 
     let mut files_to_generate = if let Some(ref saved_files) = files_to_generate_from_cp {
         debug_log_to_file(format!("[Orchestrator] Reusing {} expanded files from checkpoint.", saved_files.len()));
@@ -6890,12 +7108,28 @@ export default function RootLayout({
 
     normalize_project_structure(&mut files_to_generate, &metamanifest, &project_type);
 
-    if project_type == "nextjs"
-        || project_type == "electron"
-        || project_type == "react_native"
-        || project_type == "react-native"
-        || project_type == "expo"
-    {
+    if crate::templates_expo::is_expo_project_type(&project_type) {
+        let has_expo_home = files_to_generate.iter().any(|f| {
+            f.get("path")
+                .and_then(|path| path.as_str())
+                .map(|p| {
+                    let pl = p.to_lowercase().replace('\\', "/");
+                    pl == "app/(tabs)/index.tsx"
+                        || pl == "app/(tabs)/index.jsx"
+                        || pl == "app/index.tsx"
+                        || pl == "app/index.jsx"
+                })
+                .unwrap_or(false)
+        });
+        if !has_expo_home {
+            files_to_generate.push(serde_json::json!({
+                "path": "app/(tabs)/index.tsx",
+                "role": "ui",
+                "language": "typescript",
+                "description": format!("Primary mobile Home screen for '{}'. Built with React Native View, Text, ScrollView, Pressable, StyleSheet, Ionicons, and theme tokens.", name)
+            }));
+        }
+    } else if project_type == "nextjs" || project_type == "electron" {
         let has_root_page = files_to_generate.iter().any(|f| {
             if let Some(p) = f.get("path").and_then(|path| path.as_str()) {
                 let p_lower = p.to_lowercase().replace('\\', "/");
@@ -6915,15 +7149,6 @@ export default function RootLayout({
                 })
                 .unwrap_or(false)
         });
-        let has_mobile_tabs_index = files_to_generate.iter().any(|f| {
-            f.get("path")
-                .and_then(|p| p.as_str())
-                .map(|p| {
-                    let pl = p.to_lowercase().replace('\\', "/");
-                    pl == "app/(tabs)/index.tsx" || pl == "src/app/(tabs)/index.tsx"
-                })
-                .unwrap_or(false)
-        });
 
         if !has_root_page && has_renderer_app {
             files_to_generate.push(serde_json::json!({
@@ -6932,14 +7157,6 @@ export default function RootLayout({
                 "language": "typescript",
                 "description": "Root Next.js entry page mounting the Electron Desktop Renderer (<App /> from '@/renderer/App').",
                 "defaultContent": "\"use client\";\n\nimport React from 'react';\nimport App from '@/renderer/App';\n\nexport default function HomePage() {\n  return <App />;\n}\n"
-            }));
-        } else if !has_root_page && has_mobile_tabs_index {
-            files_to_generate.push(serde_json::json!({
-                "path": "src/app/page.tsx",
-                "role": "logic",
-                "language": "typescript",
-                "description": "Root Next.js entry page mounting the Mobile Tabs Home screen.",
-                "defaultContent": "\"use client\";\n\nimport React from 'react';\nimport MobileHomeScreen from '@/app/(tabs)/index';\n\nexport default function HomePage() {\n  return <MobileHomeScreen />;\n}\n"
             }));
         } else if !has_root_page {
             let mut has_dashboard = false;
@@ -7248,6 +7465,23 @@ export default function RootLayout({
         let mut file_gen_success = false;
         let mut attempts = 0;
         let max_attempts = 3;
+
+        // Deterministic templates (infra files + schema-derived contracts) bypass the LLM entirely.
+        if let Some(det) = crate::templates::render_deterministic_file(&proj_dir, &project_type, file_path, desc) {
+            for (side_path, side_content) in &det.side_files {
+                let side_full = proj_dir.join(side_path);
+                if let Some(parent) = side_full.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::write(&side_full, side_content);
+                crate::templates::record_deterministic_file(&proj_dir, side_path);
+            }
+            processed_content = post_process_generated_file(file_path, &det.content, &metamanifest, has_tailwind);
+            file_gen_success = true;
+            attempts = max_attempts;
+            crate::templates::record_deterministic_file(&proj_dir, file_path);
+            debug_log_to_file(format!("[Template] Deterministic file written without LLM: {}", file_path));
+        }
         let mut current_user_prompt = user_prompt.clone();
 
         while attempts < max_attempts && !file_gen_success {
@@ -7640,55 +7874,60 @@ export default function RootLayout({
     }
     let npm_install_ok = npm_install_outcome == NpmInstallOutcome::Installed;
 
-    // AST Sanity Pass: Clean invalid React imports (e.g. useRouter in 'react'), hoist client directives across src/
-    apply_ast_sanity_pass_to_project(&proj_dir);
+    let is_expo = crate::templates_expo::is_expo_project_type(&project_type)
+        || crate::templates_expo::is_expo_project_dir(&proj_dir);
 
-    // Auto-run prisma generate & db push if Prisma schema exists in the project
     let mut prisma_heal_err: Option<String> = None;
-    let has_prisma = proj_dir.join("prisma/schema.prisma").exists() || proj_dir.join("schema.prisma").exists();
-    if has_prisma {
-        if let Err(e) = heal_prisma_schema_loop_opt(&proj_dir, window.as_ref(), &model_id, "install-deps").await {
-            debug_log_to_file(format!("[Prisma Critical Error] Orchestrator schema healing failed: {}", e));
-            prisma_heal_err = Some(e);
-        }
+    if !is_expo {
+        // AST Sanity Pass: Clean invalid React imports (e.g. useRouter in 'react'), hoist client directives across src/
+        apply_ast_sanity_pass_to_project(&proj_dir);
 
-        // Run prisma db push to synchronize the database schema
-        emit_progress("install-deps", "Syncing database schema...", 79.0);
-        let local_prisma_js = proj_dir.join("node_modules").join("prisma").join("build").join("index.js");
-        let mut push_cmd = if local_prisma_js.exists() {
-            let mut c = std::process::Command::new("node");
-            c.arg(&local_prisma_js).arg("db").arg("push").arg("--accept-data-loss").current_dir(&proj_dir);
-            c
-        } else {
-            #[cfg(target_os = "windows")]
-            let mut c = std::process::Command::new("cmd");
-            #[cfg(target_os = "windows")]
-            c.arg("/C").arg("npx").arg("-y").arg("prisma@5.22.0").arg("db").arg("push").arg("--accept-data-loss").current_dir(&proj_dir);
+        // Auto-run prisma generate & db push if Prisma schema exists in the project
+        let has_prisma = proj_dir.join("prisma/schema.prisma").exists() || proj_dir.join("schema.prisma").exists();
+        if has_prisma {
+            if let Err(e) = heal_prisma_schema_loop_opt(&proj_dir, window.as_ref(), &model_id, "install-deps").await {
+                debug_log_to_file(format!("[Prisma Critical Error] Orchestrator schema healing failed: {}", e));
+                prisma_heal_err = Some(e);
+            }
+
+            // Run prisma db push to synchronize the database schema
+            emit_progress("install-deps", "Syncing database schema...", 79.0);
+            let local_prisma_js = proj_dir.join("node_modules").join("prisma").join("build").join("index.js");
+            let mut push_cmd = if local_prisma_js.exists() {
+                let mut c = std::process::Command::new("node");
+                c.arg(&local_prisma_js).arg("db").arg("push").arg("--accept-data-loss").current_dir(&proj_dir);
+                c
+            } else {
+                #[cfg(target_os = "windows")]
+                let mut c = std::process::Command::new("cmd");
+                #[cfg(target_os = "windows")]
+                c.arg("/C").arg("npx").arg("-y").arg("prisma@5.22.0").arg("db").arg("push").arg("--accept-data-loss").current_dir(&proj_dir);
+                
+                #[cfg(not(target_os = "windows"))]
+                let mut c = std::process::Command::new("npx");
+                #[cfg(not(target_os = "windows"))]
+                c.arg("-y").arg("prisma@5.22.0").arg("db").arg("push").arg("--accept-data-loss").current_dir(&proj_dir);
+                c
+            };
             
-            #[cfg(not(target_os = "windows"))]
-            let mut c = std::process::Command::new("npx");
-            #[cfg(not(target_os = "windows"))]
-            c.arg("-y").arg("prisma@5.22.0").arg("db").arg("push").arg("--accept-data-loss").current_dir(&proj_dir);
-            c
-        };
-        
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            push_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                push_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            }
+            
+            if let Ok(mut child) = push_cmd.spawn() {
+                let _ = child.wait();
+            }
         }
-        
-        if let Ok(mut child) = push_cmd.spawn() {
-            let _ = child.wait();
-        }
-    }
 
-    // Ensure barrel index.ts files exist and normalize route links BEFORE pre-build hygiene & compiler healing
-    ensure_directory_barrel_files(&proj_dir);
-    let pre_routes = get_project_routes_from_dir(&proj_dir);
-    let pre_routes_list: Vec<String> = pre_routes.into_iter().map(|(r, _)| r).collect();
-    if !pre_routes_list.is_empty() {
-        normalize_project_route_links(&proj_dir, &pre_routes_list);
+        // Ensure barrel index.ts files exist and normalize route links BEFORE pre-build hygiene & compiler healing
+        ensure_directory_barrel_files(&proj_dir);
+        let pre_routes = get_project_routes_from_dir(&proj_dir);
+        let pre_routes_list: Vec<String> = pre_routes.into_iter().map(|(r, _)| r).collect();
+        if !pre_routes_list.is_empty() {
+            normalize_project_route_links(&proj_dir, &pre_routes_list);
+        }
     }
 
     // Run pre-build hygiene pass (tsconfig, package.json, bare imports, CSS dedup, UI primitives, App Router route exports)
@@ -7714,14 +7953,16 @@ export default function RootLayout({
     .await;
 
     // Run automated post-generation static, import, hook, and Prisma checks
-    emit_progress("auto-testing", "Verifying routes, imports, and Prisma schema...", 97.0);
+    emit_progress("auto-testing", if is_expo { "Verifying Expo routes and React Native syntax..." } else { "Verifying routes, imports, and Prisma schema..." }, 97.0);
     let auto_test_warnings = crate::self_healing::run_generation_auto_test_suite_opt(&proj_dir, window.as_ref(), &model_id).await;
 
     // Refresh route links and write final up-to-date project graphs & contracts after healing
-    let post_routes = get_project_routes_from_dir(&proj_dir);
-    let post_routes_list: Vec<String> = post_routes.into_iter().map(|(r, _)| r).collect();
-    if !post_routes_list.is_empty() {
-        normalize_project_route_links(&proj_dir, &post_routes_list);
+    if !is_expo {
+        let post_routes = get_project_routes_from_dir(&proj_dir);
+        let post_routes_list: Vec<String> = post_routes.into_iter().map(|(r, _)| r).collect();
+        if !post_routes_list.is_empty() {
+            normalize_project_route_links(&proj_dir, &post_routes_list);
+        }
     }
 
     if let Err(e) = generate_axiom_map(&proj_dir) {
@@ -7758,6 +7999,8 @@ export default function RootLayout({
         "id": project_id,
         "name": name,
         "description": project_description,
+        "projectType": project_type,
+        "platform": resolved_platform,
         "status": "ready",
         "metadata": {
             "appVersion": env!("CARGO_PKG_VERSION"),

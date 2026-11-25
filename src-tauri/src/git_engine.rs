@@ -230,6 +230,23 @@ pub async fn git_refine_proposal_with_ai(
         return Err(edit_res.error.unwrap_or_else(|| "AI edit failed".to_string()));
     }
 
+    if let Some(ref mod_map) = edit_res.modified_files {
+        for (rel_path, new_content) in mod_map {
+            let rel_clean = rel_path.replace('\\', "/");
+            if crate::editor_ai::is_ignored_or_meta_edit_path(&rel_clean) {
+                continue;
+            }
+            let target = proj_dir.join(&rel_clean);
+            if !target.starts_with(&proj_dir) {
+                continue;
+            }
+            if let Some(parent) = target.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::write(&target, new_content);
+        }
+    }
+
     // 3. Stage changes
     let _ = run_git_cmd(&proj_dir, &["add", "."]).await;
 
@@ -243,7 +260,7 @@ pub async fn git_refine_proposal_with_ai(
     let mut files = Vec::new();
     for f in name_only.lines() {
         let f_trim = f.trim();
-        if !f_trim.is_empty() {
+        if !f_trim.is_empty() && !crate::editor_ai::is_ignored_or_meta_edit_path(f_trim) {
             let f_diff = run_git_cmd(&proj_dir, &["diff", &default_branch, "HEAD", "--", f_trim]).await.unwrap_or_default();
             files.push(ProposalFileDiff {
                 file_path: f_trim.to_string(),

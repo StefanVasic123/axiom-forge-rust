@@ -1,0 +1,94 @@
+{
+  "manifestId": "expo_2",
+  "platform": "mobile",
+  "projectType": "expo",
+  "resolvedStack": "React Native / Expo SDK 52 + Expo Router + TypeScript + AsyncStorage",
+  "name": "PulseFit Habit & Workout",
+  "description": "PulseFit Habit & Workout is an offline-first Expo React Native mobile fitness companion for logging strength and cardio workouts, tracking daily wellness habits, viewing weekly streak metrics, and storing all data locally via AsyncStorage.",
+  "metadata": {
+    "name": "PulseFit Habit & Workout",
+    "description": "Offline-first Expo SDK 52 mobile app for workout logging, daily habits, and streak analytics."
+  },
+  "files": [
+    {
+      "path": "package.json",
+      "description": "Expo SDK 52, expo-router, react-native-web, react-native-safe-area-context, @expo/vector-icons, and @react-native-async-storage/async-storage configuration.",
+      "language": "json"
+    },
+    {
+      "path": "app.json",
+      "description": "Expo configuration with Metro web bundler, expo-router plugin, and scheme.",
+      "language": "json"
+    },
+    {
+      "path": "babel.config.js",
+      "description": "Babel preset-expo configuration.",
+      "language": "javascript"
+    },
+    {
+      "path": "metro.config.js",
+      "description": "Expo Metro bundler default configuration.",
+      "language": "javascript"
+    },
+    {
+      "path": "tsconfig.json",
+      "description": "TypeScript configuration extending expo/tsconfig.base with @/* path alias.",
+      "language": "json"
+    },
+    {
+      "path": "src/theme.ts",
+      "description": "Semantic design tokens for PulseFit mobile UI.",
+      "language": "typescript"
+    },
+    {
+      "path": "app/+html.tsx",
+      "description": "Expo Router Web HTML document shell.",
+      "language": "typescript"
+    },
+    {
+      "path": "app/_layout.tsx",
+      "description": "Expo Router root Stack layout wrapped in SafeAreaProvider with web Live Edit inspector installer.",
+      "language": "typescript"
+    },
+    {
+      "path": "app/(tabs)/_layout.tsx",
+      "description": "Expo Router bottom tab navigator layout for index, workouts, habits, and profile.",
+      "language": "typescript"
+    },
+    {
+      "path": "src/types/index.ts",
+      "description": "Shared TypeScript types: WorkoutCategory ('STRENGTH' | 'CARDIO' | 'MOBILITY'), WorkoutSession { id, title, category, durationMin, calories, completed, loggedAt }, HabitItem { id, title, targetPerWeek, completedDays, streak, active }.",
+      "language": "typescript"
+    },
+    {
+      "path": "src/store/useFitnessStore.ts",
+      "description": "Offline-first hook/store using @react-native-async-storage/async-storage (getItem/setItem) with realistic seeded WorkoutSession[] and HabitItem[], exporting BOTH named useFitnessStore and default export, with addWorkout, toggleWorkoutCompleted, toggleHabitToday, addHabit, resetDemoData, and computed totals.",
+      "language": "typescript"
+    },
+    {
+      "path": "src/components/WorkoutCard.tsx",
+      "description": "Reusable React Native card component rendering WorkoutSession details, category badge, duration/calories, and completion toggle, exported BOTH named and default.",
+      "language": "typescript"
+    },
+    {
+      "path": "app/(tabs)/index.tsx",
+      "description": "Today dashboard screen wrapped in SafeAreaView and ScrollView with KPI summary cards (Weekly Workouts, Total Calories, Active Habits), daily goal progress card, recent WorkoutCard items, and navigation actions via expo-router.",
+      "language": "typescript"
+    },
+    {
+      "path": "app/(tabs)/workouts.tsx",
+      "description": "Workouts log screen with category filter chips (ALL, STRENGTH, CARDIO, MOBILITY), WorkoutCard list with Pressable toggle, and quick form/modal to log a new workout.",
+      "language": "typescript"
+    },
+    {
+      "path": "app/(tabs)/habits.tsx",
+      "description": "Daily habits tracker screen showing streaks, Pressable check-in buttons per habit, and an input form to create a new habit.",
+      "language": "typescript"
+    },
+    {
+      "path": "app/(tabs)/profile.tsx",
+      "description": "Athlete profile & offline storage settings screen showing total sessions, streak summary, and a Pressable button to reset demo data.",
+      "language": "typescript"
+    }
+  ]
+}

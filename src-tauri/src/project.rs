@@ -764,8 +764,8 @@ pub fn project_read_file(project_id: String, file_path: String) -> FileReadResul
 
 #[derive(Serialize)]
 pub struct FileWriteResult {
-    success: bool,
-    error: Option<String>,
+    pub success: bool,
+    pub error: Option<String>,
 }
 
 #[tauri::command]
@@ -781,8 +781,16 @@ pub fn editor_write_file(project_id: String, file_path: String, content: String)
         let _ = fs::create_dir_all(parent);
     }
     
-    match fs::write(&full_path, content) {
-        Ok(_) => FileWriteResult { success: true, error: None },
+    match fs::write(&full_path, &content) {
+        Ok(_) => {
+            crate::editor_ai::refresh_project_maps_after_file_write(
+                proj_dir,
+                project_id,
+                file_path,
+                content,
+            );
+            FileWriteResult { success: true, error: None }
+        }
         Err(e) => FileWriteResult { success: false, error: Some(e.to_string()) },
     }
 }

@@ -8,6 +8,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 
 import Editor, { DiffEditor, loader } from '@monaco-editor/react';
+import CopilotWidget from '../components/CopilotWidget';
 
 // Configure Monaco to load locally from public/vs folder to prevent any CDN network errors or offline crashes
 loader.config({
@@ -22,7 +23,7 @@ import {
   File, Folder, FolderOpen, Send, Loader2, Check, X,
   RotateCcw, RotateCw, Sparkles, Code2, AlertCircle, Eye, Monitor,
   FunctionSquare, Search, Info, Terminal, Settings,
-  MousePointer, Crosshair, Play
+  MousePointer, Crosshair, Play, Smartphone, Copy
 } from 'lucide-react';
 
 // ==================== HELPERS ====================
@@ -182,6 +183,7 @@ function AIPanel({
   ]);
   const [input, setInput] = useState('');
   const [isThinking, setIsThinking] = useState(false);
+  const [pendingTargetPath, setPendingTargetPath] = useState(null);
   const messagesEndRef = useRef(null);
 
   useEffect(() => {
@@ -235,24 +237,27 @@ function AIPanel({
     setIsThinking(true);
 
     if (aiScope === 'file') {
-      if (!activeFile) {
+      if (!activeFile?.path) {
         setMessages(m => [...m, { role: 'assistant', content: '⚠️ Please open a file first before asking me to make changes.' }]);
         setIsThinking(false);
         return;
       }
+      const capturedTargetPath = activeFile.path;
+      const capturedTargetName = activeFile.name || activeFile.path;
       setPendingContent(null);
+      setPendingTargetPath(null);
 
       try {
         let contentToUse = activeContent;
-        if (!contentToUse && activeFile?.path) {
+        if (!contentToUse && capturedTargetPath) {
           try {
-            const res = await window.electronAPI.project.readFile(projectId, activeFile.path);
+            const res = await window.electronAPI.project.readFile(projectId, capturedTargetPath);
             if (res && res.success) contentToUse = res.content;
           } catch (e) {}
         }
 
         const result = await window.electronAPI.editor.aiEdit(
-          activeFile.path,
+          capturedTargetPath,
           contentToUse || '',
           userMsg,
           projectId,
@@ -261,9 +266,10 @@ function AIPanel({
 
         if (result.success) {
           setPendingContent(result.newContent);
+          setPendingTargetPath(capturedTargetPath);
           setMessages(m => [...m, {
             role: 'assistant',
-            content: `✅ I've prepared the changes for **${activeFile.name || activeFile.path}**. Review below and click **Apply** to save.`,
+            content: `✅ I've prepared the changes for **${capturedTargetName}**. Review below and click **Apply** to save.`,
             hasDiff: true
           }]);
         } else {
@@ -305,17 +311,24 @@ function AIPanel({
 
   const handleApply = async () => {
     if (!pendingContent) return;
-    const applied = await onApply(pendingContent, `AI: ${messages.filter(m => m.role === 'user').at(-1)?.content?.slice(0, 60)}`);
+    const savedPath = pendingTargetPath || activeFile?.path || 'file';
+    const applied = await onApply(
+      pendingContent,
+      `AI: ${messages.filter(m => m.role === 'user').at(-1)?.content?.slice(0, 60)}`,
+      pendingTargetPath
+    );
     if (applied === false) {
       setMessages(m => [...m, { role: 'assistant', content: '❌ Could not save changes to disk (no active target file or write failed).' }]);
       return;
     }
     setPendingContent(null);
-    setMessages(m => [...m, { role: 'assistant', content: `✅ Changes applied and saved to disk (${activeFile?.path || 'file'}).` }]);
+    setPendingTargetPath(null);
+    setMessages(m => [...m, { role: 'assistant', content: `✅ Changes applied and saved to disk (${savedPath}).` }]);
   };
 
   const handleDiscard = () => {
     setPendingContent(null);
+    setPendingTargetPath(null);
     setMessages(m => [...m, { role: 'assistant', content: 'Changes discarded.' }]);
   };
 
@@ -574,8 +587,31 @@ export default function EditorPage() {
   const [symbolsExpanded, setSymbolsExpanded] = useState(false);
   const [functions, setFunctions] = useState([]);
   const [previewUrl, setPreviewUrl] = useState('http://localhost:3000');
+  const [expoGoUrl, setExpoGoUrl] = useState(null);
+  const [expoUrlCopied, setExpoUrlCopied] = useState(false);
+
+  const isMobileExpo = useMemo(() => {
+    if (projectDependencies?.['next']) return false;
+    const plat = (project?.manifest?.platform || project?.platform || '').toLowerCase();
+    const pType = (project?.projectType || project?.manifest?.projectType || '').toLowerCase();
+    const hasExpoFiles = Array.isArray(files) && files.some(f => {
+      const p = (f?.path || '').replace(/\\/g, '/').toLowerCase();
+      return p === 'app/_layout.tsx' || p === 'app/+html.tsx' || p.startsWith('app/(tabs)/');
+    });
+    return plat === 'mobile'
+      || ['expo', 'react_native', 'react-native'].includes(pType)
+      || Boolean(projectDependencies?.['expo'] || projectDependencies?.['expo-router'])
+      || hasExpoFiles;
+  }, [project, projectDependencies, files]);
+
   // Dev Server State
   const [serverRunning, setServerRunning] = useState(false);
+
+  useEffect(() => {
+    if (isMobileExpo && !serverRunning && previewUrl === 'http://localhost:3000') {
+      setPreviewUrl('http://localhost:8081');
+    }
+  }, [isMobileExpo, serverRunning, previewUrl]);
   const [isServerStarting, setIsServerStarting] = useState(false);
   const [isServerStopping, setIsServerStopping] = useState(false);
   const [iframeLoading, setIframeLoading] = useState(true);
@@ -673,7 +709,25 @@ export default function EditorPage() {
     const cleanRoute = rawRoute.replace(/^\/(en|sr|es|pt|fr|de|it)(?=\/|$)/, '').replace(/\/+$/, '') || '';
     const isApiRoute = cleanRoute === '/api' || cleanRoute.startsWith('/api/');
 
-    const exactCandidates = isApiRoute
+    const expoCandidates = cleanRoute
+      ? [
+          `app/(tabs)${cleanRoute}.tsx`,
+          `app/(tabs)${cleanRoute}.jsx`,
+          `app/(tabs)${cleanRoute}/index.tsx`,
+          `app/(tabs)${cleanRoute}/index.jsx`,
+          `app${cleanRoute}.tsx`,
+          `app${cleanRoute}.jsx`,
+          `app${cleanRoute}/index.tsx`,
+          `app${cleanRoute}/index.jsx`,
+        ]
+      : [
+          'app/(tabs)/index.tsx',
+          'app/(tabs)/index.jsx',
+          'app/index.tsx',
+          'app/index.jsx',
+        ];
+
+    const webCandidates = isApiRoute
       ? [
           `src/app${cleanRoute}/route.ts`,
           `src/app${cleanRoute}/route.js`,
@@ -704,6 +758,12 @@ export default function EditorPage() {
           'pages/index.jsx',
         ];
 
+    const exactCandidates = isMobileExpo && !isApiRoute
+      ? [...expoCandidates, ...webCandidates]
+      : isApiRoute
+      ? webCandidates
+      : [...webCandidates, ...expoCandidates];
+
     for (const cand of exactCandidates) {
       const hit = files.find(f => {
         const norm = f.path.replace(/\\/g, '/').replace(/^\.\//, '');
@@ -723,7 +783,7 @@ export default function EditorPage() {
     }
 
     return null;
-  }, [files]);
+  }, [files, isMobileExpo]);
 
   const activePreviewFile = useMemo(() => {
     return resolveRouteToFile(currentPreviewRoute);
@@ -791,6 +851,7 @@ export default function EditorPage() {
       if (status === 'stopped' || status === 'error') {
         setIsServerStarting(false);
         setIframeLoading(false);
+        setExpoGoUrl(null);
       }
     });
 
@@ -817,13 +878,30 @@ export default function EditorPage() {
 
       // If server logs indicate ready or real route compile completion (never Next.js internal /_error or /_not-found error pages), clear stale compileError
       const isInternalErrorPageLog = text.includes('/_error') || text.includes('/_not-found');
-      if (!isInternalErrorPageLog && (text.includes('Ready in') || text.includes('Local:') || text.includes('ready on') || text.includes('compiled successfully') || text.includes('Compiled /') || text.includes('✓ Compiled'))) {
+      if (!isInternalErrorPageLog && (
+        text.includes('Ready in')
+        || text.includes('Local:')
+        || text.includes('ready on')
+        || text.includes('compiled successfully')
+        || text.includes('Compiled /')
+        || text.includes('✓ Compiled')
+        || text.includes('Waiting on http://')
+        || text.includes('Web is waiting on')
+        || text.includes('Web Bundled')
+        || text.includes('Metro waiting on')
+        || text.includes('Logs for your project will appear below')
+      )) {
         setIsServerStarting(false);
         setCompileError(null);
       }
 
-      // Auto-detect preview URL from server output (e.g. Next.js or Vite logs)
+      // Auto-detect preview URL from server output (e.g. Next.js, Vite, or Expo Metro logs)
       if (text) {
+        const expMatch = text.match(/exp:\/\/[^\s]+/i);
+        if (expMatch) {
+          setExpoGoUrl(expMatch[0]);
+        }
+
         const match = text.match(/https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|192\.\d+\.\d+\.\d+):(\d+)/i);
         if (match) {
           let detectedUrl = match[0];
@@ -931,6 +1009,7 @@ export default function EditorPage() {
         setCompileError(null);
         setServerRunning(false);
         setIsServerStarting(false);
+        setExpoGoUrl(null);
       } finally {
         setIsServerStopping(false);
       }
@@ -938,13 +1017,14 @@ export default function EditorPage() {
       setIsServerStarting(true);
       setIframeLoading(true);
       setCompileError(null);
+      setExpoGoUrl(null);
       setServerLogs([{ text: '> Starting server...', type: 'info', id: Date.now() }]);
       setShowTerminal(true);
       try {
         const res = await window.electronAPI.server.start({ 
           projectId, 
-          platform: project?.manifest?.platform || 'web',
-          techStack: project?.manifest?.techStack?.framework || 'nextjs'
+          platform: project?.manifest?.platform || project?.platform || (isMobileExpo ? 'mobile' : 'web'),
+          techStack: project?.manifest?.techStack?.framework || (isMobileExpo ? 'expo' : 'nextjs')
         });
         if (res && res.success) {
           if (res.cdpPort) {
@@ -1255,18 +1335,42 @@ export default function EditorPage() {
 
                let highlightedElement = null;
 
-               function findAxiomTarget(el) {
-                 while (el && el !== document.body) {
-                   if (el.dataset && (el.dataset.axiomFile || el.dataset.axiomComponent)) {
-                     return el;
-                   }
-                   el = el.parentElement;
+               function findAxiomOwner(el) {
+                 let cur = el;
+                 let file = null;
+                 let component = null;
+                 while (cur && cur !== document.body && cur !== document.documentElement) {
+                   if (!file && cur.dataset && cur.dataset.axiomFile) file = cur.dataset.axiomFile;
+                   if (!component && cur.dataset && cur.dataset.axiomComponent) component = cur.dataset.axiomComponent;
+                   if (file && component) break;
+                   cur = cur.parentElement;
                  }
-                 return null;
+                 return { file, component };
+               }
+
+               function findVisualElement(el) {
+                 if (!el || el === document.body || el === document.documentElement) return null;
+                 const svgTags = ['svg', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'ellipse', 'use', 'g'];
+                 const semanticTags = ['button', 'a', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'span', 'label', 'input', 'textarea', 'select', 'img', 'li', 'td', 'th', 'article', 'section', 'header', 'footer', 'nav'];
+                 let cur = el;
+                 while (cur && cur !== document.body && cur !== document.documentElement && svgTags.includes((cur.tagName || '').toLowerCase())) {
+                   cur = cur.parentElement;
+                 }
+                 if (!cur || cur === document.body || cur === document.documentElement) return null;
+                 const curTag = (cur.tagName || '').toLowerCase();
+                 if (semanticTags.includes(curTag)) return cur;
+                 let scan = cur;
+                 while (scan && scan !== document.body && scan !== document.documentElement) {
+                   const tag = (scan.tagName || '').toLowerCase();
+                   if (['button', 'a', 'label', 'li'].includes(tag)) return scan;
+                   if (scan.dataset && (scan.dataset.axiomFile || scan.dataset.axiomComponent) && scan !== cur) break;
+                   scan = scan.parentElement;
+                 }
+                 return cur;
                }
 
                document.addEventListener('mouseover', (e) => {
-                 const target = findAxiomTarget(e.target);
+                 const target = findVisualElement(e.target);
                  if (highlightedElement && highlightedElement !== target) {
                    highlightedElement.classList.remove('axiom-inspect-highlight');
                  }
@@ -1284,15 +1388,18 @@ export default function EditorPage() {
                }, true);
 
                document.addEventListener('click', (e) => {
-                 const target = findAxiomTarget(e.target);
+                 const target = findVisualElement(e.target);
                  if (target) {
                    e.preventDefault();
                    e.stopPropagation();
+                   const owner = findAxiomOwner(target);
+                   const rawCls = typeof target.className === 'string' ? target.className : '';
                    const payload = {
-                     file: target.dataset.axiomFile || null,
-                     component: target.dataset.axiomComponent || null,
+                     file: owner.file,
+                     component: owner.component,
                      tagName: target.tagName.toLowerCase(),
-                     text: target.innerText?.substring(0, 50) || ''
+                     text: (target.innerText || target.value || '').trim().substring(0, 80),
+                     className: rawCls.split('axiom-inspect-highlight').join('').trim().substring(0, 180)
                    };
                    console.log('AXIOM_INSPECT::' + JSON.stringify(payload));
                  }
@@ -1888,43 +1995,59 @@ export default function EditorPage() {
     return () => window.removeEventListener('keydown', handler);
   }, [saveActiveFile]);
 
-  // Apply AI changes to active tab or currently previewed route file
-  const handleAIApply = useCallback(async (newContent, commitMsg) => {
-    const targetFile = activeTab || (showPreview ? activePreviewFile : null);
-    if (!targetFile?.path) return false;
+  // Apply AI changes to captured target path, active tab, or currently previewed route file
+  const handleAIApply = useCallback(async (newContent, commitMsg, explicitTargetPath = null) => {
+    const targetPath = explicitTargetPath || activeTab?.path || (showPreview ? activePreviewFile?.path : null);
+    if (!targetPath) return false;
 
     // 1. Write to disk first and check result
-    const writeRes = await window.electronAPI.editor.writeFile(projectId, targetFile.path, newContent);
+    const writeRes = await window.electronAPI.editor.writeFile(projectId, targetPath, newContent);
     if (writeRes && writeRes.success === false) {
-      setStatusMsg(`Failed to save AI changes to ${targetFile.path}: ${writeRes.error || 'write error'}`);
+      setStatusMsg(`Failed to save AI changes to ${targetPath}: ${writeRes.error || 'write error'}`);
       setTimeout(() => setStatusMsg(''), 4000);
       return false;
     }
 
     // 2. Update the React state if target file is open in a tab
     setOpenTabs(tabs => tabs.map(t =>
-      t.path === targetFile.path ? { ...t, content: newContent, isDirty: false } : t
+      t.path === targetPath ? { ...t, content: newContent, isDirty: false } : t
     ));
 
     // 3. Unmount the DiffEditor immediately
     setPendingContent(null);
 
-    // 4. Git commit
-    await window.electronAPI.editor.gitCommit(projectId, commitMsg || `AI: edited ${targetFile.path}`);
-    setStatusMsg(`AI changes applied & committed (${targetFile.path})`);
+    // 4. Refresh preview iframe when styling config changed so HMR/Tailwind/Theme reloads cleanly
+    const targetLower = targetPath.toLowerCase();
+    if (showPreview && serverRunning && webviewRef.current && (targetLower.endsWith('tailwind.config.js') || targetLower.endsWith('globals.css') || targetLower.endsWith('theme.ts'))) {
+      setTimeout(() => {
+        if (webviewRef.current) {
+          webviewRef.current.src = webviewRef.current.src;
+        }
+      }, 400);
+    }
+
+    // 5. Git commit
+    await window.electronAPI.editor.gitCommit(projectId, commitMsg || `AI: edited ${targetPath}`);
+    setStatusMsg(`AI changes applied & committed (${targetPath})`);
     setTimeout(() => setStatusMsg(''), 3000);
     return true;
-  }, [activeTab, showPreview, activePreviewFile, projectId, setOpenTabs]);
+  }, [activeTab, showPreview, activePreviewFile, serverRunning, projectId, setOpenTabs]);
 
   // Apply a single file's changes in project-level AI view
   const handleApplyProjectFile = useCallback(async (filePath, newContent) => {
-    // 1. Update tab state if open
+    // 1. Write to disk first and verify success
+    const writeRes = await window.electronAPI.editor.writeFile(projectId, filePath, newContent);
+    if (writeRes && writeRes.success === false) {
+      setStatusMsg(`Failed to save ${filePath}: ${writeRes.error || 'write error'}`);
+      setTimeout(() => setStatusMsg(''), 4000);
+      return;
+    }
+
+    // 2. Update tab state if open
     setOpenTabs(tabs => tabs.map(t =>
       t.path === filePath ? { ...t, content: newContent, isDirty: false } : t
     ));
 
-    // 2. Write to disk & Git commit
-    await window.electronAPI.editor.writeFile(projectId, filePath, newContent);
     await window.electronAPI.editor.gitCommit(projectId, `AI: applied changes to ${filePath}`);
 
     // 3. Remove file from pendingProjectChanges
@@ -1943,9 +2066,18 @@ export default function EditorPage() {
       setPendingContent(null);
     }
 
+    const lower = filePath.toLowerCase();
+    if (showPreview && serverRunning && webviewRef.current && (lower.endsWith('tailwind.config.js') || lower.endsWith('globals.css') || lower.endsWith('theme.ts'))) {
+      setTimeout(() => {
+        if (webviewRef.current) {
+          webviewRef.current.src = webviewRef.current.src;
+        }
+      }, 400);
+    }
+
     setStatusMsg(`Applied changes to ${filePath}`);
     setTimeout(() => setStatusMsg(''), 3000);
-  }, [activeTabPath, projectId, setOpenTabs]);
+  }, [activeTabPath, showPreview, serverRunning, projectId, setOpenTabs]);
 
   // Discard a single file's changes in project-level AI view
   const handleDiscardProjectFile = useCallback((filePath) => {
@@ -1973,30 +2105,58 @@ export default function EditorPage() {
   const handleApplyAllProjectChanges = useCallback(async (changes) => {
     if (!changes) return;
 
-    // 1. Update open tabs
-    setOpenTabs(tabs => tabs.map(t => {
-      if (changes[t.path] !== undefined) {
-        return { ...t, content: changes[t.path], isDirty: false };
-      }
-      return t;
-    }));
-
-    // 2. Write all changes to disk
+    // 1. Write all changes to disk and verify each write
+    const failed = [];
+    const written = [];
     for (const [filePath, content] of Object.entries(changes)) {
-      await window.electronAPI.editor.writeFile(projectId, filePath, content);
+      const writeRes = await window.electronAPI.editor.writeFile(projectId, filePath, content);
+      if (writeRes && writeRes.success === false) {
+        failed.push(`${filePath}: ${writeRes.error || 'write error'}`);
+      } else {
+        written.push(filePath);
+      }
     }
 
-    // 3. Perform a single bulk git commit
-    const fileList = Object.keys(changes).join(', ');
-    await window.electronAPI.editor.gitCommit(projectId, `AI: applied changes to ${fileList}`);
+    // 2. Update open tabs for written files
+    if (written.length > 0) {
+      const writtenSet = new Set(written);
+      setOpenTabs(tabs => tabs.map(t => {
+        if (writtenSet.has(t.path) && changes[t.path] !== undefined) {
+          return { ...t, content: changes[t.path], isDirty: false };
+        }
+        return t;
+      }));
+
+      // 3. Perform a single bulk git commit for written files
+      await window.electronAPI.editor.gitCommit(projectId, `AI: applied changes to ${written.join(', ')}`);
+    }
+
+    if (failed.length > 0) {
+      setStatusMsg(`Failed to save: ${failed.join('; ')}`);
+      setTimeout(() => setStatusMsg(''), 5000);
+      return;
+    }
 
     // 4. Clear pending states
     setPendingProjectChanges(null);
     setPendingContent(null);
 
+    // 5. Refresh preview iframe when styling config changed
+    const hasStyleConfigChange = written.some(p => {
+      const l = p.toLowerCase();
+      return l.endsWith('tailwind.config.js') || l.endsWith('globals.css') || l.endsWith('theme.ts');
+    });
+    if (showPreview && serverRunning && webviewRef.current && hasStyleConfigChange) {
+      setTimeout(() => {
+        if (webviewRef.current) {
+          webviewRef.current.src = webviewRef.current.src;
+        }
+      }, 400);
+    }
+
     setStatusMsg(`Successfully applied changes to all files`);
     setTimeout(() => setStatusMsg(''), 3000);
-  }, [projectId, setOpenTabs]);
+  }, [showPreview, serverRunning, projectId, setOpenTabs]);
 
   // Discard all changes in project-level AI view
   const handleDiscardAllProjectChanges = useCallback(() => {
@@ -2017,6 +2177,93 @@ export default function EditorPage() {
       setPendingContent(pendingProjectChanges[filePath]);
     }
   }, [openFile, pendingProjectChanges]);
+
+  // ==================== ISOLATED FLOATING COPILOT HANDLERS ====================
+  const handleCopilotOpenFile = useCallback(async (filePath) => {
+    if (!filePath) return;
+    await openFile({ path: filePath, name: filePath.split('/').pop() });
+  }, [openFile]);
+
+  const handleCopilotReviewFile = useCallback(async (stagedChange) => {
+    if (!stagedChange?.path) return;
+    const filePath = stagedChange.path;
+    const name = filePath.split('/').pop();
+    if (stagedChange.action === 'create') {
+      setOpenTabs(tabs => {
+        if (tabs.some(t => t.path === filePath)) return tabs;
+        return [...tabs, { path: filePath, name, content: '', isDirty: false }];
+      });
+      setActiveTabPath(filePath);
+    } else {
+      await openFile({ path: filePath, name });
+    }
+    setPendingContent(stagedChange.action === 'delete' ? '' : (stagedChange.proposedContent ?? ''));
+  }, [openFile]);
+
+  const handleCopilotApplyFile = useCallback(async (stagedChange) => {
+    if (!stagedChange?.path) return false;
+    const filePath = stagedChange.path;
+    if (stagedChange.action === 'delete') {
+      try {
+        await window.electronAPI.copilot.deleteFileOnDisk(projectId, filePath);
+        setOpenTabs(tabs => tabs.filter(t => t.path !== filePath));
+        if (activeTabPath === filePath) {
+          setPendingContent(null);
+          setActiveTabPath(null);
+        }
+        const fileRes = await window.electronAPI.project.getFiles(projectId);
+        if (fileRes?.success && fileRes.files) setFiles(fileRes.files);
+        await window.electronAPI.editor.gitCommit(projectId, `Copilot: deleted ${filePath}`);
+        setStatusMsg(`Copilot deleted ${filePath}`);
+        setTimeout(() => setStatusMsg(''), 3000);
+        return true;
+      } catch (e) {
+        setStatusMsg(`Failed to delete ${filePath}: ${e?.message || e}`);
+        setTimeout(() => setStatusMsg(''), 4000);
+        return false;
+      }
+    }
+
+    const newContent = stagedChange.proposedContent ?? '';
+    const writeRes = await window.electronAPI.editor.writeFile(projectId, filePath, newContent);
+    if (writeRes && writeRes.success === false) {
+      setStatusMsg(`Failed to save ${filePath}: ${writeRes.error || 'write error'}`);
+      setTimeout(() => setStatusMsg(''), 4000);
+      return false;
+    }
+
+    setOpenTabs(tabs => tabs.map(t =>
+      t.path === filePath ? { ...t, content: newContent, isDirty: false } : t
+    ));
+    if (activeTabPath === filePath) {
+      setPendingContent(null);
+    }
+    if (stagedChange.action === 'create') {
+      const fileRes = await window.electronAPI.project.getFiles(projectId);
+      if (fileRes?.success && fileRes.files) setFiles(fileRes.files);
+    }
+    await window.electronAPI.editor.gitCommit(projectId, `Copilot: applied changes to ${filePath}`);
+
+    const lower = filePath.toLowerCase();
+    if (showPreview && serverRunning && webviewRef.current && (lower.endsWith('tailwind.config.js') || lower.endsWith('globals.css') || lower.endsWith('theme.ts'))) {
+      setTimeout(() => {
+        if (webviewRef.current) webviewRef.current.src = webviewRef.current.src;
+      }, 400);
+    }
+    setStatusMsg(`Copilot applied changes to ${filePath}`);
+    setTimeout(() => setStatusMsg(''), 3000);
+    return true;
+  }, [activeTabPath, projectId, serverRunning, showPreview]);
+
+  const handleCopilotApplyAll = useCallback(async (stagedList) => {
+    if (!Array.isArray(stagedList) || stagedList.length === 0) return [];
+    const applied = [];
+    for (const sc of stagedList) {
+      const ok = await handleCopilotApplyFile(sc);
+      if (ok) applied.push(sc.path);
+    }
+    return applied;
+  }, [handleCopilotApplyFile]);
 
   // Manual git commit + push
   const handleCommit = async () => {
@@ -2378,6 +2625,22 @@ export default function EditorPage() {
                         <RotateCw className={`w-3 h-3 ${iframeLoading ? 'animate-spin text-indigo-600' : ''}`} />
                       </button>
                     </div>
+                    {isMobileExpo && expoGoUrl && (
+                      <button
+                        onClick={() => {
+                          try {
+                            navigator.clipboard?.writeText(expoGoUrl);
+                            setExpoUrlCopied(true);
+                            setTimeout(() => setExpoUrlCopied(false), 1800);
+                          } catch {}
+                        }}
+                        className="flex items-center gap-1 px-2 py-0.5 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded text-[10px] font-mono shrink-0 transition-colors"
+                        title={`Kopiraj Expo Go link: ${expoGoUrl}`}
+                      >
+                        {expoUrlCopied ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
+                        <span>{expoUrlCopied ? 'Kopirano' : 'Expo Go'}</span>
+                      </button>
+                    )}
                     <div className="flex items-center bg-slate-200 p-0.5 rounded gap-1 text-[10px]">
                       <button
                         onClick={() => setIsInspectMode(false)}
@@ -2565,16 +2828,24 @@ export default function EditorPage() {
                       {/* Server Not Running Placeholder */}
                       {!serverRunning && !isServerStarting && (
                         <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-slate-900/95 text-center px-6">
-                          <Monitor className="w-14 h-14 text-indigo-400/40 mb-4" />
-                          <h3 className="text-lg font-bold text-white mb-2">Razvojni server nije pokrenut</h3>
+                          {isMobileExpo ? (
+                            <Smartphone className="w-14 h-14 text-indigo-400/40 mb-4" />
+                          ) : (
+                            <Monitor className="w-14 h-14 text-indigo-400/40 mb-4" />
+                          )}
+                          <h3 className="text-lg font-bold text-white mb-2">
+                            {isMobileExpo ? 'Expo Metro server nije pokrenut' : 'Razvojni server nije pokrenut'}
+                          </h3>
                           <p className="text-slate-400 text-sm max-w-md mb-5">
-                            Pokrenite lokalni Next.js dev server kako biste videli interaktivni prikaz (Preview) aplikacije u realnom vremenu.
+                            {isMobileExpo
+                              ? 'Pokrenite lokalni Expo Metro server kako biste videli interaktivni mobilni prikaz (Preview) aplikacije u realnom vremenu.'
+                              : 'Pokrenite lokalni Next.js dev server kako biste videli interaktivni prikaz (Preview) aplikacije u realnom vremenu.'}
                           </p>
                           <button
                             onClick={toggleServer}
                             className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg font-semibold text-xs shadow-lg shadow-indigo-600/30 transition-all"
                           >
-                            <Play className="w-4 h-4 fill-white" /> Pokreni Dev Server
+                            <Play className="w-4 h-4 fill-white" /> {isMobileExpo ? 'Pokreni Expo Server' : 'Pokreni Dev Server'}
                           </button>
                         </div>
                       )}
@@ -2584,28 +2855,63 @@ export default function EditorPage() {
                         <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-slate-900/90 backdrop-blur-sm text-center px-6 transition-all duration-300">
                           <div className="relative mb-4">
                             <div className="w-12 h-12 rounded-full border-2 border-indigo-500/20 border-t-indigo-500 animate-spin" />
-                            <Monitor className="w-5 h-5 text-indigo-400 absolute inset-0 m-auto" />
+                            {isMobileExpo ? (
+                              <Smartphone className="w-5 h-5 text-indigo-400 absolute inset-0 m-auto" />
+                            ) : (
+                              <Monitor className="w-5 h-5 text-indigo-400 absolute inset-0 m-auto" />
+                            )}
                           </div>
                           <h4 className="text-sm font-semibold text-white mb-1">
-                            {isServerStarting ? 'Inicijalizacija servera...' : 'Kompajliranje projekta u toku...'}
+                            {isServerStarting
+                              ? (isMobileExpo ? 'Inicijalizacija Expo Metro servera...' : 'Inicijalizacija servera...')
+                              : (isMobileExpo ? 'Pakovanje mobilnog prikaza u toku...' : 'Kompajliranje projekta u toku...')}
                           </h4>
                           <p className="text-xs text-slate-400 max-w-sm">
-                            Next.js priprema rute, komponente i bazu. Stranica će se automatski prikazati čim bude spremna.
+                            {isMobileExpo
+                              ? 'Expo Metro priprema mobilne ekrane i resurse. Prikaz u okviru telefona će se automatski učitati čim bude spreman.'
+                              : 'Next.js priprema rute, komponente i bazu. Stranica će se automatski prikazati čim bude spremna.'}
                           </p>
                         </div>
                       )}
 
-                      <iframe
-                        ref={webviewRef}
-                        src={serverRunning ? previewUrl : 'about:blank'}
-                        className="flex-1 w-full border-none bg-white"
-                        title="Project Preview"
-                        sandbox="allow-same-origin allow-scripts allow-popups allow-forms"
-                        onLoad={() => {
-                          setIframeLoading(false);
-                          syncInspectMode(isInspectMode);
-                        }}
-                      />
+                      {isMobileExpo ? (
+                        <div className="flex-1 w-full flex items-center justify-center bg-slate-950 p-3 overflow-auto">
+                          <div
+                            className="relative flex flex-col w-[390px] max-w-full rounded-[36px] border-[7px] border-slate-800 bg-slate-900 shadow-[0_24px_60px_rgba(0,0,0,0.65)] ring-1 ring-slate-700/70 overflow-hidden shrink-0"
+                            style={{ height: 'min(844px, 100%)', minHeight: '480px' }}
+                          >
+                            <div className="h-5 bg-slate-900 flex items-center justify-center shrink-0 border-b border-slate-800/60">
+                              <div className="w-16 h-2.5 rounded-full bg-slate-950 border border-slate-800" />
+                            </div>
+                            <iframe
+                              ref={webviewRef}
+                              src={serverRunning ? previewUrl : 'about:blank'}
+                              className="flex-1 w-full border-none bg-white"
+                              title="Mobile Project Preview"
+                              sandbox="allow-same-origin allow-scripts allow-popups allow-forms"
+                              onLoad={() => {
+                                setIframeLoading(false);
+                                syncInspectMode(isInspectMode);
+                              }}
+                            />
+                            <div className="h-3.5 bg-slate-900 flex items-center justify-center shrink-0 border-t border-slate-800/60">
+                              <div className="w-24 h-1 rounded-full bg-slate-600/70" />
+                            </div>
+                          </div>
+                        </div>
+                      ) : (
+                        <iframe
+                          ref={webviewRef}
+                          src={serverRunning ? previewUrl : 'about:blank'}
+                          className="flex-1 w-full border-none bg-white"
+                          title="Project Preview"
+                          sandbox="allow-same-origin allow-scripts allow-popups allow-forms"
+                          onLoad={() => {
+                            setIframeLoading(false);
+                            syncInspectMode(isInspectMode);
+                          }}
+                        />
+                      )}
                     </div>
                   )}
                 </div>
@@ -2857,6 +3163,16 @@ export default function EditorPage() {
           />
         </div>
       </div>
+
+      {/* Isolated Floating AI Copilot (renders nothing unless a large native-tools model is active) */}
+      <CopilotWidget
+        projectId={projectId}
+        activeFile={activeTab || (showPreview ? activePreviewFile : null)}
+        onReviewStagedFile={handleCopilotReviewFile}
+        onApplyStagedFile={handleCopilotApplyFile}
+        onApplyAllStagedFiles={handleCopilotApplyAll}
+        onOpenFile={handleCopilotOpenFile}
+      />
     </div>
   );
 }

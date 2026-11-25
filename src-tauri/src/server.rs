@@ -204,6 +204,8 @@ pub fn extract_file_path_from_line(line: &str) -> Option<String> {
                     || norm_low.contains("_next/")
                     || norm_low.contains(".next/")
                     || norm_low.starts_with(".next")
+                    || norm_low.contains(".expo/")
+                    || norm_low.starts_with(".expo")
                     || norm_low.contains("/dist/")
                     || norm_low.starts_with("dist/")
                     || norm_low.contains("/build/")
@@ -218,10 +220,19 @@ pub fn extract_file_path_from_line(line: &str) -> Option<String> {
         }
     }
 
-    // Fallback: extensionless source paths emitted in TypeScript/Next build errors (e.g. `typeof import(".../src/app/models/page")`)
-    for token in cleaned.split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '(' | ')' | '`' | ',' | '<' | '>')) {
+    // Fallback: extensionless source paths emitted in TypeScript/Next/Metro build errors (e.g. `typeof import(".../src/app/models/page")` or `app/(tabs)/index`)
+    for token in cleaned.split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ',' | '<' | '>')) {
         let norm = token.replace('\\', "/");
-        let norm_trim = norm.trim_matches(|c: char| matches!(c, '[' | ']' | ':' | ';'));
+        let mut norm_trim = norm.trim_matches(|c: char| matches!(c, '[' | ']' | ':' | ';'));
+        if norm_trim.starts_with('(') {
+            let trimmed_open = norm_trim.trim_start_matches('(');
+            if !trimmed_open.is_empty() {
+                norm_trim = trimmed_open;
+            }
+        }
+        while norm_trim.ends_with(')') && norm_trim.matches(')').count() > norm_trim.matches('(').count() {
+            norm_trim = &norm_trim[..norm_trim.len() - 1];
+        }
         if norm_trim.is_empty() {
             continue;
         }
@@ -230,6 +241,7 @@ pub fn extract_file_path_from_line(line: &str) -> Option<String> {
             || low.starts_with("https://")
             || low.contains("node_modules/")
             || low.contains(".next/")
+            || low.contains(".expo/")
             || low.contains(".git/")
         {
             continue;
@@ -242,6 +254,15 @@ pub fn extract_file_path_from_line(line: &str) -> Option<String> {
         } else if low.starts_with("src/") && norm_trim.matches('/').count() >= 1 {
             return Some(norm_trim.trim_end_matches('/').to_string());
         } else if low.starts_with("./src/") && norm_trim.matches('/').count() >= 2 {
+            return Some(norm_trim[2..].trim_end_matches('/').to_string());
+        } else if let Some(app_idx) = low.find("/app/") {
+            let candidate = norm_trim[app_idx + 1..].trim_end_matches('/');
+            if candidate.matches('/').count() >= 1 {
+                return Some(candidate.to_string());
+            }
+        } else if low.starts_with("app/") && norm_trim.matches('/').count() >= 1 {
+            return Some(norm_trim.trim_end_matches('/').to_string());
+        } else if low.starts_with("./app/") && norm_trim.matches('/').count() >= 2 {
             return Some(norm_trim[2..].trim_end_matches('/').to_string());
         }
     }
@@ -313,7 +334,7 @@ pub fn collect_project_source_files(proj_dir: &Path) -> Vec<String> {
             if path.is_dir() {
                 if matches!(
                     name.as_ref(),
-                    "node_modules" | ".next" | ".git" | "dist" | "build" | "out" | "target" | ".axiom" | ".turbo" | ".vercel"
+                    "node_modules" | ".next" | ".expo" | ".expo-verify" | ".git" | "dist" | "build" | "out" | "target" | ".axiom" | ".turbo" | ".vercel"
                 ) {
                     continue;
                 }
@@ -937,7 +958,11 @@ impl CompileErrorDetector {
             || trimmed.starts_with("DELETE /")
             || trimmed.contains("✓ Compiled")
             || trimmed.contains("○ Compiling")
-            || trimmed.contains("✓ Ready in");
+            || trimmed.contains("✓ Ready in")
+            || trimmed.contains("Web Bundled")
+            || trimmed.contains("Waiting on http://")
+            || trimmed.contains("Web is waiting on")
+            || trimmed.contains("Metro waiting on");
 
         if is_boundary {
             if self.is_recording {
@@ -950,6 +975,11 @@ impl CompileErrorDetector {
             || clean_line.contains("Failed to compile") 
             || clean_line.contains("Module not found")
             || clean_line.contains("Cannot find module")
+            || clean_line.contains("Unable to resolve")
+            || clean_line.contains("Metro has encountered an error")
+            || clean_line.contains("Bundling failed")
+            || clean_line.contains("Web Bundling failed")
+            || clean_line.contains("TransformError")
             || clean_line.contains("Error:")
             || clean_line.contains("ReferenceError:")
             || clean_line.contains("TypeError:")
@@ -1175,39 +1205,46 @@ pub async fn server_start(
         }));
         proj_dir = proj_dir.join("src");
     }
-    
-    // Ensure multi-platform entry routes (Electron src/renderer/App.tsx, Mobile app/ routes) are bridged into src/app/page.tsx
-    ensure_multiplatform_entry_routes_bridged(&proj_dir);
-    sanitize_tailwind_config_in_project(&proj_dir);
 
-    // Ensure Axiom Live Visual Inspector is present in layout files for visual editing mode
-    ensure_axiom_inspector_injected(&proj_dir);
+    let is_expo = crate::templates_expo::is_expo_project_dir(&proj_dir);
+    if is_expo {
+        kill_process_on_port(8081);
+        crate::templates_expo::ensure_expo_html_inspector_injected(&proj_dir);
+        repair_package_json_dependencies(&proj_dir);
+    } else {
+        // Ensure multi-platform entry routes (Electron src/renderer/App.tsx, Mobile app/ routes) are bridged into src/app/page.tsx
+        ensure_multiplatform_entry_routes_bridged(&proj_dir);
+        sanitize_tailwind_config_in_project(&proj_dir);
 
-    // Ensure tsconfig.json is valid and not corrupted
-    ensure_valid_tsconfig(&proj_dir);
+        // Ensure Axiom Live Visual Inspector is present in layout files for visual editing mode
+        ensure_axiom_inspector_injected(&proj_dir);
 
-    // Ensure package.json has all required Next.js, Prisma, and Tailwind dependencies and scripts
-    repair_package_json_dependencies(&proj_dir);
+        // Ensure tsconfig.json is valid and not corrupted
+        ensure_valid_tsconfig(&proj_dir);
 
-    // Ensure NextAuth projects have NEXTAUTH_URL & NEXTAUTH_SECRET configured before server boot
-    crate::self_healing::ensure_nextauth_env_vars(&proj_dir);
+        // Ensure package.json has all required Next.js, Prisma, and Tailwind dependencies and scripts
+        repair_package_json_dependencies(&proj_dir);
 
-    // Auto-resolve route collisions between Pages Router and App Router
-    if proj_dir.join("src/app/api").exists() && proj_dir.join("src/pages/api").exists() {
-        let _ = std::fs::remove_dir_all(proj_dir.join("src/pages/api"));
-    }
+        // Ensure NextAuth projects have NEXTAUTH_URL & NEXTAUTH_SECRET configured before server boot
+        crate::self_healing::ensure_nextauth_env_vars(&proj_dir);
 
-    // Pre-flight: Auto-sanitize any bare 'react-icons' imports into specific subpaths (e.g. react-icons/hi)
-    ensure_react_icons_sanitized(&proj_dir);
+        // Auto-resolve route collisions between Pages Router and App Router
+        if proj_dir.join("src/app/api").exists() && proj_dir.join("src/pages/api").exists() {
+            let _ = std::fs::remove_dir_all(proj_dir.join("src/pages/api"));
+        }
 
-    // Pre-flight: Ensure barrel index.ts files exist in src/hooks, src/types, src/utils, src/config
-    ensure_directory_barrel_files(&proj_dir);
+        // Pre-flight: Auto-sanitize any bare 'react-icons' imports into specific subpaths (e.g. react-icons/hi)
+        ensure_react_icons_sanitized(&proj_dir);
 
-    // Pre-flight: Normalize any App Router route links across the project
-    let project_routes = get_project_routes_from_dir(&proj_dir);
-    let routes_list: Vec<String> = project_routes.into_iter().map(|(r, _)| r).collect();
-    if !routes_list.is_empty() {
-        normalize_project_route_links(&proj_dir, &routes_list);
+        // Pre-flight: Ensure barrel index.ts files exist in src/hooks, src/types, src/utils, src/config
+        ensure_directory_barrel_files(&proj_dir);
+
+        // Pre-flight: Normalize any App Router route links across the project
+        let project_routes = get_project_routes_from_dir(&proj_dir);
+        let routes_list: Vec<String> = project_routes.into_iter().map(|(r, _)| r).collect();
+        if !routes_list.is_empty() {
+            normalize_project_route_links(&proj_dir, &routes_list);
+        }
     }
 
     
@@ -1347,7 +1384,9 @@ pub async fn server_start(
         if let Ok(pkg_json) = serde_json::from_str::<Value>(&pkg_content) {
             if let Some(scripts) = pkg_json.get("scripts").and_then(|s| s.as_object()) {
                 let platform_str = options.platform.as_deref().unwrap_or("web");
-                if platform_str == "mobile" {
+                if is_expo || (platform_str == "mobile" && scripts.contains_key("web")) {
+                    run_args = vec!["run".to_string(), "web".to_string()];
+                } else if platform_str == "mobile" {
                     if scripts.contains_key("android") {
                         run_args = vec!["run".to_string(), "android".to_string()];
                     } else if scripts.contains_key("ios") {
@@ -1399,6 +1438,9 @@ pub async fn server_start(
         
     #[cfg(target_os = "windows")]
     cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    if is_expo {
+        cmd.env("BROWSER", "none").env("EXPO_NO_TELEMETRY", "1");
+    }
     
     match cmd.spawn() {
         Ok(mut child) => {
@@ -1425,6 +1467,10 @@ pub async fn server_start(
                             || filtered.contains("Failed to compile")
                             || filtered.contains("Ready in")
                             || filtered.contains("Local:")
+                            || filtered.contains("Waiting on http://")
+                            || filtered.contains("Web is waiting on")
+                            || filtered.contains("Web Bundled")
+                            || filtered.contains("exp://")
                             || filtered.contains(" 500 in ")
                             || filtered.contains("Cannot find module");
                         if is_important {
@@ -1508,8 +1554,11 @@ pub async fn server_stop(
         let _ = child.kill().await;
     }
 
-    // Always aggressively liberate port 3000 to prevent any lingering/zombie processes
+    // Always aggressively liberate port 3000 (and 8081 for Expo Metro) to prevent any lingering/zombie processes
     kill_process_on_port(3000);
+    if crate::templates_expo::is_expo_project_dir(&get_project_path(&project_id)) {
+        kill_process_on_port(8081);
+    }
 
     let _ = window.emit("server:status", serde_json::json!({
         "status": "stopped"

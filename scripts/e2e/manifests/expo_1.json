@@ -1,0 +1,99 @@
+{
+  "manifestId": "expo_1",
+  "platform": "mobile",
+  "projectType": "expo",
+  "resolvedStack": "React Native / Expo SDK 52 + Expo Router + TypeScript + AsyncStorage",
+  "name": "FieldPulse Site Inspector",
+  "description": "FieldPulse Site Inspector is an offline-first Expo React Native mobile application for construction site engineers to complete safety checklists, log structural defects, track active site alerts, and persist field inspection reports locally with AsyncStorage.",
+  "metadata": {
+    "name": "FieldPulse Site Inspector",
+    "description": "Offline-first Expo SDK 52 mobile app for construction site inspections, defect logs, and safety checklists."
+  },
+  "files": [
+    {
+      "path": "package.json",
+      "description": "Expo SDK 52, expo-router, react-native-web, react-native-safe-area-context, @expo/vector-icons, and @react-native-async-storage/async-storage configuration.",
+      "language": "json"
+    },
+    {
+      "path": "app.json",
+      "description": "Expo configuration with Metro web bundler, expo-router plugin, and scheme.",
+      "language": "json"
+    },
+    {
+      "path": "babel.config.js",
+      "description": "Babel preset-expo configuration.",
+      "language": "javascript"
+    },
+    {
+      "path": "metro.config.js",
+      "description": "Expo Metro bundler default configuration.",
+      "language": "javascript"
+    },
+    {
+      "path": "tsconfig.json",
+      "description": "TypeScript configuration extending expo/tsconfig.base with @/* path alias.",
+      "language": "json"
+    },
+    {
+      "path": "src/theme.ts",
+      "description": "Semantic design tokens (colors, spacing, radius, typography) for FieldPulse mobile UI.",
+      "language": "typescript"
+    },
+    {
+      "path": "app/+html.tsx",
+      "description": "Expo Router Web HTML document shell embedding the Axiom Live Edit inspector.",
+      "language": "typescript"
+    },
+    {
+      "path": "app/_layout.tsx",
+      "description": "Expo Router root Stack layout wrapped in SafeAreaProvider.",
+      "language": "typescript"
+    },
+    {
+      "path": "app/(tabs)/_layout.tsx",
+      "description": "Expo Router bottom tab navigator layout for index, inspections, defects, and settings.",
+      "language": "typescript"
+    },
+    {
+      "path": "src/types/index.ts",
+      "description": "Shared TypeScript types and interfaces: InspectionStatus ('PASS' | 'ACTION_REQUIRED' | 'PENDING'), SeverityLevel ('CRITICAL' | 'MAJOR' | 'MINOR'), ChecklistItem { id, label, passed }, SiteInspection { id, siteName, zone, inspector, status, updatedAt, checklist }, DefectItem { id, title, zone, severity, resolved, reportedAt, notes }.",
+      "language": "typescript"
+    },
+    {
+      "path": "src/store/useSiteStore.ts",
+      "description": "Offline-first React hook/store persisting SiteInspection[] and DefectItem[] to @react-native-async-storage/async-storage with realistic construction seed data and CRUD actions: addInspection, toggleChecklistItem, addDefect, toggleDefectResolved, resetDemoData, plus computed stats (passRate, openDefects, activeSites).",
+      "language": "typescript"
+    },
+    {
+      "path": "src/components/StatusPill.tsx",
+      "description": "Reusable React Native badge pill rendering InspectionStatus or SeverityLevel with StyleSheet.create and theme tokens from '@/theme'.",
+      "language": "typescript"
+    },
+    {
+      "path": "src/components/InspectionCard.tsx",
+      "description": "Reusable React Native Pressable card showing construction site name, zone, inspector, checklist completion ratio bar, StatusPill, and onPress handler styled with StyleSheet.create and '@/theme'.",
+      "language": "typescript"
+    },
+    {
+      "path": "app/(tabs)/index.tsx",
+      "description": "Home dashboard mobile screen wrapped in SafeAreaView (react-native-safe-area-context) and ScrollView, displaying KPI summary cards (Active Sites, Open Defects, Pass Rate), active safety alert banner, recent InspectionCard items, and quick navigation buttons via expo-router.",
+      "language": "typescript"
+    },
+    {
+      "path": "app/(tabs)/inspections.tsx",
+      "description": "Site inspections checklist screen with status filter chips (All, PASS, ACTION_REQUIRED, PENDING), interactive checklist item toggles, InspectionCard list, and an interactive form/modal to add a new inspection.",
+      "language": "typescript"
+    },
+    {
+      "path": "app/(tabs)/defects.tsx",
+      "description": "Structural defect tracker screen with severity filter chips (All, CRITICAL, MAJOR, MINOR), Pressable toggle to resolve/reopen defects, and a form to report a new defect.",
+      "language": "typescript"
+    },
+    {
+      "path": "app/(tabs)/settings.tsx",
+      "description": "Inspector profile & offline storage settings screen displaying inspector metadata, AsyncStorage sync stats, and a Pressable button to reset demo seed data.",
+      "language": "typescript"
+    }
+  ]
+}
