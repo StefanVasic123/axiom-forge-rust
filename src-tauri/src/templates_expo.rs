@@ -1493,4 +1493,162 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn test_strip_bogus_middleware_locale_redirect_preserves_auth_and_real_locale_projects() {
+        let mw = concat!(
+            "import { NextRequest, NextResponse } from 'next/server';\n",
+            "export async function middleware(request: NextRequest) {\n",
+            "  const pathname = request.nextUrl.pathname;\n",
+            "  if (pathname.startsWith('/dashboard/')) {\n",
+            "    return NextResponse.redirect(new URL('/login', request.url));\n",
+            "  }\n",
+            "  const locale = pathname.split('/')[1];\n",
+            "  if (locale && !['en', 'es'].includes(locale)) {\n",
+            "    return NextResponse.redirect(new URL('/en', request.url));\n",
+            "  }\n",
+            "  return NextResponse.next();\n",
+            "}\n"
+        );
+
+        let dir_no_locale = std::env::temp_dir().join(format!("axiom-mw-no-locale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir_no_locale);
+        std::fs::create_dir_all(dir_no_locale.join("src/app")).unwrap();
+
+        let cleaned = crate::sanitizer::strip_bogus_middleware_locale_rewrite(mw, "src/middleware.ts", Some(&dir_no_locale));
+        assert!(!cleaned.contains("'/en'"), "bogus locale redirect should be stripped, got:\n{}", cleaned);
+        assert!(!cleaned.contains("const locale"), "unused locale decl should be stripped, got:\n{}", cleaned);
+        assert!(cleaned.contains("'/login'"), "legitimate auth redirect MUST be preserved, got:\n{}", cleaned);
+
+        // When src/app/[locale] exists on disk, middleware MUST stay untouched
+        std::fs::create_dir_all(dir_no_locale.join("src/app/[locale]")).unwrap();
+        let preserved = crate::sanitizer::strip_bogus_middleware_locale_rewrite(mw, "src/middleware.ts", Some(&dir_no_locale));
+        assert_eq!(preserved, mw, "real [locale] project middleware must never be altered");
+
+        let _ = std::fs::remove_dir_all(&dir_no_locale);
+    }
+
+    #[test]
+    fn test_sanitize_openai_hybrid_configuration_with_v4_new_openai() {
+        let hybrid = concat!(
+            "import OpenAI from 'openai';\n",
+            "const openAiConfig = new Configuration({\n",
+            "  apiKey: process.env.OPENAI_API_KEY,\n",
+            "});\n",
+            "export const openaiClient = new OpenAI(openAiConfig);\n"
+        );
+        let fixed = crate::sanitizer::sanitize_openai_v3_to_v4(hybrid);
+        assert!(!fixed.contains("new Configuration("), "hybrid Configuration should be unwrapped, got:\n{}", fixed);
+        assert!(fixed.contains("apiKey: process.env.OPENAI_API_KEY"), "apiKey preserved, got:\n{}", fixed);
+        assert!(fixed.contains("new OpenAI(openAiConfig)"), "new OpenAI preserved, got:\n{}", fixed);
+
+        // Local class Configuration must never be touched
+        let local_cls = "import OpenAI from 'openai';\nclass Configuration { constructor(public o: any) {} }\nconst c = new Configuration({ apiKey: 'x' });\nconst client = new OpenAI(c as any);\n";
+        let untouched = crate::sanitizer::sanitize_openai_v3_to_v4(local_cls);
+        assert!(untouched.contains("new Configuration("), "local class Configuration must be preserved");
+    }
+
+    #[test]
+    fn test_ensure_server_prisma_import_skips_client_and_param_and_fixes_utils() {
+        let dir = std::env::temp_dir().join(format!("axiom-prisma-autoimp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src/lib")).unwrap();
+        std::fs::write(dir.join("src/lib/prisma.ts"), "export const prisma = {} as any;\nexport default prisma;\n").unwrap();
+
+        let util_src = "export const createSession = async (data: any) => prisma.audioSession.create({ data });\n";
+        let fixed = crate::self_healing::ensure_server_prisma_import_if_used(&dir, "src/utils/session.ts", util_src);
+        assert!(fixed.starts_with("import { prisma } from '@/lib/prisma';\n"), "expected named prisma import, got:\n{}", fixed);
+
+        // Client file must NEVER get Prisma imported
+        let client_src = "\"use client\";\nexport function Widget() { return prisma.user; }\n";
+        assert_eq!(crate::self_healing::ensure_server_prisma_import_if_used(&dir, "src/components/W.tsx", client_src), client_src);
+
+        // Parameter-injected prisma must NEVER get Prisma imported
+        let param_src = "export const helper = (prisma: any) => prisma.user.findMany();\n";
+        assert_eq!(crate::self_healing::ensure_server_prisma_import_if_used(&dir, "src/utils/h.ts", param_src), param_src);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_expo_router_route_link_reconciliation_fixes_tabs_prefix_and_kebab_case() {
+        let dir = std::env::temp_dir().join(format!("axiom-expo-routes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("app/(tabs)")).unwrap();
+        std::fs::write(dir.join("package.json"), r#"{"dependencies":{"expo":"~52.0.0","expo-router":"~4.0.0"}}"#).unwrap();
+        std::fs::write(dir.join("app/(tabs)/_layout.tsx"), "export default function L() { return null; }\n").unwrap();
+        std::fs::write(dir.join("app/(tabs)/addExpense.tsx"), "export default function A() { return null; }\n").unwrap();
+        std::fs::write(dir.join("app/(tabs)/budgets.tsx"), "export default function B() { return null; }\n").unwrap();
+        std::fs::write(
+            dir.join("app/(tabs)/index.tsx"),
+            "export default function Home({ router }: any) { router.push('/tabs/add-expense'); router.push('/budgets'); return null; }\n",
+        )
+        .unwrap();
+
+        let routes = crate::sanitizer::collect_expo_router_routes(&dir);
+        assert!(routes.contains(&"/".to_string()) && routes.contains(&"/addExpense".to_string()) && routes.contains(&"/budgets".to_string()), "got routes: {:?}", routes);
+        crate::sanitizer::normalize_project_route_links(&dir, &routes);
+
+        let after = std::fs::read_to_string(dir.join("app/(tabs)/index.tsx")).unwrap();
+        assert!(after.contains("router.push('/addExpense')"), "expected /tabs/add-expense rewritten to /addExpense, got:\n{}", after);
+        assert!(after.contains("router.push('/budgets')"), "expected valid /budgets preserved, got:\n{}", after);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_expo_fixes_search_params_array_destructure_and_top_level_stylesheet_state_ternary() {
+        let src = concat!(
+            "import React, { useState } from 'react';\n",
+            "import { View, StyleSheet } from 'react-native';\n",
+            "import { useLocalSearchParams } from 'expo-router';\n",
+            "import { theme } from '@/theme';\n",
+            "export default function Screen() {\n",
+            "  const [params] = useLocalSearchParams<{ category?: string }>();\n",
+            "  const [selectedCategory, setSelectedCategory] = useState('ALL');\n",
+            "  return <View style={styles.btn} />;\n",
+            "}\n",
+            "const styles = StyleSheet.create({\n",
+            "  btn: {\n",
+            "    backgroundColor: selectedCategory === 'FOOD' ? theme.colors.primary : 'transparent',\n",
+            "    color: selectedCategory === 'FOOD' ? theme.colors.surface : theme.colors.primaryText,\n",
+            "  },\n",
+            "});\n"
+        );
+        let cleaned = crate::sanitizer::sanitize_expo_react_native_file(src, "app/(tabs)/expenses.tsx");
+        assert!(
+            cleaned.contains("const params = useLocalSearchParams<"),
+            "expected array destructuring of useLocalSearchParams unwrapped, got:\n{}",
+            cleaned
+        );
+        assert!(
+            !cleaned.contains("backgroundColor: selectedCategory") && cleaned.contains("backgroundColor: 'transparent',"),
+            "expected out-of-scope state ternary in top-level StyleSheet replaced with safe fallback, got:\n{}",
+            cleaned
+        );
+        assert!(
+            !cleaned.contains("color: selectedCategory") && cleaned.contains("color: theme.colors.primaryText,"),
+            "expected second out-of-scope state ternary replaced with safe fallback, got:\n{}",
+            cleaned
+        );
+
+        // Negative test: StyleSheet.create inside component scope (indented) must NOT be altered
+        let in_scope = concat!(
+            "import React, { useState } from 'react';\n",
+            "import { View, StyleSheet } from 'react-native';\n",
+            "export default function Scoped() {\n",
+            "  const [active, setActive] = useState(false);\n",
+            "  const styles = StyleSheet.create({\n",
+            "    box: { backgroundColor: active ? '#fff' : '#000' },\n",
+            "  });\n",
+            "  return <View style={styles.box} />;\n",
+            "}\n"
+        );
+        let kept = crate::sanitizer::sanitize_expo_react_native_file(in_scope, "app/(tabs)/scoped.tsx");
+        assert!(
+            kept.contains("active ? '#fff' : '#000'"),
+            "in-scope StyleSheet inside component must never be altered, got:\n{}",
+            kept
+        );
+    }
 }

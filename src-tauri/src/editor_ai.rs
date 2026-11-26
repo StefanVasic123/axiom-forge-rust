@@ -1508,6 +1508,53 @@ pub fn expand_global_theme_targets(
     targets
 }
 
+/// Detects when an LLM accidentally returns an unrelated auxiliary file (e.g., a non-JSX hook
+/// like `useInvoices.ts`) instead of the target React/TSX component or page.
+pub fn detect_wrong_file_overwrite(rel_file_path: &str, original: &str, candidate: &str) -> Option<String> {
+    let low = rel_file_path.replace('\\', "/").to_ascii_lowercase();
+    let is_jsx_file = low.ends_with(".tsx") || low.ends_with(".jsx");
+    if !is_jsx_file {
+        return None;
+    }
+
+    let orig_clean = strip_axiom_inspector_script(original);
+    let orig_has_jsx = (orig_clean.contains("</") || orig_clean.contains("/>"))
+        && (orig_clean.contains("return (") || orig_clean.contains("return(") || orig_clean.contains("return <"));
+    let cand_has_jsx = candidate.contains("</") || candidate.contains("/>");
+
+    if orig_has_jsx && !cand_has_jsx {
+        return Some(format!(
+            "AI returned a non-JSX module instead of JSX target file '{}'; aborted to avoid overwriting the file.",
+            rel_file_path
+        ));
+    }
+
+    let is_hook_or_store_path = low.contains("/hooks/")
+        || low.starts_with("hooks/")
+        || low.contains("/store/")
+        || low.starts_with("store/");
+    if !is_hook_or_store_path && orig_has_jsx {
+        if let Ok(re_def) = regex::Regex::new(r"(?m)^\s*export\s+default\s+(?:function\s+)?([A-Za-z_$][A-Za-z0-9_$]*)") {
+            let orig_sym = re_def.captures(&orig_clean).and_then(|c| c.get(1)).map(|m| m.as_str());
+            let cand_sym = re_def.captures(candidate).and_then(|c| c.get(1)).map(|m| m.as_str());
+            let looks_like_hook = |s: &str| {
+                s.starts_with("use")
+                    && s.chars().nth(3).map(|c| c.is_ascii_uppercase()).unwrap_or(false)
+            };
+            if let Some(cs) = cand_sym {
+                if looks_like_hook(cs) && !orig_sym.map(looks_like_hook).unwrap_or(false) {
+                    return Some(format!(
+                        "AI returned hook '{}' instead of UI target file '{}'; aborted to avoid overwriting the file.",
+                        cs, rel_file_path
+                    ));
+                }
+            }
+        }
+    }
+
+    None
+}
+
 #[tauri::command]
 pub async fn editor_ai_edit(
     file_path: String,
@@ -1663,7 +1710,7 @@ pub async fn editor_ai_edit(
                             if dep_full_path.exists() {
                                 if let Ok(dep_content) = fs::read_to_string(&dep_full_path) {
                                     let dep_block = format!(
-                                        "\n--- Related File Context: {} ---\n{}\n-----------------------------------\n",
+                                        "\n--- READ-ONLY Reference File (DO NOT return this file): {} ---\n{}\n-----------------------------------\n",
                                         dep_path_str,
                                         truncate_chars(&dep_content, 900)
                                     );
@@ -1677,11 +1724,14 @@ pub async fn editor_ai_edit(
         }
     }
 
+    let core_user_prompt = user_prompt.clone();
     if !aux_context.is_empty() {
-        user_prompt.push_str(&format!(
-            "\nProject Contracts & Related Context:\n{}",
-            aux_context
-        ));
+        user_prompt = format!(
+            "READ-ONLY Project Contracts & Reference Context (for awareness ONLY — NEVER output or copy these files; ONLY edit '{}'):\n{}\n\n{}",
+            rel_file_path,
+            aux_context,
+            core_user_prompt
+        );
     }
 
     let mut last_error: Option<String> = None;
@@ -1693,9 +1743,10 @@ pub async fn editor_ai_edit(
             (
                 &full_file_retry_system_prompt,
                 format!(
-                    "{}\n\nIMPORTANT RETRY INSTRUCTION: Your previous edit could not be applied cleanly ({}). Return ONLY the COMPLETE updated file content from top to bottom (including all imports and exports) with the requested change applied. Do NOT return JSON or a partial fragment.",
-                    user_prompt,
-                    last_error.as_deref().unwrap_or("format/target mismatch")
+                    "{}\n\nIMPORTANT RETRY INSTRUCTION: Your previous edit could not be applied cleanly ({}). Return ONLY the COMPLETE updated content of target file '{}' from top to bottom (including all imports and exports) with the requested change applied. Do NOT return JSON, a partial fragment, or any other file.",
+                    core_user_prompt,
+                    last_error.as_deref().unwrap_or("format/target mismatch"),
+                    rel_file_path
                 ),
             )
         };
@@ -1869,6 +1920,15 @@ pub async fn editor_ai_edit(
                     || (clean_content.lines().count() >= 15 && clean_content.lines().count() >= (content.lines().count() / 2));
 
                 if is_complete_code {
+                    if let Some(guard_err) = detect_wrong_file_overwrite(&rel_file_path, &content, &clean_content) {
+                        debug_log_to_file(format!(
+                            "[AI Edit Safety Guard] Attempt {} blocked wrong-file overwrite: {}",
+                            attempt + 1,
+                            guard_err
+                        ));
+                        last_error = Some(guard_err);
+                        continue;
+                    }
                     debug_log_to_file("[AI Edit] Accepting full file content.".to_string());
                     final_content = post_process_edited_file(&proj_dir, &rel_file_path, &clean_content, true);
                 } else if let Some(spliced) = try_splice_partial_jsx_snippet(&content, &clean_content) {

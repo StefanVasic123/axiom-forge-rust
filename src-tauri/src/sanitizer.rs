@@ -3167,7 +3167,7 @@ pub fn strip_bogus_middleware_locale_rewrite(
             }
         }
     }
-    if !content.contains("NextResponse.rewrite") {
+    if !content.contains("NextResponse.rewrite") && !content.contains("NextResponse.redirect") {
         return content.to_string();
     }
 
@@ -3185,8 +3185,11 @@ pub fn strip_bogus_middleware_locale_rewrite(
             };
             let header = &out[m_start..m_end];
             let block_body = &out[open_brace..=close_brace];
-            let has_locale_rewrite = block_body.contains("NextResponse.rewrite")
-                && (header.contains("locale") || block_body.contains("${locale}") || block_body.contains("`${locale}"));
+            let has_locale_rewrite = (block_body.contains("NextResponse.rewrite")
+                || block_body.contains("NextResponse.redirect"))
+                && (header.contains("locale")
+                    || block_body.contains("${locale}")
+                    || block_body.contains("`${locale}"));
             if has_locale_rewrite {
                 let mut del_end = close_brace + 1;
                 let bytes = out.as_bytes();
@@ -5034,11 +5037,89 @@ pub fn resolve_best_matching_route(href: &str, valid_routes: &[String]) -> Optio
     if matches.len() == 1 {
         return Some(matches[0].clone());
     }
+
+    // Canonical alphanumeric fallback (e.g., `/tabs/add-expense` -> `/addExpense` when uniquely matched)
+    if matches.is_empty() {
+        let canon = |s: &str| -> String {
+            s.chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .map(|c| c.to_ascii_lowercase())
+                .collect()
+        };
+        let target_canon = canon(stripped_slug);
+        if !target_canon.is_empty() {
+            let canon_matches: Vec<&String> = valid_routes
+                .iter()
+                .filter(|r| {
+                    let last = r.trim_end_matches('/').split('/').filter(|s| !s.is_empty()).last().unwrap_or("");
+                    !last.is_empty() && !last.starts_with('[') && canon(last) == target_canon
+                })
+                .collect();
+            if canon_matches.len() == 1 {
+                return Some(canon_matches[0].clone());
+            }
+        }
+    }
     None
 }
 
+/// Collects real Expo Router routes from `app/` (stripping `(group)` segments like `(tabs)`,
+/// ignoring `_layout`, `+html`, `+not-found`, and mapping `index` to `/`).
+pub fn collect_expo_router_routes(proj_dir: &std::path::Path) -> Vec<String> {
+    let app_dir = if proj_dir.join("app").is_dir() {
+        proj_dir.join("app")
+    } else if proj_dir.join("src/app").is_dir() {
+        proj_dir.join("src/app")
+    } else {
+        return Vec::new();
+    };
+
+    let mut routes = Vec::new();
+    fn walk_expo_routes(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                walk_expo_routes(root, &p, out);
+            } else if p.is_file() {
+                let Some(ext) = p.extension().and_then(|e| e.to_str()) else { continue };
+                if !matches!(ext, "tsx" | "ts" | "jsx" | "js") {
+                    continue;
+                }
+                let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else { continue };
+                if stem.starts_with('_') || stem.starts_with('+') {
+                    continue;
+                }
+                let Ok(rel) = p.strip_prefix(root) else { continue };
+                let mut segs: Vec<String> = Vec::new();
+                for comp in rel.parent().into_iter().flat_map(|par| par.components()) {
+                    let s = comp.as_os_str().to_string_lossy().to_string();
+                    if s.is_empty() || (s.starts_with('(') && s.ends_with(')')) {
+                        continue;
+                    }
+                    segs.push(s);
+                }
+                if stem != "index" {
+                    segs.push(stem.to_string());
+                }
+                let route = if segs.is_empty() {
+                    "/".to_string()
+                } else {
+                    format!("/{}", segs.join("/"))
+                };
+                if !out.contains(&route) {
+                    out.push(route);
+                }
+            }
+        }
+    }
+    walk_expo_routes(&app_dir, &app_dir, &mut routes);
+    routes.sort();
+    routes
+}
+
 pub fn sanitize_app_router_links_with_routes(content: &str, valid_routes: &[String]) -> String {
-    if valid_routes.is_empty() || (!content.contains("<Link") && !content.contains("router.push")) {
+    if valid_routes.is_empty() || (!content.contains("<Link") && !content.contains("router.push") && !content.contains("router.replace")) {
         return content.to_string();
     }
 
@@ -5056,13 +5137,14 @@ pub fn sanitize_app_router_links_with_routes(content: &str, valid_routes: &[Stri
         }
     }
 
-    if let Ok(re) = regex::Regex::new(r#"router\.push\s*\(\s*(["'])(/[^"'\s)]+)["']\s*\)"#) {
+    if let Ok(re) = regex::Regex::new(r#"router\.(push|replace)\s*\(\s*(["'])(/[^"'\s)]+)["']\s*\)"#) {
         for cap in re.captures_iter(content) {
-            let quote = cap.get(1).map(|m| m.as_str()).unwrap_or("\"");
-            let href = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+            let method = cap.get(1).map(|m| m.as_str()).unwrap_or("push");
+            let quote = cap.get(2).map(|m| m.as_str()).unwrap_or("\"");
+            let href = cap.get(3).map(|m| m.as_str()).unwrap_or("");
             if let Some(replacement) = resolve_best_matching_route(href, valid_routes) {
-                let old_target = format!("router.push({}{}{})", quote, href, quote);
-                let new_target = format!("router.push({}{}{})", quote, replacement, quote);
+                let old_target = format!("router.{}({}{}{})", method, quote, href, quote);
+                let new_target = format!("router.{}({}{}{})", method, quote, replacement, quote);
                 result = result.replace(&old_target, &new_target);
             }
         }
@@ -5338,7 +5420,7 @@ pub fn normalize_project_route_links(proj_dir: &std::path::Path, valid_routes: &
                     let path_str = path.to_string_lossy();
                     if path_str.ends_with(".tsx") || path_str.ends_with(".jsx") {
                         if let Ok(content) = std::fs::read_to_string(&path) {
-                            if content.contains("<Link") || content.contains("router.push") {
+                            if content.contains("<Link") || content.contains("router.push") || content.contains("router.replace") {
                                 let sanitized = sanitize_app_router_links_with_routes(&content, valid_routes);
                                 if sanitized != content {
                                     let _ = std::fs::write(&path, sanitized);
@@ -7479,6 +7561,65 @@ pub fn sanitize_expo_react_native_file(content: &str, rel_path: &str) -> String 
                             format!("{}{}", &caps[1], ident)
                         })
                         .to_string();
+                }
+            }
+        }
+    }
+
+    // Fix erroneous array destructuring of Expo Router search params (`const [p] = useLocalSearchParams()` -> `const p = ...`)
+    if out.contains("useLocalSearchParams") || out.contains("useGlobalSearchParams") {
+        if let Ok(re_sp) = regex::Regex::new(
+            r"(?m)^([ \t]*(?:const|let|var)\s+)\[\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\](\s*=\s*use(?:Local|Global)SearchParams\b)",
+        ) {
+            out = re_sp.replace_all(&out, "${1}${2}${3}").to_string();
+        }
+    }
+
+    // Strip out-of-scope component `useState` ternaries inside top-level `StyleSheet.create({...})`
+    // (which otherwise crash at module load with `ReferenceError: <stateVar> is not defined`).
+    if (norm.ends_with(".tsx") || norm.ends_with(".jsx"))
+        && out.contains("StyleSheet.create(")
+        && out.contains("useState")
+    {
+        let mut local_state_vars: Vec<String> = Vec::new();
+        if let Ok(re_st) = regex::Regex::new(
+            r"(?m)^[ \t]+(?:const|let|var)\s+\[\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*,[^\]\r\n]*\]\s*=\s*(?:React\.)?useState\b",
+        ) {
+            for cap in re_st.captures_iter(&out) {
+                if let Some(m) = cap.get(1) {
+                    let ident = m.as_str().to_string();
+                    let top_decl_pat = format!(r"(?m)^(?:export\s+)?(?:const|let|var|function|class)\s+{}\b", regex::escape(&ident));
+                    let is_top_level = regex::Regex::new(&top_decl_pat)
+                        .map(|r| r.is_match(&out))
+                        .unwrap_or(false);
+                    if !is_top_level && !local_state_vars.contains(&ident) {
+                        local_state_vars.push(ident);
+                    }
+                }
+            }
+        }
+        if !local_state_vars.is_empty() {
+            if let Ok(re_top_ss) = regex::Regex::new(
+                r"(?m)^(?:export\s+)?(?:const|let|var)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*StyleSheet\.create\s*\(\s*\{",
+            ) {
+                if let Some(m) = re_top_ss.find(&out) {
+                    let open_brace = m.end() - 1;
+                    if let Some(close_brace) = find_balanced_delimiter_bytes(&out, open_brace, b'{', b'}') {
+                        let mut ss_body = out[open_brace + 1..close_brace].to_string();
+                        let original_ss = ss_body.clone();
+                        for var in &local_state_vars {
+                            let pat = format!(
+                                r"(?m)^([ \t]*[A-Za-z_$][A-Za-z0-9_$]*\s*:\s*)[^?\r\n]*\b{}\b[^?\r\n]*\?[^:\r\n]*:\s*([^,\r\n}}]+)",
+                                regex::escape(var)
+                            );
+                            if let Ok(re_tern) = regex::Regex::new(&pat) {
+                                ss_body = re_tern.replace_all(&ss_body, "${1}${2}").to_string();
+                            }
+                        }
+                        if ss_body != original_ss {
+                            out.replace_range(open_brace + 1..close_brace, &ss_body);
+                        }
+                    }
                 }
             }
         }
@@ -13181,8 +13322,12 @@ pub fn sanitize_openai_v3_to_v4(content: &str) -> String {
     if let Ok(api_re) = regex::Regex::new(r"\bnew\s+OpenAIApi\s*\(\s*new\s+Configuration\s*\(([^)]*)\)\s*\)") {
         out = api_re.replace_all(&out, "new OpenAI($1)").to_string();
     }
-    // Fallback if `new Configuration(...)` and `new OpenAIApi(...)` are separated by other statements
-    if out.contains("new Configuration(") && out.contains("new OpenAIApi(") {
+    // Fallback if `new Configuration(...)` is paired with `new OpenAIApi(...)` OR already-v4 `new OpenAI(...)`
+    let has_local_config_decl = out.contains("class Configuration") || out.contains("function Configuration");
+    if !has_local_config_decl
+        && out.contains("new Configuration(")
+        && (out.contains("new OpenAIApi(") || out.contains("new OpenAI("))
+    {
         if let Ok(standalone_cfg_re) = regex::Regex::new(r"\bnew\s+Configuration\s*\(\s*(\{[^)]*\})\s*\)") {
             out = standalone_cfg_re.replace_all(&out, "$1").to_string();
         }

@@ -1209,6 +1209,80 @@ fn restore_pending_file_snapshot(proj_dir: &std::path::Path, rel_path: &str, bef
     }
 }
 
+/// Safely auto-imports `prisma` in server-side `.ts`/`.tsx`/`.js`/`.jsx` modules (e.g. `src/utils/*.ts`,
+/// `src/services/*.ts`) that call `prisma.<model>` without importing, declaring, or taking `prisma` as a parameter.
+/// Strictly skips `"use client"` modules, `lib/prisma.*` itself, and projects without a local prisma singleton file.
+pub fn ensure_server_prisma_import_if_used(
+    proj_dir: &std::path::Path,
+    rel_path: &str,
+    content: &str,
+) -> String {
+    let low = rel_path.replace('\\', "/").to_ascii_lowercase();
+    if low.ends_with(".d.ts")
+        || low.ends_with("/lib/prisma.ts")
+        || low.ends_with("/lib/prisma.js")
+        || low == "lib/prisma.ts"
+        || low == "lib/prisma.js"
+    {
+        return content.to_string();
+    }
+    if !content.contains("prisma.") {
+        return content.to_string();
+    }
+    // Never import Prisma into client components
+    let is_client_file = content
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with("//"))
+        .take(3)
+        .any(|l| l.starts_with("\"use client\"") || l.starts_with("'use client'"));
+    if is_client_file {
+        return content.to_string();
+    }
+
+    let prisma_lib_path = [
+        ("src/lib/prisma.ts", "@/lib/prisma"),
+        ("src/lib/prisma.js", "@/lib/prisma"),
+        ("lib/prisma.ts", "@/lib/prisma"),
+        ("lib/prisma.js", "@/lib/prisma"),
+    ]
+    .into_iter()
+    .find(|(p, _)| proj_dir.join(p).is_file());
+
+    let Some((disk_rel, import_spec)) = prisma_lib_path else {
+        return content.to_string();
+    };
+
+    // Require standalone `prisma.<ident>` (not `something.prisma.<ident>`)
+    let uses_bare_prisma = regex::Regex::new(r"(?:^|[^.\w$])prisma\.[a-zA-Z_$]")
+        .map(|r| r.is_match(content))
+        .unwrap_or(false);
+    if !uses_bare_prisma {
+        return content.to_string();
+    }
+
+    let has_prisma_binding = regex::Regex::new(
+        r"(?m)(?:import\s+[^\n;]*\bprisma\b|(?:const|let|var)\s+prisma\b|[(,]\s*prisma\s*(?:[:=,)\n]))",
+    )
+    .map(|r| r.is_match(content))
+    .unwrap_or(true);
+    if has_prisma_binding {
+        return content.to_string();
+    }
+
+    let prisma_src = std::fs::read_to_string(proj_dir.join(disk_rel)).unwrap_or_default();
+    let has_named_export = prisma_src.contains("export const prisma")
+        || prisma_src.contains("export let prisma")
+        || prisma_src.contains("export { prisma")
+        || prisma_src.contains("export {prisma");
+    let import_line = if has_named_export {
+        format!("import {{ prisma }} from '{}';\n", import_spec)
+    } else {
+        format!("import prisma from '{}';\n", import_spec)
+    };
+    format!("{}{}", import_line, content)
+}
+
 pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
     if crate::templates_expo::is_expo_project_dir(proj_dir) {
         crate::packages::repair_package_json_dependencies(proj_dir);
@@ -1247,6 +1321,10 @@ pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
             }
         }
         crate::sanitizer::reconcile_expo_types_and_unions_in_project(proj_dir);
+        let expo_routes = crate::sanitizer::collect_expo_router_routes(proj_dir);
+        if !expo_routes.is_empty() {
+            crate::sanitizer::normalize_project_route_links(proj_dir, &expo_routes);
+        }
         let _ = crate::ast_engine::reconcile_hook_contracts_in_project(proj_dir);
         let _ = auto_import_missing_symbols_in_project(proj_dir);
         crate::templates_expo::ensure_expo_html_inspector_injected(proj_dir);
@@ -1324,6 +1402,7 @@ pub fn run_hygiene_pass_on_project(proj_dir: &std::path::Path) {
                             next = crate::sanitizer::sanitize_tsx_ux_glitches(&next, &rel);
                             next = crate::sanitizer::reconcile_server_prisma_enum_usage(proj_dir, &rel, &next);
                             next = crate::sanitizer::reconcile_client_prisma_enum_mocks(proj_dir, &rel, &next);
+                            next = ensure_server_prisma_import_if_used(proj_dir, &rel, &next);
                             if crate::sanitizer::is_app_router_route_file(&rel) {
                                 next = crate::sanitizer::sanitize_app_router_route_exports(&next, &rel);
                             }

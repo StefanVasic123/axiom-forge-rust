@@ -1815,4 +1815,47 @@ export async function PUT(request: Request) {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    #[test]
+    fn test_single_file_ai_edit_blocks_wrong_aux_file_overwrite() {
+        let orig_page = concat!(
+            "\"use client\";\n",
+            "import Link from 'next/link';\n",
+            "export default function Home() {\n",
+            "  return (\n",
+            "    <div className=\"p-8\"><h1>Welcome</h1><Link href=\"/dashboard\">Go</Link></div>\n",
+            "  );\n",
+            "}\n"
+        );
+        let wrong_hook = concat!(
+            "import { useState } from 'react';\n",
+            "export const useInvoices = () => {\n",
+            "  const [invoices, setInvoices] = useState([]);\n",
+            "  return { invoices, isLoading: false, error: null };\n",
+            "};\n",
+            "export default useInvoices;\n"
+        );
+        let valid_page_edit = concat!(
+            "\"use client\";\n",
+            "import Link from 'next/link';\n",
+            "export default function Home() {\n",
+            "  return (\n",
+            "    <div className=\"p-8\"><h1>PulseLedger Live</h1><Link href=\"/dashboard\">Open</Link></div>\n",
+            "  );\n",
+            "}\n"
+        );
+
+        assert!(
+            crate::editor_ai::detect_wrong_file_overwrite("src/app/page.tsx", orig_page, wrong_hook).is_some(),
+            "non-JSX hook returned for JSX page must be rejected"
+        );
+        assert!(
+            crate::editor_ai::detect_wrong_file_overwrite("src/app/page.tsx", orig_page, valid_page_edit).is_none(),
+            "valid JSX page edit must be accepted"
+        );
+        assert!(
+            crate::editor_ai::detect_wrong_file_overwrite("src/hooks/useInvoices.ts", wrong_hook, wrong_hook).is_none(),
+            "non-JSX .ts hook edits must never be blocked"
+        );
+    }
+
 
