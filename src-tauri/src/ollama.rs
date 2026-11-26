@@ -51,7 +51,16 @@ pub fn has_token(key: String) -> HasTokenResult {
 
 #[tauri::command]
 pub fn clear_all_tokens() -> Result<(), String> {
-    let keys = vec!["github-token", "vercel-token", "netlify-token", "render-token", "hostinger-token"];
+    let keys = vec![
+        "github-token",
+        "vercel-token",
+        "neon-token",
+        "cloudflare-token",
+        "netlify-token",
+        "render-token",
+        "hostinger-token",
+        "resend-token",
+    ];
     for key in keys {
         if let Ok(entry) = get_entry(key) {
             let _ = entry.delete_password();

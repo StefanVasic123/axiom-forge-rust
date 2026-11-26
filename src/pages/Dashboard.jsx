@@ -208,17 +208,17 @@ function ProjectCard({
                     {project.status === 'generating' ? t('dashboard.viewProgress') : t('dashboard.resumeGen')}
                   </button>
                 )}
-                {project.status === 'ready' && (
+                {(project.status === 'ready' || project.status === 'live' || project.status === 'error') && (
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
                       setShowMenu(false);
-                      window.electronAPI.task.startDeployment(project.id);
+                      navigate(`/projects/${project.id}?publish=1`);
                     }}
                     className="w-full flex items-center gap-2 px-4 py-2 text-sm text-emerald-400 hover:bg-slate-800"
                   >
                     <Play className="w-4 h-4" />
-                    {t('dashboard.deploy')}
+                    {project.status === 'live' ? 'Publish / Domain' : t('dashboard.deploy')}
                   </button>
                 )}
                 <hr className="my-1 border-slate-800" />

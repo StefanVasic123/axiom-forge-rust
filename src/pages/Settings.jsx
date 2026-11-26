@@ -490,6 +490,26 @@ function Settings() {
           <hr className="border-slate-800" />
 
           <TokenInput
+            label="Neon PostgreSQL API Key"
+            tokenKey="neon-token"
+            helpUrl="https://console.neon.tech/app/settings/api-keys"
+            description="Enables 1-click serverless PostgreSQL provisioning + automatic Vercel DATABASE_URL & Prisma push"
+            onSave={saveToken}
+          />
+
+          <hr className="border-slate-800" />
+
+          <TokenInput
+            label="Cloudflare API Token (Optional Auto-DNS)"
+            tokenKey="cloudflare-token"
+            helpUrl="https://dash.cloudflare.com/profile/api-tokens"
+            description="Optional: Zone DNS Edit token for 1-click automatic A/CNAME DNS configuration on custom domains"
+            onSave={saveToken}
+          />
+
+          <hr className="border-slate-800" />
+
+          <TokenInput
             label="Netlify Token"
             tokenKey="netlify-token"
             helpUrl="https://app.netlify.com/user/settings/applications#personal-access-tokens"

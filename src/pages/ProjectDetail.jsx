@@ -4,7 +4,7 @@
  */
 
 import React, { useEffect, useState } from 'react';
-import { useParams, useNavigate, Link } from 'react-router-dom';
+import { useParams, useNavigate, useSearchParams, Link } from 'react-router-dom';
 import { 
   ArrowLeft, 
   Folder, 
@@ -19,10 +19,14 @@ import {
   AlertCircle,
   Clock,
   Code2,
-  WifiOff
+  WifiOff,
+  Rocket,
+  Palette
 } from 'lucide-react';
 import { useAppStore } from '../hooks/useAppStore';
 import { useI18n } from '../i18n/I18nContext';
+import PublishModal from '../components/PublishModal';
+import BrandLogoModal from '../components/BrandLogoModal';
 
 // File tree component
 function FileTree({ files, onSelect }) {
@@ -132,6 +136,7 @@ function StatusBadge({ status, offlineWaiting = false }) {
 function ProjectDetail() {
   const { projectId } = useParams();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const { t } = useI18n();
   const { 
     projects, 
@@ -145,6 +150,8 @@ function ProjectDetail() {
   const [project, setProject] = useState(null);
   const [selectedFile, setSelectedFile] = useState(null);
   const [isDeploying, setIsDeploying] = useState(false);
+  const [showPublishModal, setShowPublishModal] = useState(false);
+  const [showBrandLogoModal, setShowBrandLogoModal] = useState(false);
   const [isCommitting, setIsCommitting] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [deployMessage, setDeployMessage] = useState(null);
@@ -158,6 +165,14 @@ function ProjectDetail() {
   useEffect(() => {
     loadProjects();
   }, [loadProjects]);
+
+  useEffect(() => {
+    if (searchParams.get('publish') === '1') {
+      setShowPublishModal(true);
+      searchParams.delete('publish');
+      setSearchParams(searchParams, { replace: true });
+    }
+  }, [searchParams, setSearchParams]);
 
   useEffect(() => {
     const found = projects.find(p => p.id === projectId);
@@ -174,21 +189,9 @@ function ProjectDetail() {
     }
   }, [projectId, projects]);
 
-  const handleDeploy = async () => {
-    setIsDeploying(true);
+  const handleDeploy = () => {
     setDeployMessage(null);
-    try {
-      const result = await startDeployment(projectId);
-      if (result?.success) {
-        setDeployMessage({ type: 'success', text: 'Deployment started! Check GitHub and Vercel for progress.' });
-        loadProjects();
-      }
-    } catch (error) {
-      console.error('Deployment failed:', error);
-      setDeployMessage({ type: 'error', text: `Deploy failed: ${error.message}` });
-    } finally {
-      setIsDeploying(false);
-    }
+    setShowPublishModal(true);
   };
 
   const handleCommitToGitHub = async () => {
@@ -284,6 +287,16 @@ function ProjectDetail() {
             {t('projectDetail.openEditor')}
           </button>
 
+          {/* Hybrid Brand SVG Logo Studio */}
+          <button
+            onClick={() => setShowBrandLogoModal(true)}
+            className="btn-secondary"
+            title="Design vector brand logo, favicon.ico, Apple touch icon & OG image"
+          >
+            <Palette className="w-4 h-4 text-violet-400" />
+            Brand Logo
+          </button>
+
           {(project.status === 'generating' || project.status === 'paused' || project.status === 'stopped') && (
             <button
               onClick={async () => {
@@ -316,7 +329,7 @@ function ProjectDetail() {
             </Link>
           )}
           
-          {(project.status === 'ready' || project.status === 'error') && (
+          {(project.status === 'ready' || project.status === 'error' || project.status === 'live') && (
             <button
               onClick={handleDeploy}
               disabled={isDeploying}
@@ -329,8 +342,12 @@ function ProjectDetail() {
                 </>
               ) : (
                 <>
-                  <Play className="w-4 h-4" />
-                  {project.status === 'error' ? t('projectDetail.retryDeploy') : t('projectDetail.deploy')}
+                  <Rocket className="w-4 h-4" />
+                  {project.status === 'error'
+                    ? t('projectDetail.retryDeploy')
+                    : project.status === 'live'
+                    ? 'Publish / Domain'
+                    : t('projectDetail.deploy')}
                 </>
               )}
             </button>
@@ -376,6 +393,21 @@ function ProjectDetail() {
             >
               <Globe className="w-4 h-4" />
               {t('projectDetail.liveSite')}
+            </a>
+          )}
+
+          {project.metadata?.customDomain && (
+            <a
+              href={`https://${project.metadata.customDomain}`}
+              onClick={(e) => {
+                e.preventDefault();
+                window.electronAPI.shell.openExternal(`https://${project.metadata.customDomain}`);
+              }}
+              className="btn-secondary text-emerald-300 border-emerald-500/30"
+              title="Open custom domain"
+            >
+              <Globe className="w-4 h-4 text-emerald-400" />
+              {project.metadata.customDomain}
             </a>
           )}
 
@@ -562,6 +594,29 @@ function ProjectDetail() {
           </div>
         </div>
       )}
+      <PublishModal
+        isOpen={showPublishModal}
+        onClose={() => setShowPublishModal(false)}
+        project={project}
+        onPublished={() => {
+          loadProjects();
+        }}
+      />
+
+      <BrandLogoModal
+        isOpen={showBrandLogoModal}
+        onClose={() => setShowBrandLogoModal(false)}
+        project={project}
+        onApplied={() => {
+          loadProjects();
+          window.electronAPI.project
+            .getFiles(projectId)
+            .then((result) => {
+              if (result.success) setDiskFiles(result.files);
+            })
+            .catch(console.error);
+        }}
+      />
     </div>
   );
 }

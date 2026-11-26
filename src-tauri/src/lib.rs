@@ -18,6 +18,8 @@ pub mod orchestrator;
 pub mod templates;
 pub mod templates_expo;
 pub mod copilot;
+pub mod publish;
+pub mod brand_logo;
 
 pub use ollama::*;
 pub use project::*;
@@ -395,7 +397,13 @@ pub fn run() {
             copilot::copilot_get_staged_changes,
             copilot::copilot_discard_staged_file,
             copilot::copilot_clear_staged_changes,
-            copilot::copilot_delete_file_on_disk
+            copilot::copilot_delete_file_on_disk,
+            publish::publish_get_preflight,
+            publish::publish_project_fullstack,
+            publish::publish_verify_domain,
+            brand_logo::brand_logo_get_init,
+            brand_logo::brand_logo_generate,
+            brand_logo::brand_logo_apply
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

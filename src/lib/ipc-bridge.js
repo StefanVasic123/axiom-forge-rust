@@ -536,6 +536,29 @@ window.electronAPI = {
       } catch {
         return { success: false };
       }
+    },
+    startDeployment: async (projectId, options = {}) => {
+      try {
+        const preflight = await invoke('publish_get_preflight', { projectId });
+        const dbMode = options.dbMode || (preflight.hasPrisma ? (preflight.hasNeonToken ? 'neon' : 'skip') : 'skip');
+        return await invoke('publish_project_fullstack', {
+          req: {
+            projectId,
+            repoName: options.repoName || preflight.suggestedRepoName || null,
+            isPrivateRepo: Boolean(options.isPrivateRepo),
+            dbMode,
+            customDatabaseUrl: options.customDatabaseUrl || null,
+            neonRegion: options.neonRegion || 'aws-eu-central-1',
+            runPrismaPush: options.runPrismaPush !== false,
+            customDomain: options.customDomain || null,
+            autoCloudflareDns: Boolean(options.autoCloudflareDns),
+            syncLocalEnvKeys: options.syncLocalEnvKeys !== false,
+            vercelTeamId: options.vercelTeamId || null
+          }
+        });
+      } catch (e) {
+        throw new Error(typeof e === 'string' ? e : (e?.message || String(e)));
+      }
     }
   },
   server: {
@@ -993,6 +1016,35 @@ window.electronAPI = {
     },
     onEvent: (callback) => {
       return registerGlobalListener('copilot:event', callback);
+    }
+  },
+  publish: {
+    getPreflight: async (projectId) => {
+      return await invoke('publish_get_preflight', { projectId });
+    },
+    runFullStack: async (req) => {
+      return await invoke('publish_project_fullstack', { req });
+    },
+    verifyDomain: async (projectId, domain, vercelTeamId = null) => {
+      return await invoke('publish_verify_domain', {
+        projectId,
+        domain,
+        vercelTeamId: vercelTeamId || null
+      });
+    },
+    onProgress: (callback) => {
+      return registerGlobalListener('publish:progress', callback);
+    }
+  },
+  brandLogo: {
+    getInit: async (projectId) => {
+      return await invoke('brand_logo_get_init', { projectId });
+    },
+    generate: async (req) => {
+      return await invoke('brand_logo_generate', { req });
+    },
+    apply: async (req) => {
+      return await invoke('brand_logo_apply', { req });
     }
   }
 };
