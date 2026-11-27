@@ -374,7 +374,7 @@ function FloatingProgress() {
               {isOfflineWaiting ? 'Čekam internet konekciju' : isPaused ? 'Generisanje pauzirano' : isStopped ? 'Generisanje zaustavljeno' : isCompleteWarn ? 'Završeno sa upozorenjima' : phaseInfo.label}
             </h3>
             <div className="flex items-center gap-2">
-              <p className="text-xs text-slate-500">Axiom Forge</p>
+              <p className="text-xs text-slate-500">Axon Forge</p>
               <span className="px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-400 text-[10px] font-bold border border-indigo-500/30">
                 {version}
               </span>

@@ -52,7 +52,7 @@
     "searchPlaceholder": "Search projects...",
     "allProjects": "All Projects",
     "noProjectsTitle": "No projects yet",
-    "noProjectsDesc": "Start by browsing templates on Axiom Forge and click 'Build with Axiom Forge' to create your first project.",
+    "noProjectsDesc": "Start by browsing templates on Axon Forge and click 'Build with Axon Forge' to create your first project.",
     "browseTemplates": "Browse Templates",
     "created": "Created {date}",
     "noDescription": "No description provided",
@@ -86,7 +86,7 @@
     "idle": "Idle"
   },
   "floating": {
-    "title": "Axiom Forge — Codebase Generator",
+    "title": "Axon Forge — Codebase Generator",
     "preparing": "Preparing...",
     "expandingManifest": "Expanding manifest...",
     "generatingCode": "Generating codebase files...",
@@ -105,7 +105,7 @@
     "stopTooltip": "Stop generation",
     "closeTooltip": "Close window",
     "openProjectFolder": "Open Project Folder",
-    "viewDetailsBtn": "Open Project in Axiom Forge",
+    "viewDetailsBtn": "Open Project in Axon Forge",
     "pausedMessage": "Generation is paused. Click Resume to continue from file {current}/{total}."
   },
   "projectDetail": {
@@ -167,12 +167,12 @@
     "clientModeTitle": "Switch to Client Mode",
     "clientModeDesc": "Locks the UI into a simplified overlay for non-technical clients.",
     "enterClientMode": "Enter Client Mode",
-    "aboutTitle": "About Axiom Forge",
+    "aboutTitle": "About Axon Forge",
     "aboutSubtitle": "Open-source local agent for the idea-to-app pipeline",
     "viewGithub": "View on GitHub"
   },
   "wizard": {
-    "welcomeTitle": "Welcome to Axiom Forge",
+    "welcomeTitle": "Welcome to Axon Forge",
     "welcomeSubtitle": "Your local AI-powered codebase generation engine",
     "stepWelcome": "Welcome",
     "stepOllama": "AI Engine",
@@ -184,7 +184,7 @@
     "hardwareDetected": "Hardware Profile Detected"
   },
   "editor": {
-    "title": "Axiom Forge Editor",
+    "title": "Axon Forge Editor",
     "askAi": "Ask AI to edit code...",
     "generating": "AI is generating changes...",
     "acceptChanges": "Accept Changes",
@@ -201,7 +201,7 @@
   },
   "aiOptimizer": {
     "title": "AI Model Progress & Local Trainer",
-    "subtitle": "Exponential accuracy tracking across Axiom versions, LLM domain strengths/weaknesses, and mini-LLM fine-tuning dataset export.",
+    "subtitle": "Exponential accuracy tracking across Axon versions, LLM domain strengths/weaknesses, and mini-LLM fine-tuning dataset export.",
     "allModels": "All Local Models",
     "expIndex": "Exponential Accuracy Index",
     "cleanFeatures": "100%-Clean Feature Rate",
@@ -215,7 +215,7 @@
     "versionTableTitle": "Release Cohort Breakdown",
     "domainAnalysisTitle": "Error Frequency (učestalost_greske) — LLM Strength & Weakness Map",
     "trainerTitle": "Mini-LLM SFT Dataset & Modelfile Trainer",
-    "trainerDesc": "Export verified Katastar fixes, heal-ledger pairs, and Axiom Stack Rulepacks as scrubbed JSONL + Ollama Modelfile to specialize a fast local coding model.",
+    "trainerDesc": "Export verified Katastar fixes, heal-ledger pairs, and Axon Stack Rulepacks as scrubbed JSONL + Ollama Modelfile to specialize a fast local coding model.",
     "exportBtn": "Generate SFT Dataset & Modelfile",
     "exporting": "Exporting...",
     "projectsTableTitle": "Generated Projects Telemetry",
@@ -225,9 +225,9 @@
   },
   "update": {
     "recommendedTitle": "New Version Available (v{latest})",
-    "recommendedDesc": "You are currently running Axiom Forge v{installed} ({behind} version(s) behind the latest release). We recommend installing the latest version before generating code for the newest fixes and engine improvements.",
+    "recommendedDesc": "You are currently running Axon Forge v{installed} ({behind} version(s) behind the latest release). We recommend installing the latest version before generating code for the newest fixes and engine improvements.",
     "requiredTitle": "Update Required Before Generating",
-    "requiredDesc": "Your installed Axiom Forge (v{installed}) is {behind} versions behind the latest release (v{latest}). Versions {threshold}+ releases behind must be updated before generating new code.",
+    "requiredDesc": "Your installed Axon Forge (v{installed}) is {behind} versions behind the latest release (v{latest}). Versions {threshold}+ releases behind must be updated before generating new code.",
     "currentLabel": "Installed",
     "latestLabel": "Latest",
     "behindBadge": "{behind} version(s) behind",

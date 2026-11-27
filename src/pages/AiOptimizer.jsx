@@ -282,7 +282,7 @@ export default function AiOptimizer() {
           <p className="text-slate-400 text-sm mt-1">
             {t(
               'aiOptimizer.subtitle',
-              'Exponential accuracy tracking across Axiom versions, LLM domain strengths/weaknesses, and mini-LLM fine-tuning dataset export.'
+              'Exponential accuracy tracking across Axon versions, LLM domain strengths/weaknesses, and mini-LLM fine-tuning dataset export.'
             )}
           </p>
         </div>
@@ -498,7 +498,7 @@ export default function AiOptimizer() {
             <p className="text-sm text-slate-400 mb-5">
               {t(
                 'aiOptimizer.trainerDesc',
-                'Export verified Katastar fixes, heal-ledger pairs, and Axiom Stack Rulepacks as scrubbed JSONL + Ollama Modelfile to specialize a fast local coding model.'
+                'Export verified Katastar fixes, heal-ledger pairs, and Axon Stack Rulepacks as scrubbed JSONL + Ollama Modelfile to specialize a fast local coding model.'
               )}
             </p>
 

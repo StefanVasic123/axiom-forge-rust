@@ -199,7 +199,7 @@ function ProjectDetail() {
     setIsCommitting(true);
     try {
       // 1. Local commit
-      const commitMsg = `Axiom Forge — ${new Date().toLocaleString()}`;
+      const commitMsg = `Axon Forge — ${new Date().toLocaleString()}`;
       await window.electronAPI.project.commit(projectId, commitMsg);
       // 2. Push to GitHub (no Vercel)
       const result = await window.electronAPI.project.pushToGitHub(projectId);

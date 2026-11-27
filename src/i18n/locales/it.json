@@ -52,7 +52,7 @@
     "searchPlaceholder": "Cerca progetti...",
     "allProjects": "Tutti i Progetti",
     "noProjectsTitle": "Ancora nessun progetto",
-    "noProjectsDesc": "Esplora i template su Axiom Forge e clicca su 'Costruisci con Axiom Forge' per creare il tuo primo progetto.",
+    "noProjectsDesc": "Esplora i template su Axon Forge e clicca su 'Costruisci con Axon Forge' per creare il tuo primo progetto.",
     "browseTemplates": "Esplora Template",
     "created": "Creato il {date}",
     "noDescription": "Nessuna descrizione fornita",
@@ -86,7 +86,7 @@
     "idle": "Inattivo"
   },
   "floating": {
-    "title": "Axiom Forge — Generatore di Codice",
+    "title": "Axon Forge — Generatore di Codice",
     "preparing": "Preparazione in corso...",
     "expandingManifest": "Espansione del manifesto...",
     "generatingCode": "Generazione dei file di progetto...",
@@ -105,7 +105,7 @@
     "stopTooltip": "Interrompi generazione",
     "closeTooltip": "Chiudi finestra",
     "openProjectFolder": "Apri Cartella Progetto",
-    "viewDetailsBtn": "Apri Progetto in Axiom Forge",
+    "viewDetailsBtn": "Apri Progetto in Axon Forge",
     "pausedMessage": "La generazione è in pausa. Clicca Riprendi per continuare dal file {current}/{total}."
   },
   "projectDetail": {
@@ -167,12 +167,12 @@
     "clientModeTitle": "Passa alla Modalità Cliente",
     "clientModeDesc": "Blocca l'interfaccia in una vista semplificata per clienti non tecnici.",
     "enterClientMode": "Attiva Modalità Cliente",
-    "aboutTitle": "Informazioni su Axiom Forge",
+    "aboutTitle": "Informazioni su Axon Forge",
     "aboutSubtitle": "Agente locale open-source per creare applicazioni rapidamente",
     "viewGithub": "Visualizza su GitHub"
   },
   "wizard": {
-    "welcomeTitle": "Benvenuto in Axiom Forge",
+    "welcomeTitle": "Benvenuto in Axon Forge",
     "welcomeSubtitle": "Il tuo motore AI locale per la generazione automatica di software",
     "stepWelcome": "Benvenuto",
     "stepOllama": "Motore AI",
@@ -184,7 +184,7 @@
     "hardwareDetected": "Profilo Hardware Rilevato"
   },
   "editor": {
-    "title": "Editor Axiom Forge",
+    "title": "Editor Axon Forge",
     "askAi": "Chiedi all'AI di modificare il codice...",
     "generating": "L'AI sta generando le modifiche...",
     "acceptChanges": "Accetta Modifiche",
@@ -201,9 +201,9 @@
   },
   "update": {
     "recommendedTitle": "Nuova versione disponibile (v{latest})",
-    "recommendedDesc": "Stai usando Axiom Forge v{installed} ({behind} versione/i indietro). Consigliamo di installare l’ultima versione prima di generare codice per avere tutte le ultime correzioni.",
+    "recommendedDesc": "Stai usando Axon Forge v{installed} ({behind} versione/i indietro). Consigliamo di installare l’ultima versione prima di generare codice per avere tutte le ultime correzioni.",
     "requiredTitle": "Aggiornamento obbligatorio prima di generare",
-    "requiredDesc": "Il tuo Axiom Forge installato (v{installed}) è indietro di {behind} versioni rispetto all’ultima (v{latest}). Le versioni con {threshold}+ rilasci di ritardo devono essere aggiornate prima di generare.",
+    "requiredDesc": "Il tuo Axon Forge installato (v{installed}) è indietro di {behind} versioni rispetto all’ultima (v{latest}). Le versioni con {threshold}+ rilasci di ritardo devono essere aggiornate prima di generare.",
     "currentLabel": "Installata",
     "latestLabel": "Ultima",
     "behindBadge": "{behind} versione/i indietro",

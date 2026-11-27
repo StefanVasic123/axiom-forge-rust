@@ -12,7 +12,7 @@ export default function ClientLayout() {
   const [statusMessage, setStatusMessage] = useState('');
 
   const agencyConfig = appMode?.agencyConfig || {
-    agencyName: 'Axiom Partner Agency',
+    agencyName: 'Axon Partner Agency',
     brandColor: '#4f46e5',
     logoUrl: null
   };

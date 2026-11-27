@@ -62,7 +62,7 @@ function Sidebar() {
             <Sparkles className="w-5 h-5 text-white" />
           </div>
           <div>
-            <h1 className="font-bold text-lg text-white">Axiom Forge</h1>
+            <h1 className="font-bold text-lg text-white">Axon Forge</h1>
             <p className="text-xs text-slate-500">{t('nav.appPipeline')}</p>
           </div>
         </Link>
@@ -90,7 +90,7 @@ function Sidebar() {
 
         {/* New Project Button */}
         <button
-          onClick={() => window.electronAPI.shell.openExternal('https://axiomforge.io/templates')}
+          onClick={() => window.electronAPI.shell.openExternal('https://axon-forge.com/marketplace')}
           className="w-full flex items-center gap-3 px-4 py-3 mt-4 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white transition-all shadow-lg shadow-indigo-500/20"
         >
           <Plus className="w-5 h-5" />
@@ -133,7 +133,7 @@ function Sidebar() {
           <span>{t('nav.openSource')}</span>
         </a>
         <div className="text-[10px] text-slate-600 font-bold uppercase tracking-[0.2em] pl-1">
-          Axiom Forge v{version}
+          Axon Forge v{version}
         </div>
       </div>
     </aside>
@@ -151,7 +151,7 @@ function Header() {
     if (path === '/ai-optimizer') return t('nav.aiOptimizer');
     if (path === '/settings') return t('nav.settings');
     if (path.startsWith('/projects/')) return t('dashboard.viewDetails');
-    return 'Axiom Forge';
+    return 'Axon Forge';
   };
 
   return (

@@ -335,7 +335,7 @@ function EmptyState() {
         {t('dashboard.noProjectsDesc')}
       </p>
       <button
-        onClick={() => window.electronAPI.shell.openExternal('https://axiomforge.io/templates')}
+        onClick={() => window.electronAPI.shell.openExternal('https://axon-forge.com/marketplace')}
         className="btn-primary"
       >
         {t('dashboard.browseTemplates')}
@@ -471,7 +471,7 @@ function Dashboard() {
           </button>
           
           <button
-            onClick={() => window.electronAPI.shell.openExternal('https://axiomforge.io/templates')}
+            onClick={() => window.electronAPI.shell.openExternal('https://axon-forge.com/marketplace')}
             className="btn-primary"
           >
             <Plus className="w-5 h-5" />

@@ -491,7 +491,7 @@ function Settings() {
           <TokenInput
             label="GitHub Token"
             tokenKey="github-token"
-            helpUrl="https://github.com/settings/tokens/new?scopes=repo,workflow&description=Axiom%20Forge"
+            helpUrl="https://github.com/settings/tokens/new?scopes=repo,workflow&description=Axon%20Forge"
             description="Required for pushing code to GitHub repositories"
             onSave={saveToken}
           />

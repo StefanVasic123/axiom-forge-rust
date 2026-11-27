@@ -22,7 +22,7 @@ import { useAppStore } from '../hooks/useAppStore';
 import { useI18n, LanguageSelector } from '../i18n/I18nContext';
 
 const STEPS = [
-  { id: 'welcome', title: 'Welcome', description: 'Get started with Axiom Forge' },
+  { id: 'welcome', title: 'Welcome', description: 'Get started with Axon Forge' },
   { id: 'ollama', title: 'AI Brain', description: 'Configure local AI' },
   { id: 'github', title: 'GitHub', description: 'Connect your account' },
   { id: 'hosting', title: 'Hosting Tokens', description: 'Deploy with ease' },
@@ -78,7 +78,7 @@ function WelcomeStep({ onNext }) {
       
       <div>
         <h2 className="text-3xl font-bold text-white mb-3">
-          Welcome to <span className="gradient-text">Axiom Forge</span>
+          Welcome to <span className="gradient-text">Axon Forge</span>
         </h2>
         <p className="text-slate-400 max-w-md mx-auto">
           Your open-source local agent for the idea-to-app pipeline. 
@@ -263,7 +263,7 @@ function OllamaStep({ onNext, onBack }) {
         </div>
         <h2 className="text-2xl font-bold text-white mb-2">Local AI Setup</h2>
         <p className="text-slate-400">
-          Axiom Forge runs AI completely privately on your hardware
+          Axon Forge runs AI completely privately on your hardware
         </p>
       </div>
 
@@ -404,7 +404,7 @@ function OllamaStep({ onNext, onBack }) {
               />
             </div>
             <p className="text-[10px] text-slate-500 text-center italic">
-              Please keep Axiom Forge open. Depending on your internet speed, this may take a few minutes.
+              Please keep Axon Forge open. Depending on your internet speed, this may take a few minutes.
             </p>
           </div>
         )}
@@ -535,7 +535,7 @@ function GitHubStep({ onNext, onBack }) {
           href="https://github.com/settings/tokens/new"
           onClick={(e) => {
             e.preventDefault();
-            window.electronAPI.shell.openExternal('https://github.com/settings/tokens/new?scopes=repo,workflow&description=Axiom%20Forge');
+            window.electronAPI.shell.openExternal('https://github.com/settings/tokens/new?scopes=repo,workflow&description=Axon%20Forge');
           }}
           className="flex items-center gap-2 text-sm text-indigo-400 hover:text-indigo-300"
         >
@@ -747,7 +747,7 @@ function CompleteStep() {
           You're All Set!
         </h2>
         <p className="text-slate-400 max-w-md mx-auto">
-          Axiom Forge is ready to build. Start by creating your first project 
+          Axon Forge is ready to build. Start by creating your first project 
           or explore the dashboard.
         </p>
       </div>
@@ -759,13 +759,13 @@ function CompleteStep() {
             <div className="w-6 h-6 rounded-full bg-indigo-500/10 flex items-center justify-center flex-shrink-0 mt-0.5">
               <span className="text-xs text-indigo-400 font-medium">1</span>
             </div>
-            <span className="text-slate-300 text-sm">Browse templates on Axiom Forge</span>
+            <span className="text-slate-300 text-sm">Browse templates on Axon Forge</span>
           </li>
           <li className="flex items-start gap-3">
             <div className="w-6 h-6 rounded-full bg-indigo-500/10 flex items-center justify-center flex-shrink-0 mt-0.5">
               <span className="text-xs text-indigo-400 font-medium">2</span>
             </div>
-            <span className="text-slate-300 text-sm">Click "Build with Axiom Forge" to start</span>
+            <span className="text-slate-300 text-sm">Click "Build with Axon Forge" to start</span>
           </li>
           <li className="flex items-start gap-3">
             <div className="w-6 h-6 rounded-full bg-indigo-500/10 flex items-center justify-center flex-shrink-0 mt-0.5">
@@ -828,7 +828,7 @@ function InstallationWizard() {
         <p className="text-center text-slate-500 text-sm mt-6">
           Your data is stored locally and encrypted.{' '}
           <button 
-            onClick={() => window.electronAPI.shell.openExternal('https://axiomforge.io/privacy')}
+            onClick={() => window.electronAPI.shell.openExternal('https://axon-forge.com/privacy')}
             className="text-indigo-400 hover:text-indigo-300"
           >
             Learn more

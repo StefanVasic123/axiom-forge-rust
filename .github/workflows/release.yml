@@ -40,8 +40,8 @@ jobs:
           RUSTFLAGS: "-C target-feature=+crt-static"
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: 'Axiom Forge ${{ github.ref_name }}'
-          releaseBody: 'Official Release of Axiom Forge Desktop Engine.'
+          releaseName: 'Axon Forge ${{ github.ref_name }}'
+          releaseBody: 'Official Release of Axon Forge Desktop Engine.'
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}

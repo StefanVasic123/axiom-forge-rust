@@ -2274,7 +2274,7 @@ export default function EditorPage() {
     setOpenTabs(tabs => tabs.map(t => ({ ...t, isDirty: false })));
 
     setIsCommitting(true);
-    const msg = `Axiom Editor — ${new Date().toLocaleString()}`;
+    const msg = `Axon Editor — ${new Date().toLocaleString()}`;
     await window.electronAPI.editor.gitCommit(projectId, msg);
     const pushResult = await window.electronAPI.project.pushToGitHub(projectId);
     setIsCommitting(false);
@@ -2773,7 +2773,7 @@ export default function EditorPage() {
                       <Monitor className="w-16 h-16 text-indigo-500/50 mb-6" />
                       <h3 className="text-xl font-bold text-white mb-2">Desktop WYSIWYG Active</h3>
                       <p className="text-slate-400 max-w-sm mb-6">
-                        The desktop app is running in a separate native window. Axiom Forge is attached as a debugger.
+                        The desktop app is running in a separate native window. Axon Forge is attached as a debugger.
                       </p>
                       <div className="flex items-center gap-3 bg-slate-800 px-4 py-2 rounded-lg border border-slate-700">
                         <div className={`w-3 h-3 rounded-full ${cdpConnected ? 'bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.5)]' : 'bg-amber-500 animate-pulse'}`} />
