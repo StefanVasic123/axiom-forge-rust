@@ -2,6 +2,7 @@ import http from 'http';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { createCpuThermalGuard } from './cpu-thermal-guard.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -514,6 +515,25 @@ const server = http.createServer((req, res) => {
   res.end('Not found');
 });
 
+const thermalGuard = createCpuThermalGuard({
+  thresholdC: 95,
+  sustainMs: 5000,
+  pauseMs: 30000,
+  pollIntervalMs: 1500,
+});
+
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`[E2E Monitor] Live Dashboard & Mock Manifest Server running at http://127.0.0.1:${PORT}`);
+  thermalGuard.start().catch((err) => {
+    console.warn('[E2E Monitor] Thermal guard startup warning:', err?.message || err);
+  });
+});
+
+process.on('SIGINT', () => {
+  thermalGuard.stop();
+  process.exit(0);
+});
+process.on('SIGTERM', () => {
+  thermalGuard.stop();
+  process.exit(0);
 });

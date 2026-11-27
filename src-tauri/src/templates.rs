@@ -810,8 +810,16 @@ import \"./globals.css\";\n\
 import {{ Providers }} from \"@/components/Providers\";\n\
 {}{}\n\
 export const metadata: Metadata = {{\n  \
+  metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL || process.env.NEXTAUTH_URL || \"http://localhost:3000\"),\n  \
   title: {},\n  \
-  description: {},\n\
+  description: {},\n  \
+  icons: {{\n    \
+    icon: [{{ url: \"/favicon.ico\" }}, {{ url: \"/favicon.svg\", type: \"image/svg+xml\" }}],\n    \
+    apple: \"/apple-touch-icon.png\",\n  \
+  }},\n  \
+  openGraph: {{\n    \
+    images: [{{ url: \"/og-image.png\", width: 1200, height: 630 }}],\n  \
+  }},\n\
 }};\n\n\
 export default function RootLayout({{ children }}: {{ children: React.ReactNode }}) {{\n  \
   return (\n    \
@@ -826,6 +834,66 @@ export default function RootLayout({{ children }}: {{ children: React.ReactNode 
 }}\n",
         navbar_imp, footer_imp, title_json, desc_json, navbar_jsx, footer_jsx
     )
+}
+
+/// Deterministic Edge-safe Next.js middleware for standard apps (no custom i18n/multi-tenant routing).
+/// Prevents LLM-hallucinated root self-rewrite loops (`NextResponse.rewrite(new URL('/', ...))`)
+/// and bogus static-to-`/api/health` rewrites.
+pub fn render_middleware_ts(has_auth: bool) -> String {
+    if has_auth {
+        r#"import { NextRequest, NextResponse } from "next/server";
+import { getToken } from "next-auth/jwt";
+
+const PROTECTED_PREFIXES = ["/dashboard", "/account", "/admin", "/profile", "/settings"];
+
+export async function middleware(request: NextRequest) {
+  const { pathname } = request.nextUrl;
+
+  if (pathname === "/login" || pathname === "/register" || pathname.startsWith("/api/auth")) {
+    return NextResponse.next();
+  }
+
+  const requiresAuth = PROTECTED_PREFIXES.some(
+    (prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`)
+  );
+
+  if (requiresAuth) {
+    const token = await getToken({
+      req: request,
+      secret: process.env.NEXTAUTH_SECRET,
+    });
+    if (!token) {
+      const loginUrl = new URL("/login", request.url);
+      loginUrl.searchParams.set("callbackUrl", pathname);
+      return NextResponse.redirect(loginUrl);
+    }
+  }
+
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: [
+    "/((?!api|_next/static|_next/image|_vercel|favicon\\.ico|robots\\.txt|sitemap\\.xml|.*\\..*).*)",
+  ],
+};
+"#
+        .to_string()
+    } else {
+        r#"import { NextResponse } from "next/server";
+
+export function middleware() {
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: [
+    "/((?!api|_next/static|_next/image|_vercel|favicon\\.ico|robots\\.txt|sitemap\\.xml|.*\\..*).*)",
+  ],
+};
+"#
+        .to_string()
+    }
 }
 
 /// Returns deterministic content for `file_path`, or `None` when the LLM must generate it.
@@ -883,6 +951,22 @@ pub fn render_deterministic_file(
     if p == "src/components/providers.tsx" || p == "components/providers.tsx" {
         let has_auth = project_has_auth(proj_dir, spec_desc);
         return plain(&render_providers_component(has_auth));
+    }
+
+    if p == "src/middleware.ts" || p == "middleware.ts" {
+        let spec_low = spec_desc.to_lowercase();
+        let needs_custom_routing = spec_low.contains("next-intl")
+            || spec_low.contains("multi-tenant")
+            || spec_low.contains("subdomain")
+            || proj_dir.join("src/i18n").is_dir()
+            || proj_dir.join("src/app/[locale]").is_dir()
+            || proj_dir.join("src/app/[lang]").is_dir()
+            || proj_dir.join("app/[locale]").is_dir()
+            || proj_dir.join("app/[lang]").is_dir();
+        if !needs_custom_routing {
+            let has_auth = project_has_auth(proj_dir, spec_desc);
+            return plain(&render_middleware_ts(has_auth));
+        }
     }
 
     if p == "src/lib/prisma.ts" || p == "lib/prisma.ts" {
@@ -1323,5 +1407,102 @@ mod tests {
             crate::ast_engine::ensure_companion_types_for_const_enums_in_source("src/utils/theme.ts", untouched_src),
             None
         );
+    }
+
+    #[test]
+    fn test_middleware_self_rewrite_guard_ts1361_split_and_layout_brand_metadata() {
+        // 1. Middleware sanitizer eliminates root self-rewrite loop and static /api/health rewrite
+        // while preserving auth redirect and legitimate non-root rewrites.
+        let bad_mw = concat!(
+            "import { NextRequest, NextResponse } from 'next/server';\n",
+            "export async function middleware(request: NextRequest) {\n",
+            "  const pathname = request.nextUrl.pathname;\n",
+            "  if (pathname.startsWith('/_next/static') || pathname.includes('.')) {\n",
+            "    return NextResponse.rewrite(new URL('/api/health', request.url));\n",
+            "  }\n",
+            "  if (pathname.startsWith('/dashboard')) {\n",
+            "    return NextResponse.redirect(new URL('/login', request.url));\n",
+            "  }\n",
+            "  return NextResponse.rewrite(new URL('/', request.url));\n",
+            "}\n"
+        );
+        let fixed_mw = crate::sanitizer::sanitize_middleware_redundancy(bad_mw, "src/middleware.ts");
+        assert!(!fixed_mw.contains("new URL('/', request.url)"), "root self-rewrite must be removed:\n{}", fixed_mw);
+        assert!(!fixed_mw.contains("new URL('/api/health', request.url)"), "static health rewrite must be removed:\n{}", fixed_mw);
+        assert!(fixed_mw.contains("NextResponse.redirect(new URL('/login', request.url))"), "auth redirect must be preserved");
+        assert!(fixed_mw.contains("return NextResponse.next();"), "must fall back to NextResponse.next()");
+
+        // Legitimate multi-tenant non-root rewrite is preserved
+        let tenant_mw = concat!(
+            "import { NextRequest, NextResponse } from 'next/server';\n",
+            "export function middleware(request: NextRequest) {\n",
+            "  return NextResponse.rewrite(new URL('/sites/acme', request.url));\n",
+            "}\n"
+        );
+        let kept_tenant = crate::sanitizer::sanitize_middleware_redundancy(tenant_mw, "src/middleware.ts");
+        assert!(kept_tenant.contains("new URL('/sites/acme', request.url)"));
+
+        // 2. Deterministic middleware template skips custom i18n/multi-tenant projects
+        let tmp = std::env::temp_dir().join(format!("axiom_mw_tpl_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(tmp.join("src/app")).unwrap();
+        std::fs::write(tmp.join("package.json"), r#"{"name":"demo","dependencies":{"next-auth":"^4.24.0"}}"#).unwrap();
+        let det_mw = render_deterministic_file(&tmp, "nextjs", "src/middleware.ts", "standard dashboard").unwrap();
+        assert!(det_mw.content.contains("return NextResponse.next();"));
+        assert!(!det_mw.content.contains("NextResponse.rewrite"));
+
+        // i18n project must return None so custom routing isn't overwritten
+        assert!(render_deterministic_file(&tmp, "nextjs", "src/middleware.ts", "multi-language next-intl").is_none());
+
+        // Root layout includes metadataBase, icons, and openGraph automatically
+        let layout = render_root_layout(&tmp, "demo");
+        assert!(layout.contains("metadataBase:"));
+        assert!(layout.contains("/favicon.ico"));
+        assert!(layout.contains("/apple-touch-icon.png"));
+        assert!(layout.contains("/og-image.png"));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        // 3. TS1361 sanitizer splits runtime enum value out of `import type` while keeping pure types intact
+        let ts1361_src = concat!(
+            "\"use client\";\n",
+            "import type { Shipment, ShipmentStatus } from '@/types/shipment';\n",
+            "import type { Prisma } from '@prisma/client';\n",
+            "export function Demo({ filter }: { filter: Prisma.ShipmentWhereInput }) {\n",
+            "  const update = (s: ShipmentStatus) => s;\n",
+            "  const item: Shipment | null = null;\n",
+            "  return <button onClick={() => update(ShipmentStatus.PENDING)}>{String(item)}{String(filter)}</button>;\n",
+            "}\n"
+        );
+        let fixed_ts = crate::sanitizer::sanitize_nextjs_and_zod_hallucinations(ts1361_src, "src/app/shipments/[id]/page.tsx");
+        assert!(fixed_ts.contains("import type { Shipment } from '@/types/shipment';"), "pure type must stay in import type:\n{}", fixed_ts);
+        assert!(fixed_ts.contains("import { ShipmentStatus } from '@/types/shipment';"), "runtime enum must split to value import:\n{}", fixed_ts);
+        assert!(fixed_ts.contains("import type { Prisma } from '@prisma/client';"), "type-only namespace Prisma.ShipmentWhereInput must stay import type:\n{}", fixed_ts);
+
+        // 4. Hallucinated `@lucide-react` / `@lucide/react` -> `lucide-react`
+        let bad_lucide = "import { AlertTriangle } from '@lucide-react';\nimport { Check } from \"@lucide/react\";\nexport const x = [AlertTriangle, Check];\n";
+        let fixed_lucide = crate::sanitizer::sanitize_nextjs_and_zod_hallucinations(bad_lucide, "src/app/page.tsx");
+        assert!(fixed_lucide.contains("from 'lucide-react'"), "expected @lucide-react rewritten:\n{}", fixed_lucide);
+        assert!(fixed_lucide.contains("from \"lucide-react\""), "expected @lucide/react rewritten:\n{}", fixed_lucide);
+        assert!(!fixed_lucide.contains("@lucide"));
+
+        // 5. Empty Prisma `include: { // comment }` stripped while non-empty `include: { items: true }` preserved
+        let prisma_empty_inc = concat!(
+            "import { prisma } from '@/lib/prisma';\n",
+            "export async function GET() {\n",
+            "  const a = await prisma.shipment.findMany({\n",
+            "    include: {\n",
+            "      // Include any necessary relations here\n",
+            "    },\n",
+            "  });\n",
+            "  const b = await prisma.order.findMany({\n",
+            "    include: {\n",
+            "      items: true,\n",
+            "    },\n",
+            "  });\n",
+            "  return [a, b];\n",
+            "}\n"
+        );
+        let fixed_inc = crate::sanitizer::sanitize_nextjs_and_zod_hallucinations(prisma_empty_inc, "src/app/api/shipments/route.ts");
+        assert!(!fixed_inc.contains("Include any necessary relations"), "empty include must be stripped:\n{}", fixed_inc);
+        assert!(fixed_inc.contains("items: true"), "non-empty include must be preserved:\n{}", fixed_inc);
     }
 }

@@ -3211,6 +3211,10 @@ pub fn strip_bogus_middleware_locale_rewrite(
     }
 
     if !changed {
+        // Even if no locale block was stripped, still guard against unconditional root self-rewrite
+        // (`return NextResponse.rewrite(new URL('/', request.url))`) which causes infinite HTTP 500 loops,
+        // and static-asset rewrite to `/api/health`.
+        out = fix_bogus_middleware_self_rewrites(&out);
         return out;
     }
 
@@ -3231,6 +3235,39 @@ pub fn strip_bogus_middleware_locale_rewrite(
         ) {
             out = re_decl.replace_all(&out, "").to_string();
         }
+    }
+
+    fix_bogus_middleware_self_rewrites(&out)
+}
+
+/// Replaces universally broken Next.js middleware rewrite patterns that cause infinite proxy loops
+/// (`return NextResponse.rewrite(new URL('/', request.url))` -> `return NextResponse.next()`) or
+/// corrupt static assets (`return NextResponse.rewrite(new URL('/api/health', ...))` inside a static
+/// asset bypass guard -> `return NextResponse.next()`). Preserves all legitimate auth redirects and
+/// non-root rewrites.
+fn fix_bogus_middleware_self_rewrites(content: &str) -> String {
+    if !content.contains("NextResponse.rewrite") {
+        return content.to_string();
+    }
+    let mut out = content.to_string();
+
+    // 1. Unconditional rewrite to root `'/'` or `"/"` or `` `/` `` causes an infinite self-proxy loop (HTTP 500 / ECONNRESET).
+    if let Ok(re_root_rw) = regex::Regex::new(
+        r#"(?m)^([ \t]*)return\s+NextResponse\.rewrite\(\s*new\s+URL\(\s*['"`]/['"`]\s*,\s*[^)\r\n]+\)\s*\)\s*;?"#,
+    ) {
+        out = re_root_rw
+            .replace_all(&out, "${1}return NextResponse.next();")
+            .to_string();
+    }
+
+    // 2. Rewriting static asset bypass branches (`/_next/static`, `favicon.ico`, `pathname.includes('.')`)
+    // to `/api/health` breaks CSS/JS/SVG loading; static bypass must call `NextResponse.next()`.
+    if let Ok(re_static_health) = regex::Regex::new(
+        r#"(?m)(if\s*\([^\r\n]*(?:/_next/static|favicon\.ico|pathname\.includes\(\s*['"]\.['"]\s*\))[^\r\n]*\)\s*\{\s*\r?\n)([ \t]*)return\s+NextResponse\.rewrite\(\s*new\s+URL\(\s*['"`]/api/health['"`]\s*,\s*[^)\r\n]+\)\s*\)\s*;?"#,
+    ) {
+        out = re_static_health
+            .replace_all(&out, "${1}${2}return NextResponse.next();")
+            .to_string();
     }
 
     out
@@ -6520,19 +6557,37 @@ pub fn sanitize_nextjs_and_zod_hallucinations(content: &str, rel_path: &str) -> 
         out = insert_import_after_use_client(&out, "import { zodResolver } from '@hookform/resolvers/zod';");
     }
 
-    // 3k. `import type { ..., useXxx, ... } from '...'` where `useXxx(` is called as a runtime hook (TS1361):
-    // split runtime `use*` hook identifiers out of `import type` into a normal value import.
+    // 3k. `import type { ..., Sym, ... } from '...'` where `Sym` is used as a runtime value (TS1361):
+    // - `useXxx(` hook invocation, OR
+    // - enum / const-object runtime member access (`Sym.MEMBER` in non-type-decl expressions), OR
+    // - `Object.values(Sym)` / `Object.keys(Sym)` / `Object.entries(Sym)`.
+    // Split ONLY the runtime-used identifiers out of `import type` into a normal value import,
+    // leaving pure types untouched in `import type`.
     if is_ts && out.contains("import type") {
         if let Ok(re_imp_type) = regex::Regex::new(
             r#"(?m)^([ \t]*)import\s+type\s*\{([^}]+)\}\s*from\s*(['"][^'"]+['"])\s*;?[ \t]*$"#,
         ) {
             let snapshot = out.clone();
+            let non_import_lines: Vec<&str> = snapshot
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !t.starts_with("import ")
+                        && !t.starts_with("import{")
+                        && !t.starts_with("export type ")
+                        && !t.starts_with("type ")
+                        && !t.starts_with("interface ")
+                        && !t.starts_with("//")
+                })
+                .collect();
+            let runtime_body = non_import_lines.join("\n");
+
             out = re_imp_type.replace_all(&snapshot, |caps: &regex::Captures| {
                 let indent = caps.get(1).map_or("", |m| m.as_str());
                 let inner = caps.get(2).map_or("", |m| m.as_str());
                 let mod_spec = caps.get(3).map_or("", |m| m.as_str());
                 let mut type_items: Vec<&str> = Vec::new();
-                let mut value_hooks: Vec<&str> = Vec::new();
+                let mut value_items: Vec<&str> = Vec::new();
                 for raw in inner.split(',') {
                     let item = raw.trim();
                     if item.is_empty() {
@@ -6541,21 +6596,38 @@ pub fn sanitize_nextjs_and_zod_hallucinations(content: &str, rel_path: &str) -> 
                     let local = item.split(" as ").last().unwrap_or(item).trim();
                     let is_hook_name = local.starts_with("use")
                         && local.chars().nth(3).map_or(false, |c| c.is_ascii_uppercase());
-                    let called_as_value = is_hook_name && snapshot.contains(&format!("{}(", local));
-                    if called_as_value {
-                        value_hooks.push(item);
+                    let called_as_hook = is_hook_name && runtime_body.contains(&format!("{}(", local));
+
+                    let esc = regex::escape(local);
+                    let used_as_enum_or_obj_value = !called_as_hook
+                        && local.chars().next().map_or(false, |c| c.is_ascii_uppercase())
+                        && (regex::Regex::new(&format!(
+                            r#"(?:^|[=(\[,!&|?]\s*|\b(?:return|case|throw)\s+){}\.[A-Za-z_][A-Za-z0-9_]*|:\s*{}\.[A-Z][A-Z0-9_]+"#,
+                            esc, esc
+                        ))
+                        .ok()
+                        .map_or(false, |re| re.is_match(&runtime_body))
+                            || regex::Regex::new(&format!(
+                                r#"\bObject\.(?:values|keys|entries)\(\s*{}\s*\)"#,
+                                esc
+                            ))
+                            .ok()
+                            .map_or(false, |re| re.is_match(&runtime_body)));
+
+                    if called_as_hook || used_as_enum_or_obj_value {
+                        value_items.push(item);
                     } else {
                         type_items.push(item);
                     }
                 }
-                if value_hooks.is_empty() {
+                if value_items.is_empty() {
                     return caps[0].to_string();
                 }
                 let mut lines = Vec::new();
                 if !type_items.is_empty() {
                     lines.push(format!("{}import type {{ {} }} from {};", indent, type_items.join(", "), mod_spec));
                 }
-                lines.push(format!("{}import {{ {} }} from {};", indent, value_hooks.join(", "), mod_spec));
+                lines.push(format!("{}import {{ {} }} from {};", indent, value_items.join(", "), mod_spec));
                 lines.join("\n")
             }).into_owned();
         }
@@ -6574,6 +6646,24 @@ pub fn sanitize_nextjs_and_zod_hallucinations(content: &str, rel_path: &str) -> 
             "ChangeEvent<HTMLInputElement>",
             "ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>",
         );
+    }
+
+    // 3o. Hallucinated scoped Lucide package names (`@lucide-react` / `@lucide/react`) do not exist on npm;
+    // normalize them to the official `lucide-react` package.
+    if out.contains("@lucide-react") || out.contains("@lucide/react") {
+        if let Ok(re_lucide) = regex::Regex::new(r#"from\s+(['"])@lucide[-/]react(['"])"#) {
+            out = re_lucide.replace_all(&out, "from ${1}lucide-react${2}").into_owned();
+        }
+    }
+
+    // 3p. Empty Prisma `include: { /* optional comments */ }` causes TS2353 on models without relations
+    // and is a no-op on models with relations. Strip ONLY when the object body contains no properties.
+    if out.contains("prisma.") && out.contains("include:") {
+        if let Ok(re_empty_inc) = regex::Regex::new(
+            r#"(?m)[ \t]*\binclude\s*:\s*\{\s*(?:(?://[^\r\n]*\r?\n|/\*[\s\S]*?\*/)\s*)*\}\s*,?[ \t]*\r?\n?"#,
+        ) {
+            out = re_empty_inc.replace_all(&out, "").into_owned();
+        }
     }
 
     // 3m. Generic array-constrained hook cast: `<T extends Item[]>` calling `setData(initialFallbackData as T[])` -> `as T`

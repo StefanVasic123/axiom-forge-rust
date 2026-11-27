@@ -40,6 +40,8 @@ pub const VALID_INDUSTRIES: &[&str] = &[
     "analytics",
     "security",
     "logistics",
+    "energy",
+    "industrial",
     "general",
 ];
 
@@ -257,102 +259,156 @@ fn clean_display_brand_name(raw: &str) -> String {
     trimmed.to_string()
 }
 
+/// Splits text into lowercase whole-word tokens, also splitting CamelCase boundaries
+/// (e.g. "GridWatch" -> ["gridwatch", "grid", "watch"], "ForgeCAD" -> ["forgecad", "forge", "cad"],
+/// "SCADA" -> ["scada"] — never false-matching "cad" inside "scada" or "sec" inside "seconds").
+fn extract_brand_tokens(text: &str) -> std::collections::HashSet<String> {
+    let mut tokens = std::collections::HashSet::new();
+    for raw_word in text.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if raw_word.is_empty() {
+            continue;
+        }
+        tokens.insert(raw_word.to_ascii_lowercase());
+
+        // Split CamelCase / acronym transitions: e.g. PulseLedger -> Pulse, Ledger; ForgeCAD -> Forge, CAD
+        let chars: Vec<char> = raw_word.chars().collect();
+        let mut start = 0usize;
+        for i in 1..chars.len() {
+            let prev = chars[i - 1];
+            let cur = chars[i];
+            let next_is_lower = chars.get(i + 1).map_or(false, |c| c.is_ascii_lowercase());
+            let split_here = (prev.is_ascii_lowercase() && cur.is_ascii_uppercase())
+                || (prev.is_ascii_uppercase() && cur.is_ascii_uppercase() && next_is_lower)
+                || (prev.is_ascii_alphabetic() != cur.is_ascii_alphabetic());
+            if split_here {
+                let part: String = chars[start..i].iter().collect();
+                if !part.is_empty() {
+                    tokens.insert(part.to_ascii_lowercase());
+                }
+                start = i;
+            }
+        }
+        if start > 0 && start < chars.len() {
+            let tail: String = chars[start..].iter().collect();
+            if !tail.is_empty() {
+                tokens.insert(tail.to_ascii_lowercase());
+            }
+        }
+    }
+    tokens
+}
+
+fn has_any_token(tokens: &std::collections::HashSet<String>, words: &[&str]) -> bool {
+    words.iter().any(|w| tokens.contains(*w))
+}
+
 /// Deterministic brand brief derived from project name, description, and prompt keywords.
 pub fn derive_deterministic_brief(name: &str, description: &str, extra_prompt: Option<&str>) -> BrandBrief {
     let brand_name = clean_display_brand_name(name);
-    let combined = format!(
+    let combined_raw = format!(
         "{} {} {}",
-        brand_name.to_lowercase(),
-        description.to_lowercase(),
-        extra_prompt.unwrap_or("").to_lowercase()
+        brand_name,
+        description,
+        extra_prompt.unwrap_or("")
     );
+    let tokens = extract_brand_tokens(&combined_raw);
 
-    let (industry, motif, primary, secondary, accent, bg) = if combined.contains("ledger")
-        || combined.contains("finance")
-        || combined.contains("budget")
-        || combined.contains("invoice")
-        || combined.contains("bank")
-        || combined.contains("pay")
-        || combined.contains("wallet")
-        || combined.contains("crypto")
-    {
+    let (industry, motif, primary, secondary, accent, bg) = if has_any_token(
+        &tokens,
+        &[
+            "freight", "fleet", "logistics", "shipment", "shipments", "shipping", "cargo",
+            "warehouse", "dispatch", "delivery", "supply", "trucking", "courier",
+        ],
+    ) {
+        ("logistics", "layers", "#0EA5E9", "#2563EB", "#38BDF8", "#071426")
+    } else if has_any_token(
+        &tokens,
+        &[
+            "scada", "substation", "substations", "power", "voltage", "energy", "electrical",
+            "utility", "turbine", "solar", "microgrid", "industrial", "factory", "plant",
+        ],
+    ) {
+        ("energy", "bolt", "#F59E0B", "#EA580C", "#FDE047", "#14100A")
+    } else if has_any_token(
+        &tokens,
+        &[
+            "ledger", "finance", "finops", "fintech", "budget", "budgets", "invoice", "invoices",
+            "billing", "bank", "banking", "payment", "payments", "wallet", "expense", "expenses",
+            "crypto", "trading", "accounting",
+        ],
+    ) {
         ("fintech", "pulse", "#10B981", "#0EA5E9", "#34D399", "#06151B")
-    } else if combined.contains("health")
-        || combined.contains("fit")
-        || combined.contains("clinic")
-        || combined.contains("med")
-        || combined.contains("patient")
-        || combined.contains("workout")
-        || combined.contains("wellness")
-    {
+    } else if has_any_token(
+        &tokens,
+        &[
+            "health", "healthcare", "fitness", "fit", "clinic", "medical", "medicine", "patient",
+            "patients", "workout", "workouts", "wellness", "doctor", "hospital", "therapy",
+        ],
+    ) {
         ("health", "pulse", "#06B6D4", "#10B981", "#67E8F9", "#071821")
-    } else if combined.contains("sound")
-        || combined.contains("audio")
-        || combined.contains("music")
-        || combined.contains("studio")
-        || combined.contains("podcast")
-        || combined.contains("beat")
-    {
+    } else if has_any_token(
+        &tokens,
+        &[
+            "sound", "audio", "music", "podcast", "beat", "beats", "synth", "daw", "mixer",
+            "voice", "acoustic",
+        ],
+    ) {
         ("creative", "wave", "#8B5CF6", "#EC4899", "#F472B6", "#110B22")
-    } else if combined.contains("cad")
-        || combined.contains("forge")
-        || combined.contains("3d")
-        || combined.contains("architect")
-        || combined.contains("design")
-        || combined.contains("canvas")
-    {
+    } else if has_any_token(
+        &tokens,
+        &[
+            "cad", "3d", "mesh", "architect", "architecture", "design", "canvas", "studio",
+            "render", "vector", "illustrator", "creative",
+        ],
+    ) {
         ("creative", "prism", "#F97316", "#6366F1", "#FBBF24", "#12101B")
-    } else if combined.contains("sec")
-        || combined.contains("auth")
-        || combined.contains("vault")
-        || combined.contains("guard")
-        || combined.contains("shield")
-        || combined.contains("trust")
-    {
+    } else if has_any_token(
+        &tokens,
+        &[
+            "security", "cyber", "cybersecurity", "auth", "vault", "guard", "shield", "trust",
+            "firewall", "compliance", "audit", "identity",
+        ],
+    ) {
         ("security", "shield", "#3B82F6", "#14B8A6", "#60A5FA", "#081224")
-    } else if combined.contains("ai")
-        || combined.contains("cortex")
-        || combined.contains("neural")
-        || combined.contains("agent")
-        || combined.contains("llm")
-        || combined.contains("ops")
-    {
+    } else if has_any_token(
+        &tokens,
+        &[
+            "ai", "cortex", "neural", "agent", "agents", "llm", "ml", "copilot", "automation",
+            "cognitive", "intelligence",
+        ],
+    ) {
         ("ai", "orbit", "#6366F1", "#A855F7", "#38BDF8", "#0B0F1F")
-    } else if combined.contains("eco")
-        || combined.contains("carbon")
-        || combined.contains("green")
-        || combined.contains("sustain")
-        || combined.contains("plant")
-        || combined.contains("farm")
-    {
+    } else if has_any_token(
+        &tokens,
+        &[
+            "eco", "carbon", "green", "sustainability", "sustainable", "climate", "solar",
+            "forest", "farm", "agriculture",
+        ],
+    ) {
         ("general", "leaf", "#22C55E", "#14B8A6", "#86EFAC", "#071A12")
-    } else if combined.contains("shop")
-        || combined.contains("store")
-        || combined.contains("commerce")
-        || combined.contains("market")
-        || combined.contains("retail")
-    {
+    } else if has_any_token(
+        &tokens,
+        &[
+            "shop", "store", "commerce", "ecommerce", "marketplace", "market", "retail", "cart",
+            "checkout", "merchant",
+        ],
+    ) {
         ("commerce", "layers", "#EC4899", "#F59E0B", "#FB7185", "#170D1C")
-    } else if combined.contains("analytics")
-        || combined.contains("metric")
-        || combined.contains("data")
-        || combined.contains("bi")
-        || combined.contains("chart")
-    {
+    } else if has_any_token(
+        &tokens,
+        &[
+            "analytics", "telemetry", "metric", "metrics", "data", "bi", "chart", "charts",
+            "inspection", "inspector", "monitor", "monitoring", "site", "field",
+        ],
+    ) {
         ("analytics", "grid", "#3B82F6", "#6366F1", "#38BDF8", "#0A1122")
-    } else if combined.contains("energy")
-        || combined.contains("fast")
-        || combined.contains("bolt")
-        || combined.contains("flash")
-        || combined.contains("speed")
-    {
-        ("developer", "bolt", "#F59E0B", "#EF4444", "#FDE047", "#18100A")
-    } else if combined.contains("dev")
-        || combined.contains("code")
-        || combined.contains("cloud")
-        || combined.contains("api")
-        || combined.contains("stack")
-    {
+    } else if has_any_token(
+        &tokens,
+        &[
+            "dev", "developer", "code", "cloud", "api", "stack", "devops", "ops", "deploy",
+            "infra", "kubernetes", "docker",
+        ],
+    ) {
         ("developer", "hexagon", "#6366F1", "#06B6D4", "#818CF8", "#0B1020")
     } else {
         ("general", "spark", "#6366F1", "#10B981", "#38BDF8", "#0B1120")
@@ -362,20 +418,20 @@ pub fn derive_deterministic_brief(name: &str, description: &str, extra_prompt: O
     let mut final_primary = primary.to_string();
     let mut final_secondary = secondary.to_string();
     if let Some(p) = extra_prompt {
-        let pl = p.to_lowercase();
-        if pl.contains("emerald") || pl.contains("green") || pl.contains("zelen") {
+        let p_tokens = extract_brand_tokens(p);
+        if has_any_token(&p_tokens, &["emerald", "green", "zelena", "zeleni", "zeleno"]) {
             final_primary = "#10B981".to_string();
             final_secondary = "#059669".to_string();
-        } else if pl.contains("gold") || pl.contains("amber") || pl.contains("zlat") || pl.contains("orange") {
+        } else if has_any_token(&p_tokens, &["gold", "amber", "zlatna", "zlatni", "orange"]) {
             final_primary = "#F59E0B".to_string();
             final_secondary = "#EA580C".to_string();
-        } else if pl.contains("red") || pl.contains("crimson") || pl.contains("rose") || pl.contains("crven") {
+        } else if has_any_token(&p_tokens, &["red", "crimson", "rose", "crvena", "crveni"]) {
             final_primary = "#F43F5E".to_string();
             final_secondary = "#E11D48".to_string();
-        } else if pl.contains("purple") || pl.contains("violet") || pl.contains("ljubic") {
+        } else if has_any_token(&p_tokens, &["purple", "violet", "ljubicasta", "ljubicasti"]) {
             final_primary = "#8B5CF6".to_string();
             final_secondary = "#6366F1".to_string();
-        } else if pl.contains("blue") || pl.contains("cyan") || pl.contains("plav") {
+        } else if has_any_token(&p_tokens, &["blue", "cyan", "plava", "plavi"]) {
             final_primary = "#3B82F6".to_string();
             final_secondary = "#06B6D4".to_string();
         }
@@ -804,10 +860,15 @@ fn render_wordmark_svg(brief: &BrandBrief, mark_svg: &str, dark_mode: bool) -> S
     let tag_short: String = brief.tagline.chars().take(34).collect();
     let tag_esc = xml_escape(&tag_short);
 
-    let font_size = if brief.brand_name.len() > 16 {
-        26
-    } else if brief.brand_name.len() > 12 {
-        30
+    let name_chars = brief.brand_name.chars().count();
+    let font_size = if name_chars > 24 {
+        20
+    } else if name_chars > 18 {
+        23
+    } else if name_chars > 14 {
+        27
+    } else if name_chars > 11 {
+        31
     } else {
         34
     };
@@ -829,11 +890,96 @@ fn render_wordmark_svg(brief: &BrandBrief, mark_svg: &str, dark_mode: bool) -> S
     )
 }
 
+/// Splits a long title into 2 balanced lines at word boundaries so it fits cleanly inside the OG card.
+fn split_og_title_lines(title: &str) -> (String, Option<String>) {
+    let char_len = title.chars().count();
+    if char_len <= 18 {
+        return (title.to_string(), None);
+    }
+    let words: Vec<&str> = title.split_whitespace().collect();
+    if words.len() < 2 {
+        return (title.to_string(), None);
+    }
+    let mut best_split = 1usize;
+    let mut best_diff = usize::MAX;
+    for i in 1..words.len() {
+        let l1 = words[..i].join(" ");
+        let l2 = words[i..].join(" ");
+        let diff = l1.chars().count().abs_diff(l2.chars().count());
+        if diff < best_diff {
+            best_diff = diff;
+            best_split = i;
+        }
+    }
+    (words[..best_split].join(" "), Some(words[best_split..].join(" ")))
+}
+
 fn render_og_image_svg(brief: &BrandBrief, mark_svg: &str) -> String {
     let inner_mark = strip_outer_svg_wrapper(mark_svg);
     let name_esc = xml_escape(&brief.brand_name);
     let tag_esc = xml_escape(&brief.tagline);
-    let ind_esc = xml_escape(&brief.industry.to_uppercase());
+    let ind_upper = brief.industry.to_uppercase();
+    let ind_esc = xml_escape(&ind_upper);
+
+    // Dynamic industry pill width so longer labels like LOGISTICS / INDUSTRIAL never crowd the pill
+    let pill_w = (ind_upper.chars().count() * 11 + 52).clamp(132, 240);
+    let pill_cx = 380 + (pill_w / 2);
+
+    // Dynamic title typography + balanced 2-line wrap so titles NEVER clip past x=1140 (760px available)
+    let (line1, line2_opt) = split_og_title_lines(&brief.brand_name);
+    let (title_svg, tag_y, bar_y) = if let Some(line2) = line2_opt {
+        let max_line = line1.chars().count().max(line2.chars().count());
+        let fs = if max_line <= 14 {
+            58
+        } else if max_line <= 18 {
+            50
+        } else if max_line <= 24 {
+            42
+        } else {
+            34
+        };
+        let l1_esc = xml_escape(&line1);
+        let l2_esc = xml_escape(&line2);
+        let y1 = 296;
+        let y2 = y1 + fs + 10;
+        let svg_block = format!(
+            r##"<text x="380" y="{y1}" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="{fs}" font-weight="800" letter-spacing="-1.2" fill="#F8FAFC">{l1}</text>
+  <text x="380" y="{y2}" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="{fs}" font-weight="800" letter-spacing="-1.2" fill="#F8FAFC">{l2}</text>"##,
+            y1 = y1,
+            y2 = y2,
+            fs = fs,
+            l1 = l1_esc,
+            l2 = l2_esc
+        );
+        (svg_block, y2 + 52, y2 + 94)
+    } else {
+        let len = line1.chars().count();
+        let fs = if len <= 13 {
+            72
+        } else if len <= 17 {
+            58
+        } else if len <= 22 {
+            46
+        } else {
+            ((700.0 / (len as f32 * 0.62)).round() as usize).clamp(28, 44)
+        };
+        let l1_esc = xml_escape(&line1);
+        let svg_block = format!(
+            r##"<text x="380" y="314" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="{fs}" font-weight="800" letter-spacing="-1.5" fill="#F8FAFC">{l1}</text>"##,
+            fs = fs,
+            l1 = l1_esc
+        );
+        (svg_block, 376, 422)
+    };
+
+    let tag_len = brief.tagline.chars().count();
+    let tag_fs = if tag_len <= 38 {
+        28
+    } else if tag_len <= 52 {
+        23
+    } else {
+        19
+    };
 
     format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630" role="img" aria-label="{name}">
@@ -858,16 +1004,22 @@ fn render_og_image_svg(brief: &BrandBrief, mark_svg: &str) -> String {
   <g transform="translate(104, 195) scale(1.85)">
     {inner}
   </g>
-  <rect x="380" y="198" width="146" height="34" rx="17" fill="{p}" fill-opacity="0.18" stroke="{p}" stroke-opacity="0.45"/>
-  <text x="453" y="220" text-anchor="middle" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" letter-spacing="1.6" fill="{a}">{ind}</text>
-  <text x="380" y="314" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="72" font-weight="800" letter-spacing="-1.5" fill="#F8FAFC">{name}</text>
-  <text x="382" y="376" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="28" font-weight="400" fill="#CBD5E1">{tag}</text>
-  <rect x="380" y="422" width="120" height="6" rx="3" fill="{p}"/>
-  <rect x="510" y="422" width="48" height="6" rx="3" fill="{s}"/>
+  <rect x="380" y="188" width="{pill_w}" height="34" rx="17" fill="{p}" fill-opacity="0.18" stroke="{p}" stroke-opacity="0.45"/>
+  <text x="{pill_cx}" y="210" text-anchor="middle" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" letter-spacing="1.6" fill="{a}">{ind}</text>
+  {title_svg}
+  <text x="382" y="{tag_y}" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="{tag_fs}" font-weight="400" fill="#CBD5E1">{tag}</text>
+  <rect x="380" y="{bar_y}" width="120" height="6" rx="3" fill="{p}"/>
+  <rect x="510" y="{bar_y}" width="48" height="6" rx="3" fill="{s}"/>
 </svg>"##,
         name = name_esc,
         tag = tag_esc,
         ind = ind_esc,
+        pill_w = pill_w,
+        pill_cx = pill_cx,
+        title_svg = title_svg,
+        tag_y = tag_y,
+        tag_fs = tag_fs,
+        bar_y = bar_y,
         bg = brief.bg_color,
         p = brief.primary_color,
         s = brief.secondary_color,
@@ -1610,5 +1762,40 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         assert!(expo_dir.join("assets/favicon.png").is_file());
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_word_boundary_industry_and_long_og_title_wrapping() {
+        // "scada" must NOT match "cad" -> should classify as energy/bolt, NOT creative/prism
+        let grid = derive_deterministic_brief(
+            "GridWatch Substation OS",
+            "Native Electron SCADA console for electrical substation monitoring.",
+            None,
+        );
+        assert_eq!(grid.industry, "energy");
+        assert_eq!(grid.motif, "bolt");
+
+        // "seconds" must NOT match "sec" -> should classify as logistics/layers, NOT security/shield
+        let freight = derive_deterministic_brief(
+            "FreightGrid Fleet Logistics",
+            "Real-time fleet maintenance and shipment tracking updated every 5 seconds.",
+            None,
+        );
+        assert_eq!(freight.industry, "logistics");
+        assert_eq!(freight.motif, "layers");
+
+        // CamelCase "ForgeCAD" still detects "cad" -> creative/prism
+        let cad = derive_deterministic_brief("ForgeCAD", "3D parametric modeling studio", None);
+        assert_eq!(cad.industry, "creative");
+        assert_eq!(cad.motif, "prism");
+
+        // Long titles wrap cleanly into 2 lines inside OG image and never use clipped font-size="72"
+        let vars = render_logo_variants(&freight);
+        let og = &vars[0].og_image_svg;
+        assert!(og.contains("FreightGrid Fleet") && og.contains("Logistics"));
+        assert!(!og.contains("font-size=\"72\""), "Long title must not use 72px font:\n{}", og);
+        // Must rasterize cleanly to 1200x630 PNG
+        let png = rasterize_svg_to_png(og, 1200, 630).expect("wrapped OG PNG must rasterize");
+        assert_eq!(&png[0..8], &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
     }
 }
