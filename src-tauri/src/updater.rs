@@ -2,9 +2,9 @@ use serde_json::{json, Value};
 
 pub const MANDATORY_BEHIND_THRESHOLD: u64 = 10;
 pub const GITHUB_RELEASES_API_URL: &str =
-    "https://api.github.com/repos/StefanVasic123/axiom-forge-rust/releases?per_page=30";
+    "https://api.github.com/repos/axon-forge/axon-forge/releases?per_page=30";
 pub const RELEASES_PAGE_URL: &str =
-    "https://github.com/StefanVasic123/axiom-forge-rust/releases/latest";
+    "https://github.com/axon-forge/axon-forge/releases/latest";
 
 pub fn parse_semver(raw: &str) -> Option<(u64, u64, u64)> {
     let trimmed = raw.trim();

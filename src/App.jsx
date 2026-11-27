@@ -97,7 +97,7 @@ function AppContent() {
               latestVersion: 'latest',
               versionsBehind: 10,
               mandatoryThreshold: 10,
-              downloadUrl: 'https://github.com/StefanVasic123/axiom-forge-rust/releases/latest',
+              downloadUrl: 'https://github.com/axon-forge/axon-forge/releases/latest',
             });
           }
         }

@@ -171,7 +171,10 @@ fn handle_axiom_url<R: tauri::Runtime>(app: &tauri::AppHandle<R>, url_str: &str)
         }
     }
 
-    if let Some(rest) = url_str.strip_prefix("axiom://") {
+    if let Some(rest) = url_str
+        .strip_prefix("axon://")
+        .or_else(|| url_str.strip_prefix("axiom://"))
+    {
         let mut parts = rest.splitn(2, '?');
         let action = parts.next().unwrap_or("").trim_end_matches('/');
         let query = parts.next().unwrap_or("");
@@ -245,7 +248,7 @@ pub fn run() {
             for arg in argv {
                 let cleaned = arg.trim_matches('"').trim_matches('\'').to_string();
                 debug_log_to_file(format!("Single instance checking arg: {}", cleaned));
-                if cleaned.starts_with("axiom://") {
+                if cleaned.starts_with("axon://") || cleaned.starts_with("axiom://") {
                     handle_axiom_url(app, &cleaned);
                 }
             }
@@ -268,7 +271,11 @@ pub fn run() {
                 let mut found_cli_url = false;
                 for arg in std::env::args() {
                     let arg_lower = arg.to_lowercase();
-                    if arg_lower.starts_with("axiom://") || arg_lower.contains("axiom://") {
+                    if arg_lower.starts_with("axon://")
+                        || arg_lower.contains("axon://")
+                        || arg_lower.starts_with("axiom://")
+                        || arg_lower.contains("axiom://")
+                    {
                         let cleaned_url = arg.trim_matches('"').trim_matches('\'').to_string();
                         debug_log_to_file(format!("Cold start CLI argument match found: {}", cleaned_url));
                         handle_axiom_url(app.handle(), &cleaned_url);

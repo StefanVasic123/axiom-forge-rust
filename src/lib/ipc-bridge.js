@@ -63,8 +63,14 @@ function registerGlobalListener(eventName, callback) {
 }
 
 function parseAxiomUrl(urlStr) {
-  if (!urlStr.startsWith('axiom://')) return null;
-  const rest = urlStr.substring('axiom://'.length);
+  let rest = null;
+  if (urlStr.startsWith('axon://')) {
+    rest = urlStr.substring('axon://'.length);
+  } else if (urlStr.startsWith('axiom://')) {
+    rest = urlStr.substring('axiom://'.length);
+  } else {
+    return null;
+  }
   const parts = rest.split('?');
   const action = parts[0].replace(/\/$/, '');
   const query = parts[1] || '';
@@ -752,7 +758,7 @@ window.electronAPI = {
           const ver = await getVersion();
           return { success: true, version: ver };
         } catch {
-          return { success: true, version: '0.1.66' };
+          return { success: true, version: '0.1.69' };
         }
       }
     },

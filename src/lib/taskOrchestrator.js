@@ -244,13 +244,6 @@ export class TaskOrchestrator extends EventEmitter {
       console.log(`[Orchestrator] Phase 1: Fetching manifest for ${manifestId}...`);
       
       const manifest = await this._fetchManifest(manifestId, token);
-      
-      // DEBUG: Log activity
-      try {
-        const fs = await import('fs');
-        fs.appendFileSync('C:\\Users\\StefanV\\Desktop\\Projects\\axiom-forge\\axiom-live-debug.log', `[${new Date().toISOString()}] Manifest fetched. Expecting clear text...\n`);
-        fs.writeFileSync('C:\\Users\\StefanV\\Desktop\\Projects\\axiom-forge\\axiom-live-manifest.json', JSON.stringify(manifest, null, 2));
-      } catch (e) {}
 
       this._updateTask(taskId, { phase: TaskPhase.FETCH_MANIFEST, progress: 10 });
       onProgress({ phase: 'fetch-manifest', message: 'Manifest secured and ready.', progress: 10 });
@@ -318,11 +311,6 @@ export class TaskOrchestrator extends EventEmitter {
 
       // Generate files
       console.log(`[Orchestrator] Starting file generation...`);
-      // DEBUG: Log start of generation
-      try {
-        const fs = await import('fs');
-        fs.appendFileSync('C:\\Users\\StefanV\\Desktop\\Projects\\axiom-forge\\axiom-live-debug.log', `[${new Date().toISOString()}] TRIGGERING OLLAMA GENERATION: ${manifest.name} | Files: ${manifest.files?.length}\n`);
-      } catch (e) {}
 
       const generationResult = await this.ollama.generateProject(manifest, (progress) => {
         // Safe progress calculation to avoid NaN

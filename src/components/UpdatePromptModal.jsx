@@ -2,7 +2,7 @@ import React from 'react';
 import { AlertTriangle, Download, ArrowRight, X, ShieldAlert } from 'lucide-react';
 import { useI18n } from '../i18n/I18nContext';
 
-const DEFAULT_RELEASES_URL = 'https://github.com/StefanVasic123/axiom-forge-rust/releases/latest';
+const DEFAULT_RELEASES_URL = 'https://github.com/axon-forge/axon-forge/releases/latest';
 
 export default function UpdatePromptModal({
   updateInfo,

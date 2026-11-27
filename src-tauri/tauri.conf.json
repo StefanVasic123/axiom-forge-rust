@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Axon Forge",
-  "version": "0.1.68",
-  "identifier": "com.stefanv.axiom-forge-rust",
+  "version": "0.1.69",
+  "identifier": "com.axonforge.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:5173",
@@ -41,6 +41,7 @@
     "deep-link": {
       "desktop": {
         "schemes": [
+          "axon",
           "axiom"
         ]
       }

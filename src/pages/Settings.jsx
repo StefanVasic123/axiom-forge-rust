@@ -1183,10 +1183,10 @@ function Settings() {
                 {isCheckingUpdate ? t('update.checkingUpdates') : t('update.checkUpdatesBtn')}
               </button>
               <a
-                href="https://github.com/StefanVasic123/axiom-forge-rust/releases/latest"
+                href="https://github.com/axon-forge/axon-forge/releases/latest"
                 onClick={(e) => {
                   e.preventDefault();
-                  window.electronAPI.shell.openExternal('https://github.com/StefanVasic123/axiom-forge-rust/releases/latest');
+                  window.electronAPI.shell.openExternal('https://github.com/axon-forge/axon-forge/releases/latest');
                 }}
                 className="text-xs text-indigo-400 hover:text-indigo-300"
               >
@@ -1233,7 +1233,7 @@ function Settings() {
                 onClick={() =>
                   window.electronAPI.shell.openExternal(
                     updateCheckResult.downloadUrl ||
-                      'https://github.com/StefanVasic123/axiom-forge-rust/releases/latest'
+                      'https://github.com/axon-forge/axon-forge/releases/latest'
                   )
                 }
                 className={`shrink-0 px-3 py-1.5 rounded-lg font-semibold inline-flex items-center gap-1.5 ${

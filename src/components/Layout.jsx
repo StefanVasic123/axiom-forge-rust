@@ -120,12 +120,12 @@ function Sidebar() {
       {/* Footer */}
       <div className="p-4 border-t border-slate-800 flex flex-col gap-3">
         <a
-          href="https://github.com/axiom-forge/axiom-forge"
+          href="https://github.com/axon-forge/axon-forge"
           target="_blank"
           rel="noopener noreferrer"
           onClick={(e) => {
             e.preventDefault();
-            window.electronAPI.shell.openExternal('https://github.com/axiom-forge/axiom-forge');
+            window.electronAPI.shell.openExternal('https://github.com/axon-forge/axon-forge');
           }}
           className="flex items-center gap-2 text-sm text-slate-500 hover:text-slate-300 transition-colors"
         >
