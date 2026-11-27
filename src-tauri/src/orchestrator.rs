@@ -7096,6 +7096,13 @@ pub async fn run_orchestrator_opt(
 
     // Immediately register/update the project in projects.json with "generating" status
     // so it appears on the Dashboard right away with its real name and description.
+    let _compliance_cfg = crate::compliance::resolve_and_save_compliance(
+        &proj_dir,
+        &manifest,
+        name,
+        project_description,
+    );
+
     let initial_proj = serde_json::json!({
         "id": project_id,
         "name": name,
@@ -8415,8 +8422,9 @@ pub async fn run_orchestrator_opt(
     }
     let has_warnings = !completion_warnings.is_empty();
 
-    // 3.9 Ensure crisp default Brand Logo + Favicon + OG assets (static files only, never breaks TS/build)
+    // 3.9 Ensure crisp default Brand Logo + Favicon + OG assets and Zero-Config Redis/Upstash cache utility
     crate::brand_logo::ensure_default_brand_assets(&proj_dir, &name, &project_description);
+    crate::cache_template::ensure_cache_infrastructure(&proj_dir);
 
     // 4. Save Project State
     emit_progress("save-project", "Saving project files...", 99.0);

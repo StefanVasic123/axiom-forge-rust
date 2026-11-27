@@ -20,6 +20,8 @@ pub mod templates_expo;
 pub mod copilot;
 pub mod publish;
 pub mod brand_logo;
+pub mod compliance;
+pub mod cache_template;
 pub mod updater;
 
 pub use ollama::*;

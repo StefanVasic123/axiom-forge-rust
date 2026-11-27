@@ -54,6 +54,8 @@ pub struct PublishPreflight {
     pub is_expo: bool,
     pub detected_env_keys: Vec<String>,
     pub existing_state: Option<PublishStateFile>,
+    pub compliance_summary: Option<crate::compliance::CompliancePreflightSummary>,
+    pub cache_summary: Option<crate::cache_template::CachePreflightSummary>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -76,6 +78,12 @@ pub struct PublishRequest {
     #[serde(default = "default_true")]
     pub sync_local_env_keys: bool,
     pub vercel_team_id: Option<String>,
+    #[serde(default)]
+    pub upstash_redis_rest_url: Option<String>,
+    #[serde(default)]
+    pub upstash_redis_rest_token: Option<String>,
+    #[serde(default)]
+    pub redis_url: Option<String>,
 }
 
 fn default_db_mode() -> String {
@@ -840,6 +848,13 @@ pub fn publish_get_preflight(project_id: String) -> Result<PublishPreflight, Str
             sanitize_repo_slug(&base)
         });
 
+    let compliance_summary = crate::compliance::build_compliance_preflight_summary(&proj_dir);
+    let cache_summary = if is_expo {
+        None
+    } else {
+        Some(crate::cache_template::build_cache_preflight_summary(&proj_dir))
+    };
+
     Ok(PublishPreflight {
         project_id,
         suggested_repo_name,
@@ -851,6 +866,8 @@ pub fn publish_get_preflight(project_id: String) -> Result<PublishPreflight, Str
         is_expo,
         detected_env_keys,
         existing_state,
+        compliance_summary,
+        cache_summary,
     })
 }
 
@@ -1078,6 +1095,17 @@ pub async fn publish_project_fullstack(
     }
     env_vars.insert("NEXTAUTH_SECRET".to_string(), nextauth_secret);
     env_vars.insert("NEXTAUTH_URL".to_string(), canonical_site_url);
+
+    // Optional plug-and-play Redis / Upstash cache ENV overrides from Publish Modal
+    if let Some(u) = req.upstash_redis_rest_url.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        env_vars.insert("UPSTASH_REDIS_REST_URL".to_string(), u.to_string());
+    }
+    if let Some(t) = req.upstash_redis_rest_token.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        env_vars.insert("UPSTASH_REDIS_REST_TOKEN".to_string(), t.to_string());
+    }
+    if let Some(r) = req.redis_url.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        env_vars.insert("REDIS_URL".to_string(), r.to_string());
+    }
 
     let mut env_keys_synced: Vec<String> = env_vars.keys().cloned().collect();
     env_keys_synced.sort();

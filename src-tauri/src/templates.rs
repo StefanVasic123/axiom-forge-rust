@@ -627,6 +627,91 @@ export default function RegisterPage() {
     .to_string()
 }
 
+/// Renders RegisterPage with legal/age consent checkboxes when compliance is active;
+/// otherwise delegates unchanged to `render_register_page()`.
+pub fn render_register_page_with_compliance(comp: Option<&crate::compliance::ComplianceConfig>) -> String {
+    let Some(c) = comp else {
+        return render_register_page();
+    };
+    let need_terms = c.register_consent_checkbox || c.cookie_consent || !c.disclaimers.is_empty();
+    let need_age = c.age_gate.enabled;
+    if !need_terms && !need_age {
+        return render_register_page();
+    }
+    let min_age = c.age_gate.min_age.max(13);
+
+    let mut page = render_register_page();
+    // Inject checkbox state right after password state
+    let state_add = if need_age {
+        "  const [password, setPassword] = useState(\"\");\n  const [acceptedTerms, setAcceptedTerms] = useState(false);\n  const [confirmedAge, setConfirmedAge] = useState(false);"
+    } else {
+        "  const [password, setPassword] = useState(\"\");\n  const [acceptedTerms, setAcceptedTerms] = useState(false);"
+    };
+    page = page.replace(
+        "  const [password, setPassword] = useState(\"\");",
+        state_add,
+    );
+
+    // Inject validation before API call
+    let validation_add = if need_age {
+        format!(
+            "    if (password.length < 8) {{\n      setError(\"Password must be at least 8 characters long.\");\n      return;\n    }}\n    if (!acceptedTerms) {{\n      setError(\"You must agree to the Terms of Service and Privacy Policy.\");\n      return;\n    }}\n    if (!confirmedAge) {{\n      setError(\"You must confirm that you are at least {min_age} years old.\");\n      return;\n    }}",
+            min_age = min_age
+        )
+    } else {
+        "    if (password.length < 8) {\n      setError(\"Password must be at least 8 characters long.\");\n      return;\n    }\n    if (!acceptedTerms) {\n      setError(\"You must agree to the Terms of Service and Privacy Policy.\");\n      return;\n    }".to_string()
+    };
+    page = page.replace(
+        "    if (password.length < 8) {\n      setError(\"Password must be at least 8 characters long.\");\n      return;\n    }",
+        &validation_add,
+    );
+
+    // Inject checkboxes right before submit button
+    let mut checkboxes = String::from(
+        r#"          <div className="space-y-2.5 pt-1">
+            <label className="flex items-start gap-2.5 text-xs text-muted-foreground cursor-pointer">
+              <input
+                type="checkbox"
+                checked={acceptedTerms}
+                onChange={(e) => setAcceptedTerms(e.target.checked)}
+                required
+                className="mt-0.5 rounded border-border text-primary focus:ring-primary"
+              />
+              <span>
+                I agree to the{" "}
+                <Link href="/legal/terms" prefetch={false} className="underline text-primary hover:opacity-80">
+                  Terms of Service
+                </Link>{" "}
+                and{" "}
+                <Link href="/legal/privacy" prefetch={false} className="underline text-primary hover:opacity-80">
+                  Privacy Policy
+                </Link>
+                .
+              </span>
+            </label>
+"#,
+    );
+    if need_age {
+        checkboxes.push_str(&format!(
+            r#"            <label className="flex items-start gap-2.5 text-xs text-muted-foreground cursor-pointer">
+              <input
+                type="checkbox"
+                checked={{confirmedAge}}
+                onChange={{(e) => setConfirmedAge(e.target.checked)}}
+                required
+                className="mt-0.5 rounded border-border text-primary focus:ring-primary"
+              />
+              <span>I confirm that I am at least {min_age} years old.</span>
+            </label>
+"#,
+            min_age = min_age
+        ));
+    }
+    checkboxes.push_str("          </div>\n\n          <button");
+    page = page.replace("          <button", &checkboxes);
+    page
+}
+
 const TSCONFIG_TEMPLATE: &str = r#"{
   "compilerOptions": {
     "lib": ["dom", "dom.iterable", "esnext"],
@@ -753,6 +838,49 @@ pub fn render_providers_component(has_auth: bool) -> String {
     }
 }
 
+pub fn render_providers_component_with_compliance(
+    has_auth: bool,
+    comp: Option<&crate::compliance::ComplianceConfig>,
+) -> String {
+    let Some(c) = comp else {
+        return render_providers_component(has_auth);
+    };
+    if !c.age_gate.enabled && !c.cookie_consent {
+        return render_providers_component(has_auth);
+    }
+
+    let mut imports = String::from("\"use client\";\n\nimport React from \"react\";\n");
+    if has_auth {
+        imports.push_str("import { SessionProvider } from \"next-auth/react\";\n");
+    }
+    if c.age_gate.enabled {
+        imports.push_str("import { AgeGateModal } from \"@/components/AgeGateModal\";\n");
+    }
+    if c.cookie_consent {
+        imports.push_str("import { CookieConsentBanner } from \"@/components/CookieConsentBanner\";\n");
+    }
+
+    let mut overlays = String::new();
+    if c.age_gate.enabled {
+        overlays.push_str("\n      <AgeGateModal />");
+    }
+    if c.cookie_consent {
+        overlays.push_str("\n      <CookieConsentBanner />");
+    }
+
+    if has_auth {
+        format!(
+            "{}\nexport function Providers({{ children }}: {{ children: React.ReactNode }}) {{\n  return (\n    <SessionProvider>\n      {{children}}{}\n    </SessionProvider>\n  );\n}}\n\nexport default Providers;\n",
+            imports, overlays
+        )
+    } else {
+        format!(
+            "{}\nexport function Providers({{ children }}: {{ children: React.ReactNode }}) {{\n  return (\n    <>\n      {{children}}{}\n    </>\n  );\n}}\n\nexport default Providers;\n",
+            imports, overlays
+        )
+    }
+}
+
 fn read_pkg_meta(proj_dir: &Path) -> (String, String, bool) {
     let mut title = String::from("Axiom App");
     let mut desc = String::from("Generated with Axiom Forge");
@@ -799,16 +927,32 @@ pub fn render_root_layout(proj_dir: &Path, spec_desc: &str) -> String {
         || proj_dir.join("src/components/Footer.tsx").is_file()
         || proj_dir.join("components/Footer.tsx").is_file();
 
+    let comp_cfg = crate::compliance::load_compliance_config(proj_dir);
+    let has_disclaimer_bar = comp_cfg
+        .as_ref()
+        .map_or(false, |c| !c.disclaimers.is_empty());
+
     let navbar_imp = if has_navbar { "import Navbar from \"@/components/Navbar\";\n" } else { "" };
     let footer_imp = if has_footer { "import Footer from \"@/components/Footer\";\n" } else { "" };
+    let disclaimer_imp = if has_disclaimer_bar {
+        "import { ComplianceDisclaimerBar } from \"@/components/ComplianceDisclaimerBar\";\n"
+    } else {
+        ""
+    };
     let navbar_jsx = if has_navbar { "          <Navbar />\n" } else { "" };
-    let footer_jsx = if has_footer { "\n          <Footer />" } else { "" };
+    let mut footer_jsx = String::new();
+    if has_disclaimer_bar {
+        footer_jsx.push_str("\n          <ComplianceDisclaimerBar />");
+    }
+    if has_footer {
+        footer_jsx.push_str("\n          <Footer />");
+    }
 
     format!(
         "import type {{ Metadata }} from \"next\";\n\
 import \"./globals.css\";\n\
 import {{ Providers }} from \"@/components/Providers\";\n\
-{}{}\n\
+{}{}{}\n\
 export const metadata: Metadata = {{\n  \
   metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL || process.env.NEXTAUTH_URL || \"http://localhost:3000\"),\n  \
   title: {},\n  \
@@ -832,7 +976,7 @@ export default function RootLayout({{ children }}: {{ children: React.ReactNode 
     </html>\n  \
   );\n\
 }}\n",
-        navbar_imp, footer_imp, title_json, desc_json, navbar_jsx, footer_jsx
+        navbar_imp, footer_imp, disclaimer_imp, title_json, desc_json, navbar_jsx, footer_jsx
     )
 }
 
@@ -937,20 +1081,65 @@ pub fn render_deterministic_file(
 
     if p == "src/app/layout.tsx" || p == "app/layout.tsx" {
         let has_auth = project_has_auth(proj_dir, spec_desc);
-        let providers_path = if p.starts_with("src/") {
-            "src/components/Providers.tsx".to_string()
+        let comp_cfg = crate::compliance::load_compliance_config(proj_dir);
+        let comp_prefix = if p.starts_with("src/") {
+            "src/components"
         } else {
-            "components/Providers.tsx".to_string()
+            "components"
         };
+        let mut side_files = vec![(
+            format!("{}/Providers.tsx", comp_prefix),
+            render_providers_component_with_compliance(has_auth, comp_cfg.as_ref()),
+        )];
+        if let Some(ref c) = comp_cfg {
+            if c.age_gate.enabled {
+                side_files.push((
+                    format!("{}/AgeGateModal.tsx", comp_prefix),
+                    crate::compliance::render_age_gate_modal_tsx(&c.age_gate),
+                ));
+            }
+            if c.cookie_consent {
+                side_files.push((
+                    format!("{}/CookieConsentBanner.tsx", comp_prefix),
+                    crate::compliance::render_cookie_consent_banner_tsx(),
+                ));
+            }
+            if !c.disclaimers.is_empty() {
+                side_files.push((
+                    format!("{}/ComplianceDisclaimerBar.tsx", comp_prefix),
+                    crate::compliance::render_compliance_disclaimer_bar_tsx(c),
+                ));
+            }
+        }
         return Some(DeterministicFile {
             content: render_root_layout(proj_dir, spec_desc),
-            side_files: vec![(providers_path, render_providers_component(has_auth))],
+            side_files,
         });
     }
 
     if p == "src/components/providers.tsx" || p == "components/providers.tsx" {
         let has_auth = project_has_auth(proj_dir, spec_desc);
-        return plain(&render_providers_component(has_auth));
+        let comp_cfg = crate::compliance::load_compliance_config(proj_dir);
+        return plain(&render_providers_component_with_compliance(
+            has_auth,
+            comp_cfg.as_ref(),
+        ));
+    }
+
+    if p == "src/components/agegatemodal.tsx" || p == "components/agegatemodal.tsx" {
+        let ag = crate::compliance::load_compliance_config(proj_dir)
+            .map(|c| c.age_gate)
+            .unwrap_or_default();
+        return plain(&crate::compliance::render_age_gate_modal_tsx(&ag));
+    }
+
+    if p == "src/components/cookieconsentbanner.tsx" || p == "components/cookieconsentbanner.tsx" {
+        return plain(&crate::compliance::render_cookie_consent_banner_tsx());
+    }
+
+    if p == "src/components/compliancedisclaimerbar.tsx" || p == "components/compliancedisclaimerbar.tsx" {
+        let cfg = crate::compliance::load_compliance_config(proj_dir).unwrap_or_default();
+        return plain(&crate::compliance::render_compliance_disclaimer_bar_tsx(&cfg));
     }
 
     if p == "src/middleware.ts" || p == "middleware.ts" {
@@ -975,6 +1164,10 @@ pub fn render_deterministic_file(
         );
     }
 
+    if p == "src/lib/cache.ts" || p == "lib/cache.ts" || p == "src/lib/redis.ts" || p == "lib/redis.ts" {
+        return plain(&crate::cache_template::render_cache_ts());
+    }
+
     if p == "src/types/index.ts" {
         let ir = read_ir(proj_dir)?;
         let extra = extract_extra_type_names(spec_desc, &ir);
@@ -992,7 +1185,8 @@ pub fn render_deterministic_file(
         return if is_login_page {
             plain(&render_login_page())
         } else {
-            plain(&render_register_page())
+            let comp_cfg = crate::compliance::load_compliance_config(proj_dir);
+            plain(&render_register_page_with_compliance(comp_cfg.as_ref()))
         };
     }
 
@@ -1504,5 +1698,56 @@ mod tests {
         let fixed_inc = crate::sanitizer::sanitize_nextjs_and_zod_hallucinations(prisma_empty_inc, "src/app/api/shipments/route.ts");
         assert!(!fixed_inc.contains("Include any necessary relations"), "empty include must be stripped:\n{}", fixed_inc);
         assert!(fixed_inc.contains("items: true"), "non-empty include must be preserved:\n{}", fixed_inc);
+    }
+
+    #[test]
+    fn test_compliance_templates_wire_into_layout_providers_and_register_without_touching_plain_apps() {
+        let tmp = std::env::temp_dir().join(format!("axiom_comp_tpl_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(tmp.join("prisma")).unwrap();
+        std::fs::write(
+            tmp.join("package.json"),
+            r#"{"name":"demo-app","dependencies":{"next-auth":"^4.24.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("prisma/schema.prisma"),
+            "datasource db {\n  provider = \"postgresql\"\n  url = env(\"DATABASE_URL\")\n}\n\nmodel User {\n  id String @id\n  email String @unique\n  password String\n}\n",
+        )
+        .unwrap();
+
+        // 1. Without compliance.json -> plain app gets ZERO compliance components or extra checkboxes
+        let plain_layout = render_deterministic_file(&tmp, "nextjs", "src/app/layout.tsx", "plain app").unwrap();
+        assert_eq!(plain_layout.side_files.len(), 1);
+        assert!(!plain_layout.content.contains("ComplianceDisclaimerBar"));
+        let plain_reg = render_deterministic_file(&tmp, "nextjs", "src/app/register/page.tsx", "plain").unwrap();
+        assert!(!plain_reg.content.contains("acceptedTerms"));
+
+        // 2. With compliance.json (18+ Age Gate + Cookie Consent + Financial/AI Disclaimers)
+        let manifest = serde_json::json!({
+            "compliance": {
+                "ageGate": { "enabled": true, "minAge": 18, "mode": "confirm" },
+                "cookieConsent": true,
+                "disclaimers": ["financial", "ai"]
+            }
+        });
+        crate::compliance::resolve_and_save_compliance(&tmp, &manifest, "AlphaTrade", "Crypto trading");
+
+        let comp_layout = render_deterministic_file(&tmp, "nextjs", "src/app/layout.tsx", "trading").unwrap();
+        assert!(comp_layout.content.contains("ComplianceDisclaimerBar"));
+        let side_paths: Vec<&str> = comp_layout.side_files.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(side_paths.contains(&"src/components/Providers.tsx"));
+        assert!(side_paths.contains(&"src/components/AgeGateModal.tsx"));
+        assert!(side_paths.contains(&"src/components/CookieConsentBanner.tsx"));
+        assert!(side_paths.contains(&"src/components/ComplianceDisclaimerBar.tsx"));
+
+        let providers_src = &comp_layout.side_files.iter().find(|(p, _)| p == "src/components/Providers.tsx").unwrap().1;
+        assert!(providers_src.contains("<AgeGateModal />"));
+        assert!(providers_src.contains("<CookieConsentBanner />"));
+
+        let comp_reg = render_deterministic_file(&tmp, "nextjs", "src/app/register/page.tsx", "trading").unwrap();
+        assert!(comp_reg.content.contains("Terms of Service"));
+        assert!(comp_reg.content.contains("at least 18 years old"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

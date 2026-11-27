@@ -82,6 +82,10 @@ export default function PublishModal({ isOpen, onClose, project, onPublished }) 
   const [autoCloudflareDns, setAutoCloudflareDns] = useState(false);
   const [vercelTeamId, setVercelTeamId] = useState('');
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [showCacheEnv, setShowCacheEnv] = useState(false);
+  const [upstashUrl, setUpstashUrl] = useState('');
+  const [upstashToken, setUpstashToken] = useState('');
+  const [redisUrl, setRedisUrl] = useState('');
 
   // Execution state
   const [isPublishing, setIsPublishing] = useState(false);
@@ -202,7 +206,10 @@ export default function PublishModal({ isOpen, onClose, project, onPublished }) 
         customDomain: customDomain.trim() || null,
         autoCloudflareDns: Boolean(customDomain.trim() && autoCloudflareDns && preflight.hasCloudflareToken),
         syncLocalEnvKeys,
-        vercelTeamId: vercelTeamId.trim() || null
+        vercelTeamId: vercelTeamId.trim() || null,
+        upstashRedisRestUrl: upstashUrl.trim() || null,
+        upstashRedisRestToken: upstashToken.trim() || null,
+        redisUrl: redisUrl.trim() || null
       });
       setPublishResult(result);
       if (typeof onPublished === 'function') {
@@ -336,6 +343,53 @@ export default function PublishModal({ isOpen, onClose, project, onPublished }) 
                     <p className="text-xs text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2">
                       Expo project detected — Vercel will deploy the web bundle (`expo export`) if configured. Native iOS/Android builds use EAS.
                     </p>
+                  )}
+                </div>
+              )}
+
+              {/* Compliance & Legal Readiness Card (only shown when project has active compliance rules) */}
+              {preflight?.complianceSummary?.active && !isPublishing && (
+                <div className="p-4 rounded-xl bg-amber-500/10 border border-amber-500/25 space-y-2.5">
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <span className="text-xs font-semibold uppercase tracking-wider text-amber-300 flex items-center gap-1.5">
+                      <ShieldCheck className="w-4 h-4 text-amber-400" />
+                      Compliance & Legal Readiness
+                    </span>
+                    <span className="text-[11px] px-2 py-0.5 rounded-full bg-slate-900/70 border border-amber-500/30 text-amber-200">
+                      {preflight.complianceSummary.source === 'manifest' ? 'Manifest Policy' : 'Auto-Detected'}
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {preflight.complianceSummary.ageGateEnabled && (
+                      <span className="px-2 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-[11px] text-emerald-300">
+                        {preflight.complianceSummary.ageGateMinAge}+ Age Gate Active
+                      </span>
+                    )}
+                    {preflight.complianceSummary.cookieConsent && (
+                      <span className="px-2 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-[11px] text-emerald-300">
+                        GDPR Cookie Banner
+                      </span>
+                    )}
+                    {preflight.complianceSummary.registerConsentCheckbox && (
+                      <span className="px-2 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-[11px] text-emerald-300">
+                        Register Consent Checkbox
+                      </span>
+                    )}
+                    {preflight.complianceSummary.disclaimers?.map((d) => (
+                      <span
+                        key={d}
+                        className="px-2 py-0.5 rounded bg-indigo-500/15 border border-indigo-500/30 text-[11px] text-indigo-200 capitalize"
+                      >
+                        {d} Disclaimer
+                      </span>
+                    ))}
+                  </div>
+                  {preflight.complianceSummary.notices?.length > 0 && (
+                    <ul className="list-disc list-inside text-[11px] text-amber-100/85 space-y-0.5">
+                      {preflight.complianceSummary.notices.map((n, idx) => (
+                        <li key={idx}>{n}</li>
+                      ))}
+                    </ul>
                   )}
                 </div>
               )}
@@ -739,6 +793,75 @@ export default function PublishModal({ isOpen, onClose, project, onPublished }) 
                             {k}
                           </span>
                         ))}
+                      </div>
+                    )}
+
+                    {/* Zero-Config Redis / Upstash Cache ENV */}
+                    {preflight.cacheSummary && (
+                      <div className="pt-2 border-t border-slate-700/60 space-y-2">
+                        <div className="flex items-center justify-between gap-2 flex-wrap">
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs font-medium text-slate-300">Cache Driver:</span>
+                            <span
+                              className={`px-2 py-0.5 rounded-full text-[11px] font-medium border ${
+                                preflight.cacheSummary.detectedProvider !== 'memory' ||
+                                (upstashUrl.trim() && upstashToken.trim()) ||
+                                redisUrl.trim()
+                                  ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-300'
+                                  : 'bg-slate-900 border-slate-700 text-slate-400'
+                              }`}
+                            >
+                              {upstashUrl.trim() && upstashToken.trim()
+                                ? 'Upstash Redis REST (Custom ENV)'
+                                : redisUrl.trim()
+                                ? 'TCP Redis (Custom ENV)'
+                                : preflight.cacheSummary.detectedProvider === 'upstash'
+                                ? 'Upstash Redis REST (.env.local)'
+                                : preflight.cacheSummary.detectedProvider === 'redis'
+                                ? 'TCP Redis (.env.local)'
+                                : 'In-Memory LRU Fallback'}
+                            </span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setShowCacheEnv((v) => !v)}
+                            className="text-xs text-indigo-400 hover:text-indigo-300 inline-flex items-center gap-1"
+                          >
+                            {showCacheEnv ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                            {showCacheEnv ? 'Hide Redis ENV' : 'Add Redis / Upstash ENV'}
+                          </button>
+                        </div>
+
+                        {showCacheEnv && (
+                          <div className="space-y-2 pt-1">
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                              <input
+                                type="text"
+                                value={upstashUrl}
+                                onChange={(e) => setUpstashUrl(e.target.value)}
+                                placeholder="UPSTASH_REDIS_REST_URL (https://...)"
+                                className="input w-full font-mono text-xs"
+                              />
+                              <input
+                                type="password"
+                                value={upstashToken}
+                                onChange={(e) => setUpstashToken(e.target.value)}
+                                placeholder="UPSTASH_REDIS_REST_TOKEN"
+                                className="input w-full font-mono text-xs"
+                              />
+                            </div>
+                            <input
+                              type="password"
+                              value={redisUrl}
+                              onChange={(e) => setRedisUrl(e.target.value)}
+                              placeholder="Or standard REDIS_URL (redis://default:pass@host:6379)"
+                              className="input w-full font-mono text-xs"
+                            />
+                            <p className="text-[11px] text-slate-500">
+                              Plug-and-play: <code className="text-slate-300">src/lib/cache.ts</code> switches automatically from In-Memory to Redis/Upstash with zero code changes.
+                            </p>
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>
