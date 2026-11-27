@@ -222,5 +222,22 @@
     "tuningTitle": "Kontrola Inferencije i Prilagođene Direktive",
     "saveDirectiveSuccess": "Podešavanja optimizatora su sačuvana lokalno.",
     "policyRegistryTitle": "Inspektor Orkestratora i Registra Pravila (ruleId)"
+  },
+  "update": {
+    "recommendedTitle": "Dostupna je nova verzija (v{latest})",
+    "recommendedDesc": "Trenutno koristite Axiom Forge v{installed} ({behind} verzija iza najnovije). Preporučujemo da instalirate najnoviju verziju pre generisanja radi novih ispravki i boljeg kvaliteta koda.",
+    "requiredTitle": "Obavezno ažuriranje pre generisanja",
+    "requiredDesc": "Vaša instalirana verzija Axiom Forge (v{installed}) je {behind} verzija iza najnovije (v{latest}). Verzije koje kasne {threshold} ili više izdanja moraju se ažurirati pre novog generisanja.",
+    "currentLabel": "Instalirano",
+    "latestLabel": "Najnovija",
+    "behindBadge": "{behind} verzija iza najnovije",
+    "downloadBtn": "Preuzmi v{latest}",
+    "continueAnywayBtn": "Nastavi ipak",
+    "laterBtn": "Kasnije",
+    "closeBtn": "Zatvori",
+    "checkUpdatesBtn": "Proveri ažuriranja",
+    "checkingUpdates": "Proveravam...",
+    "upToDateMsg": "Koristite najnoviju verziju (v{version}).",
+    "offlineMsg": "Server za proveru ažuriranja trenutno nije dostupan."
   }
 }

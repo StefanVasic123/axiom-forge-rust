@@ -1858,4 +1858,141 @@ export async function PUT(request: Request) {
         );
     }
 
+    #[test]
+    fn test_format_software_specs_prompt_all_scopes() {
+        let specs = serde_json::json!({
+            "services": ["stripe", "leaflet"],
+            "customPackages": ["@tanstack/react-table"],
+            "dataViews": [{
+                "entityName": "Trucks",
+                "viewType": "table",
+                "columns": [
+                    {
+                        "name": "License Plate",
+                        "dataType": "text",
+                        "dbField": "licensePlate",
+                        "functionality": "Searchable uppercase plate ID"
+                    },
+                    {
+                        "name": "Driver",
+                        "dataType": "text",
+                        "dbField": "driverName",
+                        "functionality": "Inline editable driver name"
+                    },
+                    {
+                        "name": "Status",
+                        "dataType": "status",
+                        "dbField": "status",
+                        "functionality": "Dropdown filter badge"
+                    }
+                ],
+                "actions": ["Assign Driver", "Export CSV"],
+                "dataFlows": [{
+                    "trigger": "Status changes to En Route",
+                    "sourceField": "driverName",
+                    "targetDbField": "lastDriver",
+                    "effect": "Persist Driver value into DB field lastDriver and stamp dispatchedAt"
+                }]
+            }],
+            "customInstructions": "Keep dispatcher summary cards above the main Trucks table."
+        });
+
+        let prisma_prompt = crate::orchestrator::format_software_specs_prompt(&specs, "prisma");
+        assert!(prisma_prompt.contains("SOFTWARE SPECIFICS CONTRACT"));
+        assert!(prisma_prompt.contains("licensePlate"));
+        assert!(prisma_prompt.contains("lastDriver"));
+        assert!(prisma_prompt.contains("PRISMA CONTRACT"));
+
+        let api_prompt = crate::orchestrator::format_software_specs_prompt(&specs, "api");
+        assert!(api_prompt.contains("API FLOW CONTRACT"));
+        assert!(api_prompt.contains("WHEN Status changes to En Route"));
+        assert!(api_prompt.contains("write DB field: lastDriver"));
+
+        let ui_prompt = crate::orchestrator::format_software_specs_prompt(&specs, "ui");
+        assert!(ui_prompt.contains("UI TABLE/VIEW CONTRACT"));
+        assert!(ui_prompt.contains("License Plate"));
+        assert!(ui_prompt.contains("Assign Driver, Export CSV"));
+        assert!(ui_prompt.contains("@tanstack/react-table"));
+
+        let exp_prompt = crate::orchestrator::format_software_specs_prompt(&specs, "expansion");
+        assert!(exp_prompt.contains("EXPANSION RULE"));
+        assert!(exp_prompt.contains("Keep dispatcher summary cards"));
+    }
+
+    #[test]
+    fn test_merge_expanded_manifest_files_preserves_rich_descriptions() {
+        let orig = vec![
+            serde_json::json!({
+                "path": "src/app/trucks/page.tsx",
+                "description": "Full interactive Trucks table with columns License Plate, Driver, Status, inline dropdown filter, and reactive DB writes to lastDriver.",
+                "language": "typescript",
+                "internalDependencies": ["src/components/TruckTable.tsx"]
+            }),
+            serde_json::json!({
+                "path": "src/app/api/trucks/route.ts",
+                "description": "GET/PATCH route with server-side reactive data flow enforcement.",
+                "language": "typescript"
+            })
+        ];
+        let expanded = vec![
+            serde_json::json!({
+                "path": "./src\\app\\trucks\\page.tsx",
+                "description": "Trucks page.",
+                "language": "typescript"
+            }),
+            serde_json::json!({
+                "path": "src/components/TruckTable.tsx",
+                "description": "Reusable table component.",
+                "language": "typescript"
+            })
+        ];
+
+        let merged = crate::orchestrator::merge_expanded_manifest_files(&orig, expanded);
+        assert_eq!(merged.len(), 3, "Must keep expanded files and restore missing original files");
+        let trucks_page = merged
+            .iter()
+            .find(|f| f.get("path").and_then(|p| p.as_str()) == Some("./src\\app\\trucks\\page.tsx"))
+            .unwrap();
+        let desc = trucks_page.get("description").and_then(|d| d.as_str()).unwrap();
+        assert!(desc.contains("reactive DB writes to lastDriver"), "Long original server description must not be overwritten: {}", desc);
+        assert!(trucks_page.get("internalDependencies").is_some(), "Original metadata fields must be preserved");
+        assert!(merged.iter().any(|f| f.get("path").and_then(|p| p.as_str()) == Some("src/app/api/trucks/route.ts")));
+    }
+
+    #[test]
+    fn test_inject_software_specs_dependencies_into_metamanifest() {
+        let mut metamanifest = serde_json::json!({
+            "requiredFilesTemplates": [{
+                "path": "package.json",
+                "mergeDependencies": {
+                    "dependencies": {
+                        "next": "14.2.35",
+                        "@prisma/client": "5.22.0"
+                    },
+                    "devDependencies": {
+                        "typescript": "^5.3.3"
+                    }
+                }
+            }]
+        });
+        let specs = serde_json::json!({
+            "resolvedDependencies": {
+                "leaflet": "^1.9.4",
+                "papaparse": "^5.4.1"
+            },
+            "resolvedDevDependencies": {
+                "@types/leaflet": "^1.9.12"
+            },
+            "customPackages": ["@tanstack/react-table"]
+        });
+
+        crate::orchestrator::inject_software_specs_dependencies_into_metamanifest(&mut metamanifest, &specs);
+        let tpl = &metamanifest["requiredFilesTemplates"][0]["mergeDependencies"];
+        assert_eq!(tpl["dependencies"]["next"], "14.2.35");
+        assert_eq!(tpl["dependencies"]["leaflet"], "^1.9.4");
+        assert_eq!(tpl["dependencies"]["papaparse"], "^5.4.1");
+        assert_eq!(tpl["dependencies"]["@tanstack/react-table"], "latest");
+        assert_eq!(tpl["devDependencies"]["typescript"], "^5.3.3");
+        assert_eq!(tpl["devDependencies"]["@types/leaflet"], "^1.9.12");
+    }
 

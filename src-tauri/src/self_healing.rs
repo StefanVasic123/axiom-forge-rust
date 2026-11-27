@@ -6376,12 +6376,33 @@ pub async fn setup_local_postgres(_proj_dir: &std::path::Path, db_name: &str) ->
     let docker_compose_path = _proj_dir.join("docker-compose.yml");
     let _ = std::fs::write(&docker_compose_path, docker_compose_content);
 
-    // Create .env.example
-    let env_example_content = format!(
+    // Create .env.example (including any optional service env keys from softwareSpecs)
+    let mut env_example_content = format!(
         "DATABASE_URL=\"postgresql://postgres:postgres_password@localhost:54321/{}?schema=public\"\n\
          NEXTAUTH_SECRET=\"axiom-dev-secret-change-in-production\"\n",
         db_name
     );
+    let lbg_path = _proj_dir.join(".axiom").join("live_builder_guide.json");
+    if let Ok(lbg_raw) = std::fs::read_to_string(&lbg_path) {
+        if let Ok(lbg_val) = serde_json::from_str::<serde_json::Value>(&lbg_raw) {
+            if let Some(env_vars) = lbg_val
+                .get("softwareSpecs")
+                .and_then(|s| s.get("envVars"))
+                .and_then(|arr| arr.as_array())
+            {
+                for item in env_vars {
+                    if let Some(key) = item.as_str().map(|s| s.trim()) {
+                        let valid_env_key = !key.is_empty()
+                            && key.chars().next().map_or(false, |c| c.is_ascii_uppercase())
+                            && key.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+                        if valid_env_key && !env_example_content.contains(&format!("{}=", key)) {
+                            env_example_content.push_str(&format!("{}=\"your-key-here\"\n", key));
+                        }
+                    }
+                }
+            }
+        }
+    }
     let env_example_path = _proj_dir.join(".env.example");
     let _ = std::fs::write(&env_example_path, env_example_content);
 

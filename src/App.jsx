@@ -17,10 +17,13 @@ import EditorPage from './pages/Editor';
 import AiOptimizer from './pages/AiOptimizer';
 import AgencyDashboard from './pages/AgencyDashboard';
 import ClientLayout from './components/ClientLayout';
+import UpdatePromptModal from './components/UpdatePromptModal';
 import { useAppStore } from './hooks/useAppStore';
 
 function AppContent() {
   const [isLoading, setIsLoading] = useState(true);
+  const [updatePrompt, setUpdatePrompt] = useState(null);
+  const [pendingDeepLinkBuild, setPendingDeepLinkBuild] = useState(null);
   const { isFirstRun, checkFirstRun, startGeneration, appMode, setAppMode } = useAppStore();
 
   useEffect(() => {
@@ -39,6 +42,21 @@ function AppContent() {
     init();
   }, []);
 
+  // Non-blocking startup update check only after first-run wizard is complete
+  useEffect(() => {
+    if (isLoading || isFirstRun) return;
+    if (window.electronAPI?.app?.checkForUpdate) {
+      window.electronAPI.app
+        .checkForUpdate()
+        .then((info) => {
+          if (info?.status === 'update_recommended' || info?.status === 'update_required') {
+            setUpdatePrompt((prev) => prev || info);
+          }
+        })
+        .catch(() => {});
+    }
+  }, [isLoading, isFirstRun]);
+
   // Subscribe to deep link events GLOBALLY (exactly once)
   useEffect(() => {
     if (isLoading) return;
@@ -47,10 +65,41 @@ function AppContent() {
       console.log('Deep link build received globally:', data);
       if (data.manifestId) {
         try {
-          // Trigger the generation process with the security token and originating host
+          // Verify desktop version before kicking off code generation
+          if (window.electronAPI?.app?.checkForUpdate) {
+            const versionCheck = await window.electronAPI.app.checkForUpdate(data.host || null);
+            if (versionCheck?.status === 'update_required') {
+              console.warn('Generation blocked: desktop app is 10+ versions behind:', versionCheck);
+              setPendingDeepLinkBuild(null);
+              setUpdatePrompt(versionCheck);
+              return;
+            }
+            if (versionCheck?.status === 'update_recommended') {
+              console.log('Soft update recommendation shown before generation:', versionCheck);
+              setPendingDeepLinkBuild(data);
+              setUpdatePrompt(versionCheck);
+              return;
+            }
+          }
+
+          // Up to date (or offline): trigger generation immediately
           await startGeneration(data.manifestId, data.projectId || data.manifestId, data.token, data.host);
         } catch (error) {
           console.error('Failed to auto-start generation globally:', error);
+          const msg = String(error?.message || error || '');
+          if (msg.includes('DESKTOP_UPDATE_REQUIRED')) {
+            const verRes = await window.electronAPI?.app?.getVersion?.().catch(() => null);
+            setPendingDeepLinkBuild(null);
+            setUpdatePrompt({
+              checked: true,
+              status: 'update_required',
+              installedVersion: verRes?.version || 'unknown',
+              latestVersion: 'latest',
+              versionsBehind: 10,
+              mandatoryThreshold: 10,
+              downloadUrl: 'https://github.com/StefanVasic123/axiom-forge-rust/releases/latest',
+            });
+          }
         }
       }
     });
@@ -70,6 +119,24 @@ function AppContent() {
     };
   }, [isLoading, startGeneration]);
 
+  const handleContinueBuildAnyway = async () => {
+    const queued = pendingDeepLinkBuild;
+    setUpdatePrompt(null);
+    setPendingDeepLinkBuild(null);
+    if (queued?.manifestId) {
+      try {
+        await startGeneration(queued.manifestId, queued.projectId || queued.manifestId, queued.token, queued.host);
+      } catch (error) {
+        console.error('Failed to start generation after soft update warning:', error);
+      }
+    }
+  };
+
+  const handleCloseUpdateModal = () => {
+    setUpdatePrompt(null);
+    setPendingDeepLinkBuild(null);
+  };
+
   if (isLoading) {
     return (
       <div className="min-h-screen bg-slate-950 flex items-center justify-center">
@@ -86,27 +153,36 @@ function AppContent() {
   }
 
   return (
-    <Routes>
-      {isFirstRun ? (
-        <Route path="*" element={<InstallationWizard />} />
-      ) : (
-        <>
-          {/* Full-screen routes (no Layout) */}
-          <Route path="/projects/:projectId/editor" element={<EditorPage />} />
+    <>
+      <Routes>
+        {isFirstRun ? (
+          <Route path="*" element={<InstallationWizard />} />
+        ) : (
+          <>
+            {/* Full-screen routes (no Layout) */}
+            <Route path="/projects/:projectId/editor" element={<EditorPage />} />
 
-          {/* Standard routes (with Layout) */}
-          <Route element={<Layout />}>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/agency-dashboard" element={<AgencyDashboard />} />
-            <Route path="/projects/:projectId" element={<ProjectDetail />} />
-            <Route path="/projects/:projectId/config" element={<ProjectConfig />} />
-            <Route path="/settings" element={<Settings />} />
-            <Route path="/ai-optimizer" element={<AiOptimizer />} />
-            <Route path="*" element={<Navigate to="/" replace />} />
-          </Route>
-        </>
-      )}
-    </Routes>
+            {/* Standard routes (with Layout) */}
+            <Route element={<Layout />}>
+              <Route path="/" element={<Dashboard />} />
+              <Route path="/agency-dashboard" element={<AgencyDashboard />} />
+              <Route path="/projects/:projectId" element={<ProjectDetail />} />
+              <Route path="/projects/:projectId/config" element={<ProjectConfig />} />
+              <Route path="/settings" element={<Settings />} />
+              <Route path="/ai-optimizer" element={<AiOptimizer />} />
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Route>
+          </>
+        )}
+      </Routes>
+
+      <UpdatePromptModal
+        updateInfo={updatePrompt}
+        hasPendingBuild={Boolean(pendingDeepLinkBuild)}
+        onContinueAnyway={handleContinueBuildAnyway}
+        onClose={handleCloseUpdateModal}
+      />
+    </>
   );
 }
 

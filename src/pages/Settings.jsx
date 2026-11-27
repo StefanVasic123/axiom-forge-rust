@@ -227,6 +227,9 @@ function Settings() {
   });
   const [localTools, setLocalTools] = useState(null);
   const [compatibilityWarnings, setCompatibilityWarnings] = useState([]);
+  const [appVersion, setAppVersion] = useState('...');
+  const [updateCheckResult, setUpdateCheckResult] = useState(null);
+  const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
 
   useEffect(() => {
     checkTokens();
@@ -234,6 +237,9 @@ function Settings() {
     loadHardwareProfile();
     loadTechOverrides();
     loadLocalTools();
+    window.electronAPI?.app?.getVersion?.().then((res) => {
+      if (res?.version) setAppVersion(res.version);
+    }).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -249,6 +255,19 @@ function Settings() {
     });
     return () => { cancelled = true; };
   }, [editorModel, installedOllamaModels.length]);
+
+  const handleManualUpdateCheck = async () => {
+    if (!window.electronAPI?.app?.checkForUpdate) return;
+    setIsCheckingUpdate(true);
+    try {
+      const res = await window.electronAPI.app.checkForUpdate();
+      setUpdateCheckResult(res);
+    } catch {
+      setUpdateCheckResult({ checked: false, status: 'offline' });
+    } finally {
+      setIsCheckingUpdate(false);
+    }
+  };
 
   const loadTechOverrides = async () => {
     try {
@@ -1145,26 +1164,90 @@ function Settings() {
       </section>
 
       {/* About Section */}
-      <section className="card p-6">
-        <div className="flex items-center justify-between">
+      <section className="card p-6 space-y-4">
+        <div className="flex items-center justify-between gap-4 flex-wrap">
           <div>
             <h2 className="text-lg font-semibold text-white">{t('settings.aboutTitle')}</h2>
             <p className="text-sm text-slate-500">{t('settings.aboutSubtitle')}</p>
           </div>
-          <div className="text-right">
-            <p className="text-sm text-slate-400 font-mono">Version 1.1.9</p>
-            <a
-              href="https://github.com/axiom-forge/axiom-forge"
-              onClick={(e) => {
-                e.preventDefault();
-                window.electronAPI.shell.openExternal('https://github.com/axiom-forge/axiom-forge');
-              }}
-              className="text-xs text-indigo-400 hover:text-indigo-300"
-            >
-              {t('settings.viewGithub')}
-            </a>
+          <div className="text-right space-y-1">
+            <p className="text-sm text-slate-300 font-mono">Version {appVersion}</p>
+            <div className="flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={handleManualUpdateCheck}
+                disabled={isCheckingUpdate}
+                className="text-xs text-emerald-400 hover:text-emerald-300 inline-flex items-center gap-1 disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3 h-3 ${isCheckingUpdate ? 'animate-spin' : ''}`} />
+                {isCheckingUpdate ? t('update.checkingUpdates') : t('update.checkUpdatesBtn')}
+              </button>
+              <a
+                href="https://github.com/StefanVasic123/axiom-forge-rust/releases/latest"
+                onClick={(e) => {
+                  e.preventDefault();
+                  window.electronAPI.shell.openExternal('https://github.com/StefanVasic123/axiom-forge-rust/releases/latest');
+                }}
+                className="text-xs text-indigo-400 hover:text-indigo-300"
+              >
+                {t('settings.viewGithub')}
+              </a>
+            </div>
           </div>
         </div>
+
+        {updateCheckResult && (
+          <div
+            className={`rounded-xl border px-4 py-3 text-xs flex items-center justify-between gap-3 ${
+              updateCheckResult.status === 'update_required'
+                ? 'bg-rose-500/10 border-rose-500/40 text-rose-200'
+                : updateCheckResult.status === 'update_recommended'
+                ? 'bg-amber-500/10 border-amber-500/40 text-amber-200'
+                : updateCheckResult.status === 'up_to_date'
+                ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                : 'bg-slate-800/70 border-slate-700 text-slate-300'
+            }`}
+          >
+            <span>
+              {updateCheckResult.status === 'update_required'
+                ? t('update.requiredDesc', {
+                    installed: updateCheckResult.installedVersion,
+                    latest: updateCheckResult.latestVersion,
+                    behind: updateCheckResult.versionsBehind,
+                    threshold: updateCheckResult.mandatoryThreshold ?? 10,
+                  })
+                : updateCheckResult.status === 'update_recommended'
+                ? t('update.recommendedDesc', {
+                    installed: updateCheckResult.installedVersion,
+                    latest: updateCheckResult.latestVersion,
+                    behind: updateCheckResult.versionsBehind,
+                  })
+                : updateCheckResult.status === 'up_to_date'
+                ? t('update.upToDateMsg', { version: updateCheckResult.installedVersion })
+                : t('update.offlineMsg')}
+            </span>
+            {(updateCheckResult.status === 'update_required' ||
+              updateCheckResult.status === 'update_recommended') && (
+              <button
+                type="button"
+                onClick={() =>
+                  window.electronAPI.shell.openExternal(
+                    updateCheckResult.downloadUrl ||
+                      'https://github.com/StefanVasic123/axiom-forge-rust/releases/latest'
+                  )
+                }
+                className={`shrink-0 px-3 py-1.5 rounded-lg font-semibold inline-flex items-center gap-1.5 ${
+                  updateCheckResult.status === 'update_required'
+                    ? 'bg-rose-600 hover:bg-rose-500 text-white'
+                    : 'bg-amber-500 hover:bg-amber-400 text-slate-950'
+                }`}
+              >
+                <Download className="w-3.5 h-3.5" />
+                {t('update.downloadBtn', { latest: updateCheckResult.latestVersion })}
+              </button>
+            )}
+          </div>
+        )}
       </section>
     </div>
   );

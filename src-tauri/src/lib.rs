@@ -20,6 +20,7 @@ pub mod templates_expo;
 pub mod copilot;
 pub mod publish;
 pub mod brand_logo;
+pub mod updater;
 
 pub use ollama::*;
 pub use project::*;
@@ -35,6 +36,7 @@ pub use ast_engine::*;
 pub use reviewer::*;
 pub use self_healing::*;
 pub use orchestrator::*;
+pub use updater::*;
 
 pub use serde::{Deserialize, Serialize};
 pub use sysinfo::System;
@@ -297,14 +299,14 @@ pub fn run() {
                                 if stream.read(&mut buf).await.is_ok() {
                                     let req = String::from_utf8_lossy(&buf);
                                     let response = if req.starts_with("OPTIONS") {
-                                        "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\nConnection: close\r\n\r\n".to_string()
+                                        "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Private-Network: true\r\nConnection: close\r\n\r\n".to_string()
                                     } else {
                                         let body = format!(
                                             r#"{{"app":"axiom-forge","version":"{}","status":"ready"}}"#,
                                             env!("CARGO_PKG_VERSION")
                                         );
                                         format!(
-                                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Private-Network: true\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                                             body.len(),
                                             body
                                         )
@@ -403,7 +405,9 @@ pub fn run() {
             publish::publish_verify_domain,
             brand_logo::brand_logo_get_init,
             brand_logo::brand_logo_generate,
-            brand_logo::brand_logo_apply
+            brand_logo::brand_logo_apply,
+            updater::get_app_version,
+            updater::check_desktop_update
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

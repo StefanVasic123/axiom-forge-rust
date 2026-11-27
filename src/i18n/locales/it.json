@@ -198,5 +198,22 @@
     "viewProject": "Visualizza progetto generato",
     "hideTooltip": "Nascondi scheda di stato (il processo continua in background)",
     "progress": "Progresso"
+  },
+  "update": {
+    "recommendedTitle": "Nuova versione disponibile (v{latest})",
+    "recommendedDesc": "Stai usando Axiom Forge v{installed} ({behind} versione/i indietro). Consigliamo di installare l’ultima versione prima di generare codice per avere tutte le ultime correzioni.",
+    "requiredTitle": "Aggiornamento obbligatorio prima di generare",
+    "requiredDesc": "Il tuo Axiom Forge installato (v{installed}) è indietro di {behind} versioni rispetto all’ultima (v{latest}). Le versioni con {threshold}+ rilasci di ritardo devono essere aggiornate prima di generare.",
+    "currentLabel": "Installata",
+    "latestLabel": "Ultima",
+    "behindBadge": "{behind} versione/i indietro",
+    "downloadBtn": "Scarica v{latest}",
+    "continueAnywayBtn": "Continua comunque",
+    "laterBtn": "Più tardi",
+    "closeBtn": "Chiudi",
+    "checkUpdatesBtn": "Controlla aggiornamenti",
+    "checkingUpdates": "Controllo...",
+    "upToDateMsg": "Stai usando l’ultima versione (v{version}).",
+    "offlineMsg": "Impossibile raggiungere il server di aggiornamento al momento."
   }
 }

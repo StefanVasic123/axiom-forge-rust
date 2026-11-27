@@ -4654,6 +4654,368 @@ pub fn format_hooks_prompt(hooks_val: &Value) -> String {
     out
 }
 
+fn normalize_manifest_rel_path(path: &str) -> String {
+    path.replace('\\', "/").trim_start_matches("./").to_ascii_lowercase()
+}
+
+/// Renders structured `manifest.softwareSpecs` (services, custom packages, data views/tables with
+/// column functionality and reactive data flows, plus "what & HOW" custom instructions) into
+/// scope-specific directives for Manifest Expansion, Prisma, API routes, and React UI generation.
+pub fn format_software_specs_prompt(specs: &Value, scope: &str) -> String {
+    let services: Vec<String> = specs
+        .get("services")
+        .and_then(|s| s.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let custom_packages: Vec<String> = specs
+        .get("customPackages")
+        .and_then(|p| p.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let data_views: Vec<&Value> = specs
+        .get("dataViews")
+        .and_then(|d| d.as_array())
+        .map(|arr| arr.iter().collect())
+        .unwrap_or_default();
+
+    let custom_instructions = specs
+        .get("customInstructions")
+        .and_then(|c| c.as_str())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    if services.is_empty()
+        && custom_packages.is_empty()
+        && data_views.is_empty()
+        && custom_instructions.is_empty()
+    {
+        return String::new();
+    }
+
+    let mut out = String::from("SOFTWARE SPECIFICS CONTRACT (USER-DEFINED REQUIREMENTS):\n");
+
+    if !services.is_empty() || !custom_packages.is_empty() {
+        if !services.is_empty() {
+            out.push_str(&format!("- Selected Services: {}\n", services.join(", ")));
+        }
+        if !custom_packages.is_empty() {
+            out.push_str(&format!(
+                "- Requested Custom NPM Packages: {}\n",
+                custom_packages.join(", ")
+            ));
+        }
+        match scope {
+            "api" => out.push_str("- Service Integration Rule: Implement backend integration routes for selected services with graceful zero-key offline/preview fallbacks when env vars are unset.\n"),
+            "ui" => out.push_str("- UI Service Rule: Wire interactive client actions to the corresponding service endpoints/packages safely inside 'use client' boundaries.\n"),
+            _ => {}
+        }
+    }
+
+    if !data_views.is_empty() {
+        out.push_str("- User-Defined Data Views & Tables:\n");
+        for view in &data_views {
+            let entity = view
+                .get("entityName")
+                .and_then(|e| e.as_str())
+                .unwrap_or("Entity");
+            let view_type = view
+                .get("viewType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("table");
+            let desc = view
+                .get("description")
+                .and_then(|d| d.as_str())
+                .map(|s| s.trim())
+                .unwrap_or("");
+            if desc.is_empty() {
+                out.push_str(&format!("  * View \"{}\" [type: {}]\n", entity, view_type));
+            } else {
+                out.push_str(&format!(
+                    "  * View \"{}\" [type: {}] — {}\n",
+                    entity, view_type, desc
+                ));
+            }
+
+            if let Some(cols) = view.get("columns").and_then(|c| c.as_array()) {
+                for col in cols {
+                    let c_name = col.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    if c_name.is_empty() {
+                        continue;
+                    }
+                    let c_type = col
+                        .get("dataType")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("text");
+                    let db_field = col
+                        .get("dbField")
+                        .and_then(|d| d.as_str())
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(c_name);
+                    let func = col
+                        .get("functionality")
+                        .and_then(|f| f.as_str())
+                        .map(|s| s.trim())
+                        .unwrap_or("");
+                    if func.is_empty() {
+                        out.push_str(&format!(
+                            "    - Column \"{}\" [type: {}, dbField: \"{}\"]\n",
+                            c_name, c_type, db_field
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "    - Column \"{}\" [type: {}, dbField: \"{}\"] -> {}\n",
+                            c_name, c_type, db_field, func
+                        ));
+                    }
+                }
+            }
+
+            if let Some(actions) = view.get("actions").and_then(|a| a.as_array()) {
+                let action_list: Vec<&str> = actions
+                    .iter()
+                    .filter_map(|a| a.as_str().map(|s| s.trim()))
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !action_list.is_empty() {
+                    out.push_str(&format!("    - View Actions: {}\n", action_list.join(", ")));
+                }
+            }
+
+            if let Some(flows) = view.get("dataFlows").and_then(|f| f.as_array()) {
+                if !flows.is_empty() {
+                    out.push_str("    - REACTIVE DATA FLOWS (WHEN -> THEN / DB WRITE):\n");
+                    for flow in flows {
+                        let trigger = flow.get("trigger").and_then(|t| t.as_str()).unwrap_or("");
+                        let src = flow
+                            .get("sourceField")
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty());
+                        let tgt = flow
+                            .get("targetDbField")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty());
+                        let effect = flow.get("effect").and_then(|e| e.as_str()).unwrap_or("");
+                        let src_str = src.map(|s| format!(" [sourceField: {}]", s)).unwrap_or_default();
+                        let tgt_str = tgt.map(|t| format!(" [write DB field: {}]", t)).unwrap_or_default();
+                        out.push_str(&format!(
+                            "      > WHEN {}{} -> THEN {}{}\n",
+                            trigger, src_str, effect, tgt_str
+                        ));
+                    }
+                }
+            }
+        }
+
+        match scope {
+            "expansion" => out.push_str("- EXPANSION RULE: Ensure prisma/schema.prisma models, API routes (/api/<entity>/route.ts), and UI pages/components exist for every defined View and Service above.\n"),
+            "prisma" => out.push_str("- PRISMA CONTRACT: Declare exact Prisma models for every View entity above, including scalar/enum columns matching every `dbField` plus every reactive flow's `sourceField` and `targetDbField`.\n"),
+            "api" => out.push_str("- API FLOW CONTRACT: Support CRUD + filtering/sorting/actions for every View column, and execute EVERY `REACTIVE DATA FLOW` transactionally inside POST/PATCH/PUT handlers (writing `sourceField` into `targetDbField` when triggered).\n"),
+            "ui" => out.push_str("- UI TABLE/VIEW CONTRACT: Render every View with its exact layout (`viewType`), exact column headers, column interactivity (inline edit, dropdown filters, sortable badges, actions), and live API calls triggering the reactive data flows with immediate UI refresh.\n"),
+            _ => {}
+        }
+    }
+
+    if !custom_instructions.is_empty() {
+        out.push_str(&format!(
+            "- Custom Functional Instructions (WHAT & HOW):\n{}\n",
+            custom_instructions
+        ));
+    }
+
+    out
+}
+
+/// Merges Ollama-expanded manifest files with original server-curated files without losing rich
+/// server-side descriptions or metadata when a path already exists in the expanded list.
+pub fn merge_expanded_manifest_files(orig_files: &[Value], expanded_files: Vec<Value>) -> Vec<Value> {
+    let mut orig_by_path: std::collections::HashMap<String, &Value> = std::collections::HashMap::new();
+    for orig in orig_files {
+        if let Some(orig_path) = orig.get("path").and_then(|p| p.as_str()) {
+            orig_by_path.insert(normalize_manifest_rel_path(orig_path), orig);
+        }
+    }
+
+    let mut merged: Vec<Value> = expanded_files
+        .into_iter()
+        .map(|mut exp_file| {
+            let norm_path = exp_file
+                .get("path")
+                .and_then(|p| p.as_str())
+                .map(normalize_manifest_rel_path)
+                .unwrap_or_default();
+            if let Some(orig) = orig_by_path.get(&norm_path) {
+                let orig_desc = orig.get("description").and_then(|d| d.as_str()).unwrap_or("").trim();
+                let exp_desc = exp_file
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if let Some(obj) = exp_file.as_object_mut() {
+                    if orig_desc.len() > exp_desc.len() {
+                        let combined = if !exp_desc.is_empty()
+                            && !orig_desc.to_ascii_lowercase().contains(&exp_desc.to_ascii_lowercase())
+                        {
+                            format!("{} {}", orig_desc, exp_desc)
+                        } else {
+                            orig_desc.to_string()
+                        };
+                        obj.insert("description".to_string(), serde_json::json!(combined));
+                    }
+                    for key in ["internalDependencies", "dependencies", "defaultContent", "role"] {
+                        let missing = obj.get(key).map_or(true, |v| {
+                            v.is_null()
+                                || v.as_array().map_or(false, |a| a.is_empty())
+                                || v.as_str().map_or(false, |s| s.trim().is_empty())
+                        });
+                        if missing {
+                            if let Some(orig_val) = orig.get(key) {
+                                obj.insert(key.to_string(), orig_val.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            exp_file
+        })
+        .collect();
+
+    let existing_paths: std::collections::HashSet<String> = merged
+        .iter()
+        .filter_map(|f| f.get("path").and_then(|p| p.as_str()).map(normalize_manifest_rel_path))
+        .collect();
+
+    for orig in orig_files {
+        if let Some(orig_path) = orig.get("path").and_then(|p| p.as_str()) {
+            if !existing_paths.contains(&normalize_manifest_rel_path(orig_path)) {
+                merged.push(orig.clone());
+            }
+        }
+    }
+
+    merged
+}
+
+/// Injects dependencies from `manifest.softwareSpecs` (`resolvedDependencies`, `resolvedDevDependencies`,
+/// and `customPackages`) into `metamanifest.requiredFilesTemplates[package.json].mergeDependencies`
+/// without removing any existing core framework dependencies.
+pub fn inject_software_specs_dependencies_into_metamanifest(metamanifest: &mut Value, specs: &Value) {
+    let mut deps = serde_json::Map::new();
+    let mut dev_deps = serde_json::Map::new();
+
+    if let Some(obj) = specs.get("resolvedDependencies").and_then(|d| d.as_object()) {
+        for (k, v) in obj {
+            if let Some(ver) = v.as_str() {
+                deps.insert(k.clone(), serde_json::json!(ver));
+            }
+        }
+    }
+
+    if let Some(obj) = specs.get("resolvedDevDependencies").and_then(|d| d.as_object()) {
+        for (k, v) in obj {
+            if let Some(ver) = v.as_str() {
+                dev_deps.insert(k.clone(), serde_json::json!(ver));
+            }
+        }
+    }
+
+    if let Some(custom_pkgs) = specs.get("customPackages").and_then(|p| p.as_array()) {
+        let pkg_db = crate::packages::load_packages_db();
+        for item in custom_pkgs {
+            if let Some(pkg_name) = item.as_str().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                if !deps.contains_key(pkg_name) && !dev_deps.contains_key(pkg_name) {
+                    let known_ver = pkg_db
+                        .iter()
+                        .find(|p| p.name.eq_ignore_ascii_case(pkg_name))
+                        .map(|p| p.version.as_str())
+                        .unwrap_or("latest");
+                    deps.insert(pkg_name.to_string(), serde_json::json!(known_ver));
+                }
+            }
+        }
+    }
+
+    if deps.is_empty() && dev_deps.is_empty() {
+        return;
+    }
+
+    let Some(mm_obj) = metamanifest.as_object_mut() else {
+        return;
+    };
+    if !mm_obj.contains_key("requiredFilesTemplates") {
+        mm_obj.insert("requiredFilesTemplates".to_string(), serde_json::json!([]));
+    }
+    let Some(templates) = mm_obj
+        .get_mut("requiredFilesTemplates")
+        .and_then(|t| t.as_array_mut())
+    else {
+        return;
+    };
+
+    let mut pkg_idx = templates.iter().position(|t| {
+        t.get("path")
+            .and_then(|p| p.as_str())
+            .map(|p| p.trim().eq_ignore_ascii_case("package.json"))
+            .unwrap_or(false)
+    });
+
+    if pkg_idx.is_none() {
+        templates.push(serde_json::json!({
+            "path": "package.json",
+            "mergeDependencies": {
+                "dependencies": {},
+                "devDependencies": {}
+            }
+        }));
+        pkg_idx = Some(templates.len() - 1);
+    }
+
+    if let Some(idx) = pkg_idx {
+        if let Some(pkg_tpl) = templates[idx].as_object_mut() {
+            let merge_obj = pkg_tpl
+                .entry("mergeDependencies".to_string())
+                .or_insert_with(|| serde_json::json!({ "dependencies": {}, "devDependencies": {} }));
+            if let Some(m) = merge_obj.as_object_mut() {
+                if !deps.is_empty() {
+                    let target_deps = m
+                        .entry("dependencies".to_string())
+                        .or_insert_with(|| serde_json::json!({}));
+                    if let Some(td) = target_deps.as_object_mut() {
+                        for (k, v) in deps {
+                            td.entry(k).or_insert(v);
+                        }
+                    }
+                }
+                if !dev_deps.is_empty() {
+                    let target_dev = m
+                        .entry("devDependencies".to_string())
+                        .or_insert_with(|| serde_json::json!({}));
+                    if let Some(tdd) = target_dev.as_object_mut() {
+                        for (k, v) in dev_deps {
+                            tdd.entry(k).or_insert(v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn get_expert_system_prompt(
     file_path: &str,
     project_type: &str,
@@ -4827,6 +5189,12 @@ pub fn get_expert_system_prompt(
             if let Some(db_models) = clean_lbg.get("sharedContracts").and_then(|c| c.get("database")).and_then(|d| d.get("models")) {
                 prompt.push_str(&format!("\nREQUIRED DATABASE MODELS CONTRACT:\n{}\n", db_models));
             }
+            if let Some(specs) = lbg.get("softwareSpecs") {
+                let fmt_specs = format_software_specs_prompt(specs, "prisma");
+                if !fmt_specs.is_empty() {
+                    prompt.push_str(&format!("\n{}\n", fmt_specs));
+                }
+            }
         }
         return prompt;
     }
@@ -4915,6 +5283,12 @@ pub fn get_expert_system_prompt(
                     prompt.push_str(&format!("\n{}\n", fmt_api));
                 }
             }
+            if let Some(specs) = lbg.get("softwareSpecs") {
+                let fmt_specs = format_software_specs_prompt(specs, "api");
+                if !fmt_specs.is_empty() {
+                    prompt.push_str(&format!("\n{}\n", fmt_specs));
+                }
+            }
         }
         let contracts_prompt = format_axiom_contracts_prompt(proj_dir, file_path);
         if !contracts_prompt.is_empty() {
@@ -4967,6 +5341,12 @@ pub fn get_expert_system_prompt(
                 let fmt_api = format_api_endpoints_prompt(api_contracts);
                 if !fmt_api.is_empty() {
                     prompt.push_str(&format!("\n{}\n", fmt_api));
+                }
+            }
+            if let Some(specs) = lbg.get("softwareSpecs") {
+                let fmt_specs = format_software_specs_prompt(specs, "general");
+                if !fmt_specs.is_empty() {
+                    prompt.push_str(&format!("\n{}\n", fmt_specs));
                 }
             }
         }
@@ -5172,6 +5552,12 @@ pub fn get_expert_system_prompt(
                     prompt.push_str(&format!("\n{}\n", fmt_hooks));
                 }
             }
+            if let Some(specs) = lbg.get("softwareSpecs") {
+                let fmt_specs = format_software_specs_prompt(specs, "ui");
+                if !fmt_specs.is_empty() {
+                    prompt.push_str(&format!("\n{}\n", fmt_specs));
+                }
+            }
         }
 
         if !routes_ref.trim().is_empty() {
@@ -5216,6 +5602,14 @@ pub fn get_expert_system_prompt(
         );
         if !policy_block.is_empty() {
             prompt.push_str(&format!("\n{}\n", policy_block));
+        }
+    }
+    if let Some(ref lbg) = lbg_val {
+        if let Some(specs) = lbg.get("softwareSpecs") {
+            let fmt_specs = format_software_specs_prompt(specs, "general");
+            if !fmt_specs.is_empty() {
+                prompt.push_str(&format!("\n{}\n", fmt_specs));
+            }
         }
     }
     if !context_ref.is_empty() {
@@ -6597,6 +6991,7 @@ pub async fn run_orchestrator_opt(
             "resolvedStack": if cp_type == "nextjs" { "Next.js" } else { cp_type },
             "name": cp_name,
             "description": cp_desc,
+            "softwareSpecs": cp.get("softwareSpecs").cloned().unwrap_or(Value::Null),
             "metadata": {
                 "name": cp_name,
                 "description": cp_desc
@@ -6610,10 +7005,24 @@ pub async fn run_orchestrator_opt(
         let mut manifest_opt: Option<Value> = None;
         if let Ok(res) = client.get(&url)
             .header("Authorization", format!("Bearer {}", token))
+            .header("X-Axiom-Version", env!("CARGO_PKG_VERSION"))
             .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
         {
+            if res.status().as_u16() == 426 {
+                let err_msg = if let Ok(err_json) = res.json::<Value>().await {
+                    err_json
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Your Axiom Forge Desktop version is too old. Please update before generating.")
+                        .to_string()
+                } else {
+                    "Your Axiom Forge Desktop version is too old. Please update before generating.".to_string()
+                };
+                debug_log_to_file(format!("[Orchestrator] Server rejected manifest fetch with HTTP 426: {}", err_msg));
+                return Err(format!("DESKTOP_UPDATE_REQUIRED: {}", err_msg));
+            }
             if res.status().is_success() {
                 if let Ok(json) = res.json::<Value>().await {
                     manifest_opt = json.get("data").cloned();
@@ -6773,6 +7182,10 @@ pub async fn run_orchestrator_opt(
         }
     }
 
+    if let Some(specs) = manifest.get("softwareSpecs") {
+        inject_software_specs_dependencies_into_metamanifest(&mut metamanifest, specs);
+    }
+
     if resume_base_pct.is_none() {
         emit_progress("fetch-manifest", "Manifest secured and ready.", 10.0);
     }
@@ -6817,8 +7230,8 @@ pub async fn run_orchestrator_opt(
         let path = f.get("path").and_then(|p| p.as_str()).unwrap_or("");
         let lang = f.get("language").and_then(|l| l.as_str()).unwrap_or("");
         let desc = f.get("description").and_then(|d| d.as_str()).unwrap_or("");
-        let short_desc = if desc.chars().count() > 100 {
-            let truncated: String = desc.chars().take(100).collect();
+        let short_desc = if desc.chars().count() > 160 {
+            let truncated: String = desc.chars().take(160).collect();
             format!("{}...", truncated)
         } else {
             desc.to_string()
@@ -6831,12 +7244,20 @@ pub async fn run_orchestrator_opt(
     }).collect();
     let original_files_json = serde_json::to_string(&original_files_summary).unwrap_or_else(|_| "[]".to_string());
 
+    let software_specs_expansion_block = manifest
+        .get("softwareSpecs")
+        .map(|s| format_software_specs_prompt(s, "expansion"))
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| format!("\n{}\n", s))
+        .unwrap_or_default();
+
     let expansion_prompt = if crate::templates_expo::is_expo_project_type(&project_type) {
         format!(
             "You are a Senior Mobile Architect. We are generating a complete Expo SDK 52 React Native mobile application named '{}' using {}.\n\
              Project Idea & Core Domain Description: \"{}\"\n\
              Version Overrides:\n\
-             {}\n\n\
+             {}\n\
+             {}\n\
              Original files skeleton in the manifest:\n\
              {}\n\n\
              Identify only truly missing mobile screens (`app/(tabs)/*.tsx` or detail routes under `app/`), local AsyncStorage state helpers (`src/store/*.ts`), or reusable React Native UI components (`src/components/*.tsx`) needed for a complete offline-first mobile app.\n\
@@ -6845,7 +7266,7 @@ pub async fn run_orchestrator_opt(
              - NEVER add backend API routes (`src/api/**`, `src/app/api/**`, `**/route.ts`), Prisma (`prisma/schema.prisma`), Next.js files (`next.config.*`, `src/app/**`, `globals.css`, `tailwind.config.*`, `middleware.ts`), or duplicate `src/models/*` / `src/hooks/*` when `src/types/index.ts` and `src/store/*` already exist.\n\
              - Keep the expanded file list lean (~14-20 files total) and preserve ALL original files verbatim.\n\
              Output ONLY a valid JSON array of objects with 'path', 'description' (1-2 concise sentences), and 'language'. No markdown fences or prose.",
-            name, resolved_stack, project_description, overrides_desc, original_files_json
+            name, resolved_stack, project_description, overrides_desc, software_specs_expansion_block, original_files_json
         )
     } else {
         format!(
@@ -6853,7 +7274,8 @@ pub async fn run_orchestrator_opt(
              Project Idea & Core Domain Description: \"{}\"\n\
              The user requested a fully complete, production-ready implementation tailored specifically to this business domain.\n\
              Version Overrides requested by user:\n\
-             {}\n\n\
+             {}\n\
+             {}\n\
              Original files skeleton in the manifest:\n\
              {}\n\n\
              Identify all missing files, routes, state management, components, configuration files, or database schemas needed to make this project complete.\n\
@@ -6870,7 +7292,7 @@ pub async fn run_orchestrator_opt(
              Keep each file description concise (1-2 sentences) so the manifest generates quickly.\n\
              Ensure all files from the original list are preserved.\n\
              Respond ONLY with a valid JSON array. Do not include any introductory or concluding text, or markdown code blocks.",
-            platform, name, resolved_stack, project_description, overrides_desc, original_files_json
+            platform, name, resolved_stack, project_description, overrides_desc, software_specs_expansion_block, original_files_json
         )
     };
 
@@ -7056,18 +7478,8 @@ pub async fn run_orchestrator_opt(
                     }
 
                     if let Some(expanded_files) = parsed_files_opt {
-                        // Merge to ensure all original manifest files are preserved
-                        let mut merged = expanded_files;
-                        for orig in files.iter() {
-                            if let Some(orig_path) = orig.get("path").and_then(|p| p.as_str()) {
-                                let exists = merged.iter().any(|f| {
-                                    f.get("path").and_then(|p| p.as_str()) == Some(orig_path)
-                                });
-                                if !exists {
-                                    merged.push(orig.clone());
-                                }
-                            }
-                        }
+                        // Merge while preserving rich server-curated descriptions & missing original files
+                        let merged = merge_expanded_manifest_files(&files, expanded_files);
                         files_to_generate = crate::sanitizer::filter_runaway_manifest_expansion(&files, merged, &project_type);
                         crate::sanitizer::deduplicate_manifest_files(&mut files_to_generate);
                         debug_log_to_file(format!(
@@ -7265,6 +7677,7 @@ pub async fn run_orchestrator_opt(
         "name": name,
         "projectDescription": project_description,
         "projectType": project_type,
+        "softwareSpecs": manifest.get("softwareSpecs").cloned().unwrap_or(serde_json::Value::Null),
         "appVersion": env!("CARGO_PKG_VERSION"),
         "modelId": model_id,
         "token": token,
@@ -7285,13 +7698,18 @@ pub async fn run_orchestrator_opt(
     let lbg_path = axiom_dir.join("live_builder_guide.json");
     
     if let Some(lbg_val) = manifest.get("liveBuilderGuide") {
-        let sanitized_lbg = sanitize_live_builder_guide_contracts(lbg_val);
+        let mut sanitized_lbg = sanitize_live_builder_guide_contracts(lbg_val);
+        if let Some(specs) = manifest.get("softwareSpecs").filter(|s| !s.is_null()) {
+            if let Some(obj) = sanitized_lbg.as_object_mut() {
+                obj.entry("softwareSpecs".to_string()).or_insert_with(|| specs.clone());
+            }
+        }
         if let Ok(lbg_content) = serde_json::to_string_pretty(&sanitized_lbg) {
             let _ = fs::write(&lbg_path, lbg_content);
         }
     } else if !lbg_path.exists() {
         // Fallback: Generate a default LBG guide locally if not sent by the Web App
-        let default_lbg = serde_json::json!({
+        let mut default_lbg = serde_json::json!({
             "projectSpecification": {
                 "stack": resolved_stack,
                 "importExportStyle": "named",
@@ -7315,6 +7733,11 @@ pub async fn run_orchestrator_opt(
             },
             "generationPipeline": []
         });
+        if let Some(specs) = manifest.get("softwareSpecs").filter(|s| !s.is_null()) {
+            if let Some(obj) = default_lbg.as_object_mut() {
+                obj.insert("softwareSpecs".to_string(), specs.clone());
+            }
+        }
         if let Ok(lbg_content) = serde_json::to_string_pretty(&default_lbg) {
             let _ = fs::write(&lbg_path, lbg_content);
         }

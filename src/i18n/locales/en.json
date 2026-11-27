@@ -222,5 +222,22 @@
     "tuningTitle": "Local AI Inference Directives & Tuning",
     "saveDirectiveSuccess": "Optimizer preferences saved locally.",
     "policyRegistryTitle": "Pipeline Orchestrator & Policy Registry (ruleId) Inspector"
+  },
+  "update": {
+    "recommendedTitle": "New Version Available (v{latest})",
+    "recommendedDesc": "You are currently running Axiom Forge v{installed} ({behind} version(s) behind the latest release). We recommend installing the latest version before generating code for the newest fixes and engine improvements.",
+    "requiredTitle": "Update Required Before Generating",
+    "requiredDesc": "Your installed Axiom Forge (v{installed}) is {behind} versions behind the latest release (v{latest}). Versions {threshold}+ releases behind must be updated before generating new code.",
+    "currentLabel": "Installed",
+    "latestLabel": "Latest",
+    "behindBadge": "{behind} version(s) behind",
+    "downloadBtn": "Download v{latest}",
+    "continueAnywayBtn": "Continue Anyway",
+    "laterBtn": "Later",
+    "closeBtn": "Close",
+    "checkUpdatesBtn": "Check for Updates",
+    "checkingUpdates": "Checking...",
+    "upToDateMsg": "You are on the latest version (v{version}).",
+    "offlineMsg": "Could not reach the update server right now."
   }
 }

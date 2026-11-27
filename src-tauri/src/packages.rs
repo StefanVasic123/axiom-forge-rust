@@ -20,7 +20,7 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
     let mut needs_write = !db_path.exists();
     if db_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&db_path) {
-            if !content.contains("\"dbVersion\": 7") {
+            if !content.contains("\"dbVersion\": 8") {
                 needs_write = true;
             }
         }
@@ -28,7 +28,7 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
     
     if needs_write {
         let default_db = serde_json::json!({
-            "dbVersion": 7,
+            "dbVersion": 8,
             "packages": [
                 {
                     "name": "resend",
@@ -289,6 +289,59 @@ pub fn ensure_packages_db_exists() -> std::path::PathBuf {
                         "next": ">=13.0.0"
                     },
                     "bestPractices": "Call useTranslations('Namespace') with a namespace string only (never pass message objects as a second arg). Store messages in src/messages/<locale>.json and mount NextIntlClientProvider cleanly."
+                },
+                {
+                    "name": "leaflet",
+                    "version": "^1.9.4",
+                    "aliases": [],
+                    "importExamples": ["import L from 'leaflet';", "import 'leaflet/dist/leaflet.css';"],
+                    "compatibility": {},
+                    "bestPractices": "Render Leaflet maps ONLY in 'use client' components mounted inside useEffect or via next/dynamic({ ssr: false }) to prevent Next.js SSR window-is-not-defined errors. Provide clean offline/marker fallback list when map tiles fail to load."
+                },
+                {
+                    "name": "react-leaflet",
+                    "version": "^4.2.1",
+                    "aliases": [],
+                    "importExamples": ["import { MapContainer, TileLayer, Marker, Popup } from 'react-leaflet';"],
+                    "compatibility": {
+                        "leaflet": "^1.9.4",
+                        "react": "^18.0.0"
+                    },
+                    "bestPractices": "Wrap react-leaflet MapContainer with dynamic import `{ ssr: false }` inside Next.js App Router client components, and guard custom Leaflet marker icons so missing image assets never crash rendering."
+                },
+                {
+                    "name": "papaparse",
+                    "version": "^5.4.1",
+                    "aliases": [],
+                    "importExamples": ["import Papa from 'papaparse';"],
+                    "compatibility": {},
+                    "bestPractices": "Use `Papa.parse(csvText, { header: true, skipEmptyLines: true })` for CSV imports and `Papa.unparse(rows)` for exporting downloadable CSV files cleanly in browser or API routes."
+                },
+                {
+                    "name": "jspdf",
+                    "version": "^2.5.2",
+                    "aliases": [],
+                    "importExamples": ["import { jsPDF } from 'jspdf';"],
+                    "compatibility": {},
+                    "bestPractices": "Instantiate `const doc = new jsPDF()` inside client click handlers (avoid top-level SSR execution), render clean tables/headers with `doc.text(...)`, and trigger download via `doc.save('report.pdf')`."
+                },
+                {
+                    "name": "openai",
+                    "version": "^4.67.3",
+                    "aliases": [],
+                    "importExamples": ["import OpenAI from 'openai';"],
+                    "compatibility": {
+                        "node": ">=18.0.0"
+                    },
+                    "bestPractices": "Instantiate `new OpenAI({ apiKey: process.env.OPENAI_API_KEY || 'sk-dummy-local-preview' })` inside server API routes only. Always guard with a deterministic offline mock response when `OPENAI_API_KEY` is missing or invalid in local development."
+                },
+                {
+                    "name": "socket.io-client",
+                    "version": "^4.8.1",
+                    "aliases": [],
+                    "importExamples": ["import { io } from 'socket.io-client';"],
+                    "compatibility": {},
+                    "bestPractices": "Guard `io(process.env.NEXT_PUBLIC_SOCKET_URL || '')` inside `useEffect` in `'use client'` components, skip auto-connect or fall back gracefully to HTTP polling when `NEXT_PUBLIC_SOCKET_URL` is unset, and call `socket.disconnect()` on cleanup."
                 }
             ]
         });

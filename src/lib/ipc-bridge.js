@@ -744,11 +744,24 @@ window.electronAPI = {
   app: {
     getVersion: async () => {
       try {
-        const { getVersion } = await import('@tauri-apps/api/app');
-        const ver = await getVersion();
-        return { success: true, version: `${ver} (Rust)` };
+        const ver = await invoke('get_app_version');
+        return { success: true, version: ver };
       } catch {
-        return { success: true, version: '0.1.8 (Rust)' };
+        try {
+          const { getVersion } = await import('@tauri-apps/api/app');
+          const ver = await getVersion();
+          return { success: true, version: ver };
+        } catch {
+          return { success: true, version: '0.1.66' };
+        }
+      }
+    },
+    checkForUpdate: async (apiHost = null) => {
+      try {
+        return await invoke('check_desktop_update', { apiHost: apiHost || null });
+      } catch (e) {
+        console.warn('[IPC Bridge] check_desktop_update failed:', e);
+        return { checked: false, status: 'offline' };
       }
     },
     getSettings: async () => {
